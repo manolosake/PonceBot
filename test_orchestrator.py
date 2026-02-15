@@ -4,8 +4,10 @@ import unittest
 from pathlib import Path
 
 import bot
+from orchestrator.agents import load_agent_profiles
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runner import run_task
+from orchestrator.runbooks import load_runbooks
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
@@ -351,3 +353,21 @@ class TestOrchestratorStorage(unittest.TestCase):
             recovered = q.recover_stale_running()
             self.assertEqual(recovered, 0)
             self.assertIsNone(q.get_workspace_lease(job_id="deadbeef"))
+
+
+class TestYamlLikeParsing(unittest.TestCase):
+    def test_agents_yaml_parses_lists(self) -> None:
+        profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")
+        self.assertIn("frontend", profiles)
+        fe = profiles["frontend"]
+        tools = fe.get("allowed_tools")
+        self.assertIsInstance(tools, list)
+        assert isinstance(tools, list)
+        self.assertIn("screenshot", [str(x) for x in tools])
+
+    def test_runbooks_yaml_parses_multiline_prompt(self) -> None:
+        rbs = load_runbooks(Path(__file__).resolve().parent / "orchestrator" / "runbooks.yaml")
+        self.assertGreaterEqual(len(rbs), 1)
+        rb = rbs[0]
+        self.assertNotEqual(rb.prompt.strip(), "|")
+        self.assertIn("Revisa", rb.prompt)

@@ -29,11 +29,29 @@ def _parse_yaml_like(content: str) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     current: dict[str, object] | None = None
     current_list_key: str | None = None
+    multiline_key: str | None = None
+    multiline_indent: int = 0
+    multiline_lines: list[str] = []
 
     for raw_line in content.splitlines():
         line = raw_line.rstrip("\n")
+        # Multiline block scalar support: key: | (literal) or key: > (folded-ish, treated literally here).
+        if multiline_key is not None and current is not None:
+            if not line.strip():
+                multiline_lines.append("")
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent > multiline_indent:
+                cut = min(len(raw_line), multiline_indent + 2)
+                multiline_lines.append(raw_line[cut:].rstrip("\n"))
+                continue
+            current[multiline_key] = "\n".join(multiline_lines).rstrip("\n")
+            multiline_key = None
+            multiline_lines = []
+
         if not line.strip():
             continue
+        # Treat comments as comments only outside of multiline blocks.
         if line.lstrip().startswith("#"):
             continue
 
@@ -58,12 +76,19 @@ def _parse_yaml_like(content: str) -> list[dict[str, object]]:
 
         if indent >= 2 and ":" in text:
             key, value = _split_kv(text)
-            if value is not None:
-                current[key] = _coerce(value)
-                current_list_key = None
-            elif value == "":
+            if value is None:
                 current_list_key = key
                 current.setdefault(key, [])
+                continue
+            if value in ("|", ">"):
+                multiline_key = key
+                multiline_indent = indent
+                multiline_lines = []
+                current[key] = ""
+                current_list_key = None
+                continue
+            current[key] = _coerce(value)
+            current_list_key = None
             continue
 
         if indent >= 4 and text.startswith("-") and current_list_key:
@@ -76,6 +101,8 @@ def _parse_yaml_like(content: str) -> list[dict[str, object]]:
             continue
 
     if current is not None:
+        if multiline_key is not None:
+            current[multiline_key] = "\n".join(multiline_lines).rstrip("\n")
         items.append(current)
 
     return items
