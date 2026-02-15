@@ -537,7 +537,13 @@ class SQLiteTaskStorage:
         with self._lock:
             with self._conn() as conn:
                 rows = conn.execute("SELECT job_id FROM jobs WHERE state='running'").fetchall()
+                # Workspace leases are process-local; any surviving rows are stale after a restart/crash.
+                try:
+                    conn.execute("DELETE FROM workspace_leases")
+                except Exception:
+                    pass
                 if not rows:
+                    conn.commit()
                     return 0
                 total = 0
                 for row in rows:

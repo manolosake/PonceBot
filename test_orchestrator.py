@@ -338,3 +338,16 @@ class TestOrchestratorStorage(unittest.TestCase):
                 self.assertIsNotNone(row)
                 assert row is not None
                 self.assertEqual(row.state, "cancelled")
+
+    def test_recover_clears_workspace_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+
+            slot = q.lease_workspace(role="backend", job_id="deadbeef", slots=1)
+            self.assertEqual(slot, 1)
+            self.assertEqual(q.get_workspace_lease(job_id="deadbeef"), ("backend", 1))
+
+            recovered = q.recover_stale_running()
+            self.assertEqual(recovered, 0)
+            self.assertIsNone(q.get_workspace_lease(job_id="deadbeef"))
