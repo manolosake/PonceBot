@@ -5191,7 +5191,11 @@ def orchestrator_worker_loop(
                     and not task.is_autonomous
                     and not task.parent_job_id
                 ):
-                    specs = parse_ceo_subtasks(getattr(result, "structured_digest", None))
+                    if orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=1):
+                        # Avoid duplicate delegation on retries/restarts.
+                        specs = []
+                    else:
+                        specs = parse_ceo_subtasks(getattr(result, "structured_digest", None))
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
