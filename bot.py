@@ -5080,7 +5080,8 @@ def _orchestrator_run_codex(
     finally:
         elapsed = time.time() - started
         try:
-            proc.last_msg_path.unlink(missing_ok=True)
+            if proc.last_msg_path is not None:
+                proc.last_msg_path.unlink(missing_ok=True)
             proc.stdout_path.unlink(missing_ok=True)
             proc.stderr_path.unlink(missing_ok=True)
         except Exception:

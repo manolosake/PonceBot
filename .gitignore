@@ -4,6 +4,7 @@ data/jobs.sqlite
 data/artifacts/
 data/worktrees/
 state.json
+.codexbot_uploads/
 __pycache__/
 users.json
 profiles.json

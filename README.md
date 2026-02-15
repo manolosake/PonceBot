@@ -24,6 +24,10 @@ Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la sali
    - `TELEGRAM_ALLOWED_CHAT_IDS=123456789`
 6. Reinicia el bot.
 
+Nota (auth opcional):
+- Si `BOT_AUTH_ENABLED=0` (default), el bot no muestra `/login` ni `/logout` en `/help` ni en sugerencias, y respondera `Auth disabled` si los escribes.
+- Si `BOT_AUTH_ENABLED=1`, cada chat requiere `/login` (sesion con TTL).
+
 ## Uso
 
 - `/help`
@@ -102,8 +106,45 @@ Si no, la alternativa simple es correrlo dentro de `tmux`/`screen` o con `nohup`
   - Limite de descarga: `BOT_MAX_DOWNLOAD_BYTES` (0 = sin limite).
 - Puedes mandar notas de voz / audio y transcribirlas a texto:
   - Habilita `BOT_TRANSCRIBE_AUDIO=1`.
-  - Recomendado (gratis/local): `BOT_TRANSCRIBE_BACKEND=whispercpp` (requiere ffmpeg + whisper.cpp + modelo ggml).
-  - Alternativa (API): `BOT_TRANSCRIBE_BACKEND=openai` y configura `OPENAI_API_KEY`.
+  - Recomendado (gratis/local): `BOT_TRANSCRIBE_BACKEND=whispercpp`.
+    - Requiere: `ffmpeg`, `whisper-cli` (whisper.cpp) y un modelo ggml (ej. `ggml-small.bin`).
+    - Instalacion rapida (Ubuntu x86_64, sin sudo; instala binarios dentro del repo y mantenlos en `.gitignore`):
+
+      ```bash
+      cd /home/aponce/codexbot
+      mkdir -p bin models vendor
+
+      # ffmpeg estatico
+      cd vendor
+      curl -L -o ffmpeg.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+      tar -xf ffmpeg.tar.xz
+      cp ffmpeg-*-amd64-static/ffmpeg ../bin/ffmpeg
+      chmod +x ../bin/ffmpeg
+      cd ..
+
+      # whisper.cpp (build)
+      git clone https://github.com/ggerganov/whisper.cpp vendor/whisper.cpp
+
+      # CMake (sin sudo)
+      python3 -m venv vendor/.venv-cmake
+      vendor/.venv-cmake/bin/pip install --upgrade pip cmake
+      vendor/.venv-cmake/bin/cmake -S vendor/whisper.cpp -B vendor/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release
+      vendor/.venv-cmake/bin/cmake --build vendor/whisper.cpp/build -j 8
+
+      cp vendor/whisper.cpp/build/bin/whisper-cli bin/whisper-cli
+      chmod +x bin/whisper-cli
+
+      # modelo (small)
+      bash vendor/whisper.cpp/models/download-ggml-model.sh small
+      cp vendor/whisper.cpp/models/ggml-small.bin models/ggml-small.bin
+      ```
+
+    - Env recomendado:
+      - `BOT_TRANSCRIBE_FFMPEG_BIN=/home/aponce/codexbot/bin/ffmpeg`
+      - `BOT_TRANSCRIBE_WHISPERCPP_BIN=/home/aponce/codexbot/bin/whisper-cli`
+      - `BOT_TRANSCRIBE_WHISPERCPP_MODEL_PATH=/home/aponce/codexbot/models/ggml-small.bin`
+  - Alternativa (API): `BOT_TRANSCRIBE_BACKEND=openai` + `OPENAI_API_KEY`.
+    Nota: esto tiene costo por uso y no viene incluido por tener suscripcion de ChatGPT.
   - El texto transcrito se procesa igual que si lo hubieras escrito (incluye /ro /rw /exec, etc.).
 
 ## Plan de implementación (v1)
