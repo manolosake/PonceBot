@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
 import json
 import time
 import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 
 JobRole = str
@@ -32,6 +32,16 @@ class Task:
     chat_id: int
     user_id: int | None
     reply_to_message_id: int | None
+    is_autonomous: bool = False
+    parent_job_id: str | None = None
+    owner: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    ttl_seconds: int | None = None
+    retry_count: int = 0
+    max_retries: int = 2
+    labels: dict[str, str | int | float | bool] = field(default_factory=dict)
+    requires_review: bool = False
+    artifacts_dir: str | None = None
     trace: dict[str, str | int | float | bool | list[str]] = field(default_factory=dict)
 
     @classmethod
@@ -53,6 +63,16 @@ class Task:
         reply_to_message_id: int | None = None,
         due_at: float | None = None,
         state: str = "queued",
+        is_autonomous: bool = False,
+        parent_job_id: str | None = None,
+        owner: str | None = None,
+        depends_on: list[str] | None = None,
+        ttl_seconds: int | None = None,
+        retry_count: int = 0,
+        max_retries: int = 2,
+        labels: dict[str, str | int | float | bool] | None = None,
+        requires_review: bool = False,
+        artifacts_dir: str | None = None,
         trace: dict[str, str | int | float | bool | list[str]] | None = None,
         job_id: str | None = None,
         created_at: float | None = None,
@@ -77,6 +97,16 @@ class Task:
             chat_id=chat_id,
             user_id=user_id,
             reply_to_message_id=reply_to_message_id,
+            is_autonomous=bool(is_autonomous),
+            parent_job_id=parent_job_id,
+            owner=owner if (owner is None or str(owner).strip()) else None,
+            depends_on=[str(p).strip() for p in (depends_on or []) if str(p).strip()],
+            ttl_seconds=int(ttl_seconds) if ttl_seconds is not None else None,
+            retry_count=max(0, int(retry_count)),
+            max_retries=max(0, int(max_retries)),
+            labels=labels or {},
+            requires_review=bool(requires_review),
+            artifacts_dir=artifacts_dir,
             trace=trace or {},
         )
 
@@ -100,6 +130,16 @@ class Task:
             chat_id=kwargs.get("chat_id", self.chat_id),
             user_id=kwargs.get("user_id", self.user_id),
             reply_to_message_id=kwargs.get("reply_to_message_id", self.reply_to_message_id),
+            is_autonomous=kwargs.get("is_autonomous", self.is_autonomous),
+            parent_job_id=kwargs.get("parent_job_id", self.parent_job_id),
+            owner=kwargs.get("owner", self.owner),
+            depends_on=list(kwargs.get("depends_on", self.depends_on) or []),
+            ttl_seconds=kwargs.get("ttl_seconds", self.ttl_seconds),
+            retry_count=int(kwargs.get("retry_count", self.retry_count)),
+            max_retries=int(kwargs.get("max_retries", self.max_retries)),
+            labels=dict(kwargs.get("labels", self.labels)),
+            requires_review=kwargs.get("requires_review", self.requires_review),
+            artifacts_dir=kwargs.get("artifacts_dir", self.artifacts_dir),
             trace=kwargs.get("trace", dict(self.trace)),
         )
 

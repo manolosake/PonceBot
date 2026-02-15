@@ -21,6 +21,9 @@ class OrchestratorQueue:
     def submit_task(self, task: Task) -> str:
         return self._storage.submit_task(task)
 
+    def submit_batch(self, tasks: list[Task]) -> list[str]:
+        return self._storage.submit_batch(tasks)
+
     def take_next(
         self,
         role: str | None = None,
@@ -76,8 +79,41 @@ class OrchestratorQueue:
     def get_running_count(self) -> int:
         return self._storage.running_count()
 
+    def peek(
+        self,
+        *,
+        role: str | None = None,
+        state: str | None = None,
+        limit: int = 20,
+    ) -> list[Task]:
+        return self._storage.peek(role=role, state=state, limit=limit)
+
+    def dequeue_with_budget(
+        self,
+        role: str | None = None,
+        *,
+        limit_roles: set[str] | None = None,
+        budget: float | None = None,
+    ) -> Task | None:
+        max_parallel = self._max_parallel_by_role()
+        return self._storage.dequeue_with_budget(
+            role=role,
+            limit_roles=limit_roles,
+            budget=budget,
+            max_parallel_by_role=max_parallel,
+        )
+
+    def get_role_backlog(self, *, state: str | None = None) -> dict[str, dict[str, int]]:
+        return self._storage.get_role_backlog(state=state)
+
+    def set_cost_cap(self, role: str, max_cost_usd: float) -> None:
+        self._storage.set_cost_cap(role, max_cost_usd)
+
     def jobs_by_state(self, *, state: str, limit: int = 50) -> list[Task]:
         return self._storage.jobs_by_state(state=state, limit=limit)
+
+    def claim_autonomous_due_jobs(self, *, limit: int = 5) -> list[Task]:
+        return self._storage.claim_autonomous_due_jobs(limit=limit)
 
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {

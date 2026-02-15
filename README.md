@@ -31,8 +31,10 @@ Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la sali
 - `/status`
 - `/synccommands` (fuerza re-sincronizacion de sugerencias `/...` en Telegram)
 - `/cancel` (cancela el job en curso y descarta los jobs en cola de ese chat)
+- `/brief` (resumen ejecutivo corto del estado del orquestador)
 - `/new` (inicia un hilo nuevo de Codex para ese chat)
 - `/thread` (muestra el `thread_id` actual de Codex para ese chat)
+- `/snapshot <url|texto>` (solicita tarea `frontend` de captura visual)
 - `/skills` (lista skills instaladas, deshabilitadas y `.system`)
 - `/skills catalog [filter]` (lista skills instalables desde `openai/skills`)
 - `/skills install <skill>` (instala una skill curated en `~/.codex/skills/<skill>`)

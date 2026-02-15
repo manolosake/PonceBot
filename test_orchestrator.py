@@ -84,6 +84,18 @@ class TestOrchestratorCommands(unittest.TestCase):
             resp_cancel, _ = bot._parse_job(cfg, msg_cancel)
             self.assertEqual(resp_cancel, "__orch_cancel_job:8f9c")
 
+            msg_brief = bot.IncomingMessage(5, 1, 2, 14, "u", "/brief")
+            resp_brief, _ = bot._parse_job(cfg, msg_brief)
+            self.assertEqual(resp_brief, "__orch_brief__")
+
+            msg_snapshot = bot.IncomingMessage(6, 1, 2, 15, "u", "/snapshot https://example.com")
+            resp_snapshot, job_snapshot = bot._parse_job(cfg, msg_snapshot)
+            self.assertEqual(resp_snapshot, "")
+            self.assertIsNotNone(job_snapshot)
+            assert job_snapshot is not None
+            self.assertEqual(job_snapshot.mode_hint, "rw")
+            self.assertIn("@frontend", job_snapshot.user_text)
+
 
 class TestOrchestratorMarkerResponse(unittest.TestCase):
     def test_invalid_role_is_rejected(self) -> None:

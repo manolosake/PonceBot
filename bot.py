@@ -2395,13 +2395,14 @@ def _help_text(cfg: BotConfig) -> str:
             "- /agents             Show orchestrator role status and queue per role",
             "- /job <id>           Show task/job status by id",
             "- /daily              Show orchestrator digest now",
-        "- /approve <id>       Approve a blocked task",
-        "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
-        "- /pause <role>       Pause role in orchestrator",
-        "- /resume <role>      Resume role in orchestrator",
-        "- /cancel <id>        Cancel orchestrator task by id",
-        "- /emergency_resume   Resume orchestrator after emergency stop",
-        "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
+            "- /brief              Alias rápido de resumen de estado ejecutivo",
+            "- /approve <id>       Approve a blocked task",
+            "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
+            "- /pause <role>       Pause role in orchestrator",
+            "- /resume <role>      Resume role in orchestrator",
+            "- /cancel <id>        Cancel orchestrator task by id",
+            "- /emergency_resume   Resume orchestrator after emergency stop",
+            "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
             "- /new                Start a new Codex conversation thread for this chat",
             "- /restart            Restart the bot service (systemd will bring it back)",
             "- /thread             Show the current Codex thread id for this chat",
@@ -2417,6 +2418,7 @@ def _help_text(cfg: BotConfig) -> str:
             "- /m                  Alias for /model",
             "- /voice              Show/set voice transcription settings",
             "- /v                  Alias for /voice",
+            "- /snapshot           Request frontend snapshot task (screenshot-oriented)",
             "- /effort             Show current reasoning effort",
             "- /effort <level>     Set effort: low|medium|high|xhigh",
             "- /effort clear       Clear effort override for current mode",
@@ -2475,6 +2477,8 @@ def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
         ("emergency_stop", "Parar orquestador"),
         ("emergency_resume", "Reanudar orquestador"),
         ("daily", "Resumen automático de estado"),
+        ("brief", "Resumen ejecutivo corto"),
+        ("snapshot", "Solicitar captura de UI"),
         ("approve", "Aprobar tarea bloqueada"),
         ("pause", "Pausar rol"),
         ("resume", "Reanudar rol"),
@@ -3106,7 +3110,7 @@ def _send_orchestrator_marker_response(
         api.send_message(chat_id, _orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
         return True
 
-    if kind == "daily":
+    if kind in ("daily", "brief"):
         if not orch_q:
             api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
             return True
@@ -3361,6 +3365,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/daily":
         return _orch_marker("daily"), None
 
+    if text == "/brief":
+        return _orch_marker("brief"), None
+
     if text == "/pause":
         return "Uso: /pause <role>", None
 
@@ -3397,6 +3404,31 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             # Preserve legacy behavior for "/cancel" without args.
             return "__cancel__", None
         return _orch_marker("cancel_job", job_id), None
+
+    if text == "/snapshot":
+        return "Uso: /snapshot <url|objetivo>", None
+
+    if text.startswith("/snapshot "):
+        target = text[len("/snapshot") :].strip()
+        if not target:
+            return "Uso: /snapshot <url|objetivo>", None
+        # Force frontend role explicitly.
+        snapshot_text = f"@frontend Solicitud de snapshot: {target}. Genera captura visual y devuelve ruta/descripcion."
+        return (
+            "",
+            Job(
+                chat_id=msg.chat_id,
+                reply_to_message_id=msg.message_id,
+                user_text=snapshot_text,
+                argv=["exec", snapshot_text],
+                mode_hint="rw",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            ),
+        )
 
     if text == "/permissions":
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
