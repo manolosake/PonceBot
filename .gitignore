@@ -5,6 +5,7 @@ data/artifacts/
 data/worktrees/
 state.json
 .codexbot_uploads/
+.poncebot_managed_worktree
 __pycache__/
 users.json
 profiles.json

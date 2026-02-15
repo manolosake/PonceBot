@@ -70,7 +70,7 @@ def prepare_clean_workspace(path: Path) -> None:
     _run(["git", "-C", str(path), "fetch", "origin", "--prune"], check=False)
     base_ref = _pick_base_ref(path)
     _run(["git", "-C", str(path), "reset", "--hard", base_ref], check=True)
-    _run(["git", "-C", str(path), "clean", "-fdx"], check=True)
+    _run(["git", "-C", str(path), "clean", "-fdx", "-e", _SENTINEL], check=True)
 
 
 def collect_git_artifacts(*, repo_dir: Path, artifacts_dir: Path) -> list[Path]:
