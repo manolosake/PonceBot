@@ -95,7 +95,7 @@ def _explicit_role(text_l: str) -> str | None:
     return None
 
 
-def detect_role(text: str) -> str:
+def detect_role(text: str, *, default_role: str = "backend") -> str:
     text_l = (text or "").lower()
     direct = _explicit_role(text_l)
     if direct:
@@ -105,7 +105,7 @@ def detect_role(text: str) -> str:
     best = max(scored.items(), key=lambda kv: kv[1], default=("backend", 0))
     if best[1] > 0:
         return best[0]
-    return "backend"
+    return (default_role or "backend").strip().lower() or "backend"
 
 
 def detect_request_type(text_l: str) -> str:
@@ -151,7 +151,11 @@ def to_task(
     reply_to_message_id = normalized_context.get("reply_to_message_id")
     model = str(normalized_context.get("model", "gpt-5.2"))
     effort = str(normalized_context.get("effort", "medium"))
-    role = normalized_context.get("role") or detect_role(text)
+    default_role = str(normalized_context.get("default_role") or "backend").strip().lower() or "backend"
+
+    # Allow explicit @role markers to override any context-provided default.
+    explicit = _explicit_role((text or "").lower())
+    role = explicit or normalized_context.get("role") or detect_role(text, default_role=default_role)
     if role not in ("ceo", "frontend", "backend", "qa", "sre"):
         role = "backend"
 

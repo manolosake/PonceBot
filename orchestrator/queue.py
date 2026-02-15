@@ -73,6 +73,39 @@ class OrchestratorQueue:
     def get_job(self, job_id: str) -> Task | None:
         return self._storage.get_job(job_id)
 
+    def get_agent_thread(self, *, chat_id: int, role: str) -> str | None:
+        return self._storage.get_agent_thread(chat_id=chat_id, role=role)
+
+    def set_agent_thread(self, *, chat_id: int, role: str, thread_id: str) -> None:
+        self._storage.set_agent_thread(chat_id=chat_id, role=role, thread_id=thread_id)
+
+    def clear_agent_thread(self, *, chat_id: int, role: str) -> bool:
+        return self._storage.clear_agent_thread(chat_id=chat_id, role=role)
+
+    def clear_agent_threads(self, *, chat_id: int) -> int:
+        return self._storage.clear_agent_threads(chat_id=chat_id)
+
+    def lease_workspace(self, *, role: str, job_id: str, slots: int) -> int | None:
+        return self._storage.lease_workspace(role=role, job_id=job_id, slots=slots)
+
+    def release_workspace(self, *, job_id: str) -> bool:
+        return self._storage.release_workspace(job_id=job_id)
+
+    def get_workspace_lease(self, *, job_id: str) -> tuple[str, int] | None:
+        return self._storage.get_workspace_lease(job_id=job_id)
+
+    def get_runbook_last_run(self, *, runbook_id: str) -> float:
+        return self._storage.get_runbook_last_run(runbook_id=runbook_id)
+
+    def set_runbook_last_run(self, *, runbook_id: str, ts: float) -> None:
+        self._storage.set_runbook_last_run(runbook_id=runbook_id, ts=ts)
+
+    def jobs_by_parent(self, *, parent_job_id: str, limit: int = 200) -> list[Task]:
+        return self._storage.jobs_by_parent(parent_job_id=parent_job_id, limit=limit)
+
+    def inbox(self, *, role: str | None = None, limit: int = 25) -> list[Task]:
+        return self._storage.inbox(role=role, limit=limit)
+
     def get_queued_count(self) -> int:
         return self._storage.queued_count()
 

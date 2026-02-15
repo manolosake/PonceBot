@@ -1,0 +1,33 @@
+- id: sre_health
+  role: sre
+  interval_seconds: 900
+  mode_hint: ro
+  priority: 2
+  enabled: true
+  prompt: |
+    Revisa salud del host y servicios del bot:
+    - estado de systemd codexbot (si aplica)
+    - espacio en disco
+    - procesos top (cpu/mem)
+    Devuelve hallazgos y acciones sugeridas.
+
+- id: qa_smoke
+  role: qa
+  interval_seconds: 21600
+  mode_hint: ro
+  priority: 3
+  enabled: true
+  prompt: |
+    Corre smoke tests / revisión rápida:
+    - python -m unittest -q (si aplica)
+    Reporta fallos y recomendaciones.
+
+- id: ceo_digest
+  role: ceo
+  interval_seconds: 21600
+  mode_hint: ro
+  priority: 3
+  enabled: true
+  prompt: |
+    Genera un brief ejecutivo: estado del backlog, riesgos, y siguientes 3 acciones recomendadas.
+

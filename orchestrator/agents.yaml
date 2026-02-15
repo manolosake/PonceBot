@@ -3,7 +3,7 @@
   system_prompt: Coordina tareas, prioriza trabajo y propone siguientes pasos.
   model: gpt-5.2
   effort: high
-  mode_hint: rw
+  mode_hint: ro
   allowed_tools:
     - review
     - summarize
@@ -11,7 +11,7 @@
     - delegate
   max_parallel_jobs: 1
   max_runtime_seconds: 1200
-  approval_required: true
+  approval_required: false
 
 - role: frontend
   name: Frontend

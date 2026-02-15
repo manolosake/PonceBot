@@ -1,6 +1,8 @@
 codexbot.env
 .env.local
 data/jobs.sqlite
+data/artifacts/
+data/worktrees/
 state.json
 __pycache__/
 users.json

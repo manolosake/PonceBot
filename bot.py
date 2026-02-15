@@ -34,17 +34,24 @@ import hashlib
 import hmac
 import secrets
 from html import escape as _html_escape
+import dataclasses
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from orchestrator.agents import load_agent_profiles
 from orchestrator.dispatcher import to_task
+from orchestrator.delegation import parse_ceo_subtasks
+from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
+from orchestrator.runbooks import Runbook, due as runbook_due, load_runbooks, to_task as runbook_to_task
 from orchestrator.schemas.task import Task
+from orchestrator.screenshot import Viewport, capture as capture_screenshot
 from orchestrator.storage import SQLiteTaskStorage
 from orchestrator.scheduler import OrchestratorScheduler
 from orchestrator.runner import run_task as run_orchestrator_task
+from orchestrator.workspaces import WorktreeLease, collect_git_artifacts, ensure_worktree_pool, prepare_clean_workspace
 
 try:
     import tomllib  # py3.11+
@@ -544,9 +551,17 @@ class BotConfig:
     orchestrator_enabled: bool = True
     orchestrator_default_priority: int = 2
     orchestrator_default_max_cost_window_usd: float = 8.0
-    orchestrator_default_role: str = "backend"
+    orchestrator_default_role: str = "ceo"
     orchestrator_daily_digest_seconds: int = 6 * 60 * 60
     orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
+    orchestrator_worker_count: int = 3
+    orchestrator_sessions_enabled: bool = True
+    worktree_root: Path = Path(__file__).with_name("data") / "worktrees"
+    artifacts_root: Path = Path(__file__).with_name("data") / "artifacts"
+    runbooks_enabled: bool = True
+    runbooks_path: Path = Path(__file__).with_name("orchestrator") / "runbooks.yaml"
+    screenshot_enabled: bool = False
+    transcribe_async: bool = True
 
 
 class TelegramAPI:
@@ -2080,7 +2095,15 @@ class CodexRunner:
         cmd, last_msg_path = self._build_cmd(argv=argv, mode_hint=mode_hint)
         return self._start_with_cmd(cmd=cmd, last_msg_path=last_msg_path)
 
-    def start_threaded_new(self, *, prompt: str, mode_hint: str, image_paths: list[Path] | None = None) -> "CodexRunner.Running":
+    def start_threaded_new(
+        self,
+        *,
+        prompt: str,
+        mode_hint: str,
+        image_paths: list[Path] | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
+    ) -> "CodexRunner.Running":
         """
         Starts a brand-new Codex thread (session). Uses `--json` so the caller can extract `thread_id`
         from stdout, and `--output-last-message` to capture the final assistant message.
@@ -2098,9 +2121,11 @@ class CodexRunner:
             sandbox = self._threaded_sandbox_mode(mode_hint)
             cmd += ["-a", "never", "--sandbox", sandbox]
 
-        # Apply reasoning effort override (if any). This mirrors the interactive /model effort picker.
-        openai_effort, oss_effort = _effective_efforts(self._cfg, chat_id=self._chat_id)
-        eff = oss_effort if self._cfg.codex_use_oss else openai_effort
+        # Apply reasoning effort override (if any). Mirrors the interactive /model effort picker.
+        eff = _sanitize_effort(effort_override or "")
+        if not eff:
+            openai_effort, oss_effort = _effective_efforts(self._cfg, chat_id=self._chat_id)
+            eff = oss_effort if self._cfg.codex_use_oss else openai_effort
         if eff:
             cmd += ["-c", f'model_reasoning_effort="{eff}"']
         cmd += ["-C", str(self._cfg.codex_workdir)]
@@ -2118,14 +2143,12 @@ class CodexRunner:
             argv += ["--oss", "--local-provider", self._cfg.codex_local_provider]
 
         # Apply model defaults/overrides.
-        if self._cfg.codex_use_oss:
-            _, oss_model = _effective_models(self._cfg, chat_id=self._chat_id)
-            if oss_model:
-                argv += ["--model", oss_model]
-        else:
-            openai_model, _ = _effective_models(self._cfg, chat_id=self._chat_id)
-            if openai_model:
-                argv += ["--model", openai_model]
+        active_model = _sanitize_model_id(model_override or "")
+        if not active_model:
+            openai_model, oss_model = _effective_models(self._cfg, chat_id=self._chat_id)
+            active_model = oss_model if self._cfg.codex_use_oss else openai_model
+        if active_model:
+            argv += ["--model", active_model]
 
         # Keep stdout machine-readable; the human output comes from `--output-last-message`.
         argv += ["--json", "--output-last-message", str(last_msg_path)]
@@ -2138,7 +2161,14 @@ class CodexRunner:
         return self._start_with_cmd(cmd=cmd, last_msg_path=last_msg_path)
 
     def start_threaded_resume(
-        self, *, thread_id: str, prompt: str, mode_hint: str, image_paths: list[Path] | None = None
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        mode_hint: str,
+        image_paths: list[Path] | None = None,
+        model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> "CodexRunner.Running":
         """
         Resumes an existing Codex thread (session) using `codex exec resume <thread_id>`.
@@ -2158,8 +2188,10 @@ class CodexRunner:
             sandbox = self._threaded_sandbox_mode(mode_hint)
             cmd += ["-a", "never", "--sandbox", sandbox]
 
-        openai_effort, oss_effort = _effective_efforts(self._cfg, chat_id=self._chat_id)
-        eff = oss_effort if self._cfg.codex_use_oss else openai_effort
+        eff = _sanitize_effort(effort_override or "")
+        if not eff:
+            openai_effort, oss_effort = _effective_efforts(self._cfg, chat_id=self._chat_id)
+            eff = oss_effort if self._cfg.codex_use_oss else openai_effort
         if eff:
             cmd += ["-c", f'model_reasoning_effort="{eff}"']
         cmd += ["-C", str(self._cfg.codex_workdir), "exec", "resume", tid]
@@ -2169,8 +2201,10 @@ class CodexRunner:
 
         # Apply model defaults/overrides (resume supports --model).
         # If empty, Codex will use config defaults for the resumed session.
-        openai_model, oss_model = _effective_models(self._cfg, chat_id=self._chat_id)
-        active_model = oss_model if self._cfg.codex_use_oss else openai_model
+        active_model = _sanitize_model_id(model_override or "")
+        if not active_model:
+            openai_model, oss_model = _effective_models(self._cfg, chat_id=self._chat_id)
+            active_model = oss_model if self._cfg.codex_use_oss else openai_model
         if active_model:
             cmd += ["--model", active_model]
 
@@ -2474,6 +2508,10 @@ def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
         ("login", "Iniciar sesion"),
         ("logout", "Cerrar sesion"),
         ("job", "Ver estado de tarea"),
+        ("ticket", "Ver ticket/subtareas"),
+        ("inbox", "Ver backlog por rol"),
+        ("runbooks", "Ver runbooks"),
+        ("reset_role", "Reset memoria de rol"),
         ("emergency_stop", "Parar orquestador"),
         ("emergency_resume", "Reanudar orquestador"),
         ("daily", "Resumen automático de estado"),
@@ -2484,8 +2522,7 @@ def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
         ("resume", "Reanudar rol"),
         ("new", "Nuevo hilo"),
         ("thread", "Ver thread actual"),
-        ("cancel", "Cancelar ejecucion"),
-        ("cancel", "Cancelar tarea por id"),
+        ("cancel", "Cancelar (chat o por id)"),
         ("model", "Ver/cambiar modelo"),
         ("m", "Alias de /model"),
         ("voice", "Configurar voice"),
@@ -2988,7 +3025,7 @@ def _orchestrator_task_from_job(
     profiles: dict[str, dict[str, Any]] | None,
     user_id: int | None = None,
 ) -> Task:
-    detected_role = to_task(job.user_text, context={"chat_id": job.chat_id}).role
+    detected_role = to_task(job.user_text, context={"chat_id": job.chat_id, "default_role": cfg.orchestrator_default_role}).role
     role = _coerce_orchestrator_role(detected_role)
     profile = _orchestrator_profile(profiles, role)
 
@@ -3027,6 +3064,7 @@ def _orchestrator_task_from_job(
         "model": model,
         "effort": effort,
         "role": role,
+        "default_role": cfg.orchestrator_default_role,
         "priority": priority,
         "due_at": None,
         "mode_hint": mode_hint,
@@ -3050,8 +3088,22 @@ def _orchestrator_task_from_job(
         state="queued",
         max_cost_window_usd=float(task.max_cost_window_usd or cfg.orchestrator_default_max_cost_window_usd),
     )
+    # Snapshot hint: allow bot-side screenshot capture for frontend tasks.
+    try:
+        txt = (job.user_text or "").strip()
+        prefix = "@frontend Solicitud de snapshot:"
+        if txt.lower().startswith(prefix.lower()):
+            url = txt[len(prefix) :].strip().split(None, 1)[0].strip().strip(_PUNCT_TRIM)
+            if url:
+                trace["needs_screenshot"] = True
+                trace["screenshot_url"] = url
+                task = task.with_updates(trace=trace)
+    except Exception:
+        pass
     if task.max_cost_window_usd <= 0:
         task = task.with_updates(max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd))
+    if not (task.artifacts_dir or "").strip():
+        task = task.with_updates(artifacts_dir=str((cfg.artifacts_root / task.job_id).resolve()))
     return task
 
 
@@ -3108,6 +3160,61 @@ def _send_orchestrator_marker_response(
             return True
         task = orch_q.get_job(payload)
         api.send_message(chat_id, _orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "ticket":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not payload:
+            api.send_message(chat_id, "Uso: /ticket <id>", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, _orchestrator_ticket_text(orch_q, payload), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "inbox":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        role = (payload or "").strip().lower() or None
+        if role is not None and role != "all" and not _orchestrator_role_is_valid(role, profiles or {}):
+            roles = ", ".join(_orchestrator_known_roles(profiles or {}))
+            api.send_message(chat_id, f"Rol invalido: {role}. Roles: {roles}", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, _orchestrator_inbox_text(orch_q, role=None if role in (None, "all") else role), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "runbooks":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor.", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, _orchestrator_runbooks_text(cfg, orch_q), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "reset_role":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor.", reply_to_message_id=reply_to_message_id)
+            return True
+        role = (payload or "").strip().lower()
+        if not role:
+            api.send_message(chat_id, "Uso: /reset_role <role|all>", reply_to_message_id=reply_to_message_id)
+            return True
+        if role == "all":
+            n = orch_q.clear_agent_threads(chat_id=chat_id)
+            api.send_message(chat_id, f"OK. Reset sessions: {n}", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _orchestrator_role_is_valid(role, profiles or {}):
+            roles = ", ".join(_orchestrator_known_roles(profiles or {}))
+            api.send_message(chat_id, f"Rol invalido: {role}. Roles: {roles}", reply_to_message_id=reply_to_message_id)
+            return True
+        ok = orch_q.clear_agent_thread(chat_id=chat_id, role=role)
+        api.send_message(chat_id, f"OK. Reset {role}: {'cleared' if ok else 'not set'}", reply_to_message_id=reply_to_message_id)
         return True
 
     if kind in ("daily", "brief"):
@@ -3284,6 +3391,72 @@ def _orchestrator_job_text(task: Task | None) -> str:
     )
 
 
+def _orchestrator_ticket_text(orch_q: OrchestratorQueue, job_id: str) -> str:
+    t = orch_q.get_job(job_id)
+    if t is None:
+        return "No such job found."
+
+    root = t.parent_job_id or t.job_id
+    parent = orch_q.get_job(root)
+    children = orch_q.jobs_by_parent(parent_job_id=root, limit=200)
+
+    lines: list[str] = ["Ticket", "=" * 6]
+    if parent is not None:
+        lines.append(f"id: {parent.job_id}")
+        lines.append(f"state: {parent.state} role={parent.role} mode={parent.mode_hint}")
+        summary = (parent.input_text or "").strip().replace("\n", " ")[:200]
+        lines.append(f"text: {summary}")
+    else:
+        lines.append(f"id: {root} (missing parent row)")
+
+    if not children:
+        lines.append("")
+        lines.append("(no subtasks yet)")
+        return "\n".join(lines)
+
+    counts: dict[str, int] = {}
+    for c in children:
+        counts[c.state] = counts.get(c.state, 0) + 1
+    counts_part = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    lines.append("")
+    lines.append(f"subtasks: {len(children)} ({counts_part})")
+    lines.append("")
+    for c in children[:60]:
+        snippet = (c.input_text or "").strip().replace("\n", " ")[:120]
+        lines.append(f"- {c.job_id[:8]} role={c.role} state={c.state} text={snippet}")
+    if len(children) > 60:
+        lines.append(f"- ... +{len(children) - 60} more")
+    return "\n".join(lines)
+
+
+def _orchestrator_inbox_text(orch_q: OrchestratorQueue, role: str | None) -> str:
+    items = orch_q.inbox(role=role, limit=25)
+    if not items:
+        return "Inbox: empty."
+    title = f"Inbox ({role})" if role else "Inbox"
+    lines = [title, "=" * len(title)]
+    for t in items:
+        snippet = (t.input_text or "").strip().replace("\n", " ")[:160]
+        lines.append(f"- {t.job_id[:8]} role={t.role} state={t.state} text={snippet}")
+    return "\n".join(lines)
+
+
+def _orchestrator_runbooks_text(cfg: BotConfig, orch_q: OrchestratorQueue) -> str:
+    if not cfg.runbooks_enabled:
+        return "Runbooks: disabled."
+    rbs = load_runbooks(cfg.runbooks_path)
+    if not rbs:
+        return f"Runbooks: none found at {cfg.runbooks_path}"
+    lines = ["Runbooks", "=" * 8]
+    now = time.time()
+    for rb in rbs:
+        last = orch_q.get_runbook_last_run(runbook_id=rb.runbook_id)
+        due = "DUE" if runbook_due(rb, last_run_at=last, now=now) else "ok"
+        last_s = "never" if not last else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last))
+        lines.append(f"- {rb.runbook_id} role={rb.role} every={rb.interval_seconds}s enabled={rb.enabled} last={last_s} {due}")
+    return "\n".join(lines)
+
+
 def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     """
     Returns (response_text, job)
@@ -3361,6 +3534,36 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/job":
         return "Uso: /job <id>", None
+
+    if text.startswith("/ticket "):
+        job_id = _orch_job_id(text[len("/ticket ") :])
+        if not job_id:
+            return "Uso: /ticket <id>", None
+        return _orch_marker("ticket", job_id), None
+
+    if text == "/ticket":
+        return "Uso: /ticket <id>", None
+
+    if text == "/inbox":
+        return _orch_marker("inbox"), None
+
+    if text.startswith("/inbox "):
+        role = _orch_job_id(text[len("/inbox ") :]).lower()
+        if not role:
+            return "Uso: /inbox [role]", None
+        return _orch_marker("inbox", role), None
+
+    if text == "/runbooks":
+        return _orch_marker("runbooks"), None
+
+    if text == "/reset_role":
+        return "Uso: /reset_role <role|all>", None
+
+    if text.startswith("/reset_role "):
+        role = _orch_job_id(text[len("/reset_role ") :]).lower()
+        if not role:
+            return "Uso: /reset_role <role|all>", None
+        return _orch_marker("reset_role", role), None
 
     if text == "/daily":
         return _orch_marker("daily"), None
@@ -4569,8 +4772,28 @@ def _orchestrator_apply_task_flags(task: Task, argv: list[str]) -> list[str]:
     return args
 
 
-def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading.Event, orch_q: OrchestratorQueue | None) -> dict[str, Any]:
+def _orchestrator_run_codex(
+    cfg: BotConfig,
+    task: Task,
+    *,
+    stop_event: threading.Event,
+    orch_q: OrchestratorQueue | None,
+    profiles: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """
+    Execute a single orchestrator task using Codex.
+
+    Changes vs legacy behavior (grounded in this repository's "Jarvis v1" plan):
+    - Apply role profiles via `build_agent_prompt(...)` (system_prompt becomes real agent behavior).
+    - Optional per-(chat, role) Codex sessions via `codex exec resume` (memory per role).
+    - Optional git worktree pool per role/slot for isolation.
+    - Optional Playwright screenshot capture for frontend snapshot tasks.
+    - Always emit git diff/status artifacts when running in a worktree.
+    """
     started = time.time()
+    role = _coerce_orchestrator_role(task.role)
+    profile = _orchestrator_profile(profiles, role)
+
     mode = _coerce_orchestrator_mode(task.mode_hint)
     timeout_seconds = cfg.codex_timeout_seconds
     try:
@@ -4578,21 +4801,143 @@ def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading
     except Exception:
         profile_timeout = 0
     if profile_timeout > 0:
-        timeout_seconds = min(
-            timeout_seconds,
-            profile_timeout,
-        ) if timeout_seconds > 0 else profile_timeout
-    request = (task.request_type or "task").strip().lower()
-    if request in {"maintenance", "review", "status"}:
-        argv = ["review", task.input_text]
-    else:
-        argv = ["exec", task.input_text]
-    argv = _orchestrator_apply_task_flags(task, argv)
+        timeout_seconds = min(timeout_seconds, profile_timeout) if timeout_seconds > 0 else profile_timeout
 
+    artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Worktree isolation (best-effort). If configured incorrectly, fail safe (no writes) by falling back.
+    eff_cfg = cfg
+    worktree_dir: Path | None = None
+    leased_slot: int | None = None
+    lease_enabled = orch_q is not None and (cfg.codex_workdir / ".git").exists()
     try:
-        runner = CodexRunner(cfg, chat_id=task.chat_id)
-        proc = runner.start(argv=argv, mode_hint=mode)
+        slots = max(1, int(profile.get("max_parallel_jobs") or 1))
+    except Exception:
+        slots = 1
+
+    if lease_enabled:
+        try:
+            leased_slot = orch_q.lease_workspace(role=role, job_id=task.job_id, slots=slots)
+            if leased_slot is None:
+                return {
+                    "status": "error",
+                    "summary": "No workspace slot available for this role; try again.",
+                    "artifacts": [],
+                    "logs": f"role={role} slots={slots}",
+                    "next_action": "retry",
+                    "structured_digest": {"role": role, "workspace": "unavailable"},
+                }
+            ensure_worktree_pool(base_repo=cfg.codex_workdir, root=cfg.worktree_root, role=role, slots=slots)
+            worktree_dir = (cfg.worktree_root / role / f"slot{leased_slot}").resolve()
+            prepare_clean_workspace(worktree_dir)
+            eff_cfg = dataclasses.replace(cfg, codex_workdir=worktree_dir)
+        except Exception as e:
+            # Release the lease and fall back to the base repo in read-only mode.
+            try:
+                if orch_q is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                pass
+            leased_slot = None
+            worktree_dir = None
+            eff_cfg = cfg
+            mode = "ro"
+            LOG.exception("Worktree setup failed; falling back to base workdir read-only. job=%s role=%s", task.job_id, role)
+            artifacts_f = artifacts_dir / "worktree_error.txt"
+            artifacts_f.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
+
+    # Optional screenshot capture (Playwright).
+    image_paths: list[Path] = []
+    needs_shot = bool(task.trace.get("needs_screenshot", False))
+    if needs_shot:
+        url = str(task.trace.get("screenshot_url") or "").strip()
+        if not url:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (snapshot preflight). job=%s role=%s", task.job_id, role)
+            return {
+                "status": "error",
+                "summary": "Snapshot requested but no URL/target provided.",
+                "artifacts": [],
+                "logs": "",
+                "next_action": None,
+            }
+        if not cfg.screenshot_enabled:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (snapshot disabled). job=%s role=%s", task.job_id, role)
+            return {
+                "status": "error",
+                "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
+                "artifacts": [],
+                "logs": "",
+                "next_action": "enable_screenshots",
+            }
+        out_png = artifacts_dir / "snapshot.png"
+        try:
+            capture_screenshot(url, out_png, viewport=Viewport(width=1280, height=720))
+            image_paths.append(out_png)
+        except Exception as e:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (snapshot failure). job=%s role=%s", task.job_id, role)
+            return {
+                "status": "error",
+                "summary": f"Screenshot failed: {e}",
+                "artifacts": [],
+                "logs": str(e),
+                "next_action": "install_playwright",
+            }
+
+    prompt = build_agent_prompt(task, profile=profile)
+
+    # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
+    runner = CodexRunner(eff_cfg, chat_id=task.chat_id)
+    proc: CodexRunner.Running
+    used_thread_id: str | None = None
+    started_new_thread = False
+    try:
+        if cfg.orchestrator_sessions_enabled and orch_q is not None:
+            tid = orch_q.get_agent_thread(chat_id=task.chat_id, role=role) or ""
+            if tid:
+                used_thread_id = tid
+                proc = runner.start_threaded_resume(
+                    thread_id=tid,
+                    prompt=prompt,
+                    mode_hint=mode,
+                    image_paths=image_paths or None,
+                    model_override=task.model or None,
+                    effort_override=task.effort or None,
+                )
+            else:
+                started_new_thread = True
+                proc = runner.start_threaded_new(
+                    prompt=prompt,
+                    mode_hint=mode,
+                    image_paths=image_paths or None,
+                    model_override=task.model or None,
+                    effort_override=task.effort or None,
+                )
+        else:
+            argv = ["exec"]
+            for p in image_paths:
+                argv += ["--image", str(p)]
+            argv.append(prompt)
+            argv = _orchestrator_apply_task_flags(task, argv)
+            proc = runner.start(argv=argv, mode_hint=mode)
     except Exception as e:
+        try:
+            if orch_q is not None and leased_slot is not None:
+                orch_q.release_workspace(job_id=task.job_id)
+        except Exception:
+            LOG.exception("Failed to release workspace lease (codex start error). job=%s role=%s", task.job_id, role)
         return {
             "status": "error",
             "summary": f"Failed to start codex for job={task.job_id}",
@@ -4642,15 +4987,60 @@ def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading
             }
 
         code = int(proc.proc.returncode) if proc.proc.returncode is not None else 1
+
         body = ""
         if proc.last_msg_path is not None:
             body = _read_text_file(proc.last_msg_path).strip()
         if not body:
-            body = _tail_file_text(proc.stdout_path, max_chars=6000) or "(no output)"
+            # If stdout is small-ish, read it; otherwise show a tail.
+            try:
+                sz = proc.stdout_path.stat().st_size
+            except OSError:
+                sz = 0
+            if sz <= 256_000:
+                body = _strip_ansi(_read_text_file(proc.stdout_path)).strip()
+            else:
+                body = _tail_file_text(proc.stdout_path, max_chars=6000).strip()
+        if not body:
+            body = "(no output)"
+
+        # If we started a new session, extract and persist the thread id.
+        if started_new_thread and orch_q is not None:
+            try:
+                tid = _extract_thread_id_from_jsonl_file(proc.stdout_path)
+                if tid:
+                    used_thread_id = tid
+                    orch_q.set_agent_thread(chat_id=task.chat_id, role=role, thread_id=tid)
+            except Exception:
+                LOG.exception("Failed to extract/persist orchestrator thread_id. job=%s role=%s", task.job_id, role)
 
         logs = _tail_file_text(proc.stderr_path, max_chars=6000)
-        artifacts = _collect_png_artifacts(cfg, start_time=proc.start_time, text=body)
+
+        artifacts: list[Path] = []
+        # Screenshot output is outside workdir; include explicitly.
+        for p in image_paths:
+            if p.exists():
+                artifacts.append(p)
+        # Collect PNGs created in the Codex workdir.
+        artifacts.extend(_collect_png_artifacts(eff_cfg, start_time=proc.start_time, text=body))
+        # Collect git diff/status whenever we ran inside a managed worktree.
+        if worktree_dir is not None:
+            try:
+                artifacts.extend(collect_git_artifacts(repo_dir=worktree_dir, artifacts_dir=artifacts_dir))
+            except Exception:
+                LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
+
         artifacts_text = [str(p) for p in artifacts]
+        structured: dict[str, Any] = {
+            "role": role,
+            "workdir": str(eff_cfg.codex_workdir),
+            "artifacts_dir": str(artifacts_dir),
+        }
+        if leased_slot is not None:
+            structured["workspace_slot"] = int(leased_slot)
+        if used_thread_id:
+            structured["thread_id"] = used_thread_id
+
         if code == 0:
             return {
                 "status": "ok",
@@ -4658,6 +5048,7 @@ def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading
                 "artifacts": artifacts_text,
                 "logs": logs,
                 "next_action": None,
+                "structured_digest": structured,
             }
         return {
             "status": "error",
@@ -4665,6 +5056,7 @@ def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading
             "artifacts": artifacts_text,
             "logs": logs or body,
             "next_action": None,
+            "structured_digest": structured,
         }
     finally:
         elapsed = time.time() - started
@@ -4674,6 +5066,11 @@ def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading
             proc.stderr_path.unlink(missing_ok=True)
         except Exception:
             LOG.exception("Failed to cleanup orchestrator proc temp files")
+        try:
+            if orch_q is not None and leased_slot is not None:
+                orch_q.release_workspace(job_id=task.job_id)
+        except Exception:
+            LOG.exception("Failed to release workspace lease. job=%s role=%s", task.job_id, role)
         LOG.info("Orchestrator task %s finished in %.2fs", task.job_id, elapsed)
 
 
@@ -4708,10 +5105,15 @@ def _send_orchestrator_result(
         p = Path(str(raw))
         if not p.exists():
             continue
-        try:
-            api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
-        except Exception:
-            api.send_document(task.chat_id, p, filename=p.name, reply_to_message_id=task.reply_to_message_id)
+        ext = p.suffix.lower()
+        is_img = ext in (".png", ".jpg", ".jpeg", ".webp")
+        if is_img:
+            try:
+                api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
+                continue
+            except Exception:
+                pass
+        api.send_document(task.chat_id, p, filename=p.name, reply_to_message_id=task.reply_to_message_id)
 
 
 def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) -> str:
@@ -4727,13 +5129,27 @@ def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) 
 
 
 class _OrchestratorExecutor:
-    def __init__(self, cfg: BotConfig, stop_event: threading.Event, orch_q: OrchestratorQueue | None) -> None:
+    def __init__(
+        self,
+        cfg: BotConfig,
+        stop_event: threading.Event,
+        orch_q: OrchestratorQueue | None,
+        *,
+        profiles: dict[str, dict[str, Any]] | None,
+    ) -> None:
         self._cfg = cfg
         self._stop_event = stop_event
         self._orch_q = orch_q
+        self._profiles = profiles
 
     def run_task(self, task: Task) -> dict[str, Any]:
-        return _orchestrator_run_codex(self._cfg, task, stop_event=self._stop_event, orch_q=self._orch_q)
+        return _orchestrator_run_codex(
+            self._cfg,
+            task,
+            stop_event=self._stop_event,
+            orch_q=self._orch_q,
+            profiles=self._profiles,
+        )
 
 
 def orchestrator_worker_loop(
@@ -4744,7 +5160,7 @@ def orchestrator_worker_loop(
     stop_event: threading.Event,
     profiles: dict[str, dict[str, Any]] | None,
 ) -> None:
-    executor = _OrchestratorExecutor(cfg=cfg, stop_event=stop_event, orch_q=orch_q)
+    executor = _OrchestratorExecutor(cfg=cfg, stop_event=stop_event, orch_q=orch_q, profiles=profiles)
 
     while not stop_event.is_set():
         task = orch_q.take_next()
@@ -4766,6 +5182,71 @@ def orchestrator_worker_loop(
                 orch_state = "done"
             orch_q.update_state(task.job_id, orch_state)
             _send_orchestrator_result(api, task, result)
+
+            # CEO delegation: when a top-level CEO ticket finishes, enqueue child jobs from structured output.
+            try:
+                if (
+                    orch_state == "done"
+                    and _coerce_orchestrator_role(task.role) == "ceo"
+                    and not task.is_autonomous
+                    and not task.parent_job_id
+                ):
+                    specs = parse_ceo_subtasks(getattr(result, "structured_digest", None))
+                    if specs:
+                        # Cap to avoid runaway delegation.
+                        specs = specs[:12]
+                        key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
+                        children: list[Task] = []
+                        for spec in specs:
+                            child_role = _coerce_orchestrator_role(spec.role)
+                            child_profile = _orchestrator_profile(profiles, child_role)
+                            model = _orchestrator_model_for_profile(cfg, child_profile)
+                            effort = _orchestrator_effort_for_profile(child_profile, cfg)
+                            mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+                            requires_approval = bool(
+                                spec.requires_approval
+                                or bool(child_profile.get("approval_required", False))
+                                or mode_hint == "full"
+                            )
+                            deps = [key_to_job[k] for k in spec.depends_on if k in key_to_job]
+                            trace: dict[str, str | int | float | bool | list[str]] = {
+                                "source": "telegram",
+                                "delegated_by": task.job_id,
+                                "delegated_key": spec.key,
+                                "profile_name": str(child_profile.get("name") or child_role),
+                                "profile_role": child_role,
+                                "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
+                            }
+                            child = Task.new(
+                                source="telegram",
+                                role=child_role,
+                                input_text=spec.text,
+                                request_type="task",
+                                priority=int(spec.priority),
+                                model=model,
+                                effort=effort,
+                                mode_hint=mode_hint,
+                                requires_approval=requires_approval,
+                                max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+                                chat_id=int(task.chat_id),
+                                user_id=task.user_id,
+                                reply_to_message_id=task.reply_to_message_id,
+                                parent_job_id=task.job_id,
+                                depends_on=deps,
+                                labels={"ticket": task.job_id, "kind": "subtask", "key": spec.key},
+                                artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
+                                trace=trace,
+                                job_id=key_to_job[spec.key],
+                            )
+                            children.append(child)
+                        if children:
+                            orch_q.submit_batch(children)
+                            lines = ["CEO delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
+                            for c in children[:12]:
+                                lines.append(f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}")
+                            api.send_message(task.chat_id, "\n".join(lines), reply_to_message_id=task.reply_to_message_id)
+            except Exception:
+                LOG.exception("Failed to delegate CEO subtasks. job=%s", task.job_id)
         except Exception as e:
             LOG.exception("Orchestrator worker failed for task=%s", task.job_id)
             try:
@@ -4784,6 +5265,207 @@ def orchestrator_worker_loop(
             except Exception:
                 LOG.exception("Failed to report orchestrator worker failure for task=%s", task.job_id)
 
+
+
+@dataclass(frozen=True)
+class _TranscribeRequest:
+    chat_id: int
+    user_id: int
+    message_id: int
+    username: str | None
+    file_id: str
+    orig_name: str
+
+
+def _transcribe_worker_loop(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    stop_event: threading.Event,
+    requests: "queue.Queue[_TranscribeRequest]",
+    openai_transcriber: OpenAITranscriber | None,
+    orchestrator_queue: OrchestratorQueue | None,
+    orchestrator_profiles: dict[str, dict[str, Any]] | None,
+    jobs: "queue.Queue[Job]",
+    tracker: JobTracker,
+) -> None:
+    """
+    Background voice/audio transcriber so poll_loop can ACK quickly.
+
+    Grounded behavior (in-code): mirrors the synchronous transcription path but runs off-thread.
+    """
+    while not stop_event.is_set():
+        try:
+            req = requests.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        except Exception:
+            continue
+
+        chat_id = int(req.chat_id)
+        message_id = int(req.message_id)
+        file_id = (req.file_id or "").strip()
+        if not file_id:
+            continue
+
+        backend = _effective_transcribe_backend(cfg)
+        eff_lang = _effective_transcribe_language(cfg)
+        eff_timeout = _effective_transcribe_timeout(cfg)
+        eff_threads = _effective_whisper_threads(cfg)
+        eff_model_path = _effective_whisper_model_path(cfg)
+
+        def _pick_backend() -> str:
+            if backend == "openai":
+                return "openai"
+            if backend == "whispercpp":
+                return "whispercpp"
+            # auto: prefer local if available, else OpenAI.
+            w = WhisperCppTranscriber(
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                whisper_bin=cfg.whispercpp_bin,
+                model_path=eff_model_path,
+                threads=eff_threads,
+                timeout_seconds=eff_timeout,
+                language=eff_lang,
+                prompt=cfg.transcribe_prompt,
+            )
+            ok, _reason = w.is_available()
+            if ok:
+                return "whispercpp"
+            if openai_transcriber is not None:
+                return "openai"
+            return ""
+
+        chosen = _pick_backend()
+        if not chosen:
+            api.send_message(
+                chat_id,
+                "Transcripción habilitada pero no hay backend disponible. Configura whisper.cpp (recomendado) o OPENAI_API_KEY.",
+                reply_to_message_id=message_id if message_id else None,
+            )
+            continue
+
+        upload_dir = cfg.codex_workdir / ".codexbot_uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        safe = _safe_filename(req.orig_name, fallback="audio.bin")
+        dest_path = upload_dir / f"tg_audio_{chat_id}_{message_id}_{safe}"
+        if dest_path.exists():
+            dest_path = upload_dir / f"tg_audio_{chat_id}_{message_id}_{int(time.time())}_{safe}"
+
+        incoming_text = ""
+        try:
+            info = api.get_file(file_id)
+            fp = info.get("file_path") if isinstance(info, dict) else None
+            if not isinstance(fp, str) or not fp:
+                raise RuntimeError("Telegram getFile did not return file_path")
+            api.download_file_to(file_path=fp, dest=dest_path, max_bytes=cfg.max_download_bytes)
+
+            try:
+                sz = dest_path.stat().st_size
+            except Exception:
+                sz = 0
+            if cfg.transcribe_max_bytes > 0 and sz > cfg.transcribe_max_bytes:
+                raise RuntimeError(f"Audio demasiado grande para transcribir (>{cfg.transcribe_max_bytes} bytes)")
+
+            if chosen == "whispercpp":
+                w = WhisperCppTranscriber(
+                    ffmpeg_bin=cfg.ffmpeg_bin,
+                    whisper_bin=cfg.whispercpp_bin,
+                    model_path=eff_model_path,
+                    threads=eff_threads,
+                    timeout_seconds=eff_timeout,
+                    language=eff_lang,
+                    prompt=cfg.transcribe_prompt,
+                )
+                incoming_text = w.transcribe_file(input_path=dest_path)
+            else:
+                if openai_transcriber is None:
+                    raise RuntimeError("OPENAI_API_KEY faltante o OpenAI transcriber no inicializado")
+                incoming_text = openai_transcriber.transcribe(
+                    audio_path=dest_path,
+                    model=cfg.transcribe_model,
+                    language=eff_lang,
+                    prompt=cfg.transcribe_prompt,
+                )
+            incoming_text = (incoming_text or "").strip()
+            if not incoming_text:
+                raise RuntimeError("Transcripción vacía")
+        except Exception as e:
+            api.send_message(
+                chat_id,
+                f"No pude transcribir el audio: {e}",
+                reply_to_message_id=message_id if message_id else None,
+            )
+            continue
+        finally:
+            try:
+                dest_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        prompt = _normalize_slash_aliases(incoming_text)
+        job = Job(
+            chat_id=chat_id,
+            reply_to_message_id=message_id,
+            user_text=prompt,
+            argv=["exec", prompt],
+            mode_hint=cfg.codex_default_mode,
+            epoch=0,
+            threaded=True,
+            image_paths=[],
+            upload_paths=[],
+            force_new_thread=False,
+        )
+
+        # Prefer orchestrator if enabled; otherwise fall back to legacy queue.
+        if orchestrator_queue is not None and cfg.orchestrator_enabled:
+            try:
+                did_submit, orch_job_id = _submit_orchestrator_task(
+                    cfg=cfg,
+                    orch_q=orchestrator_queue,
+                    profiles=orchestrator_profiles,
+                    job=job,
+                    user_id=req.user_id,
+                )
+            except Exception:
+                did_submit = False
+                orch_job_id = ""
+                LOG.exception("Failed to submit transcribed task to orchestrator")
+            if did_submit:
+                api.send_message(
+                    chat_id,
+                    f"Transcrito y encolado: task={orch_job_id[:8]}",
+                    reply_to_message_id=message_id if message_id else None,
+                )
+                continue
+
+        ok, reason, epoch, q_after = tracker.try_mark_enqueued(chat_id, max_queued_per_chat=cfg.max_queued_per_chat)
+        if not ok:
+            api.send_message(chat_id, reason, reply_to_message_id=message_id if message_id else None)
+            continue
+        job = Job(
+            chat_id=job.chat_id,
+            reply_to_message_id=job.reply_to_message_id,
+            user_text=job.user_text,
+            argv=job.argv,
+            mode_hint=job.mode_hint,
+            epoch=epoch,
+            threaded=job.threaded,
+            image_paths=job.image_paths,
+            upload_paths=job.upload_paths,
+            force_new_thread=job.force_new_thread,
+        )
+        try:
+            jobs.put(job, block=False)
+            if q_after > 1 or tracker.inflight(chat_id) > 0:
+                api.send_message(
+                    chat_id,
+                    f"Queued (voice) (mode={job.mode_hint}, queue_len={jobs.qsize()}).",
+                    reply_to_message_id=message_id if message_id else None,
+                )
+        except queue.Full:
+            tracker.on_dequeue(chat_id)
+            api.send_message(chat_id, "Queue is full; try again in a bit.", reply_to_message_id=message_id if message_id else None)
 
 
 def worker_loop(
@@ -5086,6 +5768,27 @@ def poll_loop(
                 retry_max_seconds=cfg.http_retry_max_seconds,
             )
 
+    transcribe_requests: "queue.Queue[_TranscribeRequest]" | None = None
+    if cfg.transcribe_async and _effective_transcribe_enabled(cfg):
+        transcribe_requests = queue.Queue(maxsize=16)
+        t = threading.Thread(
+            target=_transcribe_worker_loop,
+            kwargs={
+                "cfg": cfg,
+                "api": api,
+                "stop_event": stop_event,
+                "requests": transcribe_requests,
+                "openai_transcriber": openai_transcriber,
+                "orchestrator_queue": orchestrator_queue,
+                "orchestrator_profiles": orchestrator_profiles,
+                "jobs": jobs,
+                "tracker": tracker,
+            },
+            daemon=True,
+            name="transcribe-worker",
+        )
+        t.start()
+
     while not stop_event.is_set():
         try:
             now = time.time()
@@ -5138,6 +5841,63 @@ def poll_loop(
                         orig_name = fn if isinstance(fn, str) and fn else "audio.bin"
 
                     if file_id:
+                        if cfg.transcribe_async and transcribe_requests is not None:
+                            # Auth preflight: avoid downloading/transcribing for unauthorized chats.
+                            incoming_stub = IncomingMessage(
+                                update_id=update_id,
+                                chat_id=chat_id,
+                                user_id=user_id,
+                                message_id=message_id,
+                                username=username,
+                                text="",
+                            )
+                            if not _is_authorized(cfg, incoming_stub):
+                                now = time.time()
+                                last = last_unauth_reply_at.get(chat_id, 0.0)
+                                if now - last >= cfg.unauthorized_reply_cooldown_seconds:
+                                    last_unauth_reply_at[chat_id] = now
+                                    api.send_message(
+                                        chat_id,
+                                        "Unauthorized. Ask the admin to add your chat_id/user_id.\n\n" + _whoami_text(incoming_stub),
+                                        reply_to_message_id=message_id if message_id else None,
+                                    )
+                                continue
+
+                            if cfg.auth_enabled:
+                                active, _sess = _auth_is_session_active(cfg, chat_id=chat_id)
+                                if not active:
+                                    api.send_message(
+                                        chat_id,
+                                        _auth_required_text(),
+                                        reply_to_message_id=message_id if message_id else None,
+                                    )
+                                    continue
+                                _auth_touch_session(cfg, chat_id=chat_id)
+
+                            api.send_message(
+                                chat_id,
+                                "Recibido, transcribiendo y encolando...",
+                                reply_to_message_id=message_id if message_id else None,
+                            )
+                            try:
+                                transcribe_requests.put_nowait(
+                                    _TranscribeRequest(
+                                        chat_id=chat_id,
+                                        user_id=user_id,
+                                        message_id=message_id,
+                                        username=username,
+                                        file_id=file_id,
+                                        orig_name=orig_name or "audio.bin",
+                                    )
+                                )
+                            except queue.Full:
+                                api.send_message(
+                                    chat_id,
+                                    "Cola de transcripción llena; intenta de nuevo en un momento.",
+                                    reply_to_message_id=message_id if message_id else None,
+                                )
+                            continue
+
                         backend = _effective_transcribe_backend(cfg)
                         eff_lang = _effective_transcribe_language(cfg)
                         eff_timeout = _effective_transcribe_timeout(cfg)
@@ -5492,16 +6252,20 @@ def poll_loop(
                         "/setnotify",
                         "/agents",
                         "/daily",
+                        "/brief",
+                        "/snapshot",
                         "/approve",
                         "/emergency_stop",
                         "/emergency_resume",
                         "/pause",
                         "/resume",
+                        "/ticket",
+                        "/inbox",
+                        "/runbooks",
+                        "/reset_role",
                         "/synccommands",
                         "/cancel",
                         "/job",
-                        "/restart",
-                        "/daily",
                         "/botpermissions",
                         "/format",
                         "/example",
@@ -5519,6 +6283,10 @@ def poll_loop(
                         "/review ",
                         "/codex ",
                         "/job ",
+                        "/ticket ",
+                        "/inbox ",
+                        "/reset_role ",
+                        "/snapshot ",
                         "/daily",
                         "/approve ",
                         "/pause ",
@@ -5830,7 +6598,7 @@ def _load_config() -> BotConfig:
     orchestrator_default_max_cost_window_usd = float(os.environ.get("BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD", "8.0"))
     if orchestrator_default_max_cost_window_usd <= 0:
         orchestrator_default_max_cost_window_usd = 8.0
-    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "backend").strip() or "backend"
+    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "ceo").strip() or "ceo"
     orchestrator_daily_digest_seconds = int(
         os.environ.get("BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS", str(6 * 60 * 60))
     )
@@ -5842,6 +6610,32 @@ def _load_config() -> BotConfig:
             str(Path(__file__).with_name("orchestrator") / "agents.yaml"),
         )
     ).expanduser().resolve()
+    orchestrator_worker_count = int(os.environ.get("BOT_ORCHESTRATOR_WORKERS", str(worker_count)))
+    if orchestrator_worker_count < 1:
+        orchestrator_worker_count = max(1, int(worker_count))
+    orchestrator_sessions_enabled = os.environ.get("BOT_ORCH_SESSIONS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+
+    worktree_root = Path(
+        os.environ.get(
+            "BOT_WORKTREE_ROOT",
+            str(Path(__file__).with_name("data") / "worktrees"),
+        )
+    ).expanduser().resolve()
+    artifacts_root = Path(
+        os.environ.get(
+            "BOT_ARTIFACTS_ROOT",
+            str(Path(__file__).with_name("data") / "artifacts"),
+        )
+    ).expanduser().resolve()
+    runbooks_enabled = os.environ.get("BOT_RUNBOOKS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    runbooks_path = Path(
+        os.environ.get(
+            "BOT_RUNBOOKS_PATH",
+            str(Path(__file__).with_name("orchestrator") / "runbooks.yaml"),
+        )
+    ).expanduser().resolve()
+    screenshot_enabled = os.environ.get("BOT_SCREENSHOT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    transcribe_async = os.environ.get("BOT_TRANSCRIBE_ASYNC", "1").strip().lower() in ("1", "true", "yes", "on")
 
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
@@ -5909,6 +6703,14 @@ def _load_config() -> BotConfig:
         orchestrator_default_role=orchestrator_default_role,
         orchestrator_daily_digest_seconds=orchestrator_daily_digest_seconds,
         orchestrator_agent_profiles=orchestrator_agent_profiles,
+        orchestrator_worker_count=orchestrator_worker_count,
+        orchestrator_sessions_enabled=orchestrator_sessions_enabled,
+        worktree_root=worktree_root,
+        artifacts_root=artifacts_root,
+        runbooks_enabled=runbooks_enabled,
+        runbooks_path=runbooks_path,
+        screenshot_enabled=screenshot_enabled,
+        transcribe_async=transcribe_async,
         codex_workdir=codex_workdir,
         codex_timeout_seconds=codex_timeout_seconds,
         codex_use_oss=codex_use_oss,
@@ -5983,6 +6785,7 @@ def main() -> None:
     orchestrator_queue: OrchestratorQueue | None = None
     orchestrator_profiles: dict[str, dict[str, Any]] | None = None
     orchestrator_scheduler: OrchestratorScheduler | None = None
+    runbooks_scheduler: OrchestratorScheduler | None = None
     jobs: "queue.Queue[Job]" = queue.Queue(maxsize=cfg.queue_maxsize)
     stop_event = threading.Event()
     tracker = JobTracker()
@@ -6001,7 +6804,7 @@ def main() -> None:
             orchestrator_queue = None
 
     if orchestrator_queue is not None:
-        for i in range(max(1, cfg.worker_count)):
+        for i in range(max(1, cfg.orchestrator_worker_count)):
             t = threading.Thread(
                 target=orchestrator_worker_loop,
                 kwargs={
@@ -6030,6 +6833,40 @@ def main() -> None:
             orchestrator_scheduler = OrchestratorScheduler(interval_seconds=cfg.orchestrator_daily_digest_seconds, enabled=True)
             orchestrator_scheduler.add_tick(_send_orchestrator_digest)
             orchestrator_scheduler.start()
+
+        # Runbooks scheduler: enqueues autonomous tasks periodically to the notify chat.
+        if cfg.runbooks_enabled and _configured_notify_chat_id(cfg):
+            notify_chat_id = _configured_notify_chat_id(cfg)
+
+            def _tick_runbooks() -> None:
+                if orchestrator_queue is None or notify_chat_id is None:
+                    return
+                if orchestrator_queue.is_paused_globally():
+                    return
+                try:
+                    rbs = load_runbooks(cfg.runbooks_path)
+                except Exception:
+                    LOG.exception("Failed to load runbooks: %s", cfg.runbooks_path)
+                    return
+                if not rbs:
+                    return
+                now = time.time()
+                for rb in rbs:
+                    try:
+                        last = orchestrator_queue.get_runbook_last_run(runbook_id=rb.runbook_id)
+                        if not runbook_due(rb, last_run_at=last, now=now):
+                            continue
+                        t = runbook_to_task(rb, chat_id=int(notify_chat_id))
+                        if not (t.artifacts_dir or "").strip():
+                            t = t.with_updates(artifacts_dir=str((cfg.artifacts_root / t.job_id).resolve()))
+                        orchestrator_queue.submit_task(t)
+                        orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
+                    except Exception:
+                        LOG.exception("Failed to enqueue runbook=%s", rb.runbook_id)
+
+            runbooks_scheduler = OrchestratorScheduler(interval_seconds=60, enabled=True)
+            runbooks_scheduler.add_tick(_tick_runbooks)
+            runbooks_scheduler.start(name="orchestrator-runbooks")
     try:
         for chat_id_str, tid in _get_threads_state(cfg).items():
             try:
@@ -6102,6 +6939,8 @@ def main() -> None:
         stop_event.set()
         if orchestrator_scheduler is not None:
             orchestrator_scheduler.stop()
+        if runbooks_scheduler is not None:
+            runbooks_scheduler.stop()
 
 
 if __name__ == "__main__":

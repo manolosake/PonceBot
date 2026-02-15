@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -98,14 +99,27 @@ class SQLiteTaskStorage:
         return self._path
 
     def _connect(self) -> sqlite3.Connection:
+        # NOTE: Callers should prefer `_conn()` which closes connections reliably.
         conn = sqlite3.connect(self._path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=3000;")
         return conn
 
+    @contextmanager
+    def _conn(self) -> Any:
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
@@ -165,6 +179,37 @@ class SQLiteTaskStorage:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS agent_sessions (
+                    chat_id INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(chat_id, role)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workspace_leases (
+                    role TEXT NOT NULL,
+                    slot INTEGER NOT NULL,
+                    job_id TEXT NOT NULL,
+                    leased_at REAL NOT NULL,
+                    PRIMARY KEY(role, slot),
+                    UNIQUE(job_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runbook_state (
+                    runbook_id TEXT PRIMARY KEY,
+                    last_run_at REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS approver_log (
                     job_id TEXT PRIMARY KEY,
                     approved_by INTEGER,
@@ -192,6 +237,8 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_chat_state ON jobs(chat_id, state)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_autonomous_due ON jobs(state, is_autonomous, due_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner, state)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_role ON agent_sessions(chat_id, role)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_leases_role ON workspace_leases(role, slot)")
             conn.commit()
 
     def _migrate_jobs_table(self, conn: sqlite3.Connection) -> None:
@@ -215,7 +262,7 @@ class SQLiteTaskStorage:
     def submit_task(self, task: Task) -> str:
         with self._lock:
             job_id = task.job_id or str(uuid.uuid4())
-            with self._connect() as conn:
+            with self._conn() as conn:
                 columns = (
                     "job_id",
                     "source",
@@ -247,6 +294,10 @@ class SQLiteTaskStorage:
                     "artifacts_dir",
                     "trace",
                 )
+                artifacts_dir = task.artifacts_dir
+                if artifacts_dir is None:
+                    # Default artifacts directory lives next to the SQLite DB (typically ./data/artifacts/<job_id>/).
+                    artifacts_dir = str((self._path.parent / "artifacts" / job_id).resolve())
                 values = (
                     job_id,
                     str(task.source),
@@ -275,7 +326,7 @@ class SQLiteTaskStorage:
                     int(task.max_retries),
                     json.dumps(dict(task.labels or {}), ensure_ascii=False),
                     1 if task.requires_review else 0,
-                    task.artifacts_dir,
+                    artifacts_dir,
                     task.trace_json(),
                 )
                 query = (
@@ -289,15 +340,15 @@ class SQLiteTaskStorage:
                     query,
                     values,
                 )
-                conn.commit()
                 self._append_event(conn, job_id, "submitted", {"state": task.state, "role": task.role})
+                conn.commit()
             return job_id
 
     def submit_batch(self, tasks: list[Task]) -> list[str]:
         return [self.submit_task(task) for task in tasks]
 
     def get_job(self, job_id: str) -> Task | None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
             return self._row_to_task(row) if row is not None else None
 
@@ -363,7 +414,7 @@ class SQLiteTaskStorage:
 
         now = time.time()
         with self._lock:
-            with self._connect() as conn:
+            with self._conn() as conn:
                 if self._is_global_pause(conn):
                     return None
 
@@ -396,9 +447,12 @@ class SQLiteTaskStorage:
                         where.append("role != ?")
                         params.append(r)
 
+                # Avoid starvation: scan more than `max_rows` so we can skip paused roles,
+                # saturated roles, or dependency-blocked tasks.
+                scan_limit = max(50, int(max_rows) * 25)
                 base_sql = (
                     f"SELECT * FROM jobs WHERE {' AND '.join(where)} "
-                    f"ORDER BY priority ASC, created_at ASC LIMIT {int(max_rows)}"
+                    f"ORDER BY priority ASC, created_at ASC LIMIT {int(scan_limit)}"
                 )
                 rows = conn.execute(base_sql, params).fetchall()
                 if not rows:
@@ -408,6 +462,10 @@ class SQLiteTaskStorage:
                 for row in rows:
                     role_name = str(row["role"])
                     if self._is_role_paused(conn, role_name):
+                        continue
+
+                    deps = _coerce_json_list(row["depends_on"])
+                    if deps and not self._deps_satisfied(conn, deps):
                         continue
 
                     running = self._count_jobs(conn, role=role_name, state="running")
@@ -421,11 +479,11 @@ class SQLiteTaskStorage:
                     )
                     if updated.rowcount:
                         self._append_event(conn, row["job_id"], "dequeued", {"role": role_name})
-                        conn.commit()
                         next_row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
                         task = self._row_to_task(next_row)
                         if task is not None:
                             out.append(task)
+                        conn.commit()
                     if len(out) >= max_rows:
                         break
 
@@ -436,24 +494,29 @@ class SQLiteTaskStorage:
                 return out
 
     def update_state(self, job_id: str, state: str, **metadata: Any) -> bool:
-        now = time.time()
         with self._lock:
-            with self._connect() as conn:
-                row = conn.execute("SELECT state, trace FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
-                if row is None:
-                    return False
-
-                trace = Task.from_trace_json(row["trace"])
-                trace.update(metadata)
-                conn.execute(
-                    "UPDATE jobs SET state = ?, updated_at = ?, trace = ? WHERE job_id = ?",
-                    (str(state), now, json.dumps(trace, ensure_ascii=False), str(job_id)),
-                )
-                if conn.total_changes:
-                    self._append_event(conn, str(job_id), f"state:{state}", metadata)
+            with self._conn() as conn:
+                ok = self._update_state_in_conn(conn, job_id=str(job_id), state=str(state), metadata=metadata)
+                if ok:
                     conn.commit()
-                    return True
-                return False
+                return ok
+
+    def _update_state_in_conn(self, conn: sqlite3.Connection, *, job_id: str, state: str, metadata: dict[str, Any]) -> bool:
+        now = time.time()
+        row = conn.execute("SELECT state, trace FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+        if row is None:
+            return False
+
+        trace = Task.from_trace_json(row["trace"])
+        trace.update(metadata)
+        cur = conn.execute(
+            "UPDATE jobs SET state = ?, updated_at = ?, trace = ? WHERE job_id = ?",
+            (str(state), now, json.dumps(trace, ensure_ascii=False), str(job_id)),
+        )
+        if cur.rowcount:
+            self._append_event(conn, str(job_id), f"state:{state}", metadata)
+            return True
+        return False
 
     def cancel(self, job_id: str) -> bool:
         return self.update_state(str(job_id), "cancelled", reason="user_requested")
@@ -472,7 +535,7 @@ class SQLiteTaskStorage:
             Number of jobs moved from `running` to `queued`.
         """
         with self._lock:
-            with self._connect() as conn:
+            with self._conn() as conn:
                 rows = conn.execute("SELECT job_id FROM jobs WHERE state='running'").fetchall()
                 if not rows:
                     return 0
@@ -490,7 +553,7 @@ class SQLiteTaskStorage:
                 return total
 
     def pause_role(self, role: str) -> None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO role_controls(role, is_paused) VALUES (?, 1) ON CONFLICT(role) DO UPDATE SET is_paused = 1",
                 (str(role),),
@@ -498,7 +561,7 @@ class SQLiteTaskStorage:
             conn.commit()
 
     def resume_role(self, role: str) -> None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO role_controls(role, is_paused) VALUES (?, 0) ON CONFLICT(role) DO UPDATE SET is_paused = 0",
                 (str(role),),
@@ -519,7 +582,7 @@ class SQLiteTaskStorage:
 
     def cancel_running_jobs(self, *, reason: str = "emergency_stop") -> int:
         with self._lock:
-            with self._connect() as conn:
+            with self._conn() as conn:
                 rows = conn.execute("SELECT job_id, trace FROM jobs WHERE state = 'running'").fetchall()
                 if not rows:
                     return 0
@@ -542,7 +605,7 @@ class SQLiteTaskStorage:
                 return total
 
     def is_role_paused(self, role: str) -> bool:
-        with self._connect() as conn:
+        with self._conn() as conn:
             return self._is_role_paused(conn, str(role))
 
     def _is_role_paused(self, conn: sqlite3.Connection, role: str) -> bool:
@@ -552,7 +615,7 @@ class SQLiteTaskStorage:
         return bool(int(row["is_paused"]))
 
     def _set_global_pause(self, *, paused: bool) -> None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO role_controls(role, is_paused) VALUES (?, ?) ON CONFLICT(role) DO UPDATE SET is_paused = ?",
                 ("__orchestrator__", 1 if paused else 0, 1 if paused else 0),
@@ -561,7 +624,7 @@ class SQLiteTaskStorage:
 
     def _is_global_pause(self, conn: sqlite3.Connection | None = None) -> bool:
         if conn is None:
-            with self._connect() as c:
+            with self._conn() as c:
                 return self._is_global_pause(c)
         row = conn.execute("SELECT is_paused FROM role_controls WHERE role = ?", ("__orchestrator__",)).fetchone()
         if row is None:
@@ -570,7 +633,7 @@ class SQLiteTaskStorage:
 
     def get_role_health(self) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
-        with self._connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute("SELECT role, state, COUNT(1) as c FROM jobs GROUP BY role, state").fetchall()
             for row in rows:
                 role = str(row["role"])
@@ -588,7 +651,7 @@ class SQLiteTaskStorage:
 
     def get_role_backlog(self, *, state: str | None = None) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
-        with self._connect() as conn:
+        with self._conn() as conn:
             base_sql = "SELECT role, state, COUNT(1) as c FROM jobs"
             params: list[Any] = []
             if state:
@@ -607,7 +670,7 @@ class SQLiteTaskStorage:
             return out
 
     def set_cost_cap(self, role: str, cost_usd: float) -> None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO cost_caps(role, max_cost_window_usd, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(role) DO UPDATE SET max_cost_window_usd = ?, updated_at = ?",
@@ -616,14 +679,14 @@ class SQLiteTaskStorage:
             conn.commit()
 
     def get_cost_cap(self, role: str, *, default: float | None = None) -> float | None:
-        with self._connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT max_cost_window_usd FROM cost_caps WHERE role = ?", (str(role),)).fetchone()
             if row is None:
                 return default
             return _coerce_float(row["max_cost_window_usd"], default)
 
     def get_default_cost_cap(self) -> float:
-        with self._connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT MAX(max_cost_window_usd) FROM cost_caps").fetchone()
             if row is None or row[0] is None:
                 return 0.0
@@ -650,7 +713,7 @@ class SQLiteTaskStorage:
         clause = ""
         if where:
             clause = " WHERE " + " AND ".join(where)
-        with self._connect() as conn:
+        with self._conn() as conn:
             q = conn.execute(
                 f"SELECT * FROM jobs{clause} ORDER BY created_at DESC LIMIT ?",
                 [*params, int(limit)],
@@ -658,17 +721,17 @@ class SQLiteTaskStorage:
             return [self._row_to_task(r) for r in q]
 
     def queued_count(self) -> int:
-        with self._connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT COUNT(1) as c FROM jobs WHERE state = 'queued'").fetchone()
             return int(row["c"]) if row else 0
 
     def running_count(self) -> int:
-        with self._connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT COUNT(1) as c FROM jobs WHERE state = 'running'").fetchone()
             return int(row["c"]) if row else 0
 
     def jobs_by_state(self, *, state: str, limit: int = 50) -> list[Task]:
-        with self._connect() as conn:
+        with self._conn() as conn:
             q = conn.execute(
                 "SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC LIMIT ?",
                 (str(state), int(limit)),
@@ -700,7 +763,7 @@ class SQLiteTaskStorage:
             trace_payload["approved_reason"] = str(reason)
 
         with self._lock:
-            with self._connect() as conn:
+            with self._conn() as conn:
                 row = conn.execute("SELECT job_id FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
                 if row is None:
                     return False
@@ -708,7 +771,7 @@ class SQLiteTaskStorage:
                     "INSERT OR REPLACE INTO approver_log(job_id, approved_by, approved_at, reason) VALUES (?, ?, ?, ?)",
                     (str(job_id), None if approved_by is None else int(approved_by), time.time(), reason),
                 )
-                updated = self.update_state(str(job_id), "queued", **trace_payload)
+                updated = self._update_state_in_conn(conn, job_id=str(job_id), state="queued", metadata=trace_payload)
                 if updated:
                     self._append_event(conn, str(job_id), "approved", {"approved": approved, "approved_by": approved_by, "reason": reason})
                     conn.commit()
@@ -716,7 +779,7 @@ class SQLiteTaskStorage:
 
     def clear_job_approval(self, job_id: str) -> bool:
         with self._lock:
-            with self._connect() as conn:
+            with self._conn() as conn:
                 row = conn.execute("SELECT trace FROM jobs WHERE job_id=?", (str(job_id),)).fetchone()
                 if row is None:
                     return False
@@ -728,9 +791,154 @@ class SQLiteTaskStorage:
                 trace.pop("approved_by", None)
                 conn.execute("UPDATE jobs SET trace = ? WHERE job_id = ?", (json.dumps(trace, ensure_ascii=False), str(job_id)))
                 conn.execute("DELETE FROM approver_log WHERE job_id = ?", (str(job_id),))
-                conn.commit()
                 self._append_event(conn, str(job_id), "approval_cleared", {})
+                conn.commit()
                 return True
+
+    def get_agent_thread(self, *, chat_id: int, role: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT thread_id FROM agent_sessions WHERE chat_id = ? AND role = ?",
+                (int(chat_id), str(role)),
+            ).fetchone()
+            if row is None:
+                return None
+            tid = row["thread_id"]
+            return str(tid).strip() if tid else None
+
+    def set_agent_thread(self, *, chat_id: int, role: str, thread_id: str) -> None:
+        tid = (thread_id or "").strip()
+        if not tid:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO agent_sessions(chat_id, role, thread_id, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, role) DO UPDATE SET thread_id = ?, updated_at = ?",
+                (int(chat_id), str(role), tid, time.time(), tid, time.time()),
+            )
+            conn.commit()
+
+    def clear_agent_thread(self, *, chat_id: int, role: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM agent_sessions WHERE chat_id = ? AND role = ?",
+                (int(chat_id), str(role)),
+            )
+            conn.commit()
+            return bool(cur.rowcount)
+
+    def clear_agent_threads(self, *, chat_id: int) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM agent_sessions WHERE chat_id = ?", (int(chat_id),))
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    def lease_workspace(self, *, role: str, job_id: str, slots: int) -> int | None:
+        """
+        Atomically lease a worktree slot for a given role. Returns slot number or None if none free.
+        """
+        role = (role or "").strip().lower()
+        job_id = (job_id or "").strip()
+        if not role or not job_id:
+            return None
+        slots = max(1, int(slots))
+        with self._lock:
+            with self._conn() as conn:
+                # Already leased by this job?
+                row = conn.execute("SELECT slot FROM workspace_leases WHERE job_id = ?", (job_id,)).fetchone()
+                if row is not None:
+                    try:
+                        return int(row["slot"])
+                    except Exception:
+                        return None
+
+                for slot in range(1, slots + 1):
+                    existing = conn.execute(
+                        "SELECT job_id FROM workspace_leases WHERE role = ? AND slot = ?",
+                        (role, int(slot)),
+                    ).fetchone()
+                    if existing is not None:
+                        continue
+                    try:
+                        conn.execute(
+                            "INSERT INTO workspace_leases(role, slot, job_id, leased_at) VALUES (?, ?, ?, ?)",
+                            (role, int(slot), job_id, time.time()),
+                        )
+                        conn.commit()
+                        return int(slot)
+                    except sqlite3.IntegrityError:
+                        continue
+        return None
+
+    def release_workspace(self, *, job_id: str) -> bool:
+        job_id = (job_id or "").strip()
+        if not job_id:
+            return False
+        with self._lock:
+            with self._conn() as conn:
+                cur = conn.execute("DELETE FROM workspace_leases WHERE job_id = ?", (job_id,))
+                conn.commit()
+                return bool(cur.rowcount)
+
+    def get_workspace_lease(self, *, job_id: str) -> tuple[str, int] | None:
+        job_id = (job_id or "").strip()
+        if not job_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute("SELECT role, slot FROM workspace_leases WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            return (str(row["role"]), int(row["slot"]))
+
+    def get_runbook_last_run(self, *, runbook_id: str) -> float:
+        rid = (runbook_id or "").strip()
+        if not rid:
+            return 0.0
+        with self._conn() as conn:
+            row = conn.execute("SELECT last_run_at FROM runbook_state WHERE runbook_id = ?", (rid,)).fetchone()
+            if row is None:
+                return 0.0
+            try:
+                return float(row["last_run_at"])
+            except Exception:
+                return 0.0
+
+    def set_runbook_last_run(self, *, runbook_id: str, ts: float) -> None:
+        rid = (runbook_id or "").strip()
+        if not rid:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO runbook_state(runbook_id, last_run_at) VALUES (?, ?) "
+                "ON CONFLICT(runbook_id) DO UPDATE SET last_run_at = ?",
+                (rid, float(ts), float(ts)),
+            )
+            conn.commit()
+
+    def jobs_by_parent(self, *, parent_job_id: str, limit: int = 200) -> list[Task]:
+        pid = (parent_job_id or "").strip()
+        if not pid:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE parent_job_id = ? ORDER BY created_at ASC LIMIT ?",
+                (pid, int(limit)),
+            ).fetchall()
+            return [self._row_to_task(r) for r in rows]
+
+    def inbox(self, *, role: str | None = None, limit: int = 25) -> list[Task]:
+        where = ["state IN ('queued', 'blocked', 'failed')"]
+        params: list[Any] = []
+        if role:
+            where.append("role = ?")
+            params.append(str(role))
+        clause = " WHERE " + " AND ".join(where)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs{clause} ORDER BY updated_at DESC LIMIT ?",
+                [*params, int(limit)],
+            ).fetchall()
+            return [self._row_to_task(r) for r in rows]
 
     def _known_roles(self, conn: sqlite3.Connection) -> list[str]:
         role_rows = conn.execute("SELECT DISTINCT role FROM jobs").fetchall()
@@ -745,6 +953,20 @@ class SQLiteTaskStorage:
             if role and role != "__orchestrator__":
                 roles.add(str(role))
         return sorted(roles)
+
+    def _deps_satisfied(self, conn: sqlite3.Connection, deps: list[str]) -> bool:
+        deps = [str(d).strip() for d in (deps or []) if str(d).strip()]
+        if not deps:
+            return True
+        placeholders = ",".join("?" for _ in deps)
+        row = conn.execute(
+            f"SELECT COUNT(1) as c FROM jobs WHERE job_id IN ({placeholders}) AND state = 'done'",
+            deps,
+        ).fetchone()
+        try:
+            return int(row["c"]) == len(deps) if row is not None else False
+        except Exception:
+            return False
 
     def _row_to_task(self, row: sqlite3.Row | None) -> Task | None:
         if row is None:

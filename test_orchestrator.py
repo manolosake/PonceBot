@@ -9,6 +9,8 @@ from orchestrator.runner import run_task
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
+import threading
+import time as _time
 
 
 def _cfg(state_file: Path, workdir: Path | None = None) -> bot.BotConfig:
@@ -179,6 +181,39 @@ class TestOrchestratorRunner(unittest.TestCase):
 
 
 class TestOrchestratorStorage(unittest.TestCase):
+    def test_approve_does_not_deadlock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            job_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="deploy",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="full",
+                    requires_approval=True,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+
+            done: list[bool] = []
+
+            def _approve() -> None:
+                ok = q.set_job_approved(job_id)
+                done.append(ok)
+
+            t = threading.Thread(target=_approve, daemon=True)
+            t.start()
+            t.join(timeout=1.0)
+            self.assertFalse(t.is_alive(), "approve deadlocked")
+            self.assertEqual(done, [True])
+
     def test_role_pause_resumes_and_blocks_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "jobs.sqlite"
@@ -212,6 +247,48 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertIsNotNone(taken)
             assert taken is not None
             self.assertEqual(taken.job_id, task.job_id)
+
+    def test_claim_skips_paused_role_and_takes_other(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            q.pause_role("backend")
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="backend work",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+            frontend_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="frontend",
+                    input_text="frontend work",
+                    request_type="task",
+                    priority=2,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+            taken = q.take_next()
+            self.assertIsNotNone(taken)
+            assert taken is not None
+            self.assertEqual(taken.job_id, frontend_id)
 
     def test_cancel_running_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
