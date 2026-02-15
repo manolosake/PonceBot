@@ -600,3 +600,65 @@ class TestTelegramFormatting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAuthCommandVisibility(unittest.TestCase):
+    def _cfg(self, state_file: Path, *, auth_enabled: bool) -> bot.BotConfig:
+        cfg = TestStateHandling()._cfg(state_file)
+        return bot.BotConfig(**{**cfg.__dict__, "auth_enabled": bool(auth_enabled)})
+
+    def test_help_hides_login_logout_when_auth_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json", auth_enabled=False)
+            txt = bot._help_text(cfg)
+            self.assertNotIn("/login", txt)
+            self.assertNotIn("/logout", txt)
+
+    def test_help_shows_login_logout_when_auth_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json", auth_enabled=True)
+            txt = bot._help_text(cfg)
+            self.assertIn("/login", txt)
+            self.assertIn("/logout", txt)
+
+    def test_command_suggestions_omit_login_logout_when_auth_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json", auth_enabled=False)
+            cmds = bot._telegram_commands_for_suggestions(cfg)
+            names = {c[0] for c in cmds}
+            self.assertNotIn("login", names)
+            self.assertNotIn("logout", names)
+
+    def test_command_suggestions_include_login_logout_when_auth_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json", auth_enabled=True)
+            cmds = bot._telegram_commands_for_suggestions(cfg)
+            names = {c[0] for c in cmds}
+            self.assertIn("login", names)
+            self.assertIn("logout", names)
+
+    def test_parse_job_login_logout_behavior_depends_on_auth_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state.json"
+
+            cfg_off = self._cfg(state, auth_enabled=False)
+            msg_login = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/login u p")
+            resp, job = bot._parse_job(cfg_off, msg_login)
+            self.assertIsNone(job)
+            self.assertIn("Auth disabled", resp)
+            self.assertFalse(resp.startswith("__login__:"))
+
+            msg_logout = bot.IncomingMessage(update_id=2, chat_id=1, user_id=2, message_id=11, username="u", text="/logout")
+            resp2, job2 = bot._parse_job(cfg_off, msg_logout)
+            self.assertIsNone(job2)
+            self.assertIn("Auth disabled", resp2)
+            self.assertNotEqual(resp2, "__logout__")
+
+            cfg_on = self._cfg(state, auth_enabled=True)
+            resp3, job3 = bot._parse_job(cfg_on, msg_login)
+            self.assertIsNone(job3)
+            self.assertTrue(resp3.startswith("__login__:"))
+
+            resp4, job4 = bot._parse_job(cfg_on, msg_logout)
+            self.assertIsNone(job4)
+            self.assertEqual(resp4, "__logout__")

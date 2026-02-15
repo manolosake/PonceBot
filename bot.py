@@ -2418,95 +2418,107 @@ def _help_text(cfg: BotConfig) -> str:
         else:
             model_line = "Model: (unknown; check ~/.codex/config.toml or set CODEX_OPENAI_MODEL)"
     qmax = "unbounded" if cfg.queue_maxsize == 0 else str(cfg.queue_maxsize)
-    return "\n".join(
-        [
-            "codexbot commands:",
-            "- /help               Show this help",
-            "- /whoami             Show your ids (chat_id, user_id)",
-            "- /login <u> <p>      Login (if auth is enabled)",
+
+    lines: list[str] = [
+        "codexbot commands:",
+        "- /help               Show this help",
+        "- /whoami             Show your ids (chat_id, user_id)",
+    ]
+    if cfg.auth_enabled:
+        lines += [
+            "- /login <u> <p>      Login",
             "- /logout             Logout",
-            "- /status             Show legacy/system status and orchestrator queue",
-            "- /agents             Show orchestrator role status and queue per role",
-            "- /job <id>           Show task/job status by id",
-            "- /daily              Show orchestrator digest now",
-            "- /brief              Alias rápido de resumen de estado ejecutivo",
-            "- /approve <id>       Approve a blocked task",
-            "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
-            "- /pause <role>       Pause role in orchestrator",
-            "- /resume <role>      Resume role in orchestrator",
-            "- /cancel <id>        Cancel orchestrator task by id",
-            "- /emergency_resume   Resume orchestrator after emergency stop",
-            "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
-            "- /new                Start a new Codex conversation thread for this chat",
-            "- /restart            Restart the bot service (systemd will bring it back)",
-            "- /thread             Show the current Codex thread id for this chat",
-            f"- Strict proxy mode:  {'ON' if cfg.strict_proxy else 'off'} (forwards most text directly to Codex)",
-            "- /setnotify          Save this chat as the notify target",
-            "- /notify <text>      Send a message to the notify target chat",
-            "- /synccommands       Re-sync Telegram slash command suggestions",
-            "- /model              Show current model selection",
-            "- /model <name>       Set model for current provider mode",
-            "- /model openai <n>   Set model for OpenAI mode (CODEX_USE_OSS=0)",
-            "- /model oss <n>      Set model for OSS mode (CODEX_USE_OSS=1)",
-            "- /model clear        Clear model override for current mode",
-            "- /m                  Alias for /model",
-            "- /voice              Show/set voice transcription settings",
-            "- /v                  Alias for /voice",
-            "- /snapshot           Request frontend snapshot task (screenshot-oriented)",
-            "- /effort             Show current reasoning effort",
-            "- /effort <level>     Set effort: low|medium|high|xhigh",
-            "- /effort clear       Clear effort override for current mode",
-            "- /skills             List installed skills (local + disabled + .system)",
-            "- /skills catalog     List installable curated skills (from openai/skills)",
-            "- /skills install <s> Install a curated skill to ~/.codex/skills/<s>",
-            "- /skills enable <s>  Re-enable a previously disabled local skill",
-            "- /skills disable <s> Disable a local skill (moves it under ~/.codex/skills/.disabled/)",
-            "- /permissions        Show/set Codex CLI permission options",
-            "- /p                  Alias for /permissions",
-            "- /botpermissions     Show bot + codex execution policy",
-            "- /format             Show Telegram formatting preview",
-            "- /example            Show a pretty formatted example",
-            "- /reset              Alias for /new (new thread)",
-            "- /x                  Alias for /cancel",
-            "",
-            "Codex passthrough:",
-            "- Plain text runs: codex exec (threaded per chat, using codex exec resume)",
-            "- /exec ... runs:   codex exec ...",
-            "- /review ... runs: codex review ...",
-            "- /codex ... runs:  codex ...",
-            "",
-            "Sandbox shortcuts:",
-            "- /ro <text> runs exec with default read-only sandbox",
-            "- /rw <text> runs exec with default workspace-write sandbox",
-            "- /full <text> runs exec with danger-full-access sandbox (unsafe)",
-            "",
-            "Attachments:",
-            "- If Codex creates or references *.png files inside the workdir, they will be sent as images automatically.",
-            "- If you send a Telegram document (file), it will be saved under .codexbot_uploads/ and Codex will be told the path.",
-            "- If you send a voice note / audio and transcription is enabled (BOT_TRANSCRIBE_AUDIO=1), it will be transcribed and treated as normal text.",
-            "",
-            f"Default mode for plain text: {cfg.codex_default_mode}",
-            f"Workdir: {cfg.codex_workdir}",
-            f"Provider: {cfg.codex_local_provider if cfg.codex_use_oss else 'default (non-oss)'}",
-            model_line,
-            f"Queue maxsize: {qmax}",
         ]
-    )
+
+    lines += [
+        "- /status             Show legacy/system status and orchestrator queue",
+        "- /agents             Show orchestrator role status and queue per role",
+        "- /job <id>           Show task/job status by id",
+        "- /daily              Show orchestrator digest now",
+        "- /brief              Alias rápido de resumen de estado ejecutivo",
+        "- /approve <id>       Approve a blocked task",
+        "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
+        "- /pause <role>       Pause role in orchestrator",
+        "- /resume <role>      Resume role in orchestrator",
+        "- /cancel <id>        Cancel orchestrator task by id",
+        "- /emergency_resume   Resume orchestrator after emergency stop",
+        "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
+        "- /new                Start a new Codex conversation thread for this chat",
+        "- /restart            Restart the bot service (systemd will bring it back)",
+        "- /thread             Show the current Codex thread id for this chat",
+        f"- Strict proxy mode:  {'ON' if cfg.strict_proxy else 'off'} (forwards most text directly to Codex)",
+        "- /setnotify          Save this chat as the notify target",
+        "- /notify <text>      Send a message to the notify target chat",
+        "- /synccommands       Re-sync Telegram slash command suggestions",
+        "- /model              Show current model selection",
+        "- /model <name>       Set model for current provider mode",
+        "- /model openai <n>   Set model for OpenAI mode (CODEX_USE_OSS=0)",
+        "- /model oss <n>      Set model for OSS mode (CODEX_USE_OSS=1)",
+        "- /model clear        Clear model override for current mode",
+        "- /m                  Alias for /model",
+        "- /voice              Show/set voice transcription settings",
+        "- /v                  Alias for /voice",
+        "- /snapshot           Request frontend snapshot task (screenshot-oriented)",
+        "- /effort             Show current reasoning effort",
+        "- /effort <level>     Set effort: low|medium|high|xhigh",
+        "- /effort clear       Clear effort override for current mode",
+        "- /skills             List installed skills (local + disabled + .system)",
+        "- /skills catalog     List installable curated skills (from openai/skills)",
+        "- /skills install <s> Install a curated skill to ~/.codex/skills/<s>",
+        "- /skills enable <s>  Re-enable a previously disabled local skill",
+        "- /skills disable <s> Disable a local skill (moves it under ~/.codex/skills/.disabled/)",
+        "- /permissions        Show/set Codex CLI permission options",
+        "- /p                  Alias for /permissions",
+        "- /botpermissions     Show bot + codex execution policy",
+        "- /format             Show Telegram formatting preview",
+        "- /example            Show a pretty formatted example",
+        "- /reset              Alias for /new (new thread)",
+        "- /x                  Alias for /cancel",
+        "",
+        "Codex passthrough:",
+        "- Plain text runs: codex exec (threaded per chat, using codex exec resume)",
+        "- /exec ... runs:   codex exec ...",
+        "- /review ... runs: codex review ...",
+        "- /codex ... runs:  codex ...",
+        "",
+        "Sandbox shortcuts:",
+        "- /ro <text> runs exec with default read-only sandbox",
+        "- /rw <text> runs exec with default workspace-write sandbox",
+        "- /full <text> runs exec with danger-full-access sandbox (unsafe)",
+        "",
+        "Attachments:",
+        "- If Codex creates or references *.png files inside the workdir, they will be sent as images automatically.",
+        "- If you send a Telegram document (file), it will be saved under .codexbot_uploads/ and Codex will be told the path.",
+        "- If you send a voice note / audio and transcription is enabled (BOT_TRANSCRIBE_AUDIO=1), it will be transcribed and treated as normal text.",
+        "",
+        f"Default mode for plain text: {cfg.codex_default_mode}",
+        f"Workdir: {cfg.codex_workdir}",
+        f"Provider: {cfg.codex_local_provider if cfg.codex_use_oss else 'default (non-oss)'}",
+        model_line,
+        f"Queue maxsize: {qmax}",
+    ]
+
+    return "\n".join(lines)
 
 
-def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
+def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
     """
     Command list shown by Telegram UI when user types "/".
     Keep descriptions short and action-oriented.
     """
-    return [
+    cmds: list[tuple[str, str]] = [
         ("help", "Mostrar ayuda"),
         ("agents", "Estado del orquestador"),
         ("status", "Estado del bot/modelo"),
         ("s", "Alias de /status"),
         ("whoami", "Ver tus IDs"),
-        ("login", "Iniciar sesion"),
-        ("logout", "Cerrar sesion"),
+    ]
+    if cfg.auth_enabled:
+        cmds += [
+            ("login", "Iniciar sesion"),
+            ("logout", "Cerrar sesion"),
+        ]
+    cmds += [
         ("job", "Ver estado de tarea"),
         ("ticket", "Ver ticket/subtareas"),
         ("inbox", "Ver backlog por rol"),
@@ -2532,6 +2544,7 @@ def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
         ("skills", "Ver/administrar skills"),
         ("synccommands", "Re-sincronizar comandos"),
     ]
+    return cmds
 
 
 def _telegram_command_scopes_for_suggestions() -> tuple[str, ...]:
@@ -2541,8 +2554,8 @@ def _telegram_command_scopes_for_suggestions() -> tuple[str, ...]:
     return ("default", "all_private_chats", "all_group_chats", "all_chat_administrators")
 
 
-def _sync_telegram_command_suggestions(api: TelegramAPI) -> None:
-    cmds = _telegram_commands_for_suggestions()
+def _sync_telegram_command_suggestions(api: TelegramAPI, cfg: BotConfig) -> None:
+    cmds = _telegram_commands_for_suggestions(cfg)
     scopes = _telegram_command_scopes_for_suggestions()
     synced = 0
     errors: list[str] = []
@@ -3475,13 +3488,19 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         return _whoami_text(msg), None
 
     if text == "/logout":
+        if not cfg.auth_enabled:
+            return "Auth disabled on this bot.", None
         return "__logout__", None
 
     if text.startswith("/login "):
+        if not cfg.auth_enabled:
+            return "Auth disabled on this bot.", None
         # Handled in poll_loop (needs access to chat_id + updates auth state).
         return "__login__:" + text[len("/login ") :].strip(), None
 
     if text == "/login":
+        if not cfg.auth_enabled:
+            return "Auth disabled on this bot.", None
         return "Uso: /login <usuario> <password>", None
 
     if text == "/cancel":
@@ -5798,7 +5817,7 @@ def poll_loop(
             now = time.time()
             if not command_suggestions_synced and now >= next_command_sync_at:
                 try:
-                    _sync_telegram_command_suggestions(api)
+                    _sync_telegram_command_suggestions(api, cfg)
                     command_suggestions_synced = True
                     LOG.info("Telegram command suggestions synced.")
                 except Exception:
@@ -6379,7 +6398,7 @@ def poll_loop(
 
                     if response == "__synccommands__":
                         try:
-                            _sync_telegram_command_suggestions(api)
+                            _sync_telegram_command_suggestions(api, cfg)
                             command_suggestions_synced = True
                             api.send_message(
                                 chat_id,
@@ -6900,7 +6919,7 @@ def main() -> None:
 
     command_suggestions_synced = False
     try:
-        _sync_telegram_command_suggestions(api)
+        _sync_telegram_command_suggestions(api, cfg)
         command_suggestions_synced = True
         LOG.info("Telegram command suggestions synced.")
     except Exception:
