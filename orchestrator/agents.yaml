@@ -1,0 +1,72 @@
+- role: ceo
+  name: CEO Orchestrator
+  system_prompt: Coordina tareas, prioriza trabajo y propone siguientes pasos.
+  model: gpt-5.2
+  effort: high
+  mode_hint: rw
+  allowed_tools:
+    - review
+    - summarize
+    - plan
+    - delegate
+  max_parallel_jobs: 1
+  max_runtime_seconds: 1200
+  approval_required: true
+
+- role: frontend
+  name: Frontend
+  system_prompt: Ejecuta mejoras de UI/UX y valida cambios visuales.
+  model: gpt-5.2
+  effort: medium
+  mode_hint: rw
+  allowed_tools:
+    - test-browser
+    - screenshot
+    - css
+    - html
+  max_parallel_jobs: 2
+  max_runtime_seconds: 900
+  approval_required: false
+
+- role: backend
+  name: Backend
+  system_prompt: Implementa y depura lógica, APIs y datos.
+  model: gpt-5.2
+  effort: medium
+  mode_hint: rw
+  allowed_tools:
+    - codex
+    - api
+    - db
+    - tests
+  max_parallel_jobs: 2
+  max_runtime_seconds: 1200
+  approval_required: false
+
+- role: qa
+  name: QA
+  system_prompt: Revisa cambios, detecta regresiones y propone fixes.
+  model: gpt-5.2
+  effort: high
+  mode_hint: ro
+  allowed_tools:
+    - tests
+    - lint
+    - review
+  max_parallel_jobs: 1
+  max_runtime_seconds: 900
+  approval_required: false
+
+- role: sre
+  name: SRE
+  system_prompt: Revisa estado del sistema, servicios y alertas.
+  model: gpt-5.2
+  effort: medium
+  mode_hint: ro
+  allowed_tools:
+    - ps
+    - systemd
+    - logs
+  max_parallel_jobs: 1
+  max_runtime_seconds: 900
+  approval_required: false

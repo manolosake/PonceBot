@@ -38,6 +38,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from orchestrator.agents import load_agent_profiles
+from orchestrator.dispatcher import to_task
+from orchestrator.queue import OrchestratorQueue
+from orchestrator.schemas.task import Task
+from orchestrator.storage import SQLiteTaskStorage
+from orchestrator.scheduler import OrchestratorScheduler
+from orchestrator.runner import run_task as run_orchestrator_task
+
 try:
     import tomllib  # py3.11+
 except ModuleNotFoundError:  # pragma: no cover
@@ -336,6 +344,7 @@ def _status_text_for_chat(
     tracker: "JobTracker",
     jobs: "queue.Queue[Job]",
     thread_mgr: "ThreadManager",
+    orchestrator_queue: OrchestratorQueue | None = None,
 ) -> str:
     profile = _auth_effective_profile_name(cfg, chat_id=chat_id) if cfg.auth_enabled else ""
     eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
@@ -352,6 +361,16 @@ def _status_text_for_chat(
     inflight = tracker.inflight(chat_id)
     queued = tracker.queued(chat_id)
     global_q = jobs.qsize()
+    if orchestrator_queue is not None:
+        orch_q = orchestrator_queue.get_queued_count()
+        orch_r = orchestrator_queue.get_running_count()
+        orch_paused = "paused" if orchestrator_queue.is_paused_globally() else "active"
+        qmax = f"unbounded:{orch_q}" if cfg.queue_maxsize == 0 else f"{cfg.queue_maxsize}:{orch_q}"
+    else:
+        orch_q = 0
+        orch_r = 0
+        orch_paused = "disabled"
+        qmax = "unbounded" if cfg.queue_maxsize == 0 else str(cfg.queue_maxsize)
 
     lines = [
         f"permissions: {permissions}",
@@ -359,12 +378,21 @@ def _status_text_for_chat(
         f"provider: {eff_cfg.codex_local_provider if eff_cfg.codex_use_oss else 'default (non-oss)'}",
         f"model: {model_label}",
         f"thread: {tid or '(none; send a message or use /reset)'}",
-        f"queue: inflight={inflight} queued={queued} global={global_q}",
+        f"queue: inflight={inflight} queued={queued} legacy_global={global_q} orch_queued={orch_q} orch_running={orch_r}",
+        f"orchestrator: {orch_paused}",
+        f"queue policy: max={qmax}",
         "",
         "Common commands:",
         "- /reset  (new thread)",
         "- /thread (show thread id)",
         "- /x      (cancel)",
+        "- /agents (agent/role status)",
+        "- /job <id> (job status)",
+        "- /daily (daily digest)",
+        "- /approve <id> (approve blocked job)",
+        "- /pause <role> (pause role)",
+        "- /resume <role> (resume role)",
+        "- /cancel <id> (cancel orchestrator job)",
         "- /restart",
         "- /m      (model)",
         "- /p      (permissions)",
@@ -510,6 +538,15 @@ class BotConfig:
     auth_session_ttl_seconds: int
     auth_users_file: Path
     auth_profiles_file: Path
+
+    # Orchestrator feature flags / policy defaults.
+    orchestrator_db_path: Path = Path(__file__).with_name("data") / "jobs.sqlite"
+    orchestrator_enabled: bool = True
+    orchestrator_default_priority: int = 2
+    orchestrator_default_max_cost_window_usd: float = 8.0
+    orchestrator_default_role: str = "backend"
+    orchestrator_daily_digest_seconds: int = 6 * 60 * 60
+    orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
 
 
 class TelegramAPI:
@@ -2354,8 +2391,17 @@ def _help_text(cfg: BotConfig) -> str:
             "- /whoami             Show your ids (chat_id, user_id)",
             "- /login <u> <p>      Login (if auth is enabled)",
             "- /logout             Logout",
-            "- /status             Show model, permissions, thread, and queue",
-            "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
+            "- /status             Show legacy/system status and orchestrator queue",
+            "- /agents             Show orchestrator role status and queue per role",
+            "- /job <id>           Show task/job status by id",
+            "- /daily              Show orchestrator digest now",
+        "- /approve <id>       Approve a blocked task",
+        "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
+        "- /pause <role>       Pause role in orchestrator",
+        "- /resume <role>      Resume role in orchestrator",
+        "- /cancel <id>        Cancel orchestrator task by id",
+        "- /emergency_resume   Resume orchestrator after emergency stop",
+        "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
             "- /new                Start a new Codex conversation thread for this chat",
             "- /restart            Restart the bot service (systemd will bring it back)",
             "- /thread             Show the current Codex thread id for this chat",
@@ -2419,14 +2465,23 @@ def _telegram_commands_for_suggestions() -> list[tuple[str, str]]:
     """
     return [
         ("help", "Mostrar ayuda"),
+        ("agents", "Estado del orquestador"),
         ("status", "Estado del bot/modelo"),
         ("s", "Alias de /status"),
         ("whoami", "Ver tus IDs"),
         ("login", "Iniciar sesion"),
         ("logout", "Cerrar sesion"),
+        ("job", "Ver estado de tarea"),
+        ("emergency_stop", "Parar orquestador"),
+        ("emergency_resume", "Reanudar orquestador"),
+        ("daily", "Resumen automático de estado"),
+        ("approve", "Aprobar tarea bloqueada"),
+        ("pause", "Pausar rol"),
+        ("resume", "Reanudar rol"),
         ("new", "Nuevo hilo"),
         ("thread", "Ver thread actual"),
         ("cancel", "Cancelar ejecucion"),
+        ("cancel", "Cancelar tarea por id"),
         ("model", "Ver/cambiar modelo"),
         ("m", "Alias de /model"),
         ("voice", "Configurar voice"),
@@ -2837,6 +2892,394 @@ def _threaded_sandbox_mode_label(cfg: BotConfig) -> str:
     return "danger-full-access"
 
 
+def _orch_marker(kind: str, payload: str = "") -> str:
+    """
+    Internal marker for orchestration commands handled in poll_loop.
+    """
+    if payload:
+        return f"__orch_{kind}:{payload}"
+    return f"__orch_{kind}__"
+
+
+def _orch_job_id(raw: str) -> str:
+    return (raw or "").strip()
+
+
+_ORCHESTRATOR_ROLES = ("ceo", "frontend", "backend", "qa", "sre")
+
+
+def _coerce_orchestrator_role(value: str) -> str:
+    role = (value or "").strip().lower()
+    return role if role in _ORCHESTRATOR_ROLES else "backend"
+
+
+def _orchestrator_known_roles(profiles: dict[str, dict[str, Any]]) -> tuple[str, ...]:
+    keys = sorted({*_ORCHESTRATOR_ROLES, *(str(k).strip().lower() for k in profiles.keys())})
+    return tuple(keys)
+
+
+def _orchestrator_role_is_valid(role: str, profiles: dict[str, dict[str, Any]]) -> bool:
+    normalized = (role or "").strip().lower()
+    return normalized in _orchestrator_known_roles(profiles)
+
+
+def _coerce_orchestrator_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    return mode if mode in ("ro", "rw", "full") else "ro"
+
+
+def _default_orchestrator_profile(role: str) -> dict[str, Any]:
+    return {
+        "name": role.title(),
+        "role": role,
+        "system_prompt": "",
+        "model": "",
+        "effort": "medium",
+        "mode_hint": "ro",
+        "allowed_tools": [],
+        "max_parallel_jobs": 1,
+        "max_runtime_seconds": 900,
+        "approval_required": False,
+    }
+
+
+def _orchestrator_profile(
+    profiles: dict[str, dict[str, Any]] | None,
+    role: str,
+) -> dict[str, Any]:
+    normalized = _coerce_orchestrator_role(role)
+    if profiles is None:
+        return _default_orchestrator_profile(normalized)
+    profile = profiles.get(normalized)
+    if profile is None:
+        return _default_orchestrator_profile(normalized)
+    if not isinstance(profile, dict):
+        return _default_orchestrator_profile(normalized)
+    out: dict[str, Any] = _default_orchestrator_profile(normalized)
+    out.update(profile)
+    return out
+
+
+def _orchestrator_model_for_profile(cfg: BotConfig, profile: dict[str, Any]) -> str:
+    model = str(profile.get("model") or "").strip()
+    model = _sanitize_model_id(model)
+    if model:
+        return model
+    return _sanitize_model_id(cfg.codex_openai_model if not cfg.codex_use_oss else cfg.codex_oss_model)
+
+
+def _orchestrator_effort_for_profile(profile: dict[str, Any], cfg: BotConfig) -> str:
+    effort = str(profile.get("effort") or "").strip().lower()
+    effort = _sanitize_effort(effort)
+    if effort:
+        return effort
+    _, cfg_effort = _codex_defaults_from_config()
+    return cfg_effort or "medium"
+
+
+def _orchestrator_task_from_job(
+    cfg: BotConfig,
+    job: Job,
+    *,
+    profiles: dict[str, dict[str, Any]] | None,
+    user_id: int | None = None,
+) -> Task:
+    detected_role = to_task(job.user_text, context={"chat_id": job.chat_id}).role
+    role = _coerce_orchestrator_role(detected_role)
+    profile = _orchestrator_profile(profiles, role)
+
+    mode_hint = _coerce_orchestrator_mode(str(profile.get("mode_hint") or ""))
+    mode_hint = _coerce_orchestrator_mode(job.mode_hint or mode_hint)
+    model = _orchestrator_model_for_profile(cfg, profile)
+    effort = _orchestrator_effort_for_profile(profile, cfg)
+
+    requires_approval = bool(profile.get("approval_required", False))
+    if mode_hint == "full":
+        requires_approval = True
+
+    trace: dict[str, str | int | float | bool | list[str]] = {
+        "source": "telegram",
+        "legacy_mode_hint": job.mode_hint,
+        "profile_name": str(profile.get("name") or role),
+        "profile_role": role,
+        "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
+    }
+    if job.reply_to_message_id is not None:
+        trace["reply_to_message_id"] = int(job.reply_to_message_id)
+
+    raw_priority = cfg.orchestrator_default_priority
+    try:
+        priority = int(raw_priority)
+    except Exception:
+        priority = 2
+    if priority < 1:
+        priority = 1
+
+    context = {
+        "source": "telegram",
+        "chat_id": job.chat_id,
+        "user_id": user_id,
+        "reply_to_message_id": job.reply_to_message_id,
+        "model": model,
+        "effort": effort,
+        "role": role,
+        "priority": priority,
+        "due_at": None,
+        "mode_hint": mode_hint,
+        "request_type": "task",
+        "requires_approval": requires_approval,
+        "max_cost_window_usd": float(cfg.orchestrator_default_max_cost_window_usd),
+        "trace": trace,
+    }
+
+    # role can be overridden by explicit @role markers in the input text.
+    task = to_task(job.user_text, context=context)
+    if task.role not in _ORCHESTRATOR_ROLES:
+        task = task.with_updates(role=role)
+    task = task.with_updates(
+        model=task.model or model,
+        effort=task.effort or effort,
+        mode_hint=_coerce_orchestrator_mode(task.mode_hint),
+        requires_approval=bool(requires_approval),
+        trace=trace,
+        priority=int(task.priority or priority),
+        state="queued",
+        max_cost_window_usd=float(task.max_cost_window_usd or cfg.orchestrator_default_max_cost_window_usd),
+    )
+    if task.max_cost_window_usd <= 0:
+        task = task.with_updates(max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd))
+    return task
+
+
+def _parse_orchestrator_marker(text: str) -> tuple[str, str] | None:
+    """
+    Decode internal command markers produced by _orch_marker into (kind, payload).
+    """
+    if not text.startswith("__orch_"):
+        return None
+    body = text[len("__orch_") :]
+    if not body:
+        return None
+    if ":" in body:
+        kind, payload = body.split(":", 1)
+        return kind, payload.strip()
+    return body, ""
+
+
+def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
+    if not cfg.auth_enabled:
+        return True
+    profile = _auth_effective_profile_name(cfg, chat_id=chat_id)
+    if not profile:
+        return True
+    return _profile_can_manage_bot(cfg, profile_name=profile)
+
+
+def _send_orchestrator_marker_response(
+    kind: str,
+    payload: str,
+    cfg: BotConfig,
+    api: "TelegramAPI",
+    chat_id: int,
+    reply_to_message_id: int | None,
+    orch_q: OrchestratorQueue | None,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> bool:
+    """
+    Returns True if marker was handled.
+    """
+    if kind == "agents":
+        if orch_q is None:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, _orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "job":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not payload:
+            api.send_message(chat_id, "Uso: /job <id>", reply_to_message_id=reply_to_message_id)
+            return True
+        task = orch_q.get_job(payload)
+        api.send_message(chat_id, _orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "daily":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, _orchestrator_daily_digest_text(orch_q), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind in ("pause", "resume"):
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para acciones de orquestador.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if not payload:
+            api.send_message(chat_id, f"Uso: /{kind} <role>", reply_to_message_id=reply_to_message_id)
+            return True
+        role = (payload or "").strip().lower()
+        if not _orchestrator_role_is_valid(role, profiles or {}):
+            roles = ", ".join(_orchestrator_known_roles(profiles or {}))
+            api.send_message(chat_id, f"Rol invalido: {role}. Roles: {roles}", reply_to_message_id=reply_to_message_id)
+            return True
+        if kind == "pause":
+            orch_q.pause_role(role)
+            api.send_message(chat_id, f"Pausado: {role}", reply_to_message_id=reply_to_message_id)
+        else:
+            orch_q.resume_role(role)
+            api.send_message(chat_id, f"Reanudado: {role}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind in ("emergency_stop", "emergency_resume"):
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para controlar el orquestador.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if kind == "emergency_stop":
+            orch_q.pause_all_roles()
+            canceled = orch_q.cancel_running_jobs()
+            api.send_message(
+                chat_id,
+                f"Emergency stop activo. Roles pausados y tareas en ejecución canceladas: {canceled}.",
+                reply_to_message_id=reply_to_message_id,
+            )
+        else:
+            orch_q.resume_all_roles()
+            api.send_message(chat_id, "Emergency stop liberado. Roles reanudados.", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "approve":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para aprobar tareas.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if not payload:
+            api.send_message(chat_id, "Uso: /approve <id>", reply_to_message_id=reply_to_message_id)
+            return True
+        ok = orch_q.set_job_approved(payload)
+        if ok:
+            api.send_message(chat_id, f"Aprobado: {payload}", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, f"No existe tarea: {payload}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "cancel_job":
+        if not orch_q:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para cancelar tareas.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if not payload:
+            api.send_message(chat_id, "Uso: /cancel <id>", reply_to_message_id=reply_to_message_id)
+            return True
+        ok = orch_q.cancel(payload)
+        if ok:
+            api.send_message(chat_id, f"Cancelado: {payload}", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(chat_id, f"No existe o ya finalizado: {payload}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    return False
+
+
+def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
+    health = orch_q.get_role_health()
+    if not health:
+        return "No orchestrator jobs yet."
+
+    states = ("queued", "running", "blocked", "done", "failed", "cancelled")
+    system_state = "paused" if orch_q.is_paused_globally() else "active"
+    lines = ["Orchestrator role health:", f"system: {system_state}", ""]
+    for role in sorted(health.keys()):
+        vals = health.get(role, {})
+        state_parts = [f"{s}={int(vals.get(s, 0))}" for s in states if vals.get(s) is not None]
+        if not state_parts:
+            state_parts = [f"{s}=0" for s in states]
+        paused = int(vals.get("paused", 0))
+        lines.append(f"- {role} ({'paused' if paused else 'active'}): " + ", ".join(state_parts))
+
+    return "\n".join(lines)
+
+
+def _orchestrator_daily_digest_text(orch_q: OrchestratorQueue) -> str:
+    lines = ["Orchestrator digest", "=" * 19]
+    lines.append(_orchestrator_status_text(orch_q))
+
+    running = orch_q.jobs_by_state(state="running", limit=8)
+    if running:
+        lines.extend(["", "Running jobs:"])
+        for t in running[:8]:
+            summary = (t.input_text or "").strip().replace("\n", " ")[:160]
+            lines.append(f"- {t.job_id[:8]} role={t.role} state={t.state} text={summary}")
+        if len(running) > 8:
+            lines.append(f"- ... +{len(running) - 8} more")
+
+    return "\n".join(lines)
+
+
+def _orchestrator_job_text(task: Task | None) -> str:
+    if task is None:
+        return "No such job found."
+
+    def _as_int(v: Any) -> str:
+        try:
+            return str(int(v))
+        except Exception:
+            return "n/a"
+
+    created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.created_at))
+    updated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.updated_at))
+    due = "n/a" if task.due_at in (None, 0) else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.due_at))
+
+    return "\n".join(
+        [
+            f"Job: {task.job_id}",
+            f"state: {task.state}",
+            f"role: {task.role}",
+            f"request_type: {task.request_type}",
+            f"priority: {_as_int(task.priority)}",
+            f"mode_hint: {task.mode_hint}",
+            f"model: {task.model}",
+            f"effort: {task.effort}",
+            f"requires_approval: {task.requires_approval}",
+            f"max_cost_window_usd: {task.max_cost_window_usd}",
+            f"created_at: {created}",
+            f"updated_at: {updated}",
+            f"due_at: {due}",
+            "input_text:",
+            task.input_text[:1200],
+            f"trace: {task.trace}",
+        ]
+    )
+
+
 def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     """
     Returns (response_text, job)
@@ -2902,6 +3345,58 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             f"send_as_file_threshold_chars: {eff_cfg.send_as_file_threshold_chars}",
         ]
         return "\n".join(lines), None
+
+    if text == "/agents":
+        return _orch_marker("agents"), None
+
+    if text.startswith("/job "):
+        job_id = _orch_job_id(text[len("/job ") :])
+        if not job_id:
+            return "Uso: /job <id>", None
+        return _orch_marker("job", job_id), None
+
+    if text == "/job":
+        return "Uso: /job <id>", None
+
+    if text == "/daily":
+        return _orch_marker("daily"), None
+
+    if text == "/pause":
+        return "Uso: /pause <role>", None
+
+    if text.startswith("/pause "):
+        role = _orch_job_id(text[len("/pause ") :]).lower()
+        if not role:
+            return "Uso: /pause <role>", None
+        return _orch_marker("pause", role), None
+
+    if text == "/emergency_stop":
+        return _orch_marker("emergency_stop"), None
+
+    if text == "/emergency_resume":
+        return _orch_marker("emergency_resume"), None
+
+    if text == "/resume":
+        return "Uso: /resume <role>", None
+
+    if text.startswith("/resume "):
+        role = _orch_job_id(text[len("/resume ") :]).lower()
+        if not role:
+            return "Uso: /resume <role>", None
+        return _orch_marker("resume", role), None
+
+    if text.startswith("/approve "):
+        job_id = _orch_job_id(text[len("/approve ") :])
+        if not job_id:
+            return "Uso: /approve <id>", None
+        return _orch_marker("approve", job_id), None
+
+    if text.startswith("/cancel "):
+        job_id = _orch_job_id(text[len("/cancel ") :])
+        if not job_id:
+            # Preserve legacy behavior for "/cancel" without args.
+            return "__cancel__", None
+        return _orch_marker("cancel_job", job_id), None
 
     if text == "/permissions":
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
@@ -3994,6 +4489,271 @@ def _run_internal_skills_job(
     api.send_message(job.chat_id, "Unknown skills command.", reply_to_message_id=job.reply_to_message_id)
 
 
+def _should_route_to_orchestrator(cfg: BotConfig, job: Job | None) -> bool:
+    if not cfg.orchestrator_enabled or job is None:
+        return False
+    if not job.argv:
+        return False
+    if job.image_paths or job.upload_paths:
+        return False
+    cmd = job.argv[0]
+    if not cmd:
+        return False
+    if cmd.startswith("__"):
+        return False
+    return True
+
+
+def _submit_orchestrator_task(
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue | None,
+    profiles: dict[str, dict[str, Any]] | None,
+    job: Job,
+    *,
+    user_id: int | None = None,
+) -> tuple[bool, str]:
+    if not cfg.orchestrator_enabled or orch_q is None:
+        return False, ""
+    if not _should_route_to_orchestrator(cfg, job):
+        return False, ""
+    try:
+        task = _orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=user_id)
+        return True, orch_q.submit_task(task)
+    except Exception as e:
+        LOG.exception("Failed to submit orchestrator task")
+        raise RuntimeError(f"Failed to submit orchestrator task: {e}") from e
+
+
+def _orchestrator_apply_task_flags(task: Task, argv: list[str]) -> list[str]:
+    args = list(argv)
+    if task.model:
+        model = _sanitize_model_id(task.model)
+        if model and "--model" not in args and "-m" not in args:
+            args[1:1] = ["--model", model]
+    if task.effort:
+        effort = _sanitize_effort(task.effort)
+        if effort and not _extract_effort_override_from_argv(args):
+            args[1:1] = ["-c", f"model_reasoning_effort=\"{effort}\""]
+    return args
+
+
+def _orchestrator_run_codex(cfg: BotConfig, task: Task, *, stop_event: threading.Event, orch_q: OrchestratorQueue | None) -> dict[str, Any]:
+    started = time.time()
+    mode = _coerce_orchestrator_mode(task.mode_hint)
+    timeout_seconds = cfg.codex_timeout_seconds
+    try:
+        profile_timeout = int(task.trace.get("max_runtime_seconds", 0) or 0)
+    except Exception:
+        profile_timeout = 0
+    if profile_timeout > 0:
+        timeout_seconds = min(
+            timeout_seconds,
+            profile_timeout,
+        ) if timeout_seconds > 0 else profile_timeout
+    request = (task.request_type or "task").strip().lower()
+    if request in {"maintenance", "review", "status"}:
+        argv = ["review", task.input_text]
+    else:
+        argv = ["exec", task.input_text]
+    argv = _orchestrator_apply_task_flags(task, argv)
+
+    try:
+        runner = CodexRunner(cfg, chat_id=task.chat_id)
+        proc = runner.start(argv=argv, mode_hint=mode)
+    except Exception as e:
+        return {
+            "status": "error",
+            "summary": f"Failed to start codex for job={task.job_id}",
+            "artifacts": [],
+            "logs": str(e),
+            "next_action": None,
+        }
+
+    timed_out = False
+    canceled = False
+    try:
+        while proc.proc.poll() is None:
+            if stop_event.is_set():
+                _terminate_process(proc.proc)
+                canceled = True
+                break
+            if orch_q is not None and _poll_orchestrator_job_state(orch_q, task.job_id) == "cancelled":
+                _terminate_process(proc.proc)
+                canceled = True
+                break
+            if timeout_seconds > 0 and (time.time() - proc.start_time) >= timeout_seconds:
+                _terminate_process(proc.proc)
+                timed_out = True
+                break
+            time.sleep(0.25)
+
+        try:
+            proc.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+        if canceled:
+            return {
+                "status": "error",
+                "summary": "Task canceled by operator.",
+                "artifacts": [],
+                "logs": "",
+                "next_action": None,
+            }
+        if timed_out:
+            return {
+                "status": "error",
+                "summary": f"Task timed out after {timeout_seconds}s.",
+                "artifacts": [],
+                "logs": _tail_file_text(proc.stderr_path, max_chars=6000),
+                "next_action": None,
+            }
+
+        code = int(proc.proc.returncode) if proc.proc.returncode is not None else 1
+        body = ""
+        if proc.last_msg_path is not None:
+            body = _read_text_file(proc.last_msg_path).strip()
+        if not body:
+            body = _tail_file_text(proc.stdout_path, max_chars=6000) or "(no output)"
+
+        logs = _tail_file_text(proc.stderr_path, max_chars=6000)
+        artifacts = _collect_png_artifacts(cfg, start_time=proc.start_time, text=body)
+        artifacts_text = [str(p) for p in artifacts]
+        if code == 0:
+            return {
+                "status": "ok",
+                "summary": body,
+                "artifacts": artifacts_text,
+                "logs": logs,
+                "next_action": None,
+            }
+        return {
+            "status": "error",
+            "summary": f"Codex returned code {code}.",
+            "artifacts": artifacts_text,
+            "logs": logs or body,
+            "next_action": None,
+        }
+    finally:
+        elapsed = time.time() - started
+        try:
+            proc.last_msg_path.unlink(missing_ok=True)
+            proc.stdout_path.unlink(missing_ok=True)
+            proc.stderr_path.unlink(missing_ok=True)
+        except Exception:
+            LOG.exception("Failed to cleanup orchestrator proc temp files")
+        LOG.info("Orchestrator task %s finished in %.2fs", task.job_id, elapsed)
+
+
+def _send_orchestrator_result(
+    api: TelegramAPI,
+    task: Task,
+    result: Any,
+) -> None:
+    status = str(getattr(result, "status", "error"))
+    summary = str(getattr(result, "summary", "")).strip() or "(no summary)"
+    logs = str(getattr(result, "logs", ""))
+    next_action = getattr(result, "next_action", None)
+    artifacts = list(getattr(result, "artifacts", []) or [])
+
+    header = f"Orchestrator task={task.job_id[:8]} role={task.role} status={status}"
+    payload = [header, summary]
+    if next_action:
+        payload.append(f"next_action={next_action}")
+    msg = "\n".join(payload)
+    msg_chunks = _chunk_text(msg, limit=TELEGRAM_MSG_LIMIT - 64)
+    for idx, ch in enumerate(msg_chunks, start=1):
+        text = ch if len(msg_chunks) == 1 else f"[{idx}/{len(msg_chunks)}]\n{ch}"
+        api.send_message(task.chat_id, text, reply_to_message_id=task.reply_to_message_id)
+
+    if status != "ok" and logs:
+        log_chunks = _chunk_text(logs, limit=TELEGRAM_MSG_LIMIT - 64)
+        for idx, ch in enumerate(log_chunks, start=1):
+            prefix = f"log[{idx}/{len(log_chunks)}]\n"
+            api.send_message(task.chat_id, f"{prefix}{ch}", reply_to_message_id=task.reply_to_message_id)
+
+    for raw in artifacts[:3]:
+        p = Path(str(raw))
+        if not p.exists():
+            continue
+        try:
+            api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
+        except Exception:
+            api.send_document(task.chat_id, p, filename=p.name, reply_to_message_id=task.reply_to_message_id)
+
+
+def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) -> str:
+    if not orch_q:
+        return ""
+    try:
+        t = orch_q.get_job(job_id)
+    except Exception:
+        return ""
+    if t is None:
+        return ""
+    return t.state
+
+
+class _OrchestratorExecutor:
+    def __init__(self, cfg: BotConfig, stop_event: threading.Event, orch_q: OrchestratorQueue | None) -> None:
+        self._cfg = cfg
+        self._stop_event = stop_event
+        self._orch_q = orch_q
+
+    def run_task(self, task: Task) -> dict[str, Any]:
+        return _orchestrator_run_codex(self._cfg, task, stop_event=self._stop_event, orch_q=self._orch_q)
+
+
+def orchestrator_worker_loop(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    orch_q: OrchestratorQueue,
+    stop_event: threading.Event,
+    profiles: dict[str, dict[str, Any]] | None,
+) -> None:
+    executor = _OrchestratorExecutor(cfg=cfg, stop_event=stop_event, orch_q=orch_q)
+
+    while not stop_event.is_set():
+        task = orch_q.take_next()
+        if task is None:
+            stop_event.wait(0.25)
+            continue
+
+        if profiles and task.role in profiles:
+            trace = dict(task.trace)
+            trace["profile"] = task.role
+            task = task.with_updates(trace=trace)
+        try:
+            orch_q.update_state(task.job_id, "running")
+            result = run_orchestrator_task(task, executor=executor, cfg=cfg)
+            orch_state = str(result.status or "failed")
+            if orch_state not in {"ok", "blocked", "done", "failed", "cancelled"}:
+                orch_state = "failed"
+            if orch_state == "ok":
+                orch_state = "done"
+            orch_q.update_state(task.job_id, orch_state)
+            _send_orchestrator_result(api, task, result)
+        except Exception as e:
+            LOG.exception("Orchestrator worker failed for task=%s", task.job_id)
+            try:
+                orch_q.update_state(task.job_id, "failed", error=str(e))
+                _send_orchestrator_result(
+                    api,
+                    task,
+                    {
+                        "status": "error",
+                        "summary": f"Worker failed: {e}",
+                        "artifacts": [],
+                        "logs": str(e),
+                        "next_action": None,
+                    },
+                )
+            except Exception:
+                LOG.exception("Failed to report orchestrator worker failure for task=%s", task.job_id)
+
+
+
 def worker_loop(
     *,
     cfg: BotConfig,
@@ -4273,6 +5033,8 @@ def poll_loop(
     tracker: JobTracker,
     stop_event: threading.Event,
     thread_mgr: ThreadManager,
+    orchestrator_queue: OrchestratorQueue | None = None,
+    orchestrator_profiles: dict[str, dict[str, Any]] | None = None,
     offset: int = 0,
     command_suggestions_synced: bool = False,
 ) -> None:
@@ -4514,7 +5276,14 @@ def poll_loop(
                 if incoming_text.strip() == "/status":
                     api.send_message(
                         chat_id,
-                        _status_text_for_chat(cfg, chat_id=chat_id, tracker=tracker, jobs=jobs, thread_mgr=thread_mgr),
+                        _status_text_for_chat(
+                            cfg,
+                            chat_id=chat_id,
+                            tracker=tracker,
+                            jobs=jobs,
+                            thread_mgr=thread_mgr,
+                            orchestrator_queue=orchestrator_queue,
+                        ),
                         reply_to_message_id=message_id if message_id else None,
                     )
                     continue
@@ -4689,7 +5458,18 @@ def poll_loop(
                         "/voice",
                         "/effort",
                         "/setnotify",
+                        "/agents",
+                        "/daily",
+                        "/approve",
+                        "/emergency_stop",
+                        "/emergency_resume",
+                        "/pause",
+                        "/resume",
                         "/synccommands",
+                        "/cancel",
+                        "/job",
+                        "/restart",
+                        "/daily",
                         "/botpermissions",
                         "/format",
                         "/example",
@@ -4706,6 +5486,12 @@ def poll_loop(
                         "/exec ",
                         "/review ",
                         "/codex ",
+                        "/job ",
+                        "/daily",
+                        "/approve ",
+                        "/pause ",
+                        "/resume ",
+                        "/cancel ",
                     )
 
                     if raw in local_exact or any(raw.startswith(p) for p in local_prefixes):
@@ -4726,6 +5512,21 @@ def poll_loop(
                 else:
                     response, job = _parse_job(cfg, incoming)
                 if response:
+                    marker = _parse_orchestrator_marker(response)
+                    if marker:
+                        kind, payload = marker
+                        if _send_orchestrator_marker_response(
+                            kind=kind,
+                            payload=payload,
+                            cfg=cfg,
+                            api=api,
+                            chat_id=chat_id,
+                            reply_to_message_id=message_id if message_id else None,
+                            orch_q=orchestrator_queue,
+                            profiles=orchestrator_profiles,
+                        ):
+                            continue
+
                     if response.startswith("__login__:"):
                         payload = response[len("__login__:") :].strip()
                         # Expected: "<user> <pass...>"
@@ -4741,10 +5542,12 @@ def poll_loop(
                         ok, msg_txt = _auth_login(cfg, chat_id=chat_id, username=user, password=pw)
                         api.send_message(chat_id, msg_txt, reply_to_message_id=message_id if message_id else None)
                         continue
+
                     if response == "__logout__":
                         _auth_logout(cfg, chat_id=chat_id)
                         api.send_message(chat_id, "OK. Logout.", reply_to_message_id=message_id if message_id else None)
                         continue
+
                     if response.startswith("__notify__:"):
                         try:
                             _, raw_chat_id, payload = response.split(":", 2)
@@ -4763,11 +5566,13 @@ def poll_loop(
                                 reply_to_message_id=message_id if message_id else None,
                             )
                         continue
+
                     if response == "__cancel__":
                         had_running = tracker.cancel(chat_id)
                         msg_txt = "Cancel requested." if had_running else "Canceled queued jobs (no running job)."
                         api.send_message(chat_id, msg_txt, reply_to_message_id=message_id if message_id else None)
                         continue
+
                     if response == "__synccommands__":
                         try:
                             _sync_telegram_command_suggestions(api)
@@ -4785,6 +5590,7 @@ def poll_loop(
                                 reply_to_message_id=message_id if message_id else None,
                             )
                         continue
+
                     if response == "__restart__":
                         api.send_message(
                             chat_id,
@@ -4793,7 +5599,9 @@ def poll_loop(
                         )
                         stop_event.set()
                         return
+
                     api.send_message(chat_id, response, reply_to_message_id=message_id if message_id else None)
+
                 if job is not None:
                     profile = _auth_effective_profile_name(cfg, chat_id=chat_id) if cfg.auth_enabled else ""
                     if profile:
@@ -4805,6 +5613,34 @@ def poll_loop(
                                 reply_to_message_id=message_id if message_id else None,
                             )
                             continue
+
+                    enqueued_to_orchestrator = False
+                    if orchestrator_queue is not None and cfg.orchestrator_enabled:
+                        try:
+                            did_submit, orch_job_id = _submit_orchestrator_task(
+                                cfg=cfg,
+                                orch_q=orchestrator_queue,
+                                profiles=orchestrator_profiles,
+                                job=job,
+                                user_id=user_id,
+                            )
+                        except Exception:
+                            did_submit = False
+                            orch_job_id = ""
+                            LOG.exception("Failed to submit orchestrator task")
+                        if did_submit:
+                            enqueued_to_orchestrator = True
+                            api.send_message(
+                                chat_id,
+                                (
+                                    f"Queued to orchestrator: task={orch_job_id[:8]} "
+                                    f"(mode={job.mode_hint}, queue_queued={orchestrator_queue.get_queued_count()})."
+                                ),
+                                reply_to_message_id=message_id if message_id else None,
+                            )
+
+                    if enqueued_to_orchestrator:
+                        continue
 
                     ok, reason, epoch, q_after = tracker.try_mark_enqueued(chat_id, max_queued_per_chat=cfg.max_queued_per_chat)
                     if not ok:
@@ -4947,6 +5783,34 @@ def _load_config() -> BotConfig:
     else:
         notify_chat_id = None
 
+    orchestrator_enabled = os.environ.get("BOT_ORCHESTRATOR_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    orchestrator_db_path = Path(
+        os.environ.get(
+            "BOT_ORCHESTRATOR_DB_PATH",
+            str(Path(__file__).with_name("data") / "jobs.sqlite"),
+        )
+    ).expanduser().resolve()
+    orchestrator_default_priority = int(os.environ.get("BOT_ORCHESTRATOR_DEFAULT_PRIORITY", "2"))
+    if orchestrator_default_priority < 1:
+        orchestrator_default_priority = 1
+    if orchestrator_default_priority > 3:
+        orchestrator_default_priority = 3
+    orchestrator_default_max_cost_window_usd = float(os.environ.get("BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD", "8.0"))
+    if orchestrator_default_max_cost_window_usd <= 0:
+        orchestrator_default_max_cost_window_usd = 8.0
+    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "backend").strip() or "backend"
+    orchestrator_daily_digest_seconds = int(
+        os.environ.get("BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS", str(6 * 60 * 60))
+    )
+    if orchestrator_daily_digest_seconds < 60:
+        orchestrator_daily_digest_seconds = 0
+    orchestrator_agent_profiles = Path(
+        os.environ.get(
+            "BOT_ORCHESTRATOR_AGENT_PROFILES",
+            str(Path(__file__).with_name("orchestrator") / "agents.yaml"),
+        )
+    ).expanduser().resolve()
+
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
         raise SystemExit(f"CODEX_WORKDIR must be an existing directory: {codex_workdir}")
@@ -5006,6 +5870,13 @@ def _load_config() -> BotConfig:
         state_file=state_file,
         notify_chat_id=notify_chat_id,
         notify_on_start=notify_on_start,
+        orchestrator_enabled=orchestrator_enabled,
+        orchestrator_db_path=orchestrator_db_path,
+        orchestrator_default_priority=orchestrator_default_priority,
+        orchestrator_default_max_cost_window_usd=orchestrator_default_max_cost_window_usd,
+        orchestrator_default_role=orchestrator_default_role,
+        orchestrator_daily_digest_seconds=orchestrator_daily_digest_seconds,
+        orchestrator_agent_profiles=orchestrator_agent_profiles,
         codex_workdir=codex_workdir,
         codex_timeout_seconds=codex_timeout_seconds,
         codex_use_oss=codex_use_oss,
@@ -5049,6 +5920,19 @@ def _drain_pending_updates(cfg: BotConfig, api: TelegramAPI) -> int:
     return offset
 
 
+def _configured_notify_chat_id(cfg: BotConfig) -> int | None:
+    if cfg.notify_chat_id is not None:
+        return cfg.notify_chat_id
+    state = _read_json(cfg.state_file)
+    try:
+        raw = state.get("notify_chat_id")
+        if raw is None:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -5064,10 +5948,56 @@ def main() -> None:
         http_retry_max_seconds=cfg.http_retry_max_seconds,
         parse_mode=cfg.telegram_parse_mode,
     )
+    orchestrator_queue: OrchestratorQueue | None = None
+    orchestrator_profiles: dict[str, dict[str, Any]] | None = None
+    orchestrator_scheduler: OrchestratorScheduler | None = None
     jobs: "queue.Queue[Job]" = queue.Queue(maxsize=cfg.queue_maxsize)
     stop_event = threading.Event()
     tracker = JobTracker()
     thread_mgr = ThreadManager()
+
+    if cfg.orchestrator_enabled:
+        try:
+            orchestrator_profiles = load_agent_profiles(cfg.orchestrator_agent_profiles)
+            orch_storage = SQLiteTaskStorage(cfg.orchestrator_db_path)
+            orchestrator_queue = OrchestratorQueue(storage=orch_storage, role_profiles=orchestrator_profiles)
+            recovered = orchestrator_queue.recover_stale_running()
+            if recovered:
+                LOG.info("Recovered %d stale orchestrator jobs to queued state.", recovered)
+        except Exception:
+            LOG.exception("Failed to initialize orchestrator storage/queue; disabling orchestrator for this session.")
+            orchestrator_queue = None
+
+    if orchestrator_queue is not None:
+        for i in range(max(1, cfg.worker_count)):
+            t = threading.Thread(
+                target=orchestrator_worker_loop,
+                kwargs={
+                    "cfg": cfg,
+                    "api": api,
+                    "orch_q": orchestrator_queue,
+                    "stop_event": stop_event,
+                    "profiles": orchestrator_profiles,
+                },
+                daemon=True,
+                name=f"orch-worker-{i+1}",
+            )
+            t.start()
+
+        if cfg.orchestrator_daily_digest_seconds >= 60 and _configured_notify_chat_id(cfg):
+            notify_chat_id = _configured_notify_chat_id(cfg)
+
+            def _send_orchestrator_digest() -> None:
+                if orchestrator_queue is None or notify_chat_id is None:
+                    return
+                try:
+                    api.send_message(notify_chat_id, _orchestrator_daily_digest_text(orchestrator_queue))
+                except Exception:
+                    LOG.exception("Failed to send scheduled orchestrator digest")
+
+            orchestrator_scheduler = OrchestratorScheduler(interval_seconds=cfg.orchestrator_daily_digest_seconds, enabled=True)
+            orchestrator_scheduler.add_tick(_send_orchestrator_digest)
+            orchestrator_scheduler.start()
     try:
         for chat_id_str, tid in _get_threads_state(cfg).items():
             try:
@@ -5113,13 +6043,7 @@ def main() -> None:
         t.start()
 
     if cfg.notify_on_start:
-        target = cfg.notify_chat_id
-        if not target:
-            state = _read_json(cfg.state_file)
-            try:
-                target = int(state.get("notify_chat_id")) if state.get("notify_chat_id") is not None else None
-            except Exception:
-                target = None
+        target = _configured_notify_chat_id(cfg)
         if target:
             try:
                 api.send_message(int(target), "Poncebot is online.")
@@ -5135,6 +6059,8 @@ def main() -> None:
             tracker=tracker,
             stop_event=stop_event,
             thread_mgr=thread_mgr,
+            orchestrator_queue=orchestrator_queue,
+            orchestrator_profiles=orchestrator_profiles,
             offset=start_offset,
             command_suggestions_synced=command_suggestions_synced,
         )
@@ -5142,6 +6068,8 @@ def main() -> None:
         LOG.info("Stopping (KeyboardInterrupt)")
     finally:
         stop_event.set()
+        if orchestrator_scheduler is not None:
+            orchestrator_scheduler.stop()
 
 
 if __name__ == "__main__":

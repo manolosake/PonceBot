@@ -4,6 +4,7 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 ENV_FILE="${ENV_FILE:-$HERE/codexbot.env}"
+LOCAL_ENV_FILE="${ENV_LOCAL_FILE:-$HERE/.env.local}"
 CHECK_ONLY=0
 if [[ "${1:-}" == "--check-env" ]]; then
   CHECK_ONLY=1
@@ -59,6 +60,11 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 load_env_file "$ENV_FILE"
+
+if [[ -f "$LOCAL_ENV_FILE" ]]; then
+  load_env_file "$LOCAL_ENV_FILE"
+fi
+
 : "${TELEGRAM_BOT_TOKEN:?Missing TELEGRAM_BOT_TOKEN in $ENV_FILE}"
 
 if [[ "$CHECK_ONLY" == "1" ]]; then

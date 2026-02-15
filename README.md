@@ -15,6 +15,7 @@ Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la sali
 2. Crea el archivo de config:
    - `cp codexbot.env.example codexbot.env`
    - Edita `codexbot.env` y setea `TELEGRAM_BOT_TOKEN=...`
+   - Para secretos, usa `touch .env.local` y agrega solo valores sensibles (`OPENAI_API_KEY`, claves SSH, etc.); `run.sh` lo carga automáticamente y no se versiona.
 3. Arranca el bot:
    - `./run.sh`
 4. En Telegram, escribe cualquier mensaje al bot. Como no esta configurada la allow-list todavia, el bot contestara `Unauthorized` incluyendo `chat_id` y `user_id`.
@@ -94,3 +95,67 @@ Si no, la alternativa simple es correrlo dentro de `tmux`/`screen` o con `nohup`
   - Recomendado (gratis/local): `BOT_TRANSCRIBE_BACKEND=whispercpp` (requiere ffmpeg + whisper.cpp + modelo ggml).
   - Alternativa (API): `BOT_TRANSCRIBE_BACKEND=openai` y configura `OPENAI_API_KEY`.
   - El texto transcrito se procesa igual que si lo hubieras escrito (incluye /ro /rw /exec, etc.).
+
+## Plan de implementación (v1)
+
+### 1) Certezas del estado actual
+
+Lo siguiente está implementado en este repo:
+
+- Orquestación multirol:
+  - `orchestrator/schemas/task.py`, `orchestrator/schemas/result.py`
+  - `orchestrator/storage.py` (SQLite con `jobs` y eventos)
+  - `orchestrator/queue.py`
+  - `orchestrator/agents.yaml`
+  - `orchestrator/dispatcher.py`
+  - `orchestrator/runner.py`
+- Flujo desde Telegram:
+  - Enrutado a cola de orquestador para comandos de ejecución textuales.
+  - `/agents`, `/job <id>`, `/daily`, `/approve`, `/pause`, `/resume`, `/cancel <id>`.
+  - `/status` muestra métricas de cola legacy + cola de orquestador.
+- Arranque:
+  - `main()` intenta inicializar `orchestrator_queue`, levanta workers de orquestador y scheduler opcional.
+  - Se reintentan trabajos `running` previos: se regresan a `queued`.
+- Seguridad/operación base:
+  - Bloqueo por imagen/adjunto para entrar al orquestador (los mensajes con archivos se mantienen en ejecución legacy).
+  - `run.sh` usa `codexbot.env` y ahora carga también `.env.local`.
+  - `.gitignore` ignora `codexbot.env`, `.env.local`, y `data/jobs.sqlite`.
+
+### 2) Supuestos (a validar en entorno real)
+
+- Se asume acceso estable al host de operación (`100.93.21.71` por Tailscale) y acceso SSH ya resuelto.
+- Se asume disponibilidad de `gpt-5.2` (o alias estable configurable).
+- Se asume capacidad de correr múltiples procesos `codex` en paralelo sin saturar recursos.
+
+### 3) Fases y alcance inmediato (próximos pasos)
+
+- **Fase 1 — Entrega actual (v1 base):**
+  - Orquestador persistente (SQLite), roles y cola de trabajos.
+  - Comandos operativos para CEO y control por rol.
+  - Scheduler de digest cada `BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS`.
+- **Fase 2 — Operación autónoma real (a completar):**
+  - Auto-revisión de tareas por rol.
+  - Controles de cuota/tiempo por rol.
+  - Mejorar evidencias visuales y pipeline de screenshot real.
+  - Kill-switch (`/emergency_stop`) y reglas de gobernanza más finas.
+
+### 4) Configuración clave del orquestador
+
+- `BOT_ORCHESTRATOR_ENABLED`
+- `BOT_ORCHESTRATOR_DB_PATH`
+- `BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS`
+- `BOT_ORCHESTRATOR_DEFAULT_ROLE`
+- `BOT_ORCHESTRATOR_DEFAULT_PRIORITY`
+- `BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD`
+- `BOT_ORCHESTRATOR_AGENT_PROFILES`
+
+### 5) Puesta en marcha recomendada
+
+1. Copia secretos a `.env.local` (no se versiona): `OPENAI_API_KEY`, tokens, etc.
+2. Arranca y valida:
+   - `./run.sh --check-env`
+   - `./run.sh`
+3. Verifica:
+   - `/status`
+   - `/agents`
+   - `/job <id>` tras enviar un comando de texto.
