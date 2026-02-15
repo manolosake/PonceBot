@@ -35,6 +35,14 @@ Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la sali
 - `/new` (inicia un hilo nuevo de Codex para ese chat)
 - `/thread` (muestra el `thread_id` actual de Codex para ese chat)
 - `/snapshot <url|texto>` (solicita tarea `frontend` de captura visual)
+- `/agents` (backlog/estado por rol del orquestador)
+- `/job <id>` (ver detalle de un job)
+- `/ticket <id>` (ver arbol ticket -> subtareas)
+- `/inbox [role]` (ver queued/blocked/failed recientes)
+- `/runbooks` (ver runbooks y si estan "DUE")
+- `/reset_role <role|all>` (resetea memoria/sesion de Codex para ese rol en ese chat)
+- `/approve <id>` (desbloquea un job `blocked` que requiere aprobacion)
+- `/pause <role>` / `/resume <role>` (control de ejecucion por rol)
 - `/skills` (lista skills instaladas, deshabilitadas y `.system`)
 - `/skills catalog [filter]` (lista skills instalables desde `openai/skills`)
 - `/skills install <skill>` (instala una skill curated en `~/.codex/skills/<skill>`)
@@ -104,41 +112,49 @@ Si no, la alternativa simple es correrlo dentro de `tmux`/`screen` o con `nohup`
 
 Lo siguiente está implementado en este repo:
 
-- Orquestación multirol:
-  - `orchestrator/schemas/task.py`, `orchestrator/schemas/result.py`
-  - `orchestrator/storage.py` (SQLite con `jobs` y eventos)
-  - `orchestrator/queue.py`
-  - `orchestrator/agents.yaml`
-  - `orchestrator/dispatcher.py`
-  - `orchestrator/runner.py`
-- Flujo desde Telegram:
-  - Enrutado a cola de orquestador para comandos de ejecución textuales.
-  - `/agents`, `/job <id>`, `/daily`, `/approve`, `/pause`, `/resume`, `/cancel <id>`.
-  - `/status` muestra métricas de cola legacy + cola de orquestador.
-- Arranque:
-  - `main()` intenta inicializar `orchestrator_queue`, levanta workers de orquestador y scheduler opcional.
-  - Se reintentan trabajos `running` previos: se regresan a `queued`.
-- Seguridad/operación base:
-  - Bloqueo por imagen/adjunto para entrar al orquestador (los mensajes con archivos se mantienen en ejecución legacy).
-  - `run.sh` usa `codexbot.env` y ahora carga también `.env.local`.
-  - `.gitignore` ignora `codexbot.env`, `.env.local`, y `data/jobs.sqlite`.
+- Orquestación multirol persistente (SQLite):
+  - `orchestrator/storage.py` con `jobs`, `job_events`, `role_controls`, `approver_log`.
+  - `parent_job_id` + `depends_on` para arbol ticket -> subtareas y gating de dependencias.
+- Agentes reales por rol:
+  - `orchestrator/agents.yaml` define `system_prompt`, `model`, `effort`, `mode_hint`, `max_parallel_jobs`.
+  - `orchestrator/prompting.py` inyecta `system_prompt` + contrato JSON de salida en cada prompt.
+- Memoria por rol+chat (sesiones Codex):
+  - Tabla `agent_sessions` guarda `thread_id` por `(chat_id, role)`.
+  - El runner usa `codex exec resume <thread_id>` cuando `BOT_ORCH_SESSIONS_ENABLED=1`.
+  - `/reset_role <role|all>` limpia sesiones por chat.
+- Aislamiento de codigo (git worktrees por rol/slot):
+  - Tabla `workspace_leases` evita colisiones entre workers.
+  - `orchestrator/workspaces.py` crea y limpia pool de worktrees bajo `BOT_WORKTREE_ROOT`.
+  - Se generan evidencias por job en `BOT_ARTIFACTS_ROOT/<job_id>/`:
+    - `changes.patch` (git diff)
+    - `git_status.txt`
+- Delegación CEO:
+  - Cuando un job `ceo` top-level termina, se parsea su JSON (`subtasks`) y se encolan child jobs con `parent_job_id=ticket_id`.
+- Voz usable (ACK rapido + transcripcion async):
+  - Con `BOT_TRANSCRIBE_AUDIO=1` + `BOT_TRANSCRIBE_ASYNC=1`, el bot responde ACK rapido y transcribe en background.
+- Capturas reales (`/snapshot`):
+  - Si `BOT_SCREENSHOT_ENABLED=1` y Playwright está instalado, `/snapshot <url>` captura `snapshot.png` y lo envia como artifact.
+- Runbooks (autonomia):
+  - `orchestrator/runbooks.yaml` + scheduler cada 60s encola tareas autonomas si estan "DUE".
+  - `/runbooks` muestra estado (last run y DUE).
 
 ### 2) Supuestos (a validar en entorno real)
 
 - Se asume acceso estable al host de operación (`100.93.21.71` por Tailscale) y acceso SSH ya resuelto.
 - Se asume disponibilidad de `gpt-5.2` (o alias estable configurable).
 - Se asume capacidad de correr múltiples procesos `codex` en paralelo sin saturar recursos.
+- Para `/snapshot`: se asume Playwright instalado en el entorno Python del servidor (opcional; solo si `BOT_SCREENSHOT_ENABLED=1`).
 
 ### 3) Fases y alcance inmediato (próximos pasos)
 
 - **Fase 1 — Entrega actual (v1 base):**
-  - Orquestador persistente (SQLite), roles y cola de trabajos.
-  - Comandos operativos para CEO y control por rol.
-  - Scheduler de digest cada `BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS`.
+  - Ticket CEO -> subtareas por rol (delegación) con estado por job.
+  - Memoria por rol (Codex resume) y worktrees aislados.
+  - Voz async con ACK, runbooks y snapshots (si se habilita).
 - **Fase 2 — Operación autónoma real (a completar):**
   - Auto-revisión de tareas por rol.
   - Controles de cuota/tiempo por rol.
-  - Mejorar evidencias visuales y pipeline de screenshot real.
+  - Endurecer politicas de riesgo (deploy/push) y approvals por tipo de accion.
   - Kill-switch (`/emergency_stop`) y reglas de gobernanza más finas.
 
 ### 4) Configuración clave del orquestador
