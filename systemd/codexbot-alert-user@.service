@@ -1,0 +1,11 @@
+[Unit]
+Description=codexbot failure alert for %i [user service]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/codexbot
+EnvironmentFile=-%h/codexbot/codexbot.env
+ExecStart=%h/codexbot/scripts/notify_systemd_failure.sh %i
+

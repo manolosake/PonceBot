@@ -1,0 +1,16 @@
+[Unit]
+Description=Ollama (local LLM server) [user service]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_HOST=127.0.0.1:11434
+# Codex prompts can be large; 8192 avoids truncation with moderate RAM use.
+Environment=OLLAMA_CONTEXT_LENGTH=8192
+ExecStart=%h/.local/bin/ollama serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+codexbot.env
+state.json
+__pycache__/
+users.json
+profiles.json
+
+models/
+vendor/
+bin/

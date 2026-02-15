@@ -1,0 +1,19 @@
+[Unit]
+Description=codexbot (Telegram -> Codex) [user service]
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=4
+OnFailure=codexbot-alert-user@%n
+
+[Service]
+Type=simple
+WorkingDirectory=%h/codexbot
+EnvironmentFile=%h/codexbot/codexbot.env
+ExecStartPre=%h/codexbot/run.sh --check-env
+ExecStart=%h/codexbot/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
