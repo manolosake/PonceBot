@@ -1,3 +1,12 @@
+- id: jarvis_autopilot
+  role: jarvis
+  interval_seconds: 900
+  mode_hint: ro
+  priority: 2
+  enabled: true
+  prompt: |
+    AUTOPILOT (internal): keep agents busy on active CEO orders only.
+
 - id: sre_health
   role: sre
   interval_seconds: 900
@@ -5,11 +14,9 @@
   priority: 2
   enabled: true
   prompt: |
-    Revisa salud del host y servicios del bot:
-    - estado de systemd codexbot (si aplica)
-    - espacio en disco
-    - procesos top (cpu/mem)
-    Devuelve hallazgos y acciones sugeridas.
+    Check host + bot service health.
+    Report only actionable findings (impact, next action, ETA).
+    If everything is OK, 1 line.
 
 - id: qa_smoke
   role: qa
@@ -18,9 +25,9 @@
   priority: 3
   enabled: true
   prompt: |
-    Corre smoke tests / revisión rápida:
-    - python -m unittest -q (si aplica)
-    Reporta fallos y recomendaciones.
+    Run smoke tests for this repo:
+    - python3 -m unittest -q
+    Report failures with severity and reproduction steps.
 
 - id: jarvis_digest
   role: jarvis
@@ -29,7 +36,7 @@
   priority: 3
   enabled: true
   prompt: |
-    Genera un brief ejecutivo para el CEO (máx 3 bullets):
-    - Estado (verde/amarillo/rojo) + 1 riesgo si aplica
-    - Qué se logró / qué sigue (1 frase)
-    - Decisión requerida (o N/A)
+    Write an executive brief for the CEO ({CEO_NAME}). Max 3 bullets:
+    - Status (green/yellow/red) + 1 risk if applicable
+    - What was achieved / what's next (1 sentence)
+    - Decision needed (or N/A)

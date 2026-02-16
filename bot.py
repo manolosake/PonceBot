@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.agents import load_agent_profiles
-from orchestrator.dispatcher import to_task
+from orchestrator.dispatcher import detect_request_type, to_task
 from orchestrator.delegation import parse_orchestrator_subtasks
 from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
@@ -73,6 +73,11 @@ TELEGRAM_MSG_LIMIT = 4096
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+
+# Ticket card UX: keep one editable message per ticket (no spam).
+_TICKET_CARD_LOCK = threading.Lock()
+_TICKET_CARD_LAST_EDIT: dict[tuple[int, str], float] = {}
+_TICKET_CARD_MIN_EDIT_INTERVAL_S = 2.0
 
 
 def _codex_home_dir() -> Path:
@@ -572,6 +577,8 @@ class BotConfig:
     screenshot_enabled: bool = False
     screenshot_allowed_hosts: frozenset[str] = frozenset()
     transcribe_async: bool = True
+    # Display/name used in prompts and documentation for the CEO user.
+    ceo_name: str = "Alejandro Ponce"
 
 
 class TelegramAPI:
@@ -705,7 +712,7 @@ class TelegramAPI:
         *,
         reply_to_message_id: int | None = None,
         disable_web_page_preview: bool = True,
-    ) -> None:
+    ) -> int | None:
         parse_mode = self._parse_mode
         payload_text = text
         if parse_mode.lower() == "html":
@@ -733,7 +740,50 @@ class TelegramAPI:
             payload["reply_to_message_id"] = str(reply_to_message_id)
         if parse_mode:
             payload["parse_mode"] = parse_mode
-        self._request("sendMessage", payload)
+        res = self._request("sendMessage", payload)
+        try:
+            if isinstance(res, dict) and res.get("message_id") is not None:
+                return int(res["message_id"])
+        except Exception:
+            pass
+        return None
+
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        *,
+        disable_web_page_preview: bool = True,
+    ) -> None:
+        """
+        Edit a previously-sent bot message. Used to keep "ticket cards" and /watch status to one message (no spam).
+        """
+        parse_mode = self._parse_mode
+        payload_text = text
+        if parse_mode.lower() == "html":
+            payload_text = _markdownish_to_telegram_html(payload_text)
+            parse_mode = "HTML"
+            if len(payload_text) > TELEGRAM_MSG_LIMIT:
+                payload_text = _html_escape(text)[:TELEGRAM_MSG_LIMIT]
+        elif parse_mode.lower() in ("markdown", "markdownv2"):
+            parse_mode = "MarkdownV2" if parse_mode.lower() == "markdownv2" else "Markdown"
+            if len(payload_text) > TELEGRAM_MSG_LIMIT:
+                payload_text = payload_text[:TELEGRAM_MSG_LIMIT]
+        else:
+            parse_mode = ""
+            if len(payload_text) > TELEGRAM_MSG_LIMIT:
+                payload_text = payload_text[:TELEGRAM_MSG_LIMIT]
+
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": str(int(message_id)),
+            "text": payload_text,
+            "disable_web_page_preview": "1" if disable_web_page_preview else "0",
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        self._request("editMessageText", payload)
 
     def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         """
@@ -2374,6 +2424,35 @@ def _tail_file_text(path: Path, *, max_chars: int) -> str:
     return _tail_text(s, max_chars=max_chars).strip()
 
 
+def _render_placeholders_text(text: str, *, ceo_name: str) -> str:
+    """
+    Very small templating layer for prompts/docs.
+
+    Ground truth: we only support the placeholders we explicitly use in this repo.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    out = text
+    out = out.replace("{CEO_NAME}", ceo_name)
+    return out
+
+
+def _render_placeholders_obj(obj: Any, *, ceo_name: str) -> Any:
+    """
+    Recursively render placeholders in nested dict/list structures (agent profiles, etc.).
+    """
+    if isinstance(obj, str):
+        return _render_placeholders_text(obj, ceo_name=ceo_name)
+    if isinstance(obj, list):
+        return [_render_placeholders_obj(x, ceo_name=ceo_name) for x in obj]
+    if isinstance(obj, dict):
+        out: dict[Any, Any] = {}
+        for k, v in obj.items():
+            out[k] = _render_placeholders_obj(v, ceo_name=ceo_name)
+        return out
+    return obj
+
+
 def _extract_retry_after_seconds(body: str) -> float | None:
     try:
         parsed = json.loads(body)
@@ -2461,9 +2540,13 @@ def _help_text(cfg: BotConfig) -> str:
         "- /status             Show legacy/system status and orchestrator queue",
         "- /agents             Show orchestrator role status and queue per role",
         "- /dashboard          Visual dashboard snapshot (PNG)",
+        "- /watch              Live company status (single message, auto-updated)",
+        "- /unwatch            Disable /watch",
+        "- /orders             List CEO orders (autopilot scope)",
+        "- /order show|pause|done <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
-        "- /brief              Alias rápido de resumen de estado ejecutivo",
+        "- /brief              Executive brief (short digest)",
         "- /approve <id>       Approve a blocked task",
         "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
         "- /pause <role>       Pause role in orchestrator",
@@ -2535,43 +2618,46 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
     Keep descriptions short and action-oriented.
     """
     cmds: list[tuple[str, str]] = [
-        ("help", "Mostrar ayuda"),
-        ("agents", "Estado del orquestador"),
-        ("dashboard", "Dashboard visual (PNG)"),
-        ("status", "Estado del bot/modelo"),
-        ("s", "Alias de /status"),
-        ("whoami", "Ver tus IDs"),
+        ("help", "Show help"),
+        ("agents", "Orchestrator status"),
+        ("dashboard", "Visual dashboard (PNG)"),
+        ("watch", "Live company status"),
+        ("orders", "List CEO orders"),
+        ("status", "Bot/model status"),
+        ("s", "Alias for /status"),
+        ("whoami", "Show your IDs"),
     ]
     if cfg.auth_enabled:
         cmds += [
-            ("login", "Iniciar sesion"),
-            ("logout", "Cerrar sesion"),
+            ("login", "Login"),
+            ("logout", "Logout"),
         ]
     cmds += [
-        ("job", "Ver estado de tarea"),
-        ("ticket", "Ver ticket/subtareas"),
-        ("inbox", "Ver backlog por rol"),
-        ("runbooks", "Ver runbooks"),
-        ("reset_role", "Reset memoria de rol"),
-        ("emergency_stop", "Parar orquestador"),
-        ("emergency_resume", "Reanudar orquestador"),
-        ("daily", "Resumen automático de estado"),
-        ("brief", "Resumen ejecutivo corto"),
-        ("snapshot", "Solicitar captura de UI"),
-        ("approve", "Aprobar tarea bloqueada"),
-        ("pause", "Pausar rol"),
-        ("resume", "Reanudar rol"),
-        ("new", "Nuevo hilo"),
-        ("thread", "Ver thread actual"),
-        ("cancel", "Cancelar (chat o por id)"),
-        ("model", "Ver/cambiar modelo"),
-        ("m", "Alias de /model"),
-        ("voice", "Configurar voice"),
-        ("v", "Alias de /voice"),
-        ("permissions", "Permisos de Codex"),
-        ("p", "Alias de /permissions"),
-        ("skills", "Ver/administrar skills"),
-        ("synccommands", "Re-sincronizar comandos"),
+        ("order", "Show/pause/done order"),
+        ("job", "Show job status"),
+        ("ticket", "Show ticket tree"),
+        ("inbox", "Inbox by role"),
+        ("runbooks", "Show runbooks"),
+        ("reset_role", "Reset role memory"),
+        ("emergency_stop", "Stop orchestrator"),
+        ("emergency_resume", "Resume orchestrator"),
+        ("daily", "Digest now"),
+        ("brief", "Executive brief"),
+        ("snapshot", "Request UI snapshot"),
+        ("approve", "Approve blocked job"),
+        ("pause", "Pause role"),
+        ("resume", "Resume role"),
+        ("new", "New Codex thread"),
+        ("thread", "Show current thread"),
+        ("cancel", "Cancel job(s)"),
+        ("model", "Show/set model"),
+        ("m", "Alias for /model"),
+        ("voice", "Voice transcription"),
+        ("v", "Alias for /voice"),
+        ("permissions", "Codex permissions"),
+        ("p", "Alias for /permissions"),
+        ("skills", "Manage skills"),
+        ("synccommands", "Re-sync commands"),
     ]
     return cmds
 
@@ -2616,6 +2702,134 @@ def _sync_telegram_command_suggestions(api: TelegramAPI, cfg: BotConfig) -> None
 def _whoami_text(msg: IncomingMessage) -> str:
     uname = msg.username or "(none)"
     return f"chat_id={msg.chat_id}\nuser_id={msg.user_id}\nusername={uname}"
+
+
+def _maybe_handle_ceo_query(
+    *,
+    api: TelegramAPI,
+    cfg: BotConfig,
+    msg: IncomingMessage,
+    orchestrator_profiles: dict[str, dict[str, Any]] | None,
+) -> bool:
+    """
+    Deterministic "CEO queries" that should not go to Codex and should not delegate.
+
+    Grounded motivation: these are questions the bot can answer locally (Telegram metadata + agent config).
+    """
+    raw = (msg.text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+
+    t = raw.lower()
+    # If the CEO explicitly targets an employee (@backend/@frontend/...), don't steal it.
+    if "@" in t and any(m in t for m in ("@jarvis", "@frontend", "@backend", "@qa", "@sre", "@orchestrator", "@ceo")):
+        return False
+
+    if detect_request_type(t) != "query":
+        return False
+
+    # Helpers (best-effort; no secrets).
+    display_user = " ".join(
+        [str(x).strip() for x in (getattr(msg, "username", None),) if isinstance(x, str) and x.strip()]
+    ).strip()
+    if display_user:
+        display_user = "@" + display_user.lstrip("@")
+    else:
+        display_user = "(no username)"
+
+    if any(k in t for k in ("who am i", "quien soy", "quién soy")):
+        api.send_message(
+            msg.chat_id,
+            "\n".join(
+                [
+                    f"CEO: {cfg.ceo_name}",
+                    f"Telegram: user_id={msg.user_id} chat_id={msg.chat_id} username={display_user}",
+                    "Tip: /whoami shows raw ids.",
+                ]
+            ),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    if any(k in t for k in ("cuantos empleados", "cuántos empleados", "cuantos trabajadores", "how many employees", "how many agents")):
+        profs = orchestrator_profiles or {}
+        roles = sorted({str(k).strip().lower() for k in profs.keys() if str(k).strip()})
+        if not roles:
+            api.send_message(
+                msg.chat_id,
+                "I don't have an agent roster loaded right now (agents.yaml missing/unreadable).",
+                reply_to_message_id=msg.message_id if msg.message_id else None,
+            )
+            return True
+        api.send_message(
+            msg.chat_id,
+            "\n".join(
+                [
+                    f"Employees (agents): {len(roles)}",
+                    "Roles: " + ", ".join(roles),
+                ]
+            ),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    if any(k in t for k in ("qué modelos", "que modelos", "modelos usan", "modelo usan", "what models")):
+        profs = orchestrator_profiles or {}
+        if not profs:
+            api.send_message(
+                msg.chat_id,
+                "I don't have agent profiles loaded right now (agents.yaml missing/unreadable).",
+                reply_to_message_id=msg.message_id if msg.message_id else None,
+            )
+            return True
+        lines = ["Default models by role:"]
+        for role in sorted(profs.keys()):
+            rec = profs.get(role) or {}
+            model = str(rec.get("model") or "").strip() or "(default)"
+            effort = str(rec.get("effort") or "").strip() or "(default)"
+            lines.append(f"- {role}: model={model} effort={effort}")
+        api.send_message(
+            msg.chat_id,
+            "\n".join(lines[:40]),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    if any(k in t for k in ("what is sre", "que es sre", "qué es sre")):
+        api.send_message(
+            msg.chat_id,
+            "\n".join(
+                [
+                    "SRE = Site Reliability Engineering.",
+                    "- They keep services reliable: monitoring, incidents, deploy safety, performance, and uptime.",
+                    "- In this bot: SRE watches system health and alerts Jarvis when something is red.",
+                ]
+            ),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    if any(k in t for k in ("equipo tenemos", "a quien tenemos en el equipo", "who is on the team", "team do we have")):
+        profs = orchestrator_profiles or {}
+        roles = sorted({str(k).strip().lower() for k in profs.keys() if str(k).strip()})
+        if not roles:
+            api.send_message(
+                msg.chat_id,
+                "No agent roster loaded right now.",
+                reply_to_message_id=msg.message_id if msg.message_id else None,
+            )
+            return True
+        api.send_message(
+            msg.chat_id,
+            "Team (roles): " + ", ".join(roles),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    # Query type but not one we can answer deterministically: let Jarvis handle it.
+    return False
 
 
 def _skills_status_text() -> str:
@@ -2988,7 +3202,17 @@ def _orch_job_id(raw: str) -> str:
     return (raw or "").strip()
 
 
-_ORCHESTRATOR_ROLES = ("jarvis", "frontend", "backend", "qa", "sre")
+_ORCHESTRATOR_ROLES = (
+    "jarvis",
+    "frontend",
+    "backend",
+    "qa",
+    "sre",
+    "product_ops",
+    "security",
+    "research",
+    "release_mgr",
+)
 
 
 def _coerce_orchestrator_role(value: str) -> str:
@@ -3070,8 +3294,18 @@ def _orchestrator_task_from_job(
     profiles: dict[str, dict[str, Any]] | None,
     user_id: int | None = None,
 ) -> Task:
-    detected_role = to_task(job.user_text, context={"chat_id": job.chat_id, "default_role": cfg.orchestrator_default_role}).role
-    role = _coerce_orchestrator_role(detected_role)
+    # CEO UX rule (grounded): Jarvis is the single front door.
+    # Only explicit @role markers can override the default role for top-level messages.
+    base_role = _coerce_orchestrator_role(cfg.orchestrator_default_role)
+    pre = to_task(
+        job.user_text,
+        context={
+            "chat_id": job.chat_id,
+            "default_role": base_role,
+            "role": base_role,
+        },
+    )
+    role = _coerce_orchestrator_role(pre.role)
     profile = _orchestrator_profile(profiles, role)
 
     mode_hint = _coerce_orchestrator_mode(str(profile.get("mode_hint") or ""))
@@ -3109,17 +3343,18 @@ def _orchestrator_task_from_job(
         "model": model,
         "effort": effort,
         "role": role,
-        "default_role": cfg.orchestrator_default_role,
+        "default_role": base_role,
         "priority": priority,
         "due_at": None,
         "mode_hint": mode_hint,
-        "request_type": "task",
+        # Let dispatcher detect request_type (query/status/task), but keep our role fixed unless @role was explicit.
+        "request_type": pre.request_type,
         "requires_approval": requires_approval,
         "max_cost_window_usd": float(cfg.orchestrator_default_max_cost_window_usd),
         "trace": trace,
     }
 
-    # role can be overridden by explicit @role markers in the input text.
+    # role can still be overridden by explicit @role markers in the input text (dispatcher handles that).
     task = to_task(job.user_text, context=context)
     if task.role not in _ORCHESTRATOR_ROLES:
         task = task.with_updates(role=role)
@@ -3330,6 +3565,52 @@ def _send_orchestrator_marker_response(
             api.send_photo(chat_id, out_png, caption="dashboard", reply_to_message_id=reply_to_message_id)
         except Exception as e:
             api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "watch":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        mode = (payload or "").strip().lower() or "on"
+        st = _get_state(cfg)
+        watch_by_chat = st.get("watch_by_chat")
+        if not isinstance(watch_by_chat, dict):
+            watch_by_chat = {}
+        key = str(int(chat_id))
+
+        if mode in ("off", "0", "false", "stop", "disable", "disabled"):
+            watch_by_chat.pop(key, None)
+            st["watch_by_chat"] = watch_by_chat
+            _atomic_write_json(cfg.state_file, st)
+            api.send_message(chat_id, "OK. Watch disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        # Enable: create/update the stored message id and start updating every scheduler tick.
+        msg_txt = _watch_status_text(orch_q)
+        mid = api.send_message(chat_id, msg_txt, reply_to_message_id=reply_to_message_id)
+        if mid is not None:
+            watch_by_chat[key] = int(mid)
+            st["watch_by_chat"] = watch_by_chat
+            _atomic_write_json(cfg.state_file, st)
+        return True
+
+    if kind == "orders":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(api, chat_id=chat_id, text=_orders_text(orch_q, chat_id=chat_id), reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "order":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_order_command_text(orch_q, chat_id=chat_id, payload=payload),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if kind == "job":
@@ -3570,6 +3851,274 @@ def _orchestrator_daily_digest_text(orch_q: OrchestratorQueue) -> str:
     return "\n".join(lines)
 
 
+def _watch_status_text(orch_q: OrchestratorQueue) -> str:
+    """
+    Single-message "company status" snapshot intended to be edited in-place (no spam).
+    """
+    now = time.time()
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    health = orch_q.get_role_health() or {}
+    system_state = "paused" if orch_q.is_paused_globally() else "active"
+
+    lines: list[str] = [
+        "Company Status (Jarvis)",
+        f"updated_at: {ts}",
+        f"system: {system_state}",
+        "",
+    ]
+
+    if health:
+        lines.append("roles:")
+        for role in sorted(health.keys()):
+            vals = health.get(role, {}) or {}
+            queued = int(vals.get("queued", 0) or 0)
+            running = int(vals.get("running", 0) or 0)
+            blocked = int(vals.get("blocked", 0) or 0)
+            failed = int(vals.get("failed", 0) or 0)
+            lines.append(f"- {role}: queued={queued} running={running} blocked={blocked} failed={failed}")
+    else:
+        lines.append("roles: (no data yet)")
+
+    running_jobs = orch_q.jobs_by_state(state="running", limit=8)
+    lines.append("")
+    lines.append("running:")
+    if not running_jobs:
+        lines.append("- (none)")
+    else:
+        for t in running_jobs[:8]:
+            tr = t.trace or {}
+            phase = str(tr.get("live_phase") or "").strip() or "running"
+            tail = str(tr.get("live_stdout_tail") or "").strip().replace("\n", " ")
+            if len(tail) > 160:
+                tail = tail[-160:]
+            snippet = (t.input_text or "").strip().replace("\n", " ")
+            if len(snippet) > 90:
+                snippet = snippet[:90] + "..."
+            extra = f" tail={tail}" if tail else ""
+            lines.append(f"- {t.job_id[:8]} role={t.role} phase={phase} text={snippet}{extra}")
+
+    lines.append("")
+    lines.append("commands: /agents  /dashboard  /orders  /ticket <id>  /job <id>  /unwatch")
+    return "\n".join(lines)
+
+
+def _tick_watch_messages(*, cfg: BotConfig, api: TelegramAPI, orch_q: OrchestratorQueue) -> None:
+    """
+    Periodically edit the stored /watch message(s) (one per chat).
+    Best-effort: if editing fails (message deleted, permissions), disable watch for that chat.
+    """
+    st = _get_state(cfg)
+    watch_by_chat = st.get("watch_by_chat")
+    if not isinstance(watch_by_chat, dict) or not watch_by_chat:
+        return
+
+    changed = False
+    for chat_id_str, msg_id in list(watch_by_chat.items()):
+        try:
+            chat_id = int(chat_id_str)
+            mid = int(msg_id)
+        except Exception:
+            watch_by_chat.pop(chat_id_str, None)
+            changed = True
+            continue
+
+        try:
+            api.edit_message_text(chat_id, mid, _watch_status_text(orch_q))
+        except Exception:
+            # Disable watch to avoid retry loops/spam.
+            watch_by_chat.pop(chat_id_str, None)
+            changed = True
+
+    if changed:
+        st["watch_by_chat"] = watch_by_chat
+        _atomic_write_json(cfg.state_file, st)
+
+
+def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
+    items = orch_q.list_orders(chat_id=int(chat_id), status=None, limit=50)
+    if not items:
+        return "Orders: (none)\n\nTip: any top-level Jarvis ticket becomes an active order (except pure queries)."
+    lines: list[str] = ["Orders", "=" * 6]
+    for it in items[:50]:
+        oid = str(it.get("order_id") or "").strip()
+        status = str(it.get("status") or "").strip() or "active"
+        pr = it.get("priority")
+        try:
+            pr_s = str(int(pr)) if pr is not None else "n/a"
+        except Exception:
+            pr_s = "n/a"
+        title = str(it.get("title") or "").strip().replace("\n", " ")
+        if len(title) > 80:
+            title = title[:80] + "..."
+        lines.append(f"- {oid[:8]} status={status} priority={pr_s} title={title}")
+    lines.append("")
+    lines.append("Usage:")
+    lines.append("- /order show <id>")
+    lines.append("- /order pause <id>")
+    lines.append("- /order done <id>")
+    return "\n".join(lines)
+
+
+def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str) -> str:
+    parts = (payload or "").strip().split()
+    if len(parts) < 2:
+        return "Usage: /order show|pause|done <id>"
+    cmd = parts[0].strip().lower()
+    oid = parts[1].strip()
+    if cmd == "show":
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        title = str(it.get("title") or "").strip()
+        body = str(it.get("body") or "").strip()
+        status = str(it.get("status") or "").strip()
+        pr = it.get("priority")
+        try:
+            pr_s = str(int(pr)) if pr is not None else "n/a"
+        except Exception:
+            pr_s = "n/a"
+        return "\n".join(
+            [
+                "Order",
+                "=" * 5,
+                f"id: {str(it.get('order_id') or '')}",
+                f"status: {status}",
+                f"priority: {pr_s}",
+                "",
+                "title:",
+                title,
+                "",
+                "body:",
+                body[:2400],
+            ]
+        )
+    if cmd in ("pause", "paused"):
+        ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="paused")
+        return "OK." if ok else f"No such order: {oid}"
+    if cmd in ("done", "complete", "completed"):
+        ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+        return "OK." if ok else f"No such order: {oid}"
+    return "Usage: /order show|pause|done <id>"
+
+
+def _autopilot_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    chat_id: int,
+    now: float,
+) -> int:
+    """
+    24/7 Autopilot: keep agents working only on existing CEO orders (no random new projects).
+
+    Grounded design:
+    - Orders are persisted in SQLite (`ceo_orders`).
+    - Autopilot enqueues an autonomous Jarvis job per active order only when the order is idle.
+    - The Jarvis job is labeled `kind=autopilot` and is allowed to delegate.
+    """
+    created = 0
+    orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=30)
+    if not orders:
+        return 0
+
+    for o in orders:
+        oid = str(o.get("order_id") or "").strip()
+        if not oid:
+            continue
+
+        # Don't enqueue another autopilot job if one is already queued/running.
+        children = orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
+        if any(
+            str((c.labels or {}).get("kind") or "").strip().lower() == "autopilot"
+            and c.state in ("queued", "running")
+            for c in children
+        ):
+            continue
+
+        # If there is any real work already queued/running for this order, do nothing.
+        has_active_work = any(
+            c.state in ("queued", "running")
+            and str((c.labels or {}).get("kind") or "").strip().lower() not in ("autopilot", "wrapup", "evidence")
+            for c in children
+        )
+        if has_active_work:
+            continue
+
+        title = str(o.get("title") or "").strip()
+        body = str(o.get("body") or "").strip()
+        pr = o.get("priority")
+        try:
+            pr_i = int(pr) if pr is not None else 2
+        except Exception:
+            pr_i = 2
+        pr_i = max(1, min(3, pr_i))
+
+        ap_id = str(uuid.uuid4())
+        trace: dict[str, Any] = {
+            "source": "scheduler",
+            "autopilot": True,
+            "allow_delegation": True,
+            "order_id": oid,
+        }
+        t = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=(
+                "AUTOPILOT TICK\n"
+                f"CEO: {cfg.ceo_name}\n"
+                f"Order ID: {oid}\n"
+                f"Order title: {title}\n\n"
+                f"Order body:\n{body}\n\n"
+                "Rules:\n"
+                "- Only propose work that advances this order.\n"
+                "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
+                "- Keep outputs short.\n"
+            ),
+            request_type="maintenance",
+            priority=int(pr_i),
+            model="",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            is_autonomous=True,
+            parent_job_id=oid,
+            owner="scheduler",
+            labels={"ticket": oid, "kind": "autopilot", "order": oid, "runbook": "jarvis_autopilot"},
+            artifacts_dir=str((cfg.artifacts_root / ap_id).resolve()),
+            trace=trace,
+            job_id=ap_id,
+        )
+
+        # Apply profile defaults for Jarvis so the autopilot behaves like the same agent.
+        try:
+            rb_role = _coerce_orchestrator_role(t.role)
+            rb_profile = _orchestrator_profile(profiles, rb_role)
+            rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
+            rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
+            rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (t.mode_hint == "full")
+            rb_trace = dict(t.trace)
+            rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
+            rb_trace["profile_role"] = rb_role
+            rb_trace["max_runtime_seconds"] = int(rb_profile.get("max_runtime_seconds") or 0)
+            t = t.with_updates(
+                role=rb_role,
+                model=rb_model,
+                effort=rb_effort,
+                requires_approval=rb_requires_approval,
+                trace=rb_trace,
+            )
+        except Exception:
+            pass
+
+        orch_q.submit_task(t)
+        created += 1
+
+    return created
+
+
 def _orchestrator_job_text(task: Task | None) -> str:
     if task is None:
         return "No such job found."
@@ -3742,6 +4291,103 @@ def _orchestrator_ticket_text(orch_q: OrchestratorQueue, job_id: str) -> str:
     return "\n".join(lines)
 
 
+def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
+    """
+    Short, editable "ticket card" for CEO chat.
+    """
+    t = orch_q.get_job(ticket_id)
+    if t is None:
+        return f"Ticket {ticket_id[:8]}: (missing)"
+
+    root_id = (t.parent_job_id or t.job_id or "").strip() or t.job_id
+    parent = orch_q.get_job(root_id)
+    children = orch_q.jobs_by_parent(parent_job_id=root_id, limit=200)
+
+    head = parent or t
+    created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(head.created_at))
+    goal = (head.input_text or "").strip().replace("\n", " ")
+    if len(goal) > 160:
+        goal = goal[:160] + "..."
+
+    order = None
+    try:
+        order = orch_q.get_order(root_id, chat_id=int(head.chat_id))
+    except Exception:
+        order = None
+
+    counts: dict[str, int] = {}
+    for c in children:
+        counts[c.state] = counts.get(c.state, 0) + 1
+    progress = " ".join(f"{k}={v}" for k, v in sorted(counts.items())) if counts else "(no subtasks)"
+
+    running = [c for c in children if c.state == "running"][:5]
+
+    lines: list[str] = [
+        f"Ticket {root_id[:8]}  state={head.state}  role={head.role}  created={created}",
+    ]
+    if order:
+        lines.append(f"Order status: {str(order.get('status') or 'active')}")
+    lines.append(f"Goal: {goal or '(empty)'}")
+    lines.append(f"Progress: {progress}")
+    if running:
+        lines.append("Running:")
+        for r in running:
+            tr = r.trace or {}
+            phase = str(tr.get("live_phase") or "").strip() or "running"
+            snippet = (r.input_text or "").strip().replace("\n", " ")
+            if len(snippet) > 90:
+                snippet = snippet[:90] + "..."
+            lines.append(f"- {r.job_id[:8]} role={r.role} phase={phase} text={snippet}")
+    lines.append(f"Links: /ticket {root_id[:8]}  /job {root_id[:8]}  /agents  /dashboard")
+    return "\n".join(lines)
+
+
+def _maybe_update_ticket_card(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    orch_q: OrchestratorQueue,
+    ticket_id: str,
+) -> None:
+    """
+    Best-effort edit of the single ticket card message (no spam).
+    """
+    root_id = (ticket_id or "").strip()
+    if not root_id:
+        return
+    root = orch_q.get_job(root_id)
+    if root is None:
+        return
+    chat_id = int(root.chat_id)
+    trace = dict(root.trace or {})
+    mid = trace.get("ticket_card_message_id")
+    try:
+        message_id = int(mid) if mid is not None else None
+    except Exception:
+        message_id = None
+    if message_id is None:
+        return
+
+    now = time.time()
+    with _TICKET_CARD_LOCK:
+        k = (chat_id, root_id)
+        last = float(_TICKET_CARD_LAST_EDIT.get(k, 0.0) or 0.0)
+        if (now - last) < float(_TICKET_CARD_MIN_EDIT_INTERVAL_S):
+            return
+        _TICKET_CARD_LAST_EDIT[k] = now
+
+    try:
+        api.edit_message_text(chat_id, int(message_id), _ticket_card_text(orch_q, ticket_id=root_id))
+    except Exception:
+        # If edit fails, fall back to sending a fresh card and updating trace.
+        try:
+            new_mid = api.send_message(chat_id, _ticket_card_text(orch_q, ticket_id=root_id))
+            if new_mid is not None:
+                orch_q.update_trace(root_id, ticket_card_message_id=int(new_mid), ticket_card_replaced_at=time.time())
+        except Exception:
+            pass
+
+
 def _orchestrator_inbox_text(orch_q: OrchestratorQueue, role: str | None) -> str:
     items = orch_q.inbox(role=role, limit=25)
     if not items:
@@ -3847,6 +4493,21 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/dashboard":
         return _orch_marker("dashboard"), None
+
+    if text == "/watch":
+        return _orch_marker("watch", "on"), None
+
+    if text in ("/unwatch", "/watch off", "/watch stop"):
+        return _orch_marker("watch", "off"), None
+
+    if text == "/orders":
+        return _orch_marker("orders"), None
+
+    if text.startswith("/order "):
+        payload = text[len("/order ") :].strip()
+        if not payload:
+            return "Usage: /order show|pause|done <id>", None
+        return _orch_marker("order", payload), None
 
     if text.startswith("/job "):
         job_id = _orch_job_id(text[len("/job ") :])
@@ -5077,7 +5738,31 @@ def _submit_orchestrator_task(
         return False, ""
     try:
         task = _orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=user_id)
-        return True, orch_q.submit_task(task)
+        job_id = orch_q.submit_task(task)
+
+        # Autopilot scope: any top-level Jarvis ticket (except pure queries) becomes an "active order".
+        try:
+            if (
+                _coerce_orchestrator_role(task.role) == "jarvis"
+                and not task.is_autonomous
+                and not (task.parent_job_id or "").strip()
+                and (task.request_type or "task") != "query"
+            ):
+                title = (task.input_text or "").strip().splitlines()[0].strip()
+                if len(title) > 120:
+                    title = title[:120] + "..."
+                orch_q.upsert_order(
+                    order_id=task.job_id,
+                    chat_id=int(task.chat_id),
+                    title=title or f"Order {task.job_id[:8]}",
+                    body=(task.input_text or "").strip(),
+                    status="active",
+                    priority=int(task.priority or cfg.orchestrator_default_priority),
+                )
+        except Exception:
+            pass
+
+        return True, job_id
     except Exception as e:
         LOG.exception("Failed to submit orchestrator task")
         raise RuntimeError(f"Failed to submit orchestrator task: {e}") from e
@@ -5394,6 +6079,53 @@ def _orchestrator_run_codex(
         except Exception:
             LOG.exception("Failed to build wrap-up context. job=%s wrapup_for=%s", task.job_id, wrapup_for)
 
+    # Autopilot jobs: inject order + current queue context so Jarvis can decide next best work.
+    if bool(task.trace.get("autopilot", False)) and orch_q is not None:
+        try:
+            oid = str(task.trace.get("order_id") or task.parent_job_id or "").strip()
+            order = orch_q.get_order(oid, chat_id=int(task.chat_id)) if oid else None
+            children = orch_q.jobs_by_parent(parent_job_id=oid, limit=120) if oid else []
+            health = orch_q.get_role_health() or {}
+            running = orch_q.jobs_by_state(state="running", limit=8)
+
+            ctx_lines: list[str] = ["AUTOPILOT_CONTEXT", "================"]
+            if order:
+                ctx_lines.append(f"order_status={order.get('status')}")
+                ctx_lines.append(f"order_priority={order.get('priority')}")
+            if children:
+                counts: dict[str, int] = {}
+                for c in children:
+                    counts[c.state] = counts.get(c.state, 0) + 1
+                ctx_lines.append("order_children_counts=" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+                # Show a few most recent failures/blocked items as unblock targets.
+                blockers = [c for c in children if c.state in ("blocked", "failed")][:8]
+                if blockers:
+                    ctx_lines.append("blockers:")
+                    for c in blockers[:8]:
+                        res = str((c.trace or {}).get("result_summary") or "").strip().replace("\n", " ")
+                        if len(res) > 160:
+                            res = res[:160] + "..."
+                        ctx_lines.append(f"- {c.job_id[:8]} role={c.role} state={c.state} result={res or '(no result)'}")
+            if health:
+                ctx_lines.append("role_health:")
+                for r in sorted(health.keys()):
+                    vals = health.get(r, {}) or {}
+                    ctx_lines.append(
+                        f"- {r}: queued={int(vals.get('queued',0) or 0)} running={int(vals.get('running',0) or 0)} blocked={int(vals.get('blocked',0) or 0)}"
+                    )
+            if running:
+                ctx_lines.append("running_jobs:")
+                for t in running[:8]:
+                    tr = t.trace or {}
+                    phase = str(tr.get("live_phase") or "").strip() or "running"
+                    snippet = (t.input_text or "").strip().replace("\n", " ")[:120]
+                    ctx_lines.append(f"- {t.job_id[:8]} role={t.role} phase={phase} text={snippet}")
+
+            extra = "\n".join(ctx_lines)
+            task = task.with_updates(input_text=(task.input_text or "").rstrip() + "\n\n" + extra)
+        except Exception:
+            LOG.exception("Failed to build autopilot context. job=%s", task.job_id)
+
     prompt = build_agent_prompt(task, profile=profile)
 
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
@@ -5671,6 +6403,17 @@ def _send_orchestrator_result(
                 return True
             if kind == "wrapup":
                 return True
+            # Ticket-card UX: if a top-level ticket has an editable card message, do not send a separate
+            # "job=... status=ok" message on success. The card is updated in-place by the worker loop.
+            try:
+                if (
+                    status == "ok"
+                    and not (task.parent_job_id or "").strip()
+                    and str((task.trace or {}).get("ticket_card_message_id") or "").strip()
+                ):
+                    return False
+            except Exception:
+                pass
             # Autonomous runbooks: only notify on non-ok outcomes.
             if bool(task.is_autonomous):
                 return status != "ok"
@@ -5800,6 +6543,12 @@ def orchestrator_worker_loop(
         try:
             started = time.time()
             orch_q.update_state(task.job_id, "running")
+            # Update the single ticket card message (no spam) when work starts.
+            try:
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
+            except Exception:
+                pass
             result = run_orchestrator_task(task, executor=executor, cfg=cfg)
 
             raw_status = str(getattr(result, "status", "") or "")
@@ -5843,22 +6592,44 @@ def orchestrator_worker_loop(
                     pass
 
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
-            if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
-                retry_n = int(task.retry_count or 0) + 1
-                base = 30.0
-                delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
-                due_at = time.time() + delay
-                err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
-                scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
-                if scheduled:
-                    api.send_message(
-                        task.chat_id,
-                        f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
-                        reply_to_message_id=task.reply_to_message_id,
-                    )
-                    continue
+                if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
+                    retry_n = int(task.retry_count or 0) + 1
+                    base = 30.0
+                    delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
+                    due_at = time.time() + delay
+                    err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
+                    scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
+                    if scheduled:
+                        try:
+                            orch_q.update_trace(
+                                task.job_id,
+                                retry_scheduled_at=time.time(),
+                                retry_due_at=float(due_at),
+                                retry_delay_s=float(delay),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                            _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
+                        except Exception:
+                            pass
+                        # In minimal mode, avoid extra spam; the ticket card reflects the state.
+                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                            api.send_message(
+                                task.chat_id,
+                                f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
+                                reply_to_message_id=task.reply_to_message_id,
+                            )
+                        continue
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            # Update ticket card after the state transition so it reflects latest progress/result.
+            try:
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
+            except Exception:
+                pass
             _send_orchestrator_result(api, task, result, cfg=cfg)
 
             # Frontend evidence: if the frontend agent outputs a snapshot_url in its structured JSON,
@@ -5911,27 +6682,32 @@ def orchestrator_worker_loop(
             except Exception:
                 LOG.exception("Failed to enqueue frontend snapshot evidence job. job=%s", task.job_id)
 
-            # Jarvis delegation: when a top-level Jarvis ticket finishes, enqueue child jobs.
+            # Jarvis delegation: enqueue child jobs when Jarvis outputs structured subtasks.
             try:
-                if (
-                    orch_state == "done"
-                    and _coerce_orchestrator_role(task.role) == "jarvis"
-                    and not task.is_autonomous
-                    and not task.parent_job_id
-                    and (task.request_type or "task") == "task"
-                ):
-                    existing = orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=200)
-                    existing_wrapup = any(str(c.labels.get("kind") or "") == "wrapup" for c in existing)
-                    existing_subtasks = [c for c in existing if str(c.labels.get("kind") or "") != "wrapup"]
-                    already_delegated = bool(existing_subtasks)
+                allow_delegation = bool(task.trace.get("allow_delegation", False))
+                is_jarvis = _coerce_orchestrator_role(task.role) == "jarvis"
+                is_query = (task.request_type or "task") == "query"
+                is_top_level_manual = (not task.is_autonomous) and (not task.parent_job_id) and ((task.request_type or "task") == "task")
 
-                    if already_delegated:
-                        specs = []
-                    else:
-                        specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
+                if orch_state == "done" and is_jarvis and (not is_query) and (is_top_level_manual or allow_delegation):
+                    root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                    existing = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=400)
+                    existing_wrapup = any(str((c.labels or {}).get("kind") or "") == "wrapup" for c in existing)
+                    existing_subtasks = [c for c in existing if str((c.labels or {}).get("kind") or "") != "wrapup"]
+                    existing_keys = {
+                        str((c.labels or {}).get("key") or "").strip()
+                        for c in existing_subtasks
+                        if str((c.labels or {}).get("key") or "").strip()
+                    }
+
+                    specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
+                        # Key-based dedupe: allows multiple waves (autopilot) without duplicating keys.
+                        specs = [s for s in specs if s.key not in existing_keys]
+
+                    if specs:
                         key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
                         children: list[Task] = []
                         for spec in specs:
@@ -5968,83 +6744,68 @@ def orchestrator_worker_loop(
                                 chat_id=int(task.chat_id),
                                 user_id=task.user_id,
                                 reply_to_message_id=task.reply_to_message_id,
-                                parent_job_id=task.job_id,
+                                parent_job_id=root_ticket,
                                 depends_on=deps,
-                                labels={"ticket": task.job_id, "kind": "subtask", "key": spec.key},
+                                labels={"ticket": root_ticket, "kind": "subtask", "key": spec.key},
                                 artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
                                 trace=trace,
                                 job_id=key_to_job[spec.key],
                             )
                             children.append(child)
-                            if children:
-                                orch_q.submit_batch(children)
-                                try:
-                                    orch_q.update_trace(task.job_id, delegated_count=int(len(children)), live_at=time.time())
-                                except Exception:
-                                    pass
-                                if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
-                                    lines = ["Jarvis delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
-                                    for c in children[:12]:
-                                        lines.append(
-                                            f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}"
-                                        )
-                                    api.send_message(
-                                        task.chat_id,
-                                        "\n".join(lines),
-                                        reply_to_message_id=task.reply_to_message_id,
-                                    )
 
-                    # Wrap-up: enqueue one Jarvis job that depends on all subtasks (terminal OK).
-                    wrapup_deps: list[str] = []
-                    if existing_subtasks:
-                        wrapup_deps.extend([c.job_id for c in existing_subtasks if c.job_id != task.job_id])
-                    if not already_delegated and specs:
-                        wrapup_deps = list(key_to_job.values())
-                    wrapup_deps = [d for d in wrapup_deps if d and d != task.job_id]
-                    if wrapup_deps and not existing_wrapup:
-                        orch_profile = _orchestrator_profile(profiles, "jarvis")
-                        orch_model = _orchestrator_model_for_profile(cfg, orch_profile)
-                        orch_effort = _orchestrator_effort_for_profile(orch_profile, cfg)
-                        wrap_id = str(uuid.uuid4())
-                        wrap_trace: dict[str, str | int | float | bool | list[str]] = {
-                            "source": "telegram",
-                            "wrapup_for": task.job_id,
-                            "profile_name": str(orch_profile.get("name") or "jarvis"),
-                            "profile_role": "jarvis",
-                            "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
-                        }
-                        wrap = Task.new(
-                            source="telegram",
-                            role="jarvis",
-                            input_text=f"Wrap up ticket {task.job_id}. Provide an executive summary and next actions.",
-                            request_type="review",
-                            priority=int(task.priority or 2),
-                            model=orch_model,
-                            effort=orch_effort,
-                            mode_hint="ro",
-                            requires_approval=False,
-                            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
-                            chat_id=int(task.chat_id),
-                            user_id=task.user_id,
-                            reply_to_message_id=task.reply_to_message_id,
-                            parent_job_id=task.job_id,
-                            depends_on=wrapup_deps,
-                            labels={"ticket": task.job_id, "kind": "wrapup"},
-                            artifacts_dir=str((cfg.artifacts_root / wrap_id).resolve()),
-                            trace=wrap_trace,
-                            job_id=wrap_id,
-                        )
-                        orch_q.submit_task(wrap)
-                        try:
-                            orch_q.update_trace(task.job_id, wrapup_job_id=wrap.job_id, live_at=time.time())
-                        except Exception:
-                            pass
-                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
-                            api.send_message(
-                                task.chat_id,
-                                f"Wrap-up scheduled: {wrap.job_id[:8]} deps={len(wrap.depends_on)}",
+                        if children:
+                            orch_q.submit_batch(children)
+                            try:
+                                orch_q.update_trace(root_ticket, delegated_count=int(len(children)), live_at=time.time())
+                            except Exception:
+                                pass
+
+                    # Wrap-up is only scheduled for manual top-level tickets (avoid autopilot spam).
+                    if is_top_level_manual:
+                        wrapup_deps: list[str] = []
+                        if existing_subtasks:
+                            wrapup_deps.extend([c.job_id for c in existing_subtasks if c.job_id != task.job_id])
+                        if specs:
+                            wrapup_deps.extend([str(v) for v in key_to_job.values()])
+                        wrapup_deps = [d for d in wrapup_deps if d and d != task.job_id]
+                        if wrapup_deps and not existing_wrapup:
+                            orch_profile = _orchestrator_profile(profiles, "jarvis")
+                            orch_model = _orchestrator_model_for_profile(cfg, orch_profile)
+                            orch_effort = _orchestrator_effort_for_profile(orch_profile, cfg)
+                            wrap_id = str(uuid.uuid4())
+                            wrap_trace: dict[str, str | int | float | bool | list[str]] = {
+                                "source": "telegram",
+                                "wrapup_for": root_ticket,
+                                "profile_name": str(orch_profile.get("name") or "jarvis"),
+                                "profile_role": "jarvis",
+                                "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
+                            }
+                            wrap = Task.new(
+                                source="telegram",
+                                role="jarvis",
+                                input_text=f"Wrap up ticket {root_ticket}. Provide an executive summary and next actions.",
+                                request_type="review",
+                                priority=int(task.priority or 2),
+                                model=orch_model,
+                                effort=orch_effort,
+                                mode_hint="ro",
+                                requires_approval=False,
+                                max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+                                chat_id=int(task.chat_id),
+                                user_id=task.user_id,
                                 reply_to_message_id=task.reply_to_message_id,
+                                parent_job_id=root_ticket,
+                                depends_on=wrapup_deps,
+                                labels={"ticket": root_ticket, "kind": "wrapup"},
+                                artifacts_dir=str((cfg.artifacts_root / wrap_id).resolve()),
+                                trace=wrap_trace,
+                                job_id=wrap_id,
                             )
+                            orch_q.submit_task(wrap)
+                            try:
+                                orch_q.update_trace(root_ticket, wrapup_job_id=wrap.job_id, live_at=time.time())
+                            except Exception:
+                                pass
             except Exception:
                 LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
         except Exception as e:
@@ -6844,6 +7605,20 @@ def poll_loop(
                         # Sliding session TTL: any message keeps the session alive.
                         _auth_touch_session(cfg, chat_id=chat_id)
 
+                # Deterministic CEO queries (no Codex, no delegation).
+                # This runs after authorization/auth checks, so we don't leak info to unauthorized chats.
+                try:
+                    if _maybe_handle_ceo_query(
+                        api=api,
+                        cfg=cfg,
+                        msg=incoming,
+                        orchestrator_profiles=orchestrator_profiles,
+                    ):
+                        continue
+                except Exception:
+                    # Best-effort only; fall back to normal routing.
+                    pass
+
                 if incoming_text.strip() in ("/new", "/reset"):
                     thread_mgr.clear(chat_id)
                     _clear_persisted_thread_id(cfg, chat_id=chat_id)
@@ -7234,11 +8009,24 @@ def poll_loop(
                             LOG.exception("Failed to submit orchestrator task")
                         if did_submit:
                             enqueued_to_orchestrator = True
-                            api.send_message(
+                            try:
+                                card = _ticket_card_text(orchestrator_queue, ticket_id=orch_job_id)
+                            except Exception:
+                                card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
+                            mid = api.send_message(
                                 chat_id,
-                                f"Queued: {orch_job_id[:8]} (track: /ticket {orch_job_id[:8]} | /agents)",
+                                card,
                                 reply_to_message_id=message_id if message_id else None,
                             )
+                            try:
+                                if mid is not None and orchestrator_queue is not None:
+                                    orchestrator_queue.update_trace(
+                                        orch_job_id,
+                                        ticket_card_message_id=int(mid),
+                                        ticket_card_created_at=time.time(),
+                                    )
+                            except Exception:
+                                pass
 
                     if enqueued_to_orchestrator:
                         continue
@@ -7370,6 +8158,7 @@ def _load_config() -> BotConfig:
     telegram_parse_mode = os.environ.get("BOT_TELEGRAM_PARSE_MODE", "HTML").strip()
 
     state_file = Path(os.environ.get("BOT_STATE_FILE", str(Path(__file__).with_name("state.json")))).expanduser().resolve()
+    ceo_name = os.environ.get("BOT_CEO_NAME", "Alejandro Ponce").strip() or "Alejandro Ponce"
     auth_enabled = os.environ.get("BOT_AUTH_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     auth_session_ttl_seconds = int(os.environ.get("BOT_AUTH_SESSION_TTL_SECONDS", str(12 * 60 * 60)))
     if auth_session_ttl_seconds < 60:
@@ -7527,6 +8316,7 @@ def _load_config() -> BotConfig:
         screenshot_enabled=screenshot_enabled,
         screenshot_allowed_hosts=screenshot_allowed_hosts,
         transcribe_async=transcribe_async,
+        ceo_name=ceo_name,
         codex_workdir=codex_workdir,
         codex_timeout_seconds=codex_timeout_seconds,
         codex_use_oss=codex_use_oss,
@@ -7610,6 +8400,11 @@ def main() -> None:
     if cfg.orchestrator_enabled:
         try:
             orchestrator_profiles = load_agent_profiles(cfg.orchestrator_agent_profiles)
+            # Render small placeholders for prompts (e.g. {CEO_NAME}).
+            try:
+                orchestrator_profiles = _render_placeholders_obj(orchestrator_profiles, ceo_name=cfg.ceo_name)
+            except Exception:
+                pass
             orch_storage = SQLiteTaskStorage(cfg.orchestrator_db_path)
             orchestrator_queue = OrchestratorQueue(storage=orch_storage, role_profiles=orchestrator_profiles)
             recovered = orchestrator_queue.recover_stale_running()
@@ -7655,7 +8450,16 @@ def main() -> None:
             notify_chat_id = _configured_notify_chat_id(cfg)
 
             def _tick_runbooks() -> None:
-                if orchestrator_queue is None or notify_chat_id is None:
+                if orchestrator_queue is None:
+                    return
+
+                # /watch updates (every scheduler tick). Independent of runbooks and notify chat.
+                try:
+                    _tick_watch_messages(cfg=cfg, api=api, orch_q=orchestrator_queue)
+                except Exception:
+                    pass
+
+                if notify_chat_id is None:
                     return
                 if orchestrator_queue.is_paused_globally():
                     return
@@ -7666,11 +8470,41 @@ def main() -> None:
                     return
                 if not rbs:
                     return
+                # Render placeholders for runbook prompts (e.g. {CEO_NAME}).
+                try:
+                    rbs = [
+                        Runbook(
+                            runbook_id=rb.runbook_id,
+                            role=rb.role,
+                            interval_seconds=rb.interval_seconds,
+                            prompt=_render_placeholders_text(rb.prompt, ceo_name=cfg.ceo_name),
+                            mode_hint=rb.mode_hint,
+                            priority=rb.priority,
+                            enabled=rb.enabled,
+                        )
+                        for rb in rbs
+                    ]
+                except Exception:
+                    pass
                 now = time.time()
                 for rb in rbs:
                     try:
                         last = orchestrator_queue.get_runbook_last_run(runbook_id=rb.runbook_id)
                         if not runbook_due(rb, last_run_at=last, now=now):
+                            continue
+                        # Autopilot is implemented in-process so it can read persisted orders and current queue state.
+                        if rb.runbook_id == "jarvis_autopilot":
+                            try:
+                                _autopilot_tick(
+                                    cfg=cfg,
+                                    orch_q=orchestrator_queue,
+                                    profiles=orchestrator_profiles,
+                                    chat_id=int(notify_chat_id),
+                                    now=now,
+                                )
+                            except Exception:
+                                LOG.exception("Autopilot tick failed")
+                            orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
                             continue
                         t = runbook_to_task(rb, chat_id=int(notify_chat_id))
                         # Apply role profile defaults so autonomous tasks behave like the same "agents".

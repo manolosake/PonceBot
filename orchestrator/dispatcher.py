@@ -75,6 +75,45 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "log",
         "alert",
     ),
+    "product_ops": (
+        "acceptance",
+        "criter",
+        "scope",
+        "mvp",
+        "metrics",
+        "product",
+        "requirements",
+        "spec",
+    ),
+    "security": (
+        "security",
+        "secur",
+        "secret",
+        "token",
+        "leak",
+        "vuln",
+        "rbac",
+        "auth",
+        "ssrf",
+    ),
+    "research": (
+        "research",
+        "state of the art",
+        "sota",
+        "benchmark",
+        "paper",
+        "openclaw",
+        "gap",
+    ),
+    "release_mgr": (
+        "release",
+        "merge",
+        "branch",
+        "qa gate",
+        "deploy",
+        "changelog",
+        "version",
+    ),
 }
 
 _REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
@@ -117,7 +156,7 @@ def _explicit_role(text_l: str) -> str | None:
     if "@jarvis" in tl or "@orchestrator" in tl or "@ceo" in tl:
         return "jarvis"
 
-    for role in ("frontend", "backend", "qa", "sre"):
+    for role in ("frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
         marker = f"@{role}"
         if marker in tl:
             return role
@@ -239,7 +278,7 @@ def to_task(
     if role in ("ceo", "orchestrator"):
         role = "jarvis"
 
-    if role not in ("jarvis", "frontend", "backend", "qa", "sre"):
+    if role not in ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
         role = "backend"
 
     request_type = detect_request_type(text)

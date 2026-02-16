@@ -218,6 +218,128 @@ class TestSkillsCommands(unittest.TestCase):
             self.assertIn("Usage:", resp)
             self.assertIn("/model", resp)
 
+
+class _FakeTelegramAPI:
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, str, int | None]] = []
+
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> int | None:
+        self.sent.append((int(chat_id), str(text), int(reply_to_message_id) if reply_to_message_id is not None else None))
+        return 123
+
+
+class TestCeoQueryFastPath(unittest.TestCase):
+    def _cfg(self, state_file: Path) -> bot.BotConfig:
+        return TestStateHandling()._cfg(state_file)
+
+    def test_who_am_i_is_answered_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username="alex",
+                text="Hola, quien soy yo?",
+            )
+
+            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles={"jarvis": {"model": "gpt-5.2"}})
+            self.assertTrue(handled)
+            self.assertTrue(api.sent)
+            _chat_id, text, _rt = api.sent[-1]
+            self.assertIn("CEO: Alejandro Ponce", text)
+            self.assertIn("user_id=20", text)
+            self.assertIn("chat_id=10", text)
+
+    def test_how_many_agents_uses_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username=None,
+                text="How many agents do we have?",
+            )
+            profs = {"jarvis": {"model": "gpt-5.2"}, "backend": {"model": "gpt-5.2"}, "qa": {"model": "gpt-5.2"}}
+            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles=profs)
+            self.assertTrue(handled)
+            _chat_id, text, _rt = api.sent[-1]
+            self.assertIn("Employees (agents): 3", text)
+            self.assertIn("jarvis", text)
+
+    def test_queries_do_not_trigger_when_slash_command(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username=None,
+                text="/whoami",
+            )
+            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles=None)
+            self.assertFalse(handled)
+            self.assertFalse(api.sent)
+
+
+class TestJarvisFirstRouting(unittest.TestCase):
+    def _cfg(self, state_file: Path) -> bot.BotConfig:
+        return TestStateHandling()._cfg(state_file)
+
+    def test_orchestrator_task_defaults_to_jarvis_role(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=0,
+                user_text="Build a UI dashboard with screenshots.",
+                argv=["exec", "Build a UI dashboard with screenshots."],
+                mode_hint="ro",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+            profiles = {"jarvis": {"model": "gpt-5.2", "effort": "high", "mode_hint": "ro"}}
+            task = bot._orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=123)
+            self.assertEqual(task.role, "jarvis")
+
+    def test_explicit_role_marker_overrides_jarvis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=0,
+                user_text="@frontend Build a UI dashboard.",
+                argv=["exec", "@frontend Build a UI dashboard."],
+                mode_hint="ro",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+            profiles = {"jarvis": {"model": "gpt-5.2", "effort": "high", "mode_hint": "ro"}}
+            task = bot._orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=123)
+            self.assertEqual(task.role, "frontend")
+
     def test_alias_p_maps_to_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")

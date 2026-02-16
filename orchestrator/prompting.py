@@ -37,14 +37,16 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
     user_text = (task.input_text or "").strip()
 
     # Output contract: human summary + structured JSON.
-    if role in ("jarvis", "orchestrator", "ceo") and not task.parent_job_id and not task.is_autonomous:
+    # Jarvis may be autonomous/child (autopilot) but still allowed to delegate when explicitly enabled.
+    allow_delegation = bool((task.trace or {}).get("allow_delegation", False))
+    if role in ("jarvis", "orchestrator", "ceo") and ((not task.parent_job_id and not task.is_autonomous) or allow_delegation):
         schema_hint = (
             '{\n'
             '  "summary": "string",\n'
             '  "subtasks": [\n'
             "    {\n"
             '      "key": "short_unique_id",\n'
-            '      "role": "frontend|backend|qa|sre|jarvis",\n'
+            '      "role": "frontend|backend|qa|sre|product_ops|security|research|release_mgr|jarvis",\n'
             '      "text": "task instruction",\n'
             '      "mode_hint": "ro|rw|full (optional; omit to use role defaults)",\n'
             '      "priority": 1,\n'

@@ -228,6 +228,20 @@ class SQLiteTaskStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ceo_orders (
+                    order_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
 
             # Backward-compatible migration for older DBs that may exist in the field.
             self._migrate_jobs_table(conn)
@@ -240,6 +254,7 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner, state)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_role ON agent_sessions(chat_id, role)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_leases_role ON workspace_leases(role, slot)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ceo_orders_chat_status ON ceo_orders(chat_id, status, priority, updated_at)")
             conn.commit()
 
     def _migrate_roles(self, conn: sqlite3.Connection) -> None:
@@ -921,6 +936,130 @@ class SQLiteTaskStorage:
                 return float(row[0])
             except Exception:
                 return 0.0
+
+    def _resolve_order_id_in_conn(self, conn: sqlite3.Connection, order_id: str, *, chat_id: int) -> str | None:
+        oid = (order_id or "").strip()
+        if not oid:
+            return None
+
+        row = conn.execute(
+            "SELECT order_id FROM ceo_orders WHERE order_id = ? AND chat_id = ?",
+            (oid, int(chat_id)),
+        ).fetchone()
+        if row is not None:
+            return str(row["order_id"])
+
+        if 4 <= len(oid) < 36:
+            rows = conn.execute(
+                "SELECT order_id FROM ceo_orders WHERE chat_id = ? AND order_id LIKE ? LIMIT 2",
+                (int(chat_id), oid + "%"),
+            ).fetchall()
+            if len(rows) == 1:
+                return str(rows[0]["order_id"])
+
+        return None
+
+    def upsert_order(
+        self,
+        *,
+        order_id: str,
+        chat_id: int,
+        title: str,
+        body: str,
+        status: str = "active",
+        priority: int = 2,
+    ) -> None:
+        """
+        Persist a CEO "order" (an ongoing objective) for autopilot.
+
+        Ground truth: this is separate from jobs; orders can stay active after the initial ticket is done.
+        """
+        st = (status or "active").strip().lower()
+        if st not in ("active", "paused", "done"):
+            st = "active"
+        try:
+            pr = int(priority)
+        except Exception:
+            pr = 2
+        pr = max(1, min(3, pr))
+
+        oid = str(order_id).strip()
+        if not oid:
+            raise ValueError("order_id required")
+
+        with self._lock:
+            with self._conn() as conn:
+                now = time.time()
+                existing = conn.execute(
+                    "SELECT created_at FROM ceo_orders WHERE order_id = ? AND chat_id = ?",
+                    (oid, int(chat_id)),
+                ).fetchone()
+                created_at = float(existing["created_at"]) if existing is not None else float(now)
+                conn.execute(
+                    "INSERT OR REPLACE INTO ceo_orders(order_id, chat_id, title, body, status, priority, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        oid,
+                        int(chat_id),
+                        str(title or "").strip(),
+                        str(body or "").strip(),
+                        st,
+                        int(pr),
+                        float(created_at),
+                        float(now),
+                    ),
+                )
+                conn.commit()
+
+    def list_orders(self, *, chat_id: int, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
+        st = (status or "").strip().lower() or None
+        if st is not None and st not in ("active", "paused", "done"):
+            st = None
+        lim = max(1, min(200, int(limit)))
+        with self._conn() as conn:
+            if st is None:
+                rows = conn.execute(
+                    "SELECT * FROM ceo_orders WHERE chat_id = ? ORDER BY status ASC, priority ASC, updated_at DESC LIMIT ?",
+                    (int(chat_id), int(lim)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM ceo_orders WHERE chat_id = ? AND status = ? ORDER BY priority ASC, updated_at DESC LIMIT ?",
+                    (int(chat_id), st, int(lim)),
+                ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append({str(k): r[k] for k in r.keys()})
+            return out
+
+    def get_order(self, order_id: str, *, chat_id: int) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            resolved = self._resolve_order_id_in_conn(conn, str(order_id), chat_id=int(chat_id))
+            if not resolved:
+                return None
+            row = conn.execute(
+                "SELECT * FROM ceo_orders WHERE order_id = ? AND chat_id = ?",
+                (resolved, int(chat_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            return {str(k): row[k] for k in row.keys()}
+
+    def set_order_status(self, order_id: str, *, chat_id: int, status: str) -> bool:
+        st = (status or "").strip().lower()
+        if st not in ("active", "paused", "done"):
+            return False
+        with self._lock:
+            with self._conn() as conn:
+                resolved = self._resolve_order_id_in_conn(conn, str(order_id), chat_id=int(chat_id))
+                if not resolved:
+                    return False
+                conn.execute(
+                    "UPDATE ceo_orders SET status = ?, updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                    (st, time.time(), resolved, int(chat_id)),
+                )
+                conn.commit()
+                return True
 
     def peek(
         self,

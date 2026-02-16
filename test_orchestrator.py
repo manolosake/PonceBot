@@ -457,7 +457,7 @@ class TestYamlLikeParsing(unittest.TestCase):
         self.assertGreaterEqual(len(rbs), 1)
         rb = rbs[0]
         self.assertNotEqual(rb.prompt.strip(), "|")
-        self.assertIn("Revisa", rb.prompt)
+        self.assertTrue(rb.prompt.strip())
 
 
 class TestScreenshotUrlValidation(unittest.TestCase):
@@ -685,3 +685,32 @@ class TestSendOrchestratorResult(unittest.TestCase):
             self.assertGreaterEqual(len(api.messages), 1)
             self.assertEqual(api.docs, [])
             self.assertEqual(api.photos, [])
+
+
+class TestCeoOrders(unittest.TestCase):
+    def test_upsert_list_get_and_set_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            oid = "11111111-1111-1111-1111-111111111111"
+            st.upsert_order(order_id=oid, chat_id=1, title="ExecutiveDashboard MVP", body="Ship the first dashboard", status="active", priority=2)
+
+            rows = st.list_orders(chat_id=1, status="active", limit=10)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(str(rows[0]["order_id"]), oid)
+
+            got = st.get_order(oid[:8], chat_id=1)
+            self.assertIsNotNone(got)
+            assert got is not None
+            self.assertEqual(str(got["status"]), "active")
+
+            ok = st.set_order_status(oid[:8], chat_id=1, status="paused")
+            self.assertTrue(ok)
+            got2 = st.get_order(oid, chat_id=1)
+            self.assertIsNotNone(got2)
+            assert got2 is not None
+            self.assertEqual(str(got2["status"]), "paused")
+
+            bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
+            self.assertFalse(bad)

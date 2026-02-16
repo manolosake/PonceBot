@@ -154,6 +154,28 @@ class OrchestratorQueue:
     def claim_autonomous_due_jobs(self, *, limit: int = 5) -> list[Task]:
         return self._storage.claim_autonomous_due_jobs(limit=limit)
 
+    # CEO Orders (autopilot scope)
+    def upsert_order(
+        self,
+        *,
+        order_id: str,
+        chat_id: int,
+        title: str,
+        body: str,
+        status: str = "active",
+        priority: int = 2,
+    ) -> None:
+        self._storage.upsert_order(order_id=order_id, chat_id=chat_id, title=title, body=body, status=status, priority=priority)
+
+    def list_orders(self, *, chat_id: int, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
+        return self._storage.list_orders(chat_id=chat_id, status=status, limit=limit)
+
+    def get_order(self, order_id: str, *, chat_id: int) -> dict[str, Any] | None:
+        return self._storage.get_order(order_id, chat_id=chat_id)
+
+    def set_order_status(self, order_id: str, *, chat_id: int, status: str) -> bool:
+        return self._storage.set_order_status(order_id, chat_id=chat_id, status=status)
+
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
             "jarvis": 1,
@@ -161,6 +183,10 @@ class OrchestratorQueue:
             "backend": 2,
             "qa": 2,
             "sre": 2,
+            "product_ops": 1,
+            "security": 1,
+            "research": 1,
+            "release_mgr": 1,
         }
         for key, cfg in self._profiles.items():
             role = cfg.get("role") or key

@@ -5,7 +5,7 @@ from typing import Any
 import json
 
 
-_ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre")
+_ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr")
 _ALLOWED_MODES = ("ro", "rw", "full")
 
 
