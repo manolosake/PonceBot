@@ -1,6 +1,49 @@
-# codexbot (Telegram -> Codex)
+# PonceBot (codexbot) — Jarvis v1
 
-Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la salida por Telegram.
+Hablas por Telegram y **Jarvis** (tu mano derecha) decide si es:
+
+- **Consulta**: responde directo (sin delegar, sin spam).
+- **Trabajo real**: delega en paralelo a `frontend/backend/qa/sre`, monitorea, y te devuelve un **resumen ejecutivo + evidencias** (patches, artifacts, PNGs).
+
+## Organigrama (Jarvis v1)
+
+```mermaid
+flowchart TB
+  CEO["CEO (tú)"] --> J["Jarvis (mano derecha / orquestador)"]
+  J --> FE["Frontend (UI + evidencia visual)"]
+  J --> BE["Backend (lógica + datos)"]
+  J --> QA["QA (pruebas + regresión)"]
+  J --> SRE["SRE (salud + operación 24/7)"]
+  FE --> J
+  BE --> J
+  QA --> J
+  SRE --> J
+  J --> CEO
+```
+
+## Modo CEO (cómo se usa por Telegram)
+
+- Habla normal: “Jarvis, arma un plan para X” o “¿Qué hace SRE?”.
+- Para **forzar** un rol: `@jarvis`, `@frontend`, `@backend`, `@qa`, `@sre`.
+- Para ver quién está trabajando y en qué:
+  - `/agents` (cola + running por rol)
+  - `/ticket <id>` (árbol ticket → subtareas → wrap-up)
+  - `/job <id>` (detalle + artifacts)
+  - `/dashboard` (PNG del estado del orquestador)
+
+## Equipo (roles) y modelos por default
+
+Fuente de verdad: `orchestrator/agents.yaml` (editable).
+
+| Rol | Enfoque | Modelo | Modo default | Paralelo |
+| --- | --- | --- | --- | --- |
+| `jarvis` | coordina, responde consultas, delega y hace wrap-up | `gpt-5.2` | `ro` | 1 |
+| `frontend` | UI/UX + evidencia visual (HTML/PNG) | `gpt-5.2` | `rw` | 2 |
+| `backend` | lógica/servicios/datos/tests | `gpt-5.2` | `rw` | 2 |
+| `qa` | pruebas, regresiones, quality gates | `gpt-5.2` | `rw` | 1 |
+| `sre` | Site Reliability Engineering: salud, servicios, alertas, operación 24/7 | `gpt-5.2` | `ro` | 1 |
+
+Nota: si tu `codex` CLI no tiene el alias `gpt-5.2`, cambia `model:` en `orchestrator/agents.yaml` (o define tu alias).
 
 ## Requisitos
 
@@ -14,8 +57,11 @@ Un bot de Telegram que ejecuta `codex exec` en tu servidor y te devuelve la sali
 1. Crea un bot en Telegram con `@BotFather` y guarda el token.
 2. Crea el archivo de config:
    - `cp codexbot.env.example codexbot.env`
-   - Edita `codexbot.env` y setea `TELEGRAM_BOT_TOKEN=...`
-   - Para secretos, usa `touch .env.local` y agrega solo valores sensibles (`OPENAI_API_KEY`, claves SSH, etc.); `run.sh` lo carga automáticamente y no se versiona.
+   - Edita `codexbot.env` (no se versiona) y deja aquí solo config no-sensible.
+   - Secretos (recomendado: fuera del repo/workdir):
+     - crea `~/.config/codexbot/secrets.env` con `TELEGRAM_BOT_TOKEN=...` (y otros secretos).
+     - exporta `ENV_LOCAL_FILE=$HOME/.config/codexbot/secrets.env` (o configúralo en systemd) para que `run.sh` lo cargue.
+   - Alternativa simple: `touch .env.local` en este repo y agrega solo secretos; `run.sh` lo carga automáticamente y no se versiona.
 3. Arranca el bot:
    - `./run.sh`
 4. En Telegram, escribe cualquier mensaje al bot. Como no esta configurada la allow-list todavia, el bot contestara `Unauthorized` incluyendo `chat_id` y `user_id`.
@@ -59,7 +105,7 @@ Nota (auth opcional):
 - `/full <prompt>`: sandbox danger-full-access (sin sandbox; unsafe)
 - Passthrough a Codex: solo `/exec ...`, `/review ...`, `/codex ...` (otros slash commands muestran ayuda)
 
-### Orchestrator (Jarvis v1)
+### Jarvis v1 (Orquestación multiagente)
 
 - Notificaciones (Telegram):
   - Default: `BOT_ORCHESTRATOR_NOTIFY_MODE=minimal` => menos spam: solo tickets top-level, wrap-ups y errores.
@@ -67,6 +113,9 @@ Nota (auth opcional):
 - IDs cortos: `/job`, `/ticket`, `/approve`, `/cancel` aceptan prefijo (ej. `a1b2c3d4`) si es único.
 - Evidencia visual (frontend):
   - Si el agente crea `.codexbot_preview/preview.html` en el worktree, el bot genera `preview.png` y lo manda como artifact.
+- Consultas vs trabajo:
+  - Si Jarvis detecta una **consulta** (pregunta), responde directo (sin delegar).
+  - Si quieres **forzar ejecución**, usa verbos tipo “haz/crea/implementa…” o marca `@backend/@frontend/...`.
 
 ## Modo "sin limitaciones" (MUY PELIGROSO)
 
@@ -179,9 +228,9 @@ Lo siguiente está implementado en este repo:
   - Se generan evidencias por job en `BOT_ARTIFACTS_ROOT/<job_id>/`:
     - `changes.patch` (git diff)
     - `git_status.txt`
-- Delegación del Orchestrator:
-  - Cuando un job `orchestrator` top-level termina, se parsea su JSON (`subtasks`) y se encolan child jobs con `parent_job_id=ticket_id`.
-  - Se agenda un job adicional de `orchestrator` tipo "wrap-up" que depende de todas las subtareas y manda un brief final.
+- Delegación de Jarvis:
+  - Cuando un job `jarvis` top-level termina, se parsea su JSON (`subtasks`) y se encolan child jobs con `parent_job_id=ticket_id`.
+  - Se agenda un job adicional de `jarvis` tipo "wrap-up" que depende de todas las subtareas y manda un brief final.
 - Persistencia de resultados (memoria operativa):
   - Al finalizar un job, se guarda un resumen estructurado en `jobs.trace` (`result_summary`, `result_artifacts`, `result_duration_s`, etc).
   - `/job <id>` y `/ticket <id>` muestran esos resultados sin depender solo del chat.
@@ -204,7 +253,7 @@ Lo siguiente está implementado en este repo:
 ### 3) Fases y alcance inmediato (próximos pasos)
 
 - **Fase 1 — Entrega actual (v1 base):**
-  - Ticket Orchestrator -> subtareas por rol (delegación) con estado por job.
+  - Ticket Jarvis -> subtareas por rol (delegación) con estado por job.
   - Memoria por rol (Codex resume) y worktrees aislados.
   - Voz async con ACK, runbooks y snapshots (si se habilita).
 - **Fase 2 — Operación autónoma real (a completar):**

@@ -16,3 +16,4 @@ profiles.json
 models/
 vendor/
 bin/
+codexbot.env.bak.*
