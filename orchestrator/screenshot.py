@@ -196,3 +196,117 @@ def capture(
             browser.close()
 
     return out_path
+
+
+def capture_html(
+    html: str,
+    out_path: Path,
+    *,
+    viewport: Viewport | None = None,
+    timeout_ms: int = 30_000,
+    allowed_hosts: set[str] | frozenset[str] | None = None,
+    allow_private: bool = False,
+    block_network: bool = True,
+) -> Path:
+    """
+    Render an HTML string in Playwright and capture a screenshot.
+
+    Security note (grounded): by default, `block_network=True` aborts all http(s) requests so
+    "preview HTML" cannot exfiltrate data or probe internal network resources via resource loads.
+    """
+    raw = str(html or "")
+    out_path = out_path.resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vp = viewport or Viewport()
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
+    except Exception as e:
+        raise RuntimeError("Playwright not available. Install: pip install playwright && python -m playwright install chromium") from e
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(viewport={"width": int(vp.width), "height": int(vp.height)})
+            host_cache: dict[str, bool] = {}
+
+            def _route_guard(route: Any, request: Any) -> None:
+                try:
+                    req_url = str(getattr(request, "url", "") or "")
+                    parsed_req = urllib.parse.urlsplit(req_url)
+                    scheme = (parsed_req.scheme or "").strip().lower()
+                    if scheme in ("about", "data", "blob"):
+                        route.continue_()
+                        return
+                    if scheme in ("http", "https"):
+                        if block_network:
+                            route.abort()
+                            return
+                        host = (parsed_req.hostname or "").strip().rstrip(".").lower()
+                        if not host:
+                            route.abort()
+                            return
+                        ok = host_cache.get(host)
+                        if ok is None:
+                            chk = validate_screenshot_url(
+                                req_url,
+                                allowed_hosts=allowed_hosts,
+                                allow_private=allow_private,
+                            )
+                            ok = bool(chk.ok)
+                            host_cache[host] = ok
+                        if ok:
+                            route.continue_()
+                            return
+                        route.abort()
+                        return
+                    # Block unknown schemes (file:, ws:, etc).
+                    route.abort()
+                except Exception:
+                    try:
+                        route.abort()
+                    except Exception:
+                        pass
+
+            try:
+                page.route("**/*", _route_guard)
+            except Exception:
+                pass
+
+            page.set_content(raw, wait_until="domcontentloaded", timeout=int(timeout_ms))
+            try:
+                page.wait_for_load_state("networkidle", timeout=int(timeout_ms))
+            except Exception:
+                # It's fine: screenshots should still work for purely static HTML.
+                pass
+            page.screenshot(path=str(out_path), full_page=True)
+        finally:
+            browser.close()
+
+    return out_path
+
+
+def capture_html_file(
+    html_path: Path,
+    out_path: Path,
+    *,
+    viewport: Viewport | None = None,
+    timeout_ms: int = 30_000,
+    allowed_hosts: set[str] | frozenset[str] | None = None,
+    allow_private: bool = False,
+    block_network: bool = True,
+) -> Path:
+    """
+    Convenience wrapper around capture_html() that reads HTML from disk.
+    """
+    html_path = html_path.expanduser().resolve()
+    html = html_path.read_text(encoding="utf-8", errors="replace")
+    return capture_html(
+        html,
+        out_path,
+        viewport=viewport,
+        timeout_ms=timeout_ms,
+        allowed_hosts=allowed_hosts,
+        allow_private=allow_private,
+        block_network=block_network,
+    )

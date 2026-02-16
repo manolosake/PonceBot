@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -250,6 +251,43 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertIsNotNone(taken)
             assert taken is not None
             self.assertEqual(taken.job_id, task.job_id)
+
+    def test_update_trace_does_not_emit_job_event(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            storage = SQLiteTaskStorage(db_path)
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            job_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="do thing",
+                    request_type="task",
+                    priority=2,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+
+            with sqlite3.connect(db_path) as conn:
+                before = int(conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0])
+
+            ok = q.update_trace(job_id, live_phase="running", live_stdout_tail="hello")
+            self.assertTrue(ok)
+            task = q.get_job(job_id)
+            self.assertIsNotNone(task)
+            assert task is not None
+            self.assertEqual(str((task.trace or {}).get("live_phase")), "running")
+
+            with sqlite3.connect(db_path) as conn:
+                after = int(conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0])
+
+            self.assertEqual(before, after)
 
     def test_claim_skips_paused_role_and_takes_other(self) -> None:
         with tempfile.TemporaryDirectory() as td:

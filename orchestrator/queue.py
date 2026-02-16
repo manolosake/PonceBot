@@ -37,6 +37,9 @@ class OrchestratorQueue:
     def update_state(self, job_id: str, state: str, **metadata: Any) -> bool:
         return self._storage.update_state(job_id=job_id, state=state, **metadata)
 
+    def update_trace(self, job_id: str, **metadata: Any) -> bool:
+        return self._storage.update_trace(job_id=job_id, **metadata)
+
     def bump_retry(self, job_id: str, *, due_at: float, error: str | None = None) -> bool:
         return self._storage.bump_retry(job_id=job_id, due_at=due_at, error=error)
 

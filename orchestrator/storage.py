@@ -575,6 +575,61 @@ class SQLiteTaskStorage:
                     conn.commit()
                 return ok
 
+    def update_trace(self, job_id: str, **metadata: Any) -> bool:
+        """
+        Update trace metadata without changing state and without appending an audit event.
+
+        Intended for high-frequency "live" updates (stdout tail, phase, etc) where emitting
+        job_events rows would be noisy and expensive.
+        """
+        jid = str(job_id).strip()
+        if not jid:
+            return False
+        if not metadata:
+            return False
+
+        # Keep trace bounded; callers may pass tails/logs.
+        cleaned: dict[str, Any] = {}
+        for k, v in metadata.items():
+            key = str(k).strip()
+            if not key:
+                continue
+            if v is None:
+                cleaned[key] = None
+                continue
+            if isinstance(v, str):
+                s = v.strip("\n")
+                if len(s) > 4000:
+                    s = s[:4000] + "..."
+                cleaned[key] = s
+                continue
+            cleaned[key] = v
+
+        if not cleaned:
+            return False
+
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+                if row is None:
+                    return False
+                trace = Task.from_trace_json(row["trace"])
+                if not isinstance(trace, dict):
+                    trace = {}
+                for k, v in cleaned.items():
+                    if v is None:
+                        trace.pop(k, None)
+                    else:
+                        trace[k] = v
+                cur = conn.execute(
+                    "UPDATE jobs SET updated_at = ?, trace = ? WHERE job_id = ?",
+                    (time.time(), json.dumps(trace, ensure_ascii=False), jid),
+                )
+                if cur.rowcount:
+                    conn.commit()
+                    return True
+                return False
+
     def _update_state_in_conn(self, conn: sqlite3.Connection, *, job_id: str, state: str, metadata: dict[str, Any]) -> bool:
         now = time.time()
         row = conn.execute("SELECT state, trace FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()

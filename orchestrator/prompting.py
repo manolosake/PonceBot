@@ -24,6 +24,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         f"ROLE: {role}",
         f"REQUEST_TYPE: {task.request_type}",
         f"MODE_HINT: {task.mode_hint}",
+        f"ARTIFACTS_DIR: {task.artifacts_dir}",
     ]
     if tools_csv:
         header_lines.append(f"ALLOWED_TOOLS: {tools_csv}")
@@ -55,13 +56,23 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
             "}\n"
         )
     else:
-        schema_hint = (
-            '{\n'
-            '  "summary": "string",\n'
-            '  "artifacts": ["optional_paths"],\n'
-            '  "next_action": null\n'
-            "}\n"
-        )
+        if role == "frontend":
+            schema_hint = (
+                '{\n'
+                '  "summary": "string",\n'
+                '  "artifacts": ["optional_paths"],\n'
+                '  "snapshot_url": null,\n'
+                '  "next_action": null\n'
+                "}\n"
+            )
+        else:
+            schema_hint = (
+                '{\n'
+                '  "summary": "string",\n'
+                '  "artifacts": ["optional_paths"],\n'
+                '  "next_action": null\n'
+                "}\n"
+            )
 
     return (
         header
@@ -79,5 +90,6 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         + "IMPORTANT:\n"
         + "- Keep the JSON valid (double quotes, no trailing commas).\n"
         + "- If you cannot do something safely, explain and set next_action.\n"
+        + "- FRONTEND ONLY: if you can provide visual evidence, create a self-contained HTML preview at\n"
+        + "  `.codexbot_preview/preview.html` in the workspace. The bot will automatically screenshot it.\n"
     )
-

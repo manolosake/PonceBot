@@ -47,7 +47,12 @@ from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runbooks import Runbook, due as runbook_due, load_runbooks, to_task as runbook_to_task
 from orchestrator.schemas.task import Task
-from orchestrator.screenshot import Viewport, capture as capture_screenshot, validate_screenshot_url
+from orchestrator.screenshot import (
+    Viewport,
+    capture as capture_screenshot,
+    capture_html_file as capture_screenshot_html_file,
+    validate_screenshot_url,
+)
 from orchestrator.storage import SQLiteTaskStorage
 from orchestrator.scheduler import OrchestratorScheduler
 from orchestrator.runner import run_task as run_orchestrator_task
@@ -556,6 +561,7 @@ class BotConfig:
     orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
     orchestrator_worker_count: int = 3
     orchestrator_sessions_enabled: bool = True
+    orchestrator_live_update_seconds: int = 8
     worktree_root: Path = Path(__file__).with_name("data") / "worktrees"
     artifacts_root: Path = Path(__file__).with_name("data") / "artifacts"
     runbooks_enabled: bool = True
@@ -3113,6 +3119,8 @@ def _orchestrator_task_from_job(
             if url:
                 trace["needs_screenshot"] = True
                 trace["screenshot_url"] = url
+                # Snapshot is a bot-side operation; no need to run Codex afterwards.
+                trace["screenshot_only"] = True
                 task = task.with_updates(trace=trace)
     except Exception:
         pass
@@ -3147,6 +3155,23 @@ def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
     return _profile_can_manage_bot(cfg, profile_name=profile)
 
 
+def _send_chunked_text(
+    api: "TelegramAPI",
+    *,
+    chat_id: int,
+    text: str,
+    reply_to_message_id: int | None,
+    limit: int = TELEGRAM_MSG_LIMIT - 64,
+) -> None:
+    chunks = _chunk_text(text, limit=max(512, int(limit)))
+    for idx, ch in enumerate(chunks, start=1):
+        payload = ch if len(chunks) == 1 else f"[{idx}/{len(chunks)}]\n{ch}"
+        try:
+            api.send_message(chat_id, payload, reply_to_message_id=reply_to_message_id)
+        except Exception:
+            LOG.exception("Failed to send chunked message. chat_id=%s", chat_id)
+
+
 def _send_orchestrator_marker_response(
     kind: str,
     payload: str,
@@ -3164,7 +3189,7 @@ def _send_orchestrator_marker_response(
         if orch_q is None:
             api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
             return True
-        api.send_message(chat_id, _orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
         return True
 
     if kind == "job":
@@ -3175,7 +3200,7 @@ def _send_orchestrator_marker_response(
             api.send_message(chat_id, "Uso: /job <id>", reply_to_message_id=reply_to_message_id)
             return True
         task = orch_q.get_job(payload)
-        api.send_message(chat_id, _orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
         return True
 
     if kind == "ticket":
@@ -3185,7 +3210,12 @@ def _send_orchestrator_marker_response(
         if not payload:
             api.send_message(chat_id, "Uso: /ticket <id>", reply_to_message_id=reply_to_message_id)
             return True
-        api.send_message(chat_id, _orchestrator_ticket_text(orch_q, payload), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_orchestrator_ticket_text(orch_q, payload),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if kind == "inbox":
@@ -3197,7 +3227,12 @@ def _send_orchestrator_marker_response(
             roles = ", ".join(_orchestrator_known_roles(profiles or {}))
             api.send_message(chat_id, f"Rol invalido: {role}. Roles: {roles}", reply_to_message_id=reply_to_message_id)
             return True
-        api.send_message(chat_id, _orchestrator_inbox_text(orch_q, role=None if role in (None, "all") else role), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_orchestrator_inbox_text(orch_q, role=None if role in (None, "all") else role),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if kind == "runbooks":
@@ -3207,7 +3242,7 @@ def _send_orchestrator_marker_response(
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(chat_id, "No permitido: necesitas permisos de gestor.", reply_to_message_id=reply_to_message_id)
             return True
-        api.send_message(chat_id, _orchestrator_runbooks_text(cfg, orch_q), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_runbooks_text(cfg, orch_q), reply_to_message_id=reply_to_message_id)
         return True
 
     if kind == "reset_role":
@@ -3237,7 +3272,12 @@ def _send_orchestrator_marker_response(
         if not orch_q:
             api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
             return True
-        api.send_message(chat_id, _orchestrator_daily_digest_text(orch_q), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_orchestrator_daily_digest_text(orch_q),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if kind in ("pause", "resume"):
@@ -3352,6 +3392,25 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
         paused = int(vals.get("paused", 0))
         lines.append(f"- {role} ({'paused' if paused else 'active'}): " + ", ".join(state_parts))
 
+    running = orch_q.jobs_by_state(state="running", limit=12)
+    if running:
+        lines.append("")
+        lines.append("Running (live):")
+        for t in running[:12]:
+            trace = t.trace or {}
+            phase = str(trace.get("live_phase") or "").strip() or "running"
+            slot = trace.get("live_workspace_slot")
+            try:
+                slot_s = str(int(slot)) if slot is not None else "n/a"
+            except Exception:
+                slot_s = "n/a"
+            tail = str(trace.get("live_stdout_tail") or "").strip().replace("\n", " ")
+            if len(tail) > 160:
+                tail = tail[-160:]
+            snippet = (t.input_text or "").strip().replace("\n", " ")[:120]
+            extra = f" tail={tail}" if tail else ""
+            lines.append(f"- {t.job_id[:8]} role={t.role} phase={phase} slot={slot_s} text={snippet}{extra}")
+
     return "\n".join(lines)
 
 
@@ -3399,6 +3458,14 @@ def _orchestrator_job_text(task: Task | None) -> str:
         result_artifacts = []
     artifacts_preview = [str(x) for x in result_artifacts if str(x).strip()][:3]
 
+    live_phase = str(trace.get("live_phase") or "").strip()
+    live_at = trace.get("live_at")
+    live_pid = trace.get("live_pid")
+    live_workdir = str(trace.get("live_workdir") or "").strip()
+    live_workspace_slot = trace.get("live_workspace_slot")
+    live_stdout_tail = str(trace.get("live_stdout_tail") or "").strip()
+    live_stderr_tail = str(trace.get("live_stderr_tail") or "").strip()
+
     # Avoid dumping large trace payloads (result_summary can be big); keep it compact.
     for k in (
         "result_summary",
@@ -3409,6 +3476,50 @@ def _orchestrator_job_text(task: Task | None) -> str:
         "result_workspace_slot",
     ):
         trace.pop(k, None)
+    for k in (
+        "live_phase",
+        "live_at",
+        "live_pid",
+        "live_workdir",
+        "live_workspace_slot",
+        "live_stdout_tail",
+        "live_stderr_tail",
+    ):
+        trace.pop(k, None)
+
+    live_lines: list[str] = []
+    if task.state == "running" and (live_phase or live_at or live_pid or live_stdout_tail or live_stderr_tail):
+        live_lines.append("")
+        live_lines.append("live:")
+        live_lines.append(f"- phase: {live_phase or 'running'}")
+        if live_at:
+            try:
+                live_lines.append(
+                    f"- updated_at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(live_at)))}"
+                )
+            except Exception:
+                pass
+        if live_pid:
+            live_lines.append(f"- pid: {live_pid}")
+        if live_workdir:
+            live_lines.append(f"- workdir: {live_workdir}")
+        if live_workspace_slot is not None:
+            try:
+                live_lines.append(f"- workspace_slot: {int(live_workspace_slot)}")
+            except Exception:
+                pass
+        if live_stdout_tail:
+            if len(live_stdout_tail) > 1400:
+                live_stdout_tail = live_stdout_tail[-1400:]
+            live_lines.append("")
+            live_lines.append("stdout_tail:")
+            live_lines.append(live_stdout_tail)
+        if live_stderr_tail:
+            if len(live_stderr_tail) > 1400:
+                live_stderr_tail = live_stderr_tail[-1400:]
+            live_lines.append("")
+            live_lines.append("stderr_tail:")
+            live_lines.append(live_stderr_tail)
 
     return "\n".join(
         [
@@ -3435,6 +3546,7 @@ def _orchestrator_job_text(task: Task | None) -> str:
             f"- artifacts: {', '.join(artifacts_preview) if artifacts_preview else '(none)'}",
             "input_text:",
             (task.input_text or "")[:900],
+            *live_lines,
             "",
             f"trace: {trace}",
         ]
@@ -4873,6 +4985,86 @@ def _orchestrator_run_codex(
     artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    # Snapshot-only tasks: do bot-side capture and finish without running Codex.
+    needs_shot = bool(task.trace.get("needs_screenshot", False))
+    screenshot_only = bool(task.trace.get("screenshot_only", False))
+    if needs_shot and screenshot_only:
+        url = str(task.trace.get("screenshot_url") or "").strip()
+        if not url:
+            return {
+                "status": "error",
+                "summary": "Snapshot requested but no URL/target provided.",
+                "artifacts": [],
+                "logs": "",
+                "next_action": None,
+                "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+            }
+        if not cfg.screenshot_enabled:
+            return {
+                "status": "error",
+                "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
+                "artifacts": [],
+                "logs": "",
+                "next_action": "enable_screenshots",
+                "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+            }
+        approved = bool(task.trace.get("approved", False))
+        check = validate_screenshot_url(
+            url,
+            allowed_hosts=cfg.screenshot_allowed_hosts,
+            allow_private=approved,
+        )
+        if not check.ok:
+            if check.overrideable and not approved:
+                return {
+                    "status": "blocked",
+                    "summary": f"Snapshot blocked by guardrails: {check.reason}\nApprove with: /approve {task.job_id}",
+                    "artifacts": [],
+                    "logs": "",
+                    "next_action": "approve_screenshot",
+                    "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+                }
+            return {
+                "status": "error",
+                "summary": f"Snapshot blocked: {check.reason}",
+                "artifacts": [],
+                "logs": "",
+                "next_action": None,
+                "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+            }
+        url = check.normalized_url
+        out_png = artifacts_dir / "snapshot.png"
+        if orch_q is not None:
+            try:
+                orch_q.update_trace(task.job_id, live_phase="snapshot", live_at=time.time())
+            except Exception:
+                pass
+        try:
+            capture_screenshot(
+                url,
+                out_png,
+                viewport=Viewport(width=1280, height=720),
+                allowed_hosts=cfg.screenshot_allowed_hosts,
+                allow_private=approved,
+            )
+        except Exception as e:
+            return {
+                "status": "error",
+                "summary": f"Screenshot failed: {e}",
+                "artifacts": [],
+                "logs": str(e),
+                "next_action": "install_playwright",
+                "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+            }
+        return {
+            "status": "ok",
+            "summary": f"Snapshot captured: {url}",
+            "artifacts": [str(out_png)],
+            "logs": "",
+            "next_action": None,
+            "structured_digest": {"role": role, "artifacts_dir": str(artifacts_dir)},
+        }
+
     # Worktree isolation (best-effort). If configured incorrectly, fail safe (no writes) by falling back.
     eff_cfg = cfg
     worktree_dir: Path | None = None
@@ -4899,6 +5091,17 @@ def _orchestrator_run_codex(
             worktree_dir = (cfg.worktree_root / role / f"slot{leased_slot}").resolve()
             prepare_clean_workspace(worktree_dir)
             eff_cfg = dataclasses.replace(cfg, codex_workdir=worktree_dir)
+            try:
+                if orch_q is not None:
+                    orch_q.update_trace(
+                        task.job_id,
+                        live_phase="workspace_ready",
+                        live_workdir=str(worktree_dir),
+                        live_workspace_slot=int(leased_slot),
+                        live_at=time.time(),
+                    )
+            except Exception:
+                pass
         except Exception as e:
             # Release the lease and fall back to the base repo in read-only mode.
             try:
@@ -4913,6 +5116,11 @@ def _orchestrator_run_codex(
             LOG.exception("Worktree setup failed; falling back to base workdir read-only. job=%s role=%s", task.job_id, role)
             artifacts_f = artifacts_dir / "worktree_error.txt"
             artifacts_f.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
+            try:
+                if orch_q is not None:
+                    orch_q.update_trace(task.job_id, live_phase="workspace_fallback_ro", live_at=time.time())
+            except Exception:
+                pass
 
     # Optional screenshot capture (Playwright).
     image_paths: list[Path] = []
@@ -5068,7 +5276,20 @@ def _orchestrator_run_codex(
 
     timed_out = False
     canceled = False
+    last_live_update = 0.0
     try:
+        try:
+            if orch_q is not None:
+                orch_q.update_trace(
+                    task.job_id,
+                    live_phase="codex_start",
+                    live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
+                    live_workdir=str(eff_cfg.codex_workdir),
+                    live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                    live_at=time.time(),
+                )
+        except Exception:
+            pass
         while proc.proc.poll() is None:
             if stop_event.is_set():
                 _terminate_process(proc.proc)
@@ -5082,6 +5303,33 @@ def _orchestrator_run_codex(
                 _terminate_process(proc.proc)
                 timed_out = True
                 break
+
+            # Live progress for CEO visibility: update stdout/stderr tails periodically.
+            if orch_q is not None and cfg.orchestrator_live_update_seconds > 0:
+                now = time.time()
+                if now - last_live_update >= float(cfg.orchestrator_live_update_seconds):
+                    try:
+                        stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=1200)).strip()
+                    except Exception:
+                        stdout_tail = ""
+                    try:
+                        stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=1200)).strip()
+                    except Exception:
+                        stderr_tail = ""
+                    try:
+                        orch_q.update_trace(
+                            task.job_id,
+                            live_phase="running",
+                            live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
+                            live_workdir=str(eff_cfg.codex_workdir),
+                            live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                            live_stdout_tail=stdout_tail,
+                            live_stderr_tail=stderr_tail,
+                            live_at=now,
+                        )
+                    except Exception:
+                        pass
+                    last_live_update = now
             time.sleep(0.25)
 
         try:
@@ -5149,6 +5397,34 @@ def _orchestrator_run_codex(
                 artifacts.extend(collect_git_artifacts(repo_dir=worktree_dir, artifacts_dir=artifacts_dir))
             except Exception:
                 LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
+
+        # Frontend evidence: allow the agent to drop a self-contained preview HTML inside the workspace.
+        # The bot screenshots it (headless) and sends `preview.png` to Telegram as an artifact.
+        if role == "frontend" and cfg.screenshot_enabled:
+            try:
+                preview_html = Path(eff_cfg.codex_workdir) / ".codexbot_preview" / "preview.html"
+                if preview_html.exists() and preview_html.is_file():
+                    dest_html = artifacts_dir / "preview.html"
+                    shutil.copyfile(preview_html, dest_html)
+                    out_png = artifacts_dir / "preview.png"
+                    capture_screenshot_html_file(
+                        dest_html,
+                        out_png,
+                        viewport=Viewport(width=1280, height=720),
+                        allowed_hosts=cfg.screenshot_allowed_hosts,
+                        allow_private=False,
+                        block_network=True,
+                    )
+                    artifacts.append(dest_html)
+                    artifacts.append(out_png)
+            except Exception as e:
+                LOG.exception("Failed to generate frontend preview screenshot. job=%s", task.job_id)
+                try:
+                    err_f = artifacts_dir / "preview_screenshot_error.txt"
+                    err_f.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
+                    artifacts.append(err_f)
+                except Exception:
+                    pass
 
         artifacts_text = [str(p) for p in artifacts]
         structured: dict[str, Any] = {
@@ -5375,6 +5651,55 @@ def orchestrator_worker_loop(
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
             _send_orchestrator_result(api, task, result)
+
+            # Frontend evidence: if the frontend agent outputs a snapshot_url in its structured JSON,
+            # queue a snapshot-only job so Telegram receives a real screenshot.
+            try:
+                if (
+                    orch_state == "done"
+                    and _coerce_orchestrator_role(task.role) == "frontend"
+                    and isinstance(structured_digest, dict)
+                    and not bool(task.trace.get("needs_screenshot", False))
+                ):
+                    snap_url = str(structured_digest.get("snapshot_url") or "").strip()
+                    if snap_url:
+                        root_ticket = task.parent_job_id or task.job_id
+                        shot_id = str(uuid.uuid4())
+                        shot = Task.new(
+                            source="telegram",
+                            role="frontend",
+                            input_text=f"Snapshot evidence for job={task.job_id}: {snap_url}",
+                            request_type="maintenance",
+                            priority=int(task.priority or 2),
+                            model=str(task.model or ""),
+                            effort=str(task.effort or "medium"),
+                            mode_hint="ro",
+                            requires_approval=False,
+                            max_cost_window_usd=float(task.max_cost_window_usd or cfg.orchestrator_default_max_cost_window_usd),
+                            chat_id=int(task.chat_id),
+                            user_id=task.user_id,
+                            reply_to_message_id=task.reply_to_message_id,
+                            parent_job_id=root_ticket,
+                            depends_on=[],
+                            labels={"ticket": root_ticket, "kind": "evidence", "for": task.job_id},
+                            artifacts_dir=str((cfg.artifacts_root / shot_id).resolve()),
+                            trace={
+                                "source": "telegram",
+                                "needs_screenshot": True,
+                                "screenshot_url": snap_url,
+                                "screenshot_only": True,
+                                "delegated_by": task.job_id,
+                            },
+                            job_id=shot_id,
+                        )
+                        orch_q.submit_task(shot)
+                        api.send_message(
+                            task.chat_id,
+                            f"Snapshot queued: {shot.job_id[:8]} for job={task.job_id[:8]}",
+                            reply_to_message_id=task.reply_to_message_id,
+                        )
+            except Exception:
+                LOG.exception("Failed to enqueue frontend snapshot evidence job. job=%s", task.job_id)
 
             # Orchestrator delegation: when a top-level orchestrator ticket finishes, enqueue child jobs.
             try:
@@ -6862,6 +7187,11 @@ def _load_config() -> BotConfig:
     if orchestrator_worker_count < 1:
         orchestrator_worker_count = max(1, int(worker_count))
     orchestrator_sessions_enabled = os.environ.get("BOT_ORCH_SESSIONS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    orchestrator_live_update_seconds = int(os.environ.get("BOT_ORCHESTRATOR_LIVE_UPDATE_SECONDS", "8"))
+    if orchestrator_live_update_seconds < 2:
+        orchestrator_live_update_seconds = 2
+    if orchestrator_live_update_seconds > 60:
+        orchestrator_live_update_seconds = 60
 
     worktree_root = Path(
         os.environ.get(
@@ -6957,6 +7287,7 @@ def _load_config() -> BotConfig:
         orchestrator_agent_profiles=orchestrator_agent_profiles,
         orchestrator_worker_count=orchestrator_worker_count,
         orchestrator_sessions_enabled=orchestrator_sessions_enabled,
+        orchestrator_live_update_seconds=orchestrator_live_update_seconds,
         worktree_root=worktree_root,
         artifacts_root=artifacts_root,
         runbooks_enabled=runbooks_enabled,
