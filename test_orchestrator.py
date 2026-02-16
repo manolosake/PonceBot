@@ -6,6 +6,7 @@ from pathlib import Path
 
 import bot
 from orchestrator.agents import load_agent_profiles
+from orchestrator.delegation import parse_orchestrator_subtasks
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runner import run_task
 from orchestrator.runbooks import load_runbooks
@@ -101,6 +102,25 @@ class TestOrchestratorCommands(unittest.TestCase):
             assert job_snapshot is not None
             self.assertEqual(job_snapshot.mode_hint, "rw")
             self.assertIn("@frontend", job_snapshot.user_text)
+
+
+class TestDelegationParsing(unittest.TestCase):
+    def test_orchestrator_subtasks_mode_hint_is_optional(self) -> None:
+        specs = parse_orchestrator_subtasks({"subtasks": [{"key": "a", "role": "backend", "text": "do the thing"}]})
+        self.assertEqual(len(specs), 1)
+        # Missing mode_hint => empty string => caller applies role profile default.
+        self.assertEqual(specs[0].mode_hint, "")
+
+        specs2 = parse_orchestrator_subtasks(
+            {"subtasks": [{"key": "a", "role": "backend", "text": "do the thing", "mode_hint": "ro"}]}
+        )
+        self.assertEqual(specs2[0].mode_hint, "ro")
+
+        specs3 = parse_orchestrator_subtasks(
+            {"subtasks": [{"key": "a", "role": "backend", "text": "do the thing", "mode_hint": "nope"}]}
+        )
+        # Invalid but explicit => fall back to a safe value.
+        self.assertEqual(specs3[0].mode_hint, "ro")
 
 
 class TestOrchestratorMarkerResponse(unittest.TestCase):

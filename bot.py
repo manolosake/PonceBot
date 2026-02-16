@@ -4620,7 +4620,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             reply_to_message_id=msg.message_id,
             user_text=text,
             argv=["exec", text],
-            mode_hint=cfg.codex_default_mode,
+            # For orchestrator mode, keep legacy default out of the job so role profiles can
+            # decide (and explicit /ro|/rw still overrides).
+            mode_hint=("" if cfg.orchestrator_enabled else cfg.codex_default_mode),
             epoch=0,
             threaded=True,
             image_paths=[],
@@ -6206,7 +6208,8 @@ def _transcribe_worker_loop(
             reply_to_message_id=message_id,
             user_text=prompt,
             argv=["exec", prompt],
-            mode_hint=cfg.codex_default_mode,
+            # Same rule as plain text: let orchestrator role profiles pick defaults.
+            mode_hint=("" if cfg.orchestrator_enabled else cfg.codex_default_mode),
             epoch=0,
             threaded=True,
             image_paths=[],
@@ -6257,7 +6260,7 @@ def _transcribe_worker_loop(
             if q_after > 1 or tracker.inflight(chat_id) > 0:
                 api.send_message(
                     chat_id,
-                    f"Queued (voice) (mode={job.mode_hint}, queue_len={jobs.qsize()}).",
+                    f"Queued (voice) (mode={job.mode_hint or cfg.codex_default_mode}, queue_len={jobs.qsize()}).",
                     reply_to_message_id=message_id if message_id else None,
                 )
         except queue.Full:
@@ -6289,9 +6292,11 @@ def worker_loop(
             profile = _auth_effective_profile_name(cfg, chat_id=job.chat_id) if cfg.auth_enabled else ""
             eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
 
-            # If job used the global default mode, apply per-profile default mode.
-            mode_hint = job.mode_hint
-            if profile and mode_hint == cfg.codex_default_mode:
+            # Treat empty mode_hint as "use effective defaults" (allows orchestrator to omit legacy defaults).
+            mode_hint = (job.mode_hint or "").strip().lower()
+            if not mode_hint:
+                mode_hint = eff_cfg.codex_default_mode
+            if mode_hint not in ("ro", "rw", "full"):
                 mode_hint = eff_cfg.codex_default_mode
             if profile and not _profile_allows_mode(cfg, profile_name=profile, requested=mode_hint):
                 api.send_message(
@@ -6419,7 +6424,7 @@ def worker_loop(
             tail_stderr = _tail_file_text(running.stderr_path, max_chars=3500)
             debug_tail = _tail_text((tail_stdout + "\n" + tail_stderr).strip(), max_chars=6000)
 
-            header = f"exit={code} secs={secs:.1f} mode={job.mode_hint}"
+            header = f"exit={code} secs={secs:.1f} mode={mode_hint}"
 
             if canceled:
                 api.send_message(job.chat_id, "Canceled.", reply_to_message_id=job.reply_to_message_id)

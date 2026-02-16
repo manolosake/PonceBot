@@ -14,7 +14,8 @@ class TaskSpec:
     key: str
     role: str
     text: str
-    mode_hint: str = "ro"
+    # Empty string means "use the role profile default" (safer than guessing here).
+    mode_hint: str = ""
     priority: int = 2
     depends_on: list[str] = field(default_factory=list)
     requires_approval: bool = False
@@ -59,9 +60,13 @@ def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list
         if role not in _ALLOWED_ROLES:
             continue
 
-        mode = str(raw.get("mode_hint") or "ro").strip().lower()
-        if mode not in _ALLOWED_MODES:
-            mode = "ro"
+        # mode_hint is optional. If omitted, we let the runner apply role profile defaults.
+        if "mode_hint" in raw:
+            mode = str(raw.get("mode_hint") or "").strip().lower()
+            if mode not in _ALLOWED_MODES:
+                mode = "ro"
+        else:
+            mode = ""
 
         try:
             priority = int(raw.get("priority") or 2)
