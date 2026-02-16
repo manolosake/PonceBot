@@ -75,4 +75,13 @@ fi
 export PYTHONUNBUFFERED=1
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
-exec python3 "$HERE/bot.py"
+PYTHON_BIN="${CODEXBOT_PYTHON_BIN:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if [[ -x "$HERE/.venv/bin/python" ]]; then
+    PYTHON_BIN="$HERE/.venv/bin/python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
+
+exec "$PYTHON_BIN" "$HERE/bot.py"

@@ -1,5 +1,6 @@
 codexbot.env
 .env.local
+.venv/
 data/jobs.sqlite
 data/artifacts/
 data/worktrees/
