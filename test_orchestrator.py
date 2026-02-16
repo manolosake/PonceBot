@@ -252,6 +252,34 @@ class TestOrchestratorStorage(unittest.TestCase):
             assert taken is not None
             self.assertEqual(taken.job_id, task.job_id)
 
+    def test_job_id_prefix_resolves_for_get_and_approve(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            job_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="deploy",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="full",
+                    requires_approval=True,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+            prefix = job_id[:8]
+            t = q.get_job(prefix)
+            self.assertIsNotNone(t)
+            assert t is not None
+            self.assertEqual(t.job_id, job_id)
+            ok = q.set_job_approved(prefix)
+            self.assertTrue(ok)
+
     def test_update_trace_does_not_emit_job_event(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "jobs.sqlite"
@@ -627,10 +655,12 @@ class TestSendOrchestratorResult(unittest.TestCase):
                 chat_id=1,
                 state="queued",
             )
+            cfg = _cfg(Path(td) / "state.json")
             bot._send_orchestrator_result(  # type: ignore[arg-type]
                 api,  # type: ignore[arg-type]
                 task,
                 {"status": "ok", "summary": "done", "artifacts": [str(empty)]},
+                cfg=cfg,
             )
             self.assertGreaterEqual(len(api.messages), 1)
             self.assertEqual(api.docs, [])

@@ -50,6 +50,7 @@ from orchestrator.schemas.task import Task
 from orchestrator.screenshot import (
     Viewport,
     capture as capture_screenshot,
+    capture_html as capture_screenshot_html,
     capture_html_file as capture_screenshot_html_file,
     validate_screenshot_url,
 )
@@ -562,6 +563,8 @@ class BotConfig:
     orchestrator_worker_count: int = 3
     orchestrator_sessions_enabled: bool = True
     orchestrator_live_update_seconds: int = 8
+    # Notification policy for Telegram chat: "verbose" | "minimal".
+    orchestrator_notify_mode: str = "minimal"
     worktree_root: Path = Path(__file__).with_name("data") / "worktrees"
     artifacts_root: Path = Path(__file__).with_name("data") / "artifacts"
     runbooks_enabled: bool = True
@@ -2054,6 +2057,23 @@ class CodexRunner:
         env.pop("TELEGRAM_ALLOWED_CHAT_IDS", None)
         env.pop("TELEGRAM_ALLOWED_USER_IDS", None)
 
+        # Codex sandboxing may block writes outside the workdir (including /tmp). Force a per-workdir temp dir
+        # so QA/tests and other tools relying on tempfile.* keep working in workspace-write mode.
+        try:
+            tmp_root = (self._cfg.codex_workdir / ".codexbot_tmp").resolve()
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            env["TMPDIR"] = str(tmp_root)
+            env["TMP"] = str(tmp_root)
+            env["TEMP"] = str(tmp_root)
+        except Exception:
+            pass
+        # Frontend evidence dir: agents can drop `.codexbot_preview/preview.html` and the bot will screenshot it.
+        try:
+            preview_root = (self._cfg.codex_workdir / ".codexbot_preview").resolve()
+            preview_root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
         out_f = tempfile.NamedTemporaryFile(prefix="codexbot_stdout_", suffix=".log", delete=False)
         err_f = tempfile.NamedTemporaryFile(prefix="codexbot_stderr_", suffix=".log", delete=False)
         stdout_path = Path(out_f.name)
@@ -2440,6 +2460,7 @@ def _help_text(cfg: BotConfig) -> str:
     lines += [
         "- /status             Show legacy/system status and orchestrator queue",
         "- /agents             Show orchestrator role status and queue per role",
+        "- /dashboard          Visual dashboard snapshot (PNG)",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
         "- /brief              Alias rápido de resumen de estado ejecutivo",
@@ -3192,6 +3213,123 @@ def _send_orchestrator_marker_response(
         _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind == "dashboard":
+        if orch_q is None:
+            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not cfg.screenshot_enabled:
+            api.send_message(chat_id, _orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
+            return True
+        now = time.time()
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        health = orch_q.get_role_health() or {}
+        running = orch_q.jobs_by_state(state="running", limit=16)
+
+        def _pill(label: str, val: str) -> str:
+            return (
+                '<span class="pill">'
+                + _html_escape(label)
+                + ': <b>'
+                + _html_escape(val)
+                + "</b></span>"
+            )
+
+        role_rows: list[str] = []
+        for role in sorted(health.keys()):
+            vals = health.get(role, {}) or {}
+            queued = int(vals.get("queued", 0) or 0)
+            running_n = int(vals.get("running", 0) or 0)
+            blocked = int(vals.get("blocked", 0) or 0)
+            failed = int(vals.get("failed", 0) or 0)
+            role_rows.append(
+                "<tr>"
+                + f"<td>{_html_escape(role)}</td>"
+                + f"<td>{queued}</td>"
+                + f"<td>{running_n}</td>"
+                + f"<td>{blocked}</td>"
+                + f"<td>{failed}</td>"
+                + "</tr>"
+            )
+        if not role_rows:
+            role_rows.append("<tr><td colspan='5' class='muted'>(no data yet)</td></tr>")
+
+        run_rows: list[str] = []
+        for t in running[:16]:
+            trace = t.trace or {}
+            phase = str(trace.get("live_phase") or "").strip() or "running"
+            tail = str(trace.get("live_stdout_tail") or "").strip()
+            if len(tail) > 600:
+                tail = tail[-600:]
+            title = (t.input_text or "").strip().replace("\n", " ")
+            if len(title) > 120:
+                title = title[:120] + "..."
+            run_rows.append(
+                "<div class='run'>"
+                + f"<div class='run-h'><b>{_html_escape(t.job_id[:8])}</b> <span class='muted'>role={_html_escape(t.role)} phase={_html_escape(phase)}</span></div>"
+                + f"<div class='run-t'>{_html_escape(title)}</div>"
+                + (f"<pre class='tail'>{_html_escape(tail)}</pre>" if tail else "")
+                + "</div>"
+            )
+        if not run_rows:
+            run_rows.append("<div class='muted'>(no running jobs)</div>")
+
+        html = (
+            "<!doctype html><html><head><meta charset='utf-8'>"
+            "<style>"
+            "body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; margin:0; background:#0b0f14; color:#e8eef6}"
+            ".wrap{padding:18px}"
+            ".h{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px}"
+            ".title{font-size:18px;font-weight:700}"
+            ".sub{font-size:12px;color:#9fb0c3}"
+            ".grid{display:grid;grid-template-columns:1fr 1.2fr;gap:14px}"
+            ".card{background:#121a24;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px;box-shadow:0 10px 30px rgba(0,0,0,.35)}"
+            ".pill{display:inline-flex;gap:6px;align-items:baseline;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);margin-right:8px;font-size:12px}"
+            "table{width:100%;border-collapse:collapse;font-size:12px}"
+            "th,td{padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}"
+            "th{color:#9fb0c3;font-weight:600}"
+            ".muted{color:#9fb0c3}"
+            ".run{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}"
+            ".run:last-child{border-bottom:none}"
+            ".run-h{font-size:12px}"
+            ".run-t{font-size:12px;margin-top:4px;color:#cfe0f3}"
+            "pre.tail{margin:8px 0 0; padding:10px; border-radius:10px; background:#0b0f14; border:1px solid rgba(255,255,255,.06); font-size:11px; white-space:pre-wrap; max-height:160px; overflow:hidden}"
+            "</style></head><body><div class='wrap'>"
+            "<div class='h'>"
+            "<div><div class='title'>PonceBot Dashboard</div><div class='sub'>"
+            + _html_escape(ts)
+            + "</div></div>"
+            "<div class='sub'>"
+            + _pill("queued", str(orch_q.get_queued_count()))
+            + _pill("running", str(orch_q.get_running_count()))
+            + "</div></div>"
+            "<div class='grid'>"
+            "<div class='card'><div class='title' style='font-size:14px'>Roles</div>"
+            "<table><thead><tr><th>role</th><th>queued</th><th>running</th><th>blocked</th><th>failed</th></tr></thead><tbody>"
+            + "".join(role_rows)
+            + "</tbody></table></div>"
+            "<div class='card'><div class='title' style='font-size:14px'>Running Now</div>"
+            + "".join(run_rows)
+            + "</div>"
+            "</div></div></body></html>"
+        )
+
+        out_dir = (cfg.artifacts_root / "dashboard").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_png = out_dir / f"dashboard_{int(now)}.png"
+        try:
+            capture_screenshot_html(
+                html,
+                out_png,
+                viewport=Viewport(width=1280, height=720),
+                allowed_hosts=cfg.screenshot_allowed_hosts,
+                allow_private=False,
+                block_network=True,
+            )
+            api.send_photo(chat_id, out_png, caption="dashboard", reply_to_message_id=reply_to_message_id)
+        except Exception as e:
+            api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
     if kind == "job":
         if not orch_q:
             api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
@@ -3704,6 +3842,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/agents":
         return _orch_marker("agents"), None
+
+    if text == "/dashboard":
+        return _orch_marker("dashboard"), None
 
     if text.startswith("/job "):
         job_id = _orch_job_id(text[len("/job ") :])
@@ -4985,6 +5126,31 @@ def _orchestrator_run_codex(
     artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fast-path: status requests should not spend a Codex run. Return an in-bot view of the orchestrator.
+    if task.request_type == "status" and orch_q is not None:
+        try:
+            running = orch_q.jobs_by_state(state="running", limit=6)
+        except Exception:
+            running = []
+        lines: list[str] = []
+        if not running:
+            lines.append("Estado: no hay jobs corriendo ahora.")
+        else:
+            lines.append(f"Estado: running={len(running)}")
+            for t in running[:6]:
+                phase = str((t.trace or {}).get("live_phase") or "").strip() or "running"
+                snippet = (t.input_text or "").strip().replace("\n", " ")[:90]
+                lines.append(f"- {t.job_id[:8]} role={t.role} phase={phase} text={snippet}")
+        lines.append("Tip: /agents (texto), /dashboard (PNG), /ticket <id> (árbol).")
+        return {
+            "status": "ok",
+            "summary": "\n".join(lines),
+            "artifacts": [],
+            "logs": "",
+            "next_action": None,
+            "structured_digest": {"role": role},
+        }
+
     # Snapshot-only tasks: do bot-side capture and finish without running Codex.
     needs_shot = bool(task.trace.get("needs_screenshot", False))
     screenshot_only = bool(task.trace.get("screenshot_only", False))
@@ -5475,35 +5641,74 @@ def _send_orchestrator_result(
     api: TelegramAPI,
     task: Task,
     result: Any,
+    *,
+    cfg: BotConfig,
 ) -> None:
     try:
-        status = str(getattr(result, "status", "error"))
-        summary = str(getattr(result, "summary", "")).strip() or "(no summary)"
-        logs = str(getattr(result, "logs", ""))
-        next_action = getattr(result, "next_action", None)
-        artifacts = list(getattr(result, "artifacts", []) or [])
+        if isinstance(result, dict):
+            status = str(result.get("status", "error"))
+            summary = str(result.get("summary", "")).strip() or "(no summary)"
+            logs = str(result.get("logs", ""))
+            next_action = result.get("next_action", None)
+            artifacts = list(result.get("artifacts", []) or [])
+        else:
+            status = str(getattr(result, "status", "error"))
+            summary = str(getattr(result, "summary", "")).strip() or "(no summary)"
+            logs = str(getattr(result, "logs", ""))
+            next_action = getattr(result, "next_action", None)
+            artifacts = list(getattr(result, "artifacts", []) or [])
 
-        header = f"Orchestrator task={task.job_id[:8]} role={task.role} status={status}"
-        payload = [header, summary]
-        if next_action:
-            payload.append(f"next_action={next_action}")
-        msg = "\n".join(payload)
-        msg_chunks = _chunk_text(msg, limit=TELEGRAM_MSG_LIMIT - 64)
-        for idx, ch in enumerate(msg_chunks, start=1):
-            text = ch if len(msg_chunks) == 1 else f"[{idx}/{len(msg_chunks)}]\n{ch}"
-            try:
-                api.send_message(task.chat_id, text, reply_to_message_id=task.reply_to_message_id)
-            except Exception:
-                LOG.exception("Failed to send orchestrator message chunk. job=%s", task.job_id)
+        labels = task.labels or {}
+        kind = str(labels.get("kind") or "").strip().lower()
+        mode = (cfg.orchestrator_notify_mode or "minimal").strip().lower()
 
-        if status != "ok" and logs:
-            log_chunks = _chunk_text(logs, limit=TELEGRAM_MSG_LIMIT - 64)
-            for idx, ch in enumerate(log_chunks, start=1):
-                prefix = f"log[{idx}/{len(log_chunks)}]\n"
-                try:
-                    api.send_message(task.chat_id, f"{prefix}{ch}", reply_to_message_id=task.reply_to_message_id)
-                except Exception:
-                    LOG.exception("Failed to send orchestrator logs chunk. job=%s", task.job_id)
+        def _should_notify() -> bool:
+            if mode == "verbose":
+                return True
+            if kind == "wrapup":
+                return True
+            # Autonomous runbooks: only notify on non-ok outcomes.
+            if bool(task.is_autonomous):
+                return status != "ok"
+            # Subtasks: only notify on non-ok outcomes (details are visible via /ticket and /job).
+            if (task.parent_job_id or "").strip():
+                return status != "ok"
+            return True
+
+        # Evidence jobs: on success, send only the artifact(s) and skip the text message.
+        artifacts_only = (kind == "evidence") and status == "ok" and mode != "verbose"
+
+        if _should_notify() and (not artifacts_only):
+            # Keep chat updates short; details are always available via /job and /ticket.
+            max_summary = 900
+            if len(summary) > max_summary:
+                summary = summary[:max_summary] + "...\n(details: /job %s)" % task.job_id[:8]
+
+            header = f"job={task.job_id[:8]} role={task.role} status={status}"
+            payload = [header, summary]
+            if next_action:
+                payload.append(f"next_action={next_action}")
+            if kind == "wrapup":
+                root = (task.parent_job_id or "").strip()
+                if root:
+                    payload.append(f"ticket=/ticket {root[:8]}")
+            elif not (task.parent_job_id or "").strip():
+                payload.append(f"track: /ticket {task.job_id[:8]} | /agents")
+            msg = "\n".join(payload)
+            _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
+
+            # In minimal mode, don't spam stderr tails. Operators can inspect via /job and artifacts.
+            if mode == "verbose" and status != "ok" and logs:
+                log_chunks = _chunk_text(logs, limit=TELEGRAM_MSG_LIMIT - 64)
+                for idx, ch in enumerate(log_chunks, start=1):
+                    prefix = f"log[{idx}/{len(log_chunks)}]\n"
+                    try:
+                        api.send_message(task.chat_id, f"{prefix}{ch}", reply_to_message_id=task.reply_to_message_id)
+                    except Exception:
+                        LOG.exception("Failed to send orchestrator logs chunk. job=%s", task.job_id)
+
+        if not _should_notify() and (not artifacts_only):
+            return
 
         for raw in artifacts[:3]:
             p = Path(str(raw))
@@ -5650,7 +5855,7 @@ def orchestrator_worker_loop(
                     continue
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
-            _send_orchestrator_result(api, task, result)
+            _send_orchestrator_result(api, task, result, cfg=cfg)
 
             # Frontend evidence: if the frontend agent outputs a snapshot_url in its structured JSON,
             # queue a snapshot-only job so Telegram receives a real screenshot.
@@ -5693,11 +5898,12 @@ def orchestrator_worker_loop(
                             job_id=shot_id,
                         )
                         orch_q.submit_task(shot)
-                        api.send_message(
-                            task.chat_id,
-                            f"Snapshot queued: {shot.job_id[:8]} for job={task.job_id[:8]}",
-                            reply_to_message_id=task.reply_to_message_id,
-                        )
+                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                            api.send_message(
+                                task.chat_id,
+                                f"Snapshot queued: {shot.job_id[:8]} for job={task.job_id[:8]}",
+                                reply_to_message_id=task.reply_to_message_id,
+                            )
             except Exception:
                 LOG.exception("Failed to enqueue frontend snapshot evidence job. job=%s", task.job_id)
 
@@ -5765,12 +5971,23 @@ def orchestrator_worker_loop(
                                 job_id=key_to_job[spec.key],
                             )
                             children.append(child)
-                        if children:
-                            orch_q.submit_batch(children)
-                            lines = ["Orchestrator delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
-                            for c in children[:12]:
-                                lines.append(f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}")
-                            api.send_message(task.chat_id, "\n".join(lines), reply_to_message_id=task.reply_to_message_id)
+                            if children:
+                                orch_q.submit_batch(children)
+                                try:
+                                    orch_q.update_trace(task.job_id, delegated_count=int(len(children)), live_at=time.time())
+                                except Exception:
+                                    pass
+                                if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                                    lines = ["Orchestrator delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
+                                    for c in children[:12]:
+                                        lines.append(
+                                            f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}"
+                                        )
+                                    api.send_message(
+                                        task.chat_id,
+                                        "\n".join(lines),
+                                        reply_to_message_id=task.reply_to_message_id,
+                                    )
 
                     # Wrap-up: enqueue one orchestrator job that depends on all subtasks (terminal OK).
                     wrapup_deps: list[str] = []
@@ -5813,11 +6030,16 @@ def orchestrator_worker_loop(
                             job_id=wrap_id,
                         )
                         orch_q.submit_task(wrap)
-                        api.send_message(
-                            task.chat_id,
-                            f"Wrap-up scheduled: {wrap.job_id[:8]} deps={len(wrap.depends_on)}",
-                            reply_to_message_id=task.reply_to_message_id,
-                        )
+                        try:
+                            orch_q.update_trace(task.job_id, wrapup_job_id=wrap.job_id, live_at=time.time())
+                        except Exception:
+                            pass
+                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                            api.send_message(
+                                task.chat_id,
+                                f"Wrap-up scheduled: {wrap.job_id[:8]} deps={len(wrap.depends_on)}",
+                                reply_to_message_id=task.reply_to_message_id,
+                            )
             except Exception:
                 LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
         except Exception as e:
@@ -5834,6 +6056,7 @@ def orchestrator_worker_loop(
                         "logs": str(e),
                         "next_action": None,
                     },
+                    cfg=cfg,
                 )
             except Exception:
                 LOG.exception("Failed to report orchestrator worker failure for task=%s", task.job_id)
@@ -7005,10 +7228,7 @@ def poll_loop(
                             enqueued_to_orchestrator = True
                             api.send_message(
                                 chat_id,
-                                (
-                                    f"Queued to orchestrator: task={orch_job_id[:8]} "
-                                    f"(mode={job.mode_hint}, queue_queued={orchestrator_queue.get_queued_count()})."
-                                ),
+                                f"Queued: {orch_job_id[:8]} (track: /ticket {orch_job_id[:8]} | /agents)",
                                 reply_to_message_id=message_id if message_id else None,
                             )
 
@@ -7192,6 +7412,9 @@ def _load_config() -> BotConfig:
         orchestrator_live_update_seconds = 2
     if orchestrator_live_update_seconds > 60:
         orchestrator_live_update_seconds = 60
+    orchestrator_notify_mode = os.environ.get("BOT_ORCHESTRATOR_NOTIFY_MODE", "minimal").strip().lower() or "minimal"
+    if orchestrator_notify_mode not in ("minimal", "verbose"):
+        orchestrator_notify_mode = "minimal"
 
     worktree_root = Path(
         os.environ.get(
@@ -7288,6 +7511,7 @@ def _load_config() -> BotConfig:
         orchestrator_worker_count=orchestrator_worker_count,
         orchestrator_sessions_enabled=orchestrator_sessions_enabled,
         orchestrator_live_update_seconds=orchestrator_live_update_seconds,
+        orchestrator_notify_mode=orchestrator_notify_mode,
         worktree_root=worktree_root,
         artifacts_root=artifacts_root,
         runbooks_enabled=runbooks_enabled,

@@ -117,6 +117,32 @@ def detect_request_type(text_l: str) -> str:
     t = (text_l or "").lower()
     if t.startswith("/status") or "estado" in t or "status" in t:
         return "status"
+    # Natural-language status checks (Spanish + English).
+    if any(
+        k in t
+        for k in (
+            "estan trabajando",
+            "están trabajando",
+            "siguen trabajando",
+            "ya acabaron",
+            "ya terminaron",
+            "ya termino",
+            "ya terminó",
+            "en que van",
+            "en qué van",
+            "progreso",
+            "avance",
+            "que estan haciendo",
+            "qué están haciendo",
+            "que están haciendo",
+            "que hacen",
+            "qué hacen",
+            "still running",
+            "are you done",
+            "did you finish",
+        )
+    ):
+        return "status"
     if "revis" in t or "review" in t:
         return "review"
     if "mantenimiento" in t or "cron" in t or "monitor" in t:

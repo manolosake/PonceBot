@@ -400,9 +400,34 @@ class SQLiteTaskStorage:
     def submit_batch(self, tasks: list[Task]) -> list[str]:
         return [self.submit_task(task) for task in tasks]
 
+    def _resolve_job_id_in_conn(self, conn: sqlite3.Connection, job_id: str) -> str | None:
+        """
+        Resolve a job id that may be a full UUID or a short prefix.
+
+        Grounded goal: allow humans to use the 8-char prefix shown in chat for /job, /ticket, /approve, /cancel.
+        """
+        jid = (job_id or "").strip()
+        if not jid:
+            return None
+
+        row = conn.execute("SELECT job_id FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+        if row is not None:
+            return str(row["job_id"])
+
+        # Prefix resolution: only attempt for reasonably-long prefixes to avoid accidental matches.
+        if 4 <= len(jid) < 36:
+            rows = conn.execute("SELECT job_id FROM jobs WHERE job_id LIKE ? LIMIT 2", (jid + "%",)).fetchall()
+            if len(rows) == 1:
+                return str(rows[0]["job_id"])
+
+        return None
+
     def get_job(self, job_id: str) -> Task | None:
         with self._conn() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+            resolved = self._resolve_job_id_in_conn(conn, str(job_id))
+            if not resolved:
+                return None
+            row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (resolved,)).fetchone()
             return self._row_to_task(row) if row is not None else None
 
     def claim_next(
@@ -570,7 +595,10 @@ class SQLiteTaskStorage:
     def update_state(self, job_id: str, state: str, **metadata: Any) -> bool:
         with self._lock:
             with self._conn() as conn:
-                ok = self._update_state_in_conn(conn, job_id=str(job_id), state=str(state), metadata=metadata)
+                resolved = self._resolve_job_id_in_conn(conn, str(job_id))
+                if not resolved:
+                    return False
+                ok = self._update_state_in_conn(conn, job_id=resolved, state=str(state), metadata=metadata)
                 if ok:
                     conn.commit()
                 return ok
@@ -610,7 +638,10 @@ class SQLiteTaskStorage:
 
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+                resolved = self._resolve_job_id_in_conn(conn, jid)
+                if not resolved:
+                    return False
+                row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (resolved,)).fetchone()
                 if row is None:
                     return False
                 trace = Task.from_trace_json(row["trace"])
@@ -623,7 +654,7 @@ class SQLiteTaskStorage:
                         trace[k] = v
                 cur = conn.execute(
                     "UPDATE jobs SET updated_at = ?, trace = ? WHERE job_id = ?",
-                    (time.time(), json.dumps(trace, ensure_ascii=False), jid),
+                    (time.time(), json.dumps(trace, ensure_ascii=False), resolved),
                 )
                 if cur.rowcount:
                     conn.commit()
@@ -676,7 +707,13 @@ class SQLiteTaskStorage:
 
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("SELECT retry_count, max_retries, trace FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+                resolved = self._resolve_job_id_in_conn(conn, jid)
+                if not resolved:
+                    return False
+                row = conn.execute(
+                    "SELECT retry_count, max_retries, trace FROM jobs WHERE job_id = ?",
+                    (resolved,),
+                ).fetchone()
                 if row is None:
                     return False
                 try:
@@ -702,10 +739,10 @@ class SQLiteTaskStorage:
 
                 cur = conn.execute(
                     "UPDATE jobs SET state = ?, due_at = ?, retry_count = ?, updated_at = ?, trace = ? WHERE job_id = ?",
-                    ("queued", float(due), int(retries), time.time(), json.dumps(trace, ensure_ascii=False), jid),
+                    ("queued", float(due), int(retries), time.time(), json.dumps(trace, ensure_ascii=False), resolved),
                 )
                 if cur.rowcount:
-                    self._append_event(conn, jid, "retry_scheduled", {"retry_count": retries, "due_at": due})
+                    self._append_event(conn, resolved, "retry_scheduled", {"retry_count": retries, "due_at": due})
                     conn.commit()
                     return True
                 return False
@@ -953,23 +990,26 @@ class SQLiteTaskStorage:
 
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("SELECT job_id FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
-                if row is None:
+                resolved = self._resolve_job_id_in_conn(conn, str(job_id))
+                if not resolved:
                     return False
                 conn.execute(
                     "INSERT OR REPLACE INTO approver_log(job_id, approved_by, approved_at, reason) VALUES (?, ?, ?, ?)",
-                    (str(job_id), None if approved_by is None else int(approved_by), time.time(), reason),
+                    (resolved, None if approved_by is None else int(approved_by), time.time(), reason),
                 )
-                updated = self._update_state_in_conn(conn, job_id=str(job_id), state="queued", metadata=trace_payload)
+                updated = self._update_state_in_conn(conn, job_id=resolved, state="queued", metadata=trace_payload)
                 if updated:
-                    self._append_event(conn, str(job_id), "approved", {"approved": approved, "approved_by": approved_by, "reason": reason})
+                    self._append_event(conn, resolved, "approved", {"approved": approved, "approved_by": approved_by, "reason": reason})
                     conn.commit()
                 return updated
 
     def clear_job_approval(self, job_id: str) -> bool:
         with self._lock:
             with self._conn() as conn:
-                row = conn.execute("SELECT trace FROM jobs WHERE job_id=?", (str(job_id),)).fetchone()
+                resolved = self._resolve_job_id_in_conn(conn, str(job_id))
+                if not resolved:
+                    return False
+                row = conn.execute("SELECT trace FROM jobs WHERE job_id=?", (resolved,)).fetchone()
                 if row is None:
                     return False
                 trace = Task.from_trace_json(row["trace"])
@@ -978,9 +1018,9 @@ class SQLiteTaskStorage:
                 trace.pop("approved", None)
                 trace.pop("approved_at", None)
                 trace.pop("approved_by", None)
-                conn.execute("UPDATE jobs SET trace = ? WHERE job_id = ?", (json.dumps(trace, ensure_ascii=False), str(job_id)))
-                conn.execute("DELETE FROM approver_log WHERE job_id = ?", (str(job_id),))
-                self._append_event(conn, str(job_id), "approval_cleared", {})
+                conn.execute("UPDATE jobs SET trace = ? WHERE job_id = ?", (json.dumps(trace, ensure_ascii=False), resolved))
+                conn.execute("DELETE FROM approver_log WHERE job_id = ?", (resolved,))
+                self._append_event(conn, resolved, "approval_cleared", {})
                 conn.commit()
                 return True
 

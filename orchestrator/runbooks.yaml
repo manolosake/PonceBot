@@ -14,7 +14,7 @@
 - id: qa_smoke
   role: qa
   interval_seconds: 21600
-  mode_hint: ro
+  mode_hint: rw
   priority: 3
   enabled: true
   prompt: |
