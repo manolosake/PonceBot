@@ -2537,6 +2537,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
     cmds: list[tuple[str, str]] = [
         ("help", "Mostrar ayuda"),
         ("agents", "Estado del orquestador"),
+        ("dashboard", "Dashboard visual (PNG)"),
         ("status", "Estado del bot/modelo"),
         ("s", "Alias de /status"),
         ("whoami", "Ver tus IDs"),
