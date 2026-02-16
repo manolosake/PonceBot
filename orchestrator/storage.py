@@ -246,11 +246,12 @@ class SQLiteTaskStorage:
         """
         Idempotent migration for role renames.
 
-        Current supported rename:
-        - ceo -> orchestrator
+        Current supported renames:
+        - ceo -> jarvis
+        - orchestrator -> jarvis
         """
         try:
-            conn.execute("UPDATE jobs SET role = 'orchestrator' WHERE role = 'ceo'")
+            conn.execute("UPDATE jobs SET role = 'jarvis' WHERE role IN ('ceo', 'orchestrator')")
         except Exception:
             pass
 
@@ -258,9 +259,9 @@ class SQLiteTaskStorage:
         try:
             conn.execute(
                 "DELETE FROM agent_sessions "
-                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM agent_sessions a2 WHERE a2.chat_id = agent_sessions.chat_id AND a2.role = 'orchestrator')"
+                "WHERE role IN ('ceo', 'orchestrator') AND EXISTS(SELECT 1 FROM agent_sessions a2 WHERE a2.chat_id = agent_sessions.chat_id AND a2.role = 'jarvis')"
             )
-            conn.execute("UPDATE agent_sessions SET role = 'orchestrator' WHERE role = 'ceo'")
+            conn.execute("UPDATE agent_sessions SET role = 'jarvis' WHERE role IN ('ceo', 'orchestrator')")
         except Exception:
             pass
 
@@ -268,9 +269,9 @@ class SQLiteTaskStorage:
         try:
             conn.execute(
                 "DELETE FROM role_controls "
-                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM role_controls r2 WHERE r2.role = 'orchestrator')"
+                "WHERE role IN ('ceo', 'orchestrator') AND EXISTS(SELECT 1 FROM role_controls r2 WHERE r2.role = 'jarvis')"
             )
-            conn.execute("UPDATE role_controls SET role = 'orchestrator' WHERE role = 'ceo'")
+            conn.execute("UPDATE role_controls SET role = 'jarvis' WHERE role IN ('ceo', 'orchestrator')")
         except Exception:
             pass
 
@@ -278,9 +279,9 @@ class SQLiteTaskStorage:
         try:
             conn.execute(
                 "DELETE FROM workspace_leases "
-                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM workspace_leases w2 WHERE w2.role = 'orchestrator' AND w2.slot = workspace_leases.slot)"
+                "WHERE role IN ('ceo', 'orchestrator') AND EXISTS(SELECT 1 FROM workspace_leases w2 WHERE w2.role = 'jarvis' AND w2.slot = workspace_leases.slot)"
             )
-            conn.execute("UPDATE workspace_leases SET role = 'orchestrator' WHERE role = 'ceo'")
+            conn.execute("UPDATE workspace_leases SET role = 'jarvis' WHERE role IN ('ceo', 'orchestrator')")
         except Exception:
             pass
 
@@ -288,9 +289,9 @@ class SQLiteTaskStorage:
         try:
             conn.execute(
                 "DELETE FROM cost_caps "
-                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM cost_caps c2 WHERE c2.role = 'orchestrator')"
+                "WHERE role IN ('ceo', 'orchestrator') AND EXISTS(SELECT 1 FROM cost_caps c2 WHERE c2.role = 'jarvis')"
             )
-            conn.execute("UPDATE cost_caps SET role = 'orchestrator' WHERE role = 'ceo'")
+            conn.execute("UPDATE cost_caps SET role = 'jarvis' WHERE role IN ('ceo', 'orchestrator')")
         except Exception:
             pass
 

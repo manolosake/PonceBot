@@ -22,11 +22,14 @@
     - python -m unittest -q (si aplica)
     Reporta fallos y recomendaciones.
 
-- id: orchestrator_digest
-  role: orchestrator
+- id: jarvis_digest
+  role: jarvis
   interval_seconds: 21600
   mode_hint: ro
   priority: 3
   enabled: true
   prompt: |
-    Genera un brief ejecutivo: estado del backlog, riesgos, y siguientes 3 acciones recomendadas.
+    Genera un brief ejecutivo para el CEO (máx 3 bullets):
+    - Estado (verde/amarillo/rojo) + 1 riesgo si aplica
+    - Qué se logró / qué sigue (1 frase)
+    - Decisión requerida (o N/A)

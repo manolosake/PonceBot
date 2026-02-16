@@ -156,7 +156,7 @@ class OrchestratorQueue:
 
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
-            "orchestrator": 1,
+            "jarvis": 1,
             "frontend": 2,
             "backend": 2,
             "qa": 2,

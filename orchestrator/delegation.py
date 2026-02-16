@@ -5,7 +5,7 @@ from typing import Any
 import json
 
 
-_ALLOWED_ROLES = ("orchestrator", "frontend", "backend", "qa", "sre")
+_ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre")
 _ALLOWED_MODES = ("ro", "rw", "full")
 
 
@@ -21,12 +21,14 @@ class TaskSpec:
     requires_approval: bool = False
 
 
-def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
-    """Parse orchestrator structured output into TaskSpec entries.
+def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
+    """Parse Jarvis structured output into TaskSpec entries.
 
     Expects a dict with a subtasks list. If a string is provided, attempts to parse JSON.
 
-    Back-compat: if the model emits role="ceo", it is treated as role="orchestrator".
+    Back-compat aliases:
+    - role="ceo" -> role="jarvis"
+    - role="orchestrator" -> role="jarvis"
     """
 
     if structured is None:
@@ -55,8 +57,8 @@ def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list
         text = str(raw.get("text") or "").strip()
         if not key or not text:
             continue
-        if role == "ceo":
-            role = "orchestrator"
+        if role in ("ceo", "orchestrator"):
+            role = "jarvis"
         if role not in _ALLOWED_ROLES:
             continue
 
@@ -100,5 +102,6 @@ def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list
     return out
 
 
-# Backwards-compatible alias; do not document.
-parse_ceo_subtasks = parse_orchestrator_subtasks
+# Backwards-compatible aliases; do not document.
+parse_orchestrator_subtasks = parse_jarvis_subtasks
+parse_ceo_subtasks = parse_jarvis_subtasks

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from .schemas.task import Task
 
 
 _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    # Orchestrator role (formerly "ceo"). This is the coordinator agent; the human is the CEO.
-    "orchestrator": (
+    # Jarvis role (formerly "orchestrator"/"ceo"). This is the coordinator agent; the human is the CEO.
+    "jarvis": (
         "status",
         "plan",
         "coordin",
@@ -19,6 +20,7 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "decid",
         "estrateg",
         "orquest",
+        "jarvis",
     ),
     "frontend": (
         "ui",
@@ -75,13 +77,35 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_REQUEST_TYPES = {"status", "review", "maintenance", "task"}
+_REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
+
+_TOKEN_RE = re.compile(r"[\\w]+", flags=re.UNICODE)
 
 
 def _score_role(text_l: str, role: str) -> int:
+    """
+    Keyword scoring is intentionally conservative.
+
+    Grounded motivation: naive substring checks cause false positives in Spanish
+    (e.g. "quien" contains "ui"). For short keywords (<=3 chars), require token match.
+    """
     score = 0
+    tokens: set[str] | None = None
     for k in _ROLE_KEYWORDS.get(role, ()):
-        if k in text_l:
+        kk = (k or "").strip().lower()
+        if not kk:
+            continue
+        if " " in kk:
+            if kk in text_l:
+                score += 2
+            continue
+        if len(kk) <= 3:
+            if tokens is None:
+                tokens = set(_TOKEN_RE.findall(text_l))
+            if kk in tokens:
+                score += 2
+            continue
+        if kk in text_l:
             score += 1
     return score
 
@@ -89,9 +113,9 @@ def _score_role(text_l: str, role: str) -> int:
 def _explicit_role(text_l: str) -> str | None:
     tl = (text_l or "").lower()
 
-    # Explicit orchestrator markers (support legacy @ceo alias).
-    if "@orchestrator" in tl or "@ceo" in tl:
-        return "orchestrator"
+    # Explicit jarvis markers (support legacy @orchestrator/@ceo aliases).
+    if "@jarvis" in tl or "@orchestrator" in tl or "@ceo" in tl:
+        return "jarvis"
 
     for role in ("frontend", "backend", "qa", "sre"):
         marker = f"@{role}"
@@ -143,6 +167,29 @@ def detect_request_type(text_l: str) -> str:
         )
     ):
         return "status"
+    # Queries (CEO questions) that should not auto-delegate.
+    if any(
+        k in t
+        for k in (
+            "quien soy",
+            "quién soy",
+            "who am i",
+            "cuantos empleados",
+            "cuántos empleados",
+            "cuantos trabajadores",
+            "equipo tenemos",
+            "a quien tenemos en el equipo",
+            "qué modelos",
+            "que modelos",
+            "modelo usan",
+            "modelos usan",
+            "que es sre",
+            "qué es sre",
+        )
+    ):
+        return "query"
+    if "?" in t and not any(k in t for k in ("haz ", "implement", "crea ", "arregla", "build", "deploy", "refactor", "agrega ")):
+        return "query"
     if "revis" in t or "review" in t:
         return "review"
     if "mantenimiento" in t or "cron" in t or "monitor" in t:
@@ -157,7 +204,7 @@ def choose_model_by_role(role: str, model_override: str | None = None, default_m
 
 
 def choose_effort_by_role(role: str) -> str:
-    return {"orchestrator": "high", "qa": "high", "sre": "high"}.get(role, "medium")
+    return {"jarvis": "high", "qa": "high", "sre": "high"}.get(role, "medium")
 
 
 def choose_priority(text: str) -> int:
@@ -188,11 +235,11 @@ def to_task(
     explicit = _explicit_role((text or "").lower())
     role = explicit or normalized_context.get("role") or detect_role(text, default_role=default_role)
 
-    # Legacy alias: if callers still pass role=ceo, normalize.
-    if role == "ceo":
-        role = "orchestrator"
+    # Legacy aliases: if callers still pass role=ceo/orchestrator, normalize.
+    if role in ("ceo", "orchestrator"):
+        role = "jarvis"
 
-    if role not in ("orchestrator", "frontend", "backend", "qa", "sre"):
+    if role not in ("jarvis", "frontend", "backend", "qa", "sre"):
         role = "backend"
 
     request_type = detect_request_type(text)

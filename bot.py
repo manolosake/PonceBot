@@ -557,7 +557,7 @@ class BotConfig:
     orchestrator_enabled: bool = True
     orchestrator_default_priority: int = 2
     orchestrator_default_max_cost_window_usd: float = 8.0
-    orchestrator_default_role: str = "orchestrator"
+    orchestrator_default_role: str = "jarvis"
     orchestrator_daily_digest_seconds: int = 6 * 60 * 60
     orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
     orchestrator_worker_count: int = 3
@@ -2988,13 +2988,14 @@ def _orch_job_id(raw: str) -> str:
     return (raw or "").strip()
 
 
-_ORCHESTRATOR_ROLES = ("orchestrator", "frontend", "backend", "qa", "sre")
+_ORCHESTRATOR_ROLES = ("jarvis", "frontend", "backend", "qa", "sre")
 
 
 def _coerce_orchestrator_role(value: str) -> str:
     role = (value or "").strip().lower()
-    if role == "ceo":
-        return "orchestrator"
+    # Legacy aliases.
+    if role in ("ceo", "orchestrator"):
+        return "jarvis"
     return role if role in _ORCHESTRATOR_ROLES else "backend"
 
 
@@ -3209,14 +3210,14 @@ def _send_orchestrator_marker_response(
     """
     if kind == "agents":
         if orch_q is None:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
         return True
 
     if kind == "dashboard":
         if orch_q is None:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not cfg.screenshot_enabled:
             api.send_message(chat_id, _orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
@@ -3333,7 +3334,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "job":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not payload:
             api.send_message(chat_id, "Uso: /job <id>", reply_to_message_id=reply_to_message_id)
@@ -3344,7 +3345,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "ticket":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not payload:
             api.send_message(chat_id, "Uso: /ticket <id>", reply_to_message_id=reply_to_message_id)
@@ -3359,7 +3360,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "inbox":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         role = (payload or "").strip().lower() or None
         if role is not None and role != "all" and not _orchestrator_role_is_valid(role, profiles or {}):
@@ -3376,7 +3377,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "runbooks":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(chat_id, "No permitido: necesitas permisos de gestor.", reply_to_message_id=reply_to_message_id)
@@ -3386,7 +3387,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "reset_role":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(chat_id, "No permitido: necesitas permisos de gestor.", reply_to_message_id=reply_to_message_id)
@@ -3409,7 +3410,7 @@ def _send_orchestrator_marker_response(
 
     if kind in ("daily", "brief"):
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         _send_chunked_text(
             api,
@@ -3421,7 +3422,7 @@ def _send_orchestrator_marker_response(
 
     if kind in ("pause", "resume"):
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(
@@ -3448,7 +3449,7 @@ def _send_orchestrator_marker_response(
 
     if kind in ("emergency_stop", "emergency_resume"):
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(
@@ -3472,7 +3473,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "approve":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(
@@ -3493,7 +3494,7 @@ def _send_orchestrator_marker_response(
 
     if kind == "cancel_job":
         if not orch_q:
-            api.send_message(chat_id, "Orchestrator disabled.", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
             api.send_message(
@@ -3522,7 +3523,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
 
     states = ("queued", "running", "blocked", "done", "failed", "cancelled")
     system_state = "paused" if orch_q.is_paused_globally() else "active"
-    lines = ["Orchestrator role health:", f"system: {system_state}", ""]
+    lines = ["Jarvis role health:", f"system: {system_state}", ""]
     for role in sorted(health.keys()):
         vals = health.get(role, {})
         state_parts = [f"{s}={int(vals.get(s, 0))}" for s in states if vals.get(s) is not None]
@@ -3554,7 +3555,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
 
 
 def _orchestrator_daily_digest_text(orch_q: OrchestratorQueue) -> str:
-    lines = ["Orchestrator digest", "=" * 19]
+    lines = ["Jarvis digest", "=" * 12]
     lines.append(_orchestrator_status_text(orch_q))
 
     running = orch_q.jobs_by_state(state="running", limit=8)
@@ -5910,13 +5911,14 @@ def orchestrator_worker_loop(
             except Exception:
                 LOG.exception("Failed to enqueue frontend snapshot evidence job. job=%s", task.job_id)
 
-            # Orchestrator delegation: when a top-level orchestrator ticket finishes, enqueue child jobs.
+            # Jarvis delegation: when a top-level Jarvis ticket finishes, enqueue child jobs.
             try:
                 if (
                     orch_state == "done"
-                    and _coerce_orchestrator_role(task.role) == "orchestrator"
+                    and _coerce_orchestrator_role(task.role) == "jarvis"
                     and not task.is_autonomous
                     and not task.parent_job_id
+                    and (task.request_type or "task") == "task"
                 ):
                     existing = orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=200)
                     existing_wrapup = any(str(c.labels.get("kind") or "") == "wrapup" for c in existing)
@@ -5981,7 +5983,7 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
                                 if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
-                                    lines = ["Orchestrator delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
+                                    lines = ["Jarvis delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
                                     for c in children[:12]:
                                         lines.append(
                                             f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}"
@@ -5992,7 +5994,7 @@ def orchestrator_worker_loop(
                                         reply_to_message_id=task.reply_to_message_id,
                                     )
 
-                    # Wrap-up: enqueue one orchestrator job that depends on all subtasks (terminal OK).
+                    # Wrap-up: enqueue one Jarvis job that depends on all subtasks (terminal OK).
                     wrapup_deps: list[str] = []
                     if existing_subtasks:
                         wrapup_deps.extend([c.job_id for c in existing_subtasks if c.job_id != task.job_id])
@@ -6000,20 +6002,20 @@ def orchestrator_worker_loop(
                         wrapup_deps = list(key_to_job.values())
                     wrapup_deps = [d for d in wrapup_deps if d and d != task.job_id]
                     if wrapup_deps and not existing_wrapup:
-                        orch_profile = _orchestrator_profile(profiles, "orchestrator")
+                        orch_profile = _orchestrator_profile(profiles, "jarvis")
                         orch_model = _orchestrator_model_for_profile(cfg, orch_profile)
                         orch_effort = _orchestrator_effort_for_profile(orch_profile, cfg)
                         wrap_id = str(uuid.uuid4())
                         wrap_trace: dict[str, str | int | float | bool | list[str]] = {
                             "source": "telegram",
                             "wrapup_for": task.job_id,
-                            "profile_name": str(orch_profile.get("name") or "orchestrator"),
-                            "profile_role": "orchestrator",
+                            "profile_name": str(orch_profile.get("name") or "jarvis"),
+                            "profile_role": "jarvis",
                             "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
                         }
                         wrap = Task.new(
                             source="telegram",
-                            role="orchestrator",
+                            role="jarvis",
                             input_text=f"Wrap up ticket {task.job_id}. Provide an executive summary and next actions.",
                             request_type="review",
                             priority=int(task.priority or 2),
@@ -7397,7 +7399,7 @@ def _load_config() -> BotConfig:
     orchestrator_default_max_cost_window_usd = float(os.environ.get("BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD", "8.0"))
     if orchestrator_default_max_cost_window_usd <= 0:
         orchestrator_default_max_cost_window_usd = 8.0
-    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "orchestrator").strip() or "orchestrator"
+    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "jarvis").strip() or "jarvis"
     orchestrator_daily_digest_seconds = int(
         os.environ.get("BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS", str(6 * 60 * 60))
     )
