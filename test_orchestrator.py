@@ -551,3 +551,49 @@ class TestRetryScheduling(unittest.TestCase):
             self.assertEqual(refreshed.state, "queued")
             self.assertEqual(refreshed.retry_count, 1)
             self.assertIsNotNone(refreshed.due_at)
+
+
+class TestSendOrchestratorResult(unittest.TestCase):
+    def test_skips_empty_artifact_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            empty = Path(td) / "empty.txt"
+            empty.write_text("", encoding="utf-8")
+
+            class API:
+                def __init__(self) -> None:
+                    self.docs: list[Path] = []
+                    self.photos: list[Path] = []
+                    self.messages: list[str] = []
+
+                def send_message(self, _chat_id: int, text: str, *, reply_to_message_id: int | None = None) -> None:
+                    self.messages.append(text)
+
+                def send_document(self, _chat_id: int, path: Path, *, filename: str, reply_to_message_id: int | None = None) -> None:
+                    self.docs.append(path)
+
+                def send_photo(self, _chat_id: int, path: Path, *, caption: str, reply_to_message_id: int | None = None) -> None:
+                    self.photos.append(path)
+
+            api = API()
+            task = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="x",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+            )
+            bot._send_orchestrator_result(  # type: ignore[arg-type]
+                api,  # type: ignore[arg-type]
+                task,
+                {"status": "ok", "summary": "done", "artifacts": [str(empty)]},
+            )
+            self.assertGreaterEqual(len(api.messages), 1)
+            self.assertEqual(api.docs, [])
+            self.assertEqual(api.photos, [])

@@ -5200,41 +5200,60 @@ def _send_orchestrator_result(
     task: Task,
     result: Any,
 ) -> None:
-    status = str(getattr(result, "status", "error"))
-    summary = str(getattr(result, "summary", "")).strip() or "(no summary)"
-    logs = str(getattr(result, "logs", ""))
-    next_action = getattr(result, "next_action", None)
-    artifacts = list(getattr(result, "artifacts", []) or [])
+    try:
+        status = str(getattr(result, "status", "error"))
+        summary = str(getattr(result, "summary", "")).strip() or "(no summary)"
+        logs = str(getattr(result, "logs", ""))
+        next_action = getattr(result, "next_action", None)
+        artifacts = list(getattr(result, "artifacts", []) or [])
 
-    header = f"Orchestrator task={task.job_id[:8]} role={task.role} status={status}"
-    payload = [header, summary]
-    if next_action:
-        payload.append(f"next_action={next_action}")
-    msg = "\n".join(payload)
-    msg_chunks = _chunk_text(msg, limit=TELEGRAM_MSG_LIMIT - 64)
-    for idx, ch in enumerate(msg_chunks, start=1):
-        text = ch if len(msg_chunks) == 1 else f"[{idx}/{len(msg_chunks)}]\n{ch}"
-        api.send_message(task.chat_id, text, reply_to_message_id=task.reply_to_message_id)
-
-    if status != "ok" and logs:
-        log_chunks = _chunk_text(logs, limit=TELEGRAM_MSG_LIMIT - 64)
-        for idx, ch in enumerate(log_chunks, start=1):
-            prefix = f"log[{idx}/{len(log_chunks)}]\n"
-            api.send_message(task.chat_id, f"{prefix}{ch}", reply_to_message_id=task.reply_to_message_id)
-
-    for raw in artifacts[:3]:
-        p = Path(str(raw))
-        if not p.exists():
-            continue
-        ext = p.suffix.lower()
-        is_img = ext in (".png", ".jpg", ".jpeg", ".webp")
-        if is_img:
+        header = f"Orchestrator task={task.job_id[:8]} role={task.role} status={status}"
+        payload = [header, summary]
+        if next_action:
+            payload.append(f"next_action={next_action}")
+        msg = "\n".join(payload)
+        msg_chunks = _chunk_text(msg, limit=TELEGRAM_MSG_LIMIT - 64)
+        for idx, ch in enumerate(msg_chunks, start=1):
+            text = ch if len(msg_chunks) == 1 else f"[{idx}/{len(msg_chunks)}]\n{ch}"
             try:
-                api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
-                continue
+                api.send_message(task.chat_id, text, reply_to_message_id=task.reply_to_message_id)
             except Exception:
-                pass
-        api.send_document(task.chat_id, p, filename=p.name, reply_to_message_id=task.reply_to_message_id)
+                LOG.exception("Failed to send orchestrator message chunk. job=%s", task.job_id)
+
+        if status != "ok" and logs:
+            log_chunks = _chunk_text(logs, limit=TELEGRAM_MSG_LIMIT - 64)
+            for idx, ch in enumerate(log_chunks, start=1):
+                prefix = f"log[{idx}/{len(log_chunks)}]\n"
+                try:
+                    api.send_message(task.chat_id, f"{prefix}{ch}", reply_to_message_id=task.reply_to_message_id)
+                except Exception:
+                    LOG.exception("Failed to send orchestrator logs chunk. job=%s", task.job_id)
+
+        for raw in artifacts[:3]:
+            p = Path(str(raw))
+            try:
+                if not p.exists() or p.is_dir():
+                    continue
+                if p.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+
+            ext = p.suffix.lower()
+            is_img = ext in (".png", ".jpg", ".jpeg", ".webp")
+            if is_img:
+                try:
+                    api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
+                    continue
+                except Exception:
+                    LOG.exception("Failed to send orchestrator image artifact. job=%s file=%s", task.job_id, p)
+
+            try:
+                api.send_document(task.chat_id, p, filename=p.name, reply_to_message_id=task.reply_to_message_id)
+            except Exception:
+                LOG.exception("Failed to send orchestrator artifact. job=%s file=%s", task.job_id, p)
+    except Exception:
+        LOG.exception("Failed to send orchestrator result. job=%s", task.job_id)
 
 
 def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) -> str:
