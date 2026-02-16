@@ -40,6 +40,7 @@ Nota (auth opcional):
 - `/thread` (muestra el `thread_id` actual de Codex para ese chat)
 - `/snapshot <url|texto>` (solicita tarea `frontend` de captura visual)
 - `/agents` (backlog/estado por rol del orquestador)
+- `/dashboard` (snapshot visual del estado del orquestador; PNG)
 - `/job <id>` (ver detalle de un job)
 - `/ticket <id>` (ver arbol ticket -> subtareas)
 - `/inbox [role]` (ver queued/blocked/failed recientes)
@@ -57,6 +58,15 @@ Nota (auth opcional):
 - `/rw <prompt>`: sandbox workspace-write (puede editar archivos en `CODEX_WORKDIR`)
 - `/full <prompt>`: sandbox danger-full-access (sin sandbox; unsafe)
 - Passthrough a Codex: solo `/exec ...`, `/review ...`, `/codex ...` (otros slash commands muestran ayuda)
+
+### Orchestrator (Jarvis v1)
+
+- Notificaciones (Telegram):
+  - Default: `BOT_ORCHESTRATOR_NOTIFY_MODE=minimal` => menos spam: solo tickets top-level, wrap-ups y errores.
+  - `verbose` => manda todo (subtasks + logs + mensajes extra de orquestación).
+- IDs cortos: `/job`, `/ticket`, `/approve`, `/cancel` aceptan prefijo (ej. `a1b2c3d4`) si es único.
+- Evidencia visual (frontend):
+  - Si el agente crea `.codexbot_preview/preview.html` en el worktree, el bot genera `preview.png` y lo manda como artifact.
 
 ## Modo "sin limitaciones" (MUY PELIGROSO)
 
