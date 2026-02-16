@@ -4639,6 +4639,25 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
         lines.append(f"Order status: {str(order.get('status') or 'active')}")
     lines.append(f"Goal: {goal or '(empty)'}")
     lines.append(f"Progress: {progress}")
+
+    # Show the latest outcome for the ticket itself so the CEO doesn't have to open /job.
+    try:
+        head_trace = head.trace or {}
+        head_res = str(head_trace.get("result_summary") or "").strip()
+        if head_res:
+            first = (head_res.splitlines()[0] if head_res else "").strip()
+            if len(first) > 220:
+                first = first[:220] + "..."
+            label = "Result" if head.state in ("done", "failed", "cancelled", "blocked") else "Latest"
+            lines.append(f"{label}: {first}")
+        head_next = str(head_trace.get("result_next_action") or "").strip()
+        if head_next:
+            if len(head_next) > 140:
+                head_next = head_next[:140] + "..."
+            lines.append(f"Next: {head_next}")
+    except Exception:
+        pass
+
     if running:
         lines.append("Running:")
         for r in running:
@@ -8240,15 +8259,22 @@ def poll_loop(
                         "/cancel ",
                     )
 
-                    if raw in local_exact or any(raw.startswith(p) for p in local_prefixes):
+                    # CEO UX rule: plain text should still go through our parser so we can
+                    # handle greetings and keep orchestrator role profiles in control.
+                    if not raw.startswith("/"):
+                        response, job = _parse_job(cfg, incoming)
+                    elif raw in local_exact or any(raw.startswith(p) for p in local_prefixes):
                         response, job = _parse_job(cfg, incoming)
                     else:
+                        # Unknown slash commands are forwarded to Codex (strict-proxy behavior).
+                        # Keep legacy default out of the job when orchestrator is enabled so role
+                        # profiles decide the effective mode.
                         response, job = "", Job(
                             chat_id=chat_id,
                             reply_to_message_id=message_id,
                             user_text=raw,
                             argv=["exec", raw],
-                            mode_hint=cfg.codex_default_mode,
+                            mode_hint=("" if cfg.orchestrator_enabled else cfg.codex_default_mode),
                             epoch=0,
                             threaded=True,
                             image_paths=[],
