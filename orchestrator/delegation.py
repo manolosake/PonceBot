@@ -5,7 +5,7 @@ from typing import Any
 import json
 
 
-_ALLOWED_ROLES = ("ceo", "frontend", "backend", "qa", "sre")
+_ALLOWED_ROLES = ("orchestrator", "frontend", "backend", "qa", "sre")
 _ALLOWED_MODES = ("ro", "rw", "full")
 
 
@@ -20,12 +20,14 @@ class TaskSpec:
     requires_approval: bool = False
 
 
-def parse_ceo_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
-    """
-    Parse the CEO structured output into TaskSpec entries.
+def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
+    """Parse orchestrator structured output into TaskSpec entries.
 
-    Expects a dict with a 'subtasks' list. If a string is provided, attempts to parse JSON.
+    Expects a dict with a subtasks list. If a string is provided, attempts to parse JSON.
+
+    Back-compat: if the model emits role="ceo", it is treated as role="orchestrator".
     """
+
     if structured is None:
         return []
     payload: Any = structured
@@ -52,11 +54,15 @@ def parse_ceo_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec
         text = str(raw.get("text") or "").strip()
         if not key or not text:
             continue
+        if role == "ceo":
+            role = "orchestrator"
         if role not in _ALLOWED_ROLES:
             continue
+
         mode = str(raw.get("mode_hint") or "ro").strip().lower()
         if mode not in _ALLOWED_MODES:
             mode = "ro"
+
         try:
             priority = int(raw.get("priority") or 2)
         except Exception:
@@ -88,3 +94,6 @@ def parse_ceo_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec
         )
     return out
 
+
+# Backwards-compatible alias; do not document.
+parse_ceo_subtasks = parse_orchestrator_subtasks

@@ -1,6 +1,6 @@
-- role: ceo
-  name: CEO Orchestrator
-  system_prompt: Coordina tareas, prioriza trabajo y propone siguientes pasos.
+- role: orchestrator
+  name: Orchestrator (Chief of Staff)
+  system_prompt: Coordina tareas, prioriza trabajo y delega subtareas. El CEO humano es el usuario.
   model: gpt-5.2
   effort: high
   mode_hint: ro

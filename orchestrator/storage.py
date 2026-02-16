@@ -231,6 +231,7 @@ class SQLiteTaskStorage:
 
             # Backward-compatible migration for older DBs that may exist in the field.
             self._migrate_jobs_table(conn)
+            self._migrate_roles(conn)
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state_due ON jobs(state, due_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_role_state_priority ON jobs(role, state, priority, created_at)")
@@ -240,6 +241,58 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_role ON agent_sessions(chat_id, role)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_leases_role ON workspace_leases(role, slot)")
             conn.commit()
+
+    def _migrate_roles(self, conn: sqlite3.Connection) -> None:
+        """
+        Idempotent migration for role renames.
+
+        Current supported rename:
+        - ceo -> orchestrator
+        """
+        try:
+            conn.execute("UPDATE jobs SET role = 'orchestrator' WHERE role = 'ceo'")
+        except Exception:
+            pass
+
+        # agent_sessions: avoid PK(chat_id, role) conflicts.
+        try:
+            conn.execute(
+                "DELETE FROM agent_sessions "
+                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM agent_sessions a2 WHERE a2.chat_id = agent_sessions.chat_id AND a2.role = 'orchestrator')"
+            )
+            conn.execute("UPDATE agent_sessions SET role = 'orchestrator' WHERE role = 'ceo'")
+        except Exception:
+            pass
+
+        # role_controls: avoid PK(role) conflicts.
+        try:
+            conn.execute(
+                "DELETE FROM role_controls "
+                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM role_controls r2 WHERE r2.role = 'orchestrator')"
+            )
+            conn.execute("UPDATE role_controls SET role = 'orchestrator' WHERE role = 'ceo'")
+        except Exception:
+            pass
+
+        # workspace_leases: avoid PK(role, slot) conflicts.
+        try:
+            conn.execute(
+                "DELETE FROM workspace_leases "
+                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM workspace_leases w2 WHERE w2.role = 'orchestrator' AND w2.slot = workspace_leases.slot)"
+            )
+            conn.execute("UPDATE workspace_leases SET role = 'orchestrator' WHERE role = 'ceo'")
+        except Exception:
+            pass
+
+        # cost caps: avoid PK(role) conflicts.
+        try:
+            conn.execute(
+                "DELETE FROM cost_caps "
+                "WHERE role='ceo' AND EXISTS(SELECT 1 FROM cost_caps c2 WHERE c2.role = 'orchestrator')"
+            )
+            conn.execute("UPDATE cost_caps SET role = 'orchestrator' WHERE role = 'ceo'")
+        except Exception:
+            pass
 
     def _migrate_jobs_table(self, conn: sqlite3.Connection) -> None:
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
@@ -459,13 +512,29 @@ class SQLiteTaskStorage:
                     return [] if max_rows > 1 else None
 
                 out: list[Task] = []
+                touched_due = False
                 for row in rows:
                     role_name = str(row["role"])
                     if self._is_role_paused(conn, role_name):
                         continue
 
                     deps = _coerce_json_list(row["depends_on"])
-                    if deps and not self._deps_satisfied(conn, deps):
+                    allow_terminal = False
+                    try:
+                        trace = Task.from_trace_json(row["trace"])
+                        allow_terminal = bool(trace.get("wrapup_for"))
+                    except Exception:
+                        allow_terminal = False
+                    if deps and not self._deps_satisfied(conn, deps, allow_terminal=allow_terminal):
+                        # Avoid "spin": push due_at forward a bit so other ready tasks can be scanned/claimed.
+                        try:
+                            conn.execute(
+                                "UPDATE jobs SET due_at = ?, updated_at = ? WHERE job_id = ? AND state = ?",
+                                (now + 10.0, time.time(), str(row["job_id"]), "queued"),
+                            )
+                            touched_due = True
+                        except Exception:
+                            pass
                         continue
 
                     running = self._count_jobs(conn, role=role_name, state="running")
@@ -488,6 +557,11 @@ class SQLiteTaskStorage:
                         break
 
                 if not out:
+                    if touched_due:
+                        try:
+                            conn.commit()
+                        except Exception:
+                            pass
                     return [] if max_rows > 1 else None
                 if max_rows == 1:
                     return out[0]
@@ -526,6 +600,60 @@ class SQLiteTaskStorage:
         if reason:
             metadata["requeue_reason"] = reason
         return self.update_state(str(job_id), "queued", **metadata)
+
+    def bump_retry(self, job_id: str, *, due_at: float, error: str | None = None) -> bool:
+        """
+        Schedule a retry by moving the job back to `queued` with a future `due_at` and incrementing retry_count.
+
+        This is used by worker code to implement retry/backoff without losing audit history.
+        """
+        jid = str(job_id).strip()
+        if not jid:
+            return False
+        try:
+            due = float(due_at)
+        except Exception:
+            due = time.time() + 30.0
+
+        err = (error or "").strip()
+        if len(err) > 4000:
+            err = err[:4000] + "..."
+
+        with self._lock:
+            with self._conn() as conn:
+                row = conn.execute("SELECT retry_count, max_retries, trace FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+                if row is None:
+                    return False
+                try:
+                    retries = int(row["retry_count"] or 0)
+                except Exception:
+                    retries = 0
+                try:
+                    max_retries = int(row["max_retries"] or 0)
+                except Exception:
+                    max_retries = 0
+                if max_retries <= 0:
+                    return False
+                retries = max(0, retries) + 1
+                if retries > max_retries:
+                    return False
+
+                trace = Task.from_trace_json(row["trace"])
+                trace["retry_scheduled_at"] = time.time()
+                trace["retry_due_at"] = due
+                trace["retry_count"] = retries
+                if err:
+                    trace["last_error"] = err
+
+                cur = conn.execute(
+                    "UPDATE jobs SET state = ?, due_at = ?, retry_count = ?, updated_at = ?, trace = ? WHERE job_id = ?",
+                    ("queued", float(due), int(retries), time.time(), json.dumps(trace, ensure_ascii=False), jid),
+                )
+                if cur.rowcount:
+                    self._append_event(conn, jid, "retry_scheduled", {"retry_count": retries, "due_at": due})
+                    conn.commit()
+                    return True
+                return False
 
     def recover_stale_running(self) -> int:
         """
@@ -960,14 +1088,16 @@ class SQLiteTaskStorage:
                 roles.add(str(role))
         return sorted(roles)
 
-    def _deps_satisfied(self, conn: sqlite3.Connection, deps: list[str]) -> bool:
+    def _deps_satisfied(self, conn: sqlite3.Connection, deps: list[str], *, allow_terminal: bool = False) -> bool:
         deps = [str(d).strip() for d in (deps or []) if str(d).strip()]
         if not deps:
             return True
         placeholders = ",".join("?" for _ in deps)
+        states = ("done", "failed", "cancelled") if allow_terminal else ("done",)
+        state_placeholders = ",".join("?" for _ in states)
         row = conn.execute(
-            f"SELECT COUNT(1) as c FROM jobs WHERE job_id IN ({placeholders}) AND state = 'done'",
-            deps,
+            f"SELECT COUNT(1) as c FROM jobs WHERE job_id IN ({placeholders}) AND state IN ({state_placeholders})",
+            [*deps, *states],
         ).fetchone()
         try:
             return int(row["c"]) == len(deps) if row is not None else False

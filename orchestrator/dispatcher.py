@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-import time
 
 from .schemas.task import Task
 
 
 _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "ceo": (
+    # Orchestrator role (formerly "ceo"). This is the coordinator agent; the human is the CEO.
+    "orchestrator": (
         "status",
         "plan",
         "coordin",
@@ -19,6 +18,7 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "idea",
         "decid",
         "estrateg",
+        "orquest",
     ),
     "frontend": (
         "ui",
@@ -46,7 +46,6 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "error",
         "bug",
         "refactor",
-        "endpoint",
         "service",
     ),
     "qa": (
@@ -88,9 +87,15 @@ def _score_role(text_l: str, role: str) -> int:
 
 
 def _explicit_role(text_l: str) -> str | None:
-    for role in ("ceo", "frontend", "backend", "qa", "sre"):
+    tl = (text_l or "").lower()
+
+    # Explicit orchestrator markers (support legacy @ceo alias).
+    if "@orchestrator" in tl or "@ceo" in tl:
+        return "orchestrator"
+
+    for role in ("frontend", "backend", "qa", "sre"):
         marker = f"@{role}"
-        if marker in text_l:
+        if marker in tl:
             return role
     return None
 
@@ -126,14 +131,14 @@ def choose_model_by_role(role: str, model_override: str | None = None, default_m
 
 
 def choose_effort_by_role(role: str) -> str:
-    return {"ceo": "high", "qa": "high", "sre": "high"}.get(role, "medium")
+    return {"orchestrator": "high", "qa": "high", "sre": "high"}.get(role, "medium")
 
 
 def choose_priority(text: str) -> int:
     t = (text or "").lower()
-    if any(w in t for w in ("urgent", "urgente", "crítico", "crítico", "bloque", "bloqueo", "prod")):
+    if any(w in t for w in ("urgent", "urgente", "crítico", "bloque", "bloqueo", "prod")):
         return 1
-    if any(w in t for w in ("importante", "importante", "necesito", "review")):
+    if any(w in t for w in ("importante", "necesito", "review")):
         return 2
     return 2
 
@@ -156,7 +161,12 @@ def to_task(
     # Allow explicit @role markers to override any context-provided default.
     explicit = _explicit_role((text or "").lower())
     role = explicit or normalized_context.get("role") or detect_role(text, default_role=default_role)
-    if role not in ("ceo", "frontend", "backend", "qa", "sre"):
+
+    # Legacy alias: if callers still pass role=ceo, normalize.
+    if role == "ceo":
+        role = "orchestrator"
+
+    if role not in ("orchestrator", "frontend", "backend", "qa", "sre"):
         role = "backend"
 
     request_type = detect_request_type(text)

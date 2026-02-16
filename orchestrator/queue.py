@@ -37,6 +37,9 @@ class OrchestratorQueue:
     def update_state(self, job_id: str, state: str, **metadata: Any) -> bool:
         return self._storage.update_state(job_id=job_id, state=state, **metadata)
 
+    def bump_retry(self, job_id: str, *, due_at: float, error: str | None = None) -> bool:
+        return self._storage.bump_retry(job_id=job_id, due_at=due_at, error=error)
+
     def cancel(self, job_id: str) -> bool:
         return self._storage.cancel(job_id)
 
@@ -150,7 +153,7 @@ class OrchestratorQueue:
 
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
-            "ceo": 1,
+            "orchestrator": 1,
             "frontend": 2,
             "backend": 2,
             "qa": 2,

@@ -22,12 +22,11 @@
     - python -m unittest -q (si aplica)
     Reporta fallos y recomendaciones.
 
-- id: ceo_digest
-  role: ceo
+- id: orchestrator_digest
+  role: orchestrator
   interval_seconds: 21600
   mode_hint: ro
   priority: 3
   enabled: true
   prompt: |
     Genera un brief ejecutivo: estado del backlog, riesgos, y siguientes 3 acciones recomendadas.
-
