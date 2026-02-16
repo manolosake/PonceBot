@@ -210,6 +210,46 @@ def _is_greeting(text: str) -> bool:
     return False
 
 
+def _is_purge_queue_request(text: str) -> bool:
+    """
+    Detect "clear the queue" intents in natural language.
+
+    Grounded motivation: CEO control-plane actions should be deterministic and immediate
+    (no Codex, no delegation, no ticket spam).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+
+    t = re.sub(r"\s+", " ", raw.lower()).strip(" .,!¿?¡")
+    if not t:
+        return False
+
+    # Must reference the queue/backlog explicitly to avoid accidental triggers.
+    if not any(w in t for w in ("cola", "queue", "backlog")):
+        return False
+
+    # Require an action verb.
+    return any(
+        w in t
+        for w in (
+            "limpia",
+            "limpiar",
+            "vacia",
+            "vacía",
+            "vaciar",
+            "purga",
+            "purgar",
+            "borra",
+            "borrar",
+            "clear",
+            "purge",
+        )
+    )
+
+
 def _humanize_orchestrator_role(role: str) -> str:
     """Human-readable role label for bot responses."""
     r = (role or "").strip().lower()
@@ -2663,6 +2703,7 @@ def _help_text(cfg: BotConfig) -> str:
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
         "- /cancel <id>        Cancel orchestrator task by id",
+        "- /purge [chat|global]  Purge queued+blocked orchestrator jobs (keeps running)",
         "- /emergency_resume   Resume orchestrator after emergency stop",
         "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
         "- /new                Start a new Codex conversation thread for this chat",
@@ -2737,6 +2778,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("status", "Bot/model status"),
         ("s", "Alias for /status"),
         ("whoami", "Show your IDs"),
+        ("purge", "Clear queue (queued+blocked)"),
     ]
     if cfg.auth_enabled:
         cmds += [
@@ -2867,15 +2909,19 @@ def _maybe_handle_ceo_query(
                 except Exception:
                     pass
             running = orchestrator_queue.jobs_by_state(state="running", limit=5)
+            queued_samples = orchestrator_queue.peek(state="queued", limit=30)
+            blocked_samples = orchestrator_queue.peek(state="blocked", limit=30)
         except Exception:
             health = {}
             queued = 0
             running_n = 0
             blocked = 0
             running = []
+            queued_samples = []
+            blocked_samples = []
 
         lines: list[str] = []
-        lines.append("Jarvis: status")
+        lines.append("Jarvis: team status")
         lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
         if running:
             parts: list[str] = []
@@ -2886,6 +2932,36 @@ def _maybe_handle_ceo_query(
                     snippet = snippet[:70] + "..."
                 parts.append(f"{role_h}: {snippet}")
             lines.append("- running: " + " | ".join(parts))
+
+        def _sample_line(label: str, items: list[Task]) -> str | None:
+            by_role: dict[str, Task] = {}
+            for it in items:
+                r = str(it.role or "").strip().lower()
+                if not r or r in by_role:
+                    continue
+                by_role[r] = it
+                if len(by_role) >= 5:
+                    break
+            if not by_role:
+                return None
+            parts: list[str] = []
+            for r in sorted(by_role.keys()):
+                it = by_role[r]
+                role_h = _humanize_orchestrator_role(it.role)
+                snippet = (it.input_text or "").strip().replace("\n", " ")
+                if len(snippet) > 70:
+                    snippet = snippet[:70] + "..."
+                parts.append(f"{role_h}: {snippet}")
+            return f"- {label}: " + " | ".join(parts)
+
+        q_line = _sample_line("queued (examples)", queued_samples)
+        if q_line:
+            lines.append(q_line)
+        b_line = _sample_line("blocked (examples)", blocked_samples)
+        if b_line:
+            lines.append(b_line)
+
+        lines.append("Links: /agents  /dashboard")
         api.send_message(
             msg.chat_id,
             "\n".join(lines),
@@ -3549,6 +3625,10 @@ def _orchestrator_task_from_job(
         priority = 2
     if priority < 1:
         priority = 1
+    # CEO preemption: for manual top-level work requests, default to priority=1 so it
+    # doesn't sit behind an old backlog.
+    if not (user_text or "").lstrip().startswith("/") and str(pre.request_type or "task") == "task":
+        priority = 1
 
     context = {
         "source": "telegram",
@@ -4104,6 +4184,65 @@ def _send_orchestrator_marker_response(
         api.send_message(chat_id, f"No existe o ya finalizado: {payload}", reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind == "purge_queue":
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para purgar la cola.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        scope = (payload or "").strip().lower()
+        target_chat_id: int | None = None
+        if scope in ("chat", "here", "aqui", "aquí", "this"):
+            target_chat_id = int(chat_id)
+        cancelled = orch_q.cancel_by_states(
+            states=("queued", "blocked"),
+            reason="purge_queue",
+            chat_id=target_chat_id,
+        )
+        try:
+            health = orch_q.get_role_health()
+            queued = int(orch_q.get_queued_count())
+            running_n = int(orch_q.get_running_count())
+            blocked = 0
+            for rec in (health or {}).values():
+                try:
+                    blocked += int((rec or {}).get("blocked", 0))
+                except Exception:
+                    pass
+            running = orch_q.jobs_by_state(state="running", limit=5)
+        except Exception:
+            queued = 0
+            running_n = 0
+            blocked = 0
+            running = []
+
+        lines: list[str] = []
+        lines.append("Jarvis: queue purged")
+        if target_chat_id is None:
+            lines.append(f"- scope: global")
+        else:
+            lines.append(f"- scope: chat_id={target_chat_id}")
+        lines.append(f"- cancelled: {int(cancelled)} (queued+blocked)")
+        lines.append(f"- now: queued={queued} running={running_n} blocked={blocked}")
+        if running:
+            parts: list[str] = []
+            for r in running[:5]:
+                role_h = _humanize_orchestrator_role(r.role)
+                snippet = (r.input_text or "").strip().replace("\n", " ")
+                if len(snippet) > 70:
+                    snippet = snippet[:70] + "..."
+                parts.append(f"{role_h}: {snippet}")
+            lines.append("- running: " + " | ".join(parts))
+
+        api.send_message(chat_id, "\n".join(lines), reply_to_message_id=reply_to_message_id)
+        return True
+
     return False
 
 
@@ -4332,6 +4471,14 @@ def _autopilot_tick(
     if not orders:
         return 0
 
+    # Avoid growing backlog: if there is already a meaningful queue, do not enqueue new autopilot jobs.
+    # Autopilot should only "fill idle time", not compete with CEO-driven work.
+    try:
+        if int(orch_q.get_queued_count()) >= 10:
+            return 0
+    except Exception:
+        pass
+
     for o in orders:
         oid = str(o.get("order_id") or "").strip()
         if not oid:
@@ -4363,6 +4510,8 @@ def _autopilot_tick(
         except Exception:
             pr_i = 2
         pr_i = max(1, min(3, pr_i))
+        # Autopilot should always be lowest priority.
+        pr_i = 3
 
         ap_id = str(uuid.uuid4())
         trace: dict[str, Any] = {
@@ -4425,6 +4574,9 @@ def _autopilot_tick(
 
         orch_q.submit_task(t)
         created += 1
+        # Cap per tick to avoid spam / runaway job creation.
+        if created >= 1:
+            break
 
     return created
 
@@ -4760,6 +4912,10 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if not text.startswith("/") and _is_greeting(text):
         return "Jarvis: ¡Hola! Soy tu mano derecha ejecutiva. ¿En qué puedo ayudar?", None
 
+    # CEO control-plane: clear queue/backlog should be immediate and deterministic.
+    if not text.startswith("/") and _is_purge_queue_request(text):
+        return _orch_marker("purge_queue", "global"), None
+
     if text in ("/start", "/help"):
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
         eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
@@ -4786,6 +4942,17 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/cancel":
         return "__cancel__", None
+
+    if text == "/purge":
+        return _orch_marker("purge_queue", "global"), None
+
+    if text.startswith("/purge "):
+        scope = (text[len("/purge ") :] or "").strip().lower()
+        if scope in ("chat", "here", "aqui", "aquí", "this"):
+            return _orch_marker("purge_queue", "chat"), None
+        if scope in ("all", "global", "company"):
+            return _orch_marker("purge_queue", "global"), None
+        return "Usage: /purge [chat|global]", None
 
     if text == "/synccommands":
         return "__synccommands__", None
@@ -8230,6 +8397,7 @@ def poll_loop(
                         "/reset_role",
                         "/synccommands",
                         "/cancel",
+                        "/purge",
                         "/job",
                         "/botpermissions",
                         "/format",
@@ -8257,6 +8425,7 @@ def poll_loop(
                         "/pause ",
                         "/resume ",
                         "/cancel ",
+                        "/purge ",
                     )
 
                     # CEO UX rule: plain text should still go through our parser so we can

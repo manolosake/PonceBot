@@ -865,6 +865,61 @@ class SQLiteTaskStorage:
                 conn.commit()
                 return total
 
+    def cancel_by_states(
+        self,
+        *,
+        states: tuple[str, ...],
+        reason: str = "bulk_cancel",
+        chat_id: int | None = None,
+        exclude_job_ids: set[str] | None = None,
+    ) -> int:
+        """
+        Bulk cancel jobs by state (e.g. queued+blocked) without touching running tasks.
+
+        Grounded motivation: CEO UX needs an immediate "clear the queue" control plane.
+        """
+        st = tuple(str(s).strip().lower() for s in (states or ()) if str(s).strip())
+        if not st:
+            return 0
+        exclude = {str(j).strip() for j in (exclude_job_ids or set()) if str(j).strip()}
+
+        with self._lock:
+            with self._conn() as conn:
+                placeholders = ",".join("?" for _ in st)
+                where = [f"state IN ({placeholders})"]
+                params: list[Any] = [*st]
+                if chat_id is not None:
+                    where.append("chat_id = ?")
+                    params.append(int(chat_id))
+                rows = conn.execute(
+                    f"SELECT job_id, state, trace FROM jobs WHERE {' AND '.join(where)}",
+                    params,
+                ).fetchall()
+                if not rows:
+                    return 0
+
+                total = 0
+                now = time.time()
+                for row in rows:
+                    jid = str(row["job_id"])
+                    if jid in exclude:
+                        continue
+                    from_state = str(row["state"] or "").strip() or "unknown"
+                    trace = Task.from_trace_json(row["trace"])
+                    if not isinstance(trace, dict):
+                        trace = {}
+                    trace["cancel_reason"] = str(reason)
+                    updated = conn.execute(
+                        "UPDATE jobs SET state = ?, updated_at = ?, trace = ? WHERE job_id = ? AND state = ?",
+                        ("cancelled", now, json.dumps(trace, ensure_ascii=False), jid, from_state),
+                    )
+                    if updated.rowcount:
+                        self._append_event(conn, jid, "bulk_cancel", {"reason": reason, "from": from_state})
+                        total += 1
+
+                conn.commit()
+                return total
+
     def is_role_paused(self, role: str) -> bool:
         with self._conn() as conn:
             return self._is_role_paused(conn, str(role))

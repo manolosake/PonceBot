@@ -67,6 +67,16 @@ class OrchestratorQueue:
     def cancel_running_jobs(self) -> int:
         return self._storage.cancel_running_jobs()
 
+    def cancel_by_states(
+        self,
+        *,
+        states: tuple[str, ...],
+        reason: str = "bulk_cancel",
+        chat_id: int | None = None,
+        exclude_job_ids: set[str] | None = None,
+    ) -> int:
+        return self._storage.cancel_by_states(states=states, reason=reason, chat_id=chat_id, exclude_job_ids=exclude_job_ids)
+
     def set_job_approved(self, job_id: str, approved: bool = True) -> bool:
         return self._storage.set_job_approved(job_id, approved=approved)
 

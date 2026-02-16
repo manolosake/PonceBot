@@ -94,23 +94,31 @@ class TestOrchestratorCommands(unittest.TestCase):
             resp_cancel, _ = bot._parse_job(cfg, msg_cancel)
             self.assertEqual(resp_cancel, "__orch_cancel_job:8f9c")
 
-            msg_job_list = bot.IncomingMessage(5, 1, 2, 14, "u", "/job")
+            msg_purge = bot.IncomingMessage(5, 1, 2, 14, "u", "/purge")
+            resp_purge, _ = bot._parse_job(cfg, msg_purge)
+            self.assertEqual(resp_purge, "__orch_purge_queue:global")
+
+            msg_purge_nl = bot.IncomingMessage(6, 1, 2, 15, "u", "Vamos a limpiar la cola, que no haya tareas.")
+            resp_purge_nl, _ = bot._parse_job(cfg, msg_purge_nl)
+            self.assertEqual(resp_purge_nl, "__orch_purge_queue:global")
+
+            msg_job_list = bot.IncomingMessage(7, 1, 2, 16, "u", "/job")
             resp_job_list, _ = bot._parse_job(cfg, msg_job_list)
             self.assertEqual(resp_job_list, "__orch_job:list")
 
-            msg_job_show = bot.IncomingMessage(6, 1, 2, 15, "u", "/job show 8f9c")
+            msg_job_show = bot.IncomingMessage(8, 1, 2, 17, "u", "/job show 8f9c")
             resp_job_show, _ = bot._parse_job(cfg, msg_job_show)
             self.assertEqual(resp_job_show, "__orch_job:show 8f9c")
 
-            msg_job_del = bot.IncomingMessage(7, 1, 2, 16, "u", "/job del 8f9c")
+            msg_job_del = bot.IncomingMessage(9, 1, 2, 18, "u", "/job del 8f9c")
             resp_job_del, _ = bot._parse_job(cfg, msg_job_del)
             self.assertEqual(resp_job_del, "__orch_job:del 8f9c")
 
-            msg_brief = bot.IncomingMessage(5, 1, 2, 14, "u", "/brief")
+            msg_brief = bot.IncomingMessage(10, 1, 2, 19, "u", "/brief")
             resp_brief, _ = bot._parse_job(cfg, msg_brief)
             self.assertEqual(resp_brief, "__orch_brief__")
 
-            msg_snapshot = bot.IncomingMessage(6, 1, 2, 15, "u", "/snapshot https://example.com")
+            msg_snapshot = bot.IncomingMessage(11, 1, 2, 20, "u", "/snapshot https://example.com")
             resp_snapshot, job_snapshot = bot._parse_job(cfg, msg_snapshot)
             self.assertEqual(resp_snapshot, "")
             self.assertIsNotNone(job_snapshot)
@@ -131,6 +139,9 @@ class TestRequestTypeDetection(unittest.TestCase):
 
     def test_still_running_is_status(self) -> None:
         self.assertEqual(detect_request_type("estan trabajando?"), "status")
+
+    def test_what_is_the_team_doing_is_status(self) -> None:
+        self.assertEqual(detect_request_type("Que está haciendo el equipo?"), "status")
 
     def test_whats_pending_is_query(self) -> None:
         self.assertEqual(detect_request_type("que tienes pendiente jarvis?"), "query")
@@ -816,3 +827,46 @@ class TestCeoOrders(unittest.TestCase):
 
             bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
             self.assertFalse(bad)
+
+
+class TestBulkCancel(unittest.TestCase):
+    def test_cancel_by_states_keeps_running(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            t_queued = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="queued work",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+            )
+            t_blocked = t_queued.with_updates(job_id="b" * 36, state="blocked", input_text="blocked work")
+            t_running = t_queued.with_updates(job_id="c" * 36, state="running", input_text="running work")
+            t_done = t_queued.with_updates(job_id="d" * 36, state="done", input_text="done work")
+
+            st.submit_task(t_queued)
+            st.submit_task(t_blocked)
+            st.submit_task(t_running)
+            st.submit_task(t_done)
+
+            n = st.cancel_by_states(states=("queued", "blocked"), reason="test_purge")
+            self.assertEqual(n, 2)
+
+            got_q = st.get_job(t_queued.job_id)
+            got_b = st.get_job(t_blocked.job_id)
+            got_r = st.get_job(t_running.job_id)
+            got_d = st.get_job(t_done.job_id)
+            assert got_q is not None and got_b is not None and got_r is not None and got_d is not None
+            self.assertEqual(got_q.state, "cancelled")
+            self.assertEqual(got_b.state, "cancelled")
+            self.assertEqual(got_r.state, "running")
+            self.assertEqual(got_d.state, "done")
