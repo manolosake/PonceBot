@@ -8,6 +8,7 @@ from orchestrator.agents import load_agent_profiles
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runner import run_task
 from orchestrator.runbooks import load_runbooks
+from orchestrator.screenshot import validate_screenshot_url
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
@@ -371,3 +372,182 @@ class TestYamlLikeParsing(unittest.TestCase):
         rb = rbs[0]
         self.assertNotEqual(rb.prompt.strip(), "|")
         self.assertIn("Revisa", rb.prompt)
+
+
+class TestScreenshotUrlValidation(unittest.TestCase):
+    def test_blocks_non_http_schemes(self) -> None:
+        chk = validate_screenshot_url("file:///etc/passwd")
+        self.assertFalse(chk.ok)
+        self.assertFalse(chk.overrideable)
+        self.assertIn("blocked scheme", chk.reason)
+
+    def test_blocks_private_ip_by_default_and_allows_with_override(self) -> None:
+        chk = validate_screenshot_url("http://127.0.0.1")
+        self.assertFalse(chk.ok)
+        self.assertTrue(chk.overrideable)
+        chk2 = validate_screenshot_url("http://127.0.0.1", allow_private=True)
+        self.assertTrue(chk2.ok)
+
+    def test_blocks_hostname_resolving_private(self) -> None:
+        def _resolver(_host: str, _port: int) -> list[object]:
+            # Minimal getaddrinfo-like shape: tuple with [4][0] as ip string.
+            return [(None, None, None, None, ("127.0.0.1", 80))]
+
+        chk = validate_screenshot_url("https://example.test", resolver=_resolver)
+        self.assertFalse(chk.ok)
+        self.assertTrue(chk.overrideable)
+        self.assertIn("blocked ip", chk.reason)
+
+    def test_allowlist_requires_exact_host_unless_approved(self) -> None:
+        chk = validate_screenshot_url("https://notexample.com", allowed_hosts={"example.com"})
+        self.assertFalse(chk.ok)
+        self.assertTrue(chk.overrideable)
+        def _resolver(_host: str, _port: int) -> list[object]:
+            return [(None, None, None, None, ("93.184.216.34", 443))]
+
+        chk2 = validate_screenshot_url(
+            "https://notexample.com",
+            allowed_hosts={"example.com"},
+            allow_private=True,
+            resolver=_resolver,
+        )
+        self.assertTrue(chk2.ok)
+
+
+class TestOrchestratorDependencyGating(unittest.TestCase):
+    def test_wrapup_allows_terminal_dependency_states(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep_failed = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep failed",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="failed",
+                )
+            )
+            dep_cancel = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep cancelled",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="cancelled",
+                )
+            )
+            wrap = Task.new(
+                source="telegram",
+                role="orchestrator",
+                input_text="wrap up",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep_failed, dep_cancel],
+                trace={"wrapup_for": "ticket123"},
+            )
+            wrap_id = q.submit_task(wrap)
+            taken = q.take_next()
+            self.assertIsNotNone(taken)
+            assert taken is not None
+            self.assertEqual(taken.job_id, wrap_id)
+
+    def test_non_wrapup_requires_done_dependencies_and_defers_due_at(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep queued",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                )
+            )
+            blocked = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="blocked by dep",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep],
+            )
+            jid = q.submit_task(blocked)
+            now = _time.time()
+            taken = q.take_next()
+            self.assertIsNone(taken)
+            refreshed = q.get_job(jid)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertIsNotNone(refreshed.due_at)
+            assert refreshed.due_at is not None
+            self.assertGreater(refreshed.due_at, now)
+
+
+class TestRetryScheduling(unittest.TestCase):
+    def test_bump_retry_moves_job_to_queued_and_increments_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            t = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="unstable",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                retry_count=0,
+                max_retries=2,
+            )
+            jid = q.submit_task(t)
+            due = _time.time() + 60.0
+            ok = q.bump_retry(jid, due_at=due, error="boom")
+            self.assertTrue(ok)
+            refreshed = q.get_job(jid)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "queued")
+            self.assertEqual(refreshed.retry_count, 1)
+            self.assertIsNotNone(refreshed.due_at)

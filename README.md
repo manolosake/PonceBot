@@ -169,12 +169,17 @@ Lo siguiente está implementado en este repo:
   - Se generan evidencias por job en `BOT_ARTIFACTS_ROOT/<job_id>/`:
     - `changes.patch` (git diff)
     - `git_status.txt`
-- Delegación CEO:
-  - Cuando un job `ceo` top-level termina, se parsea su JSON (`subtasks`) y se encolan child jobs con `parent_job_id=ticket_id`.
+- Delegación del Orchestrator:
+  - Cuando un job `orchestrator` top-level termina, se parsea su JSON (`subtasks`) y se encolan child jobs con `parent_job_id=ticket_id`.
+  - Se agenda un job adicional de `orchestrator` tipo "wrap-up" que depende de todas las subtareas y manda un brief final.
+- Persistencia de resultados (memoria operativa):
+  - Al finalizar un job, se guarda un resumen estructurado en `jobs.trace` (`result_summary`, `result_artifacts`, `result_duration_s`, etc).
+  - `/job <id>` y `/ticket <id>` muestran esos resultados sin depender solo del chat.
 - Voz usable (ACK rapido + transcripcion async):
   - Con `BOT_TRANSCRIBE_AUDIO=1` + `BOT_TRANSCRIBE_ASYNC=1`, el bot responde ACK rapido y transcribe en background.
 - Capturas reales (`/snapshot`):
   - Si `BOT_SCREENSHOT_ENABLED=1` y Playwright está instalado, `/snapshot <url>` captura `snapshot.png` y lo envia como artifact.
+  - Guardrails anti-SSRF: por defecto bloquea destinos privados/reservados y esquemas no-http(s). Para forzar un caso bloqueado: `/approve <job_id>`.
 - Runbooks (autonomia):
   - `orchestrator/runbooks.yaml` + scheduler cada 60s encola tareas autonomas si estan "DUE".
   - `/runbooks` muestra estado (last run y DUE).
@@ -189,7 +194,7 @@ Lo siguiente está implementado en este repo:
 ### 3) Fases y alcance inmediato (próximos pasos)
 
 - **Fase 1 — Entrega actual (v1 base):**
-  - Ticket CEO -> subtareas por rol (delegación) con estado por job.
+  - Ticket Orchestrator -> subtareas por rol (delegación) con estado por job.
   - Memoria por rol (Codex resume) y worktrees aislados.
   - Voz async con ACK, runbooks y snapshots (si se habilita).
 - **Fase 2 — Operación autónoma real (a completar):**
@@ -207,10 +212,15 @@ Lo siguiente está implementado en este repo:
 - `BOT_ORCHESTRATOR_DEFAULT_PRIORITY`
 - `BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD`
 - `BOT_ORCHESTRATOR_AGENT_PROFILES`
+- `BOT_SCREENSHOT_ENABLED`
+- `BOT_SCREENSHOT_ALLOWED_HOSTS`
+- `ENV_LOCAL_FILE` (ruta a secretos fuera del repo/workdir)
 
 ### 5) Puesta en marcha recomendada
 
-1. Copia secretos a `.env.local` (no se versiona): `OPENAI_API_KEY`, tokens, etc.
+1. Secretos fuera del repo/workdir:
+   - Recomendada: `~/.config/codexbot/secrets.env` (permiso `600`) con `TELEGRAM_BOT_TOKEN=...` (y opcional `OPENAI_API_KEY=...`).
+   - En `systemd --user` (unit `codexbot.service`): setea `Environment=ENV_LOCAL_FILE=%h/.config/codexbot/secrets.env`.
 2. Arranca y valida:
    - `./run.sh --check-env`
    - `./run.sh`

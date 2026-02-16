@@ -42,12 +42,12 @@ from typing import Any
 
 from orchestrator.agents import load_agent_profiles
 from orchestrator.dispatcher import to_task
-from orchestrator.delegation import parse_ceo_subtasks
+from orchestrator.delegation import parse_orchestrator_subtasks
 from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runbooks import Runbook, due as runbook_due, load_runbooks, to_task as runbook_to_task
 from orchestrator.schemas.task import Task
-from orchestrator.screenshot import Viewport, capture as capture_screenshot
+from orchestrator.screenshot import Viewport, capture as capture_screenshot, validate_screenshot_url
 from orchestrator.storage import SQLiteTaskStorage
 from orchestrator.scheduler import OrchestratorScheduler
 from orchestrator.runner import run_task as run_orchestrator_task
@@ -551,7 +551,7 @@ class BotConfig:
     orchestrator_enabled: bool = True
     orchestrator_default_priority: int = 2
     orchestrator_default_max_cost_window_usd: float = 8.0
-    orchestrator_default_role: str = "ceo"
+    orchestrator_default_role: str = "orchestrator"
     orchestrator_daily_digest_seconds: int = 6 * 60 * 60
     orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
     orchestrator_worker_count: int = 3
@@ -561,6 +561,7 @@ class BotConfig:
     runbooks_enabled: bool = True
     runbooks_path: Path = Path(__file__).with_name("orchestrator") / "runbooks.yaml"
     screenshot_enabled: bool = False
+    screenshot_allowed_hosts: frozenset[str] = frozenset()
     transcribe_async: bool = True
 
 
@@ -2959,11 +2960,13 @@ def _orch_job_id(raw: str) -> str:
     return (raw or "").strip()
 
 
-_ORCHESTRATOR_ROLES = ("ceo", "frontend", "backend", "qa", "sre")
+_ORCHESTRATOR_ROLES = ("orchestrator", "frontend", "backend", "qa", "sre")
 
 
 def _coerce_orchestrator_role(value: str) -> str:
     role = (value or "").strip().lower()
+    if role == "ceo":
+        return "orchestrator"
     return role if role in _ORCHESTRATOR_ROLES else "backend"
 
 
@@ -3382,6 +3385,31 @@ def _orchestrator_job_text(task: Task | None) -> str:
     updated = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.updated_at))
     due = "n/a" if task.due_at in (None, 0) else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(task.due_at))
 
+    trace = dict(task.trace or {})
+    result_status = str(trace.get("result_status") or "").strip()
+    result_summary = str(trace.get("result_summary") or "").strip()
+    if len(result_summary) > 1200:
+        result_summary = result_summary[:1200] + "..."
+    result_next_action = trace.get("result_next_action")
+    result_duration_s = trace.get("result_duration_s")
+    result_thread_id = str(trace.get("result_thread_id") or "").strip()
+    result_workspace_slot = trace.get("result_workspace_slot")
+    result_artifacts = trace.get("result_artifacts")
+    if not isinstance(result_artifacts, list):
+        result_artifacts = []
+    artifacts_preview = [str(x) for x in result_artifacts if str(x).strip()][:3]
+
+    # Avoid dumping large trace payloads (result_summary can be big); keep it compact.
+    for k in (
+        "result_summary",
+        "result_artifacts",
+        "result_next_action",
+        "result_duration_s",
+        "result_thread_id",
+        "result_workspace_slot",
+    ):
+        trace.pop(k, None)
+
     return "\n".join(
         [
             f"Job: {task.job_id}",
@@ -3397,9 +3425,18 @@ def _orchestrator_job_text(task: Task | None) -> str:
             f"created_at: {created}",
             f"updated_at: {updated}",
             f"due_at: {due}",
+            "",
+            "result:",
+            f"- status: {result_status or '(none)'}",
+            f"- duration_s: {result_duration_s if result_duration_s is not None else 'n/a'}",
+            f"- next_action: {result_next_action if result_next_action else 'n/a'}",
+            f"- thread_id: {result_thread_id if result_thread_id else 'n/a'}",
+            f"- workspace_slot: {result_workspace_slot if result_workspace_slot is not None else 'n/a'}",
+            f"- artifacts: {', '.join(artifacts_preview) if artifacts_preview else '(none)'}",
             "input_text:",
-            task.input_text[:1200],
-            f"trace: {task.trace}",
+            (task.input_text or "")[:900],
+            "",
+            f"trace: {trace}",
         ]
     )
 
@@ -3419,6 +3456,11 @@ def _orchestrator_ticket_text(orch_q: OrchestratorQueue, job_id: str) -> str:
         lines.append(f"state: {parent.state} role={parent.role} mode={parent.mode_hint}")
         summary = (parent.input_text or "").strip().replace("\n", " ")[:200]
         lines.append(f"text: {summary}")
+        parent_res = str((parent.trace or {}).get("result_summary") or "").strip().replace("\n", " ")
+        if parent_res:
+            if len(parent_res) > 260:
+                parent_res = parent_res[:260] + "..."
+            lines.append(f"result: {parent_res}")
     else:
         lines.append(f"id: {root} (missing parent row)")
 
@@ -3436,7 +3478,13 @@ def _orchestrator_ticket_text(orch_q: OrchestratorQueue, job_id: str) -> str:
     lines.append("")
     for c in children[:60]:
         snippet = (c.input_text or "").strip().replace("\n", " ")[:120]
-        lines.append(f"- {c.job_id[:8]} role={c.role} state={c.state} text={snippet}")
+        kind = str((c.labels or {}).get("kind") or "").strip()
+        tag = f"[{kind}] " if kind else ""
+        res = str((c.trace or {}).get("result_summary") or "").strip().replace("\n", " ")
+        if len(res) > 140:
+            res = res[:140] + "..."
+        res_part = f" result={res}" if res else ""
+        lines.append(f"- {c.job_id[:8]} {tag}role={c.role} state={c.state} text={snippet}{res_part}")
     if len(children) > 60:
         lines.append(f"- ... +{len(children) - 60} more")
     return "\n".join(lines)
@@ -4897,9 +4945,43 @@ def _orchestrator_run_codex(
                 "logs": "",
                 "next_action": "enable_screenshots",
             }
+        approved = bool(task.trace.get("approved", False))
+        check = validate_screenshot_url(
+            url,
+            allowed_hosts=cfg.screenshot_allowed_hosts,
+            allow_private=approved,
+        )
+        if not check.ok:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (snapshot blocked). job=%s role=%s", task.job_id, role)
+            if check.overrideable and not approved:
+                return {
+                    "status": "blocked",
+                    "summary": f"Snapshot blocked by guardrails: {check.reason}\nApprove with: /approve {task.job_id}",
+                    "artifacts": [],
+                    "logs": "",
+                    "next_action": "approve_screenshot",
+                }
+            return {
+                "status": "error",
+                "summary": f"Snapshot blocked: {check.reason}",
+                "artifacts": [],
+                "logs": "",
+                "next_action": None,
+            }
+        url = check.normalized_url
         out_png = artifacts_dir / "snapshot.png"
         try:
-            capture_screenshot(url, out_png, viewport=Viewport(width=1280, height=720))
+            capture_screenshot(
+                url,
+                out_png,
+                viewport=Viewport(width=1280, height=720),
+                allowed_hosts=cfg.screenshot_allowed_hosts,
+                allow_private=approved,
+            )
             image_paths.append(out_png)
         except Exception as e:
             try:
@@ -4914,6 +4996,25 @@ def _orchestrator_run_codex(
                 "logs": str(e),
                 "next_action": "install_playwright",
             }
+
+    # Wrap-up jobs: inject child results into the USER_REQUEST so the orchestrator can synthesize a final brief.
+    wrapup_for = str(task.trace.get("wrapup_for") or "").strip()
+    if wrapup_for and orch_q is not None:
+        try:
+            items = orch_q.jobs_by_parent(parent_job_id=wrapup_for, limit=200)
+            lines: list[str] = []
+            for it in items:
+                if it.job_id == task.job_id:
+                    continue
+                res_summary = str(it.trace.get("result_summary") or "").strip().replace("\n", " ")
+                if len(res_summary) > 260:
+                    res_summary = res_summary[:260] + "..."
+                lines.append(f"- {it.job_id[:8]} role={it.role} state={it.state} result={res_summary or '(no result)'}")
+            if lines:
+                extra = "SUBTASK_RESULTS:\n" + "\n".join(lines)
+                task = task.with_updates(input_text=(task.input_text or "").rstrip() + "\n\n" + extra)
+        except Exception:
+            LOG.exception("Failed to build wrap-up context. job=%s wrapup_for=%s", task.job_id, wrapup_for)
 
     prompt = build_agent_prompt(task, profile=profile)
 
@@ -4990,7 +5091,7 @@ def _orchestrator_run_codex(
 
         if canceled:
             return {
-                "status": "error",
+                "status": "cancelled",
                 "summary": "Task canceled by operator.",
                 "artifacts": [],
                 "logs": "",
@@ -5193,29 +5294,86 @@ def orchestrator_worker_loop(
             trace["profile"] = task.role
             task = task.with_updates(trace=trace)
         try:
+            started = time.time()
             orch_q.update_state(task.job_id, "running")
             result = run_orchestrator_task(task, executor=executor, cfg=cfg)
-            orch_state = str(result.status or "failed")
+
+            raw_status = str(getattr(result, "status", "") or "")
+            orch_state = raw_status or "failed"
             if orch_state not in {"ok", "blocked", "done", "failed", "cancelled"}:
                 orch_state = "failed"
             if orch_state == "ok":
                 orch_state = "done"
-            orch_q.update_state(task.job_id, orch_state)
+
+            # Persist a minimal structured result into trace so /job and /ticket have "memory".
+            summary = str(getattr(result, "summary", "") or "").strip()
+            if len(summary) > 4000:
+                summary = summary[:4000] + "..."
+            artifacts = list(getattr(result, "artifacts", []) or [])
+            artifacts = [str(a) for a in artifacts if str(a).strip()][:20]
+            next_action = getattr(result, "next_action", None)
+            if next_action is not None:
+                next_action = str(next_action).strip() or None
+
+            structured_digest: Any = getattr(result, "structured_digest", None)
+            if structured_digest is None and isinstance(result, dict):
+                structured_digest = result.get("structured_digest")
+
+            duration_s = max(0.0, float(time.time() - started))
+            result_meta: dict[str, Any] = {
+                "result_status": raw_status or orch_state,
+                "result_summary": summary,
+                "result_artifacts": artifacts,
+                "result_next_action": next_action,
+                "result_duration_s": duration_s,
+            }
+            if isinstance(structured_digest, dict):
+                tid = structured_digest.get("thread_id")
+                if isinstance(tid, str) and tid.strip():
+                    result_meta["result_thread_id"] = tid.strip()
+                slot = structured_digest.get("workspace_slot")
+                try:
+                    if slot is not None:
+                        result_meta["result_workspace_slot"] = int(slot)
+                except Exception:
+                    pass
+
+            # Retry/backoff: if task fails and retries remain, requeue with due_at.
+            if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
+                retry_n = int(task.retry_count or 0) + 1
+                base = 30.0
+                delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
+                due_at = time.time() + delay
+                err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
+                scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
+                if scheduled:
+                    api.send_message(
+                        task.chat_id,
+                        f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
+                        reply_to_message_id=task.reply_to_message_id,
+                    )
+                    continue
+
+            orch_q.update_state(task.job_id, orch_state, **result_meta)
             _send_orchestrator_result(api, task, result)
 
-            # CEO delegation: when a top-level CEO ticket finishes, enqueue child jobs from structured output.
+            # Orchestrator delegation: when a top-level orchestrator ticket finishes, enqueue child jobs.
             try:
                 if (
                     orch_state == "done"
-                    and _coerce_orchestrator_role(task.role) == "ceo"
+                    and _coerce_orchestrator_role(task.role) == "orchestrator"
                     and not task.is_autonomous
                     and not task.parent_job_id
                 ):
-                    if orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=1):
-                        # Avoid duplicate delegation on retries/restarts.
+                    existing = orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=200)
+                    existing_wrapup = any(str(c.labels.get("kind") or "") == "wrapup" for c in existing)
+                    existing_subtasks = [c for c in existing if str(c.labels.get("kind") or "") != "wrapup"]
+                    already_delegated = bool(existing_subtasks)
+
+                    if already_delegated:
                         specs = []
                     else:
-                        specs = parse_ceo_subtasks(getattr(result, "structured_digest", None))
+                        specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
@@ -5265,12 +5423,59 @@ def orchestrator_worker_loop(
                             children.append(child)
                         if children:
                             orch_q.submit_batch(children)
-                            lines = ["CEO delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
+                            lines = ["Orchestrator delegation:", f"ticket={task.job_id[:8]} subtasks={len(children)}"]
                             for c in children[:12]:
                                 lines.append(f"- {c.job_id[:8]} role={c.role} mode={c.mode_hint} deps={len(c.depends_on)}")
                             api.send_message(task.chat_id, "\n".join(lines), reply_to_message_id=task.reply_to_message_id)
+
+                    # Wrap-up: enqueue one orchestrator job that depends on all subtasks (terminal OK).
+                    wrapup_deps: list[str] = []
+                    if existing_subtasks:
+                        wrapup_deps.extend([c.job_id for c in existing_subtasks if c.job_id != task.job_id])
+                    if not already_delegated and specs:
+                        wrapup_deps = list(key_to_job.values())
+                    wrapup_deps = [d for d in wrapup_deps if d and d != task.job_id]
+                    if wrapup_deps and not existing_wrapup:
+                        orch_profile = _orchestrator_profile(profiles, "orchestrator")
+                        orch_model = _orchestrator_model_for_profile(cfg, orch_profile)
+                        orch_effort = _orchestrator_effort_for_profile(orch_profile, cfg)
+                        wrap_id = str(uuid.uuid4())
+                        wrap_trace: dict[str, str | int | float | bool | list[str]] = {
+                            "source": "telegram",
+                            "wrapup_for": task.job_id,
+                            "profile_name": str(orch_profile.get("name") or "orchestrator"),
+                            "profile_role": "orchestrator",
+                            "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
+                        }
+                        wrap = Task.new(
+                            source="telegram",
+                            role="orchestrator",
+                            input_text=f"Wrap up ticket {task.job_id}. Provide an executive summary and next actions.",
+                            request_type="review",
+                            priority=int(task.priority or 2),
+                            model=orch_model,
+                            effort=orch_effort,
+                            mode_hint="ro",
+                            requires_approval=False,
+                            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+                            chat_id=int(task.chat_id),
+                            user_id=task.user_id,
+                            reply_to_message_id=task.reply_to_message_id,
+                            parent_job_id=task.job_id,
+                            depends_on=wrapup_deps,
+                            labels={"ticket": task.job_id, "kind": "wrapup"},
+                            artifacts_dir=str((cfg.artifacts_root / wrap_id).resolve()),
+                            trace=wrap_trace,
+                            job_id=wrap_id,
+                        )
+                        orch_q.submit_task(wrap)
+                        api.send_message(
+                            task.chat_id,
+                            f"Wrap-up scheduled: {wrap.job_id[:8]} deps={len(wrap.depends_on)}",
+                            reply_to_message_id=task.reply_to_message_id,
+                        )
             except Exception:
-                LOG.exception("Failed to delegate CEO subtasks. job=%s", task.job_id)
+                LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
         except Exception as e:
             LOG.exception("Orchestrator worker failed for task=%s", task.job_id)
             try:
@@ -6622,7 +6827,7 @@ def _load_config() -> BotConfig:
     orchestrator_default_max_cost_window_usd = float(os.environ.get("BOT_ORCHESTRATOR_DEFAULT_MAX_COST_WINDOW_USD", "8.0"))
     if orchestrator_default_max_cost_window_usd <= 0:
         orchestrator_default_max_cost_window_usd = 8.0
-    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "ceo").strip() or "ceo"
+    orchestrator_default_role = os.environ.get("BOT_ORCHESTRATOR_DEFAULT_ROLE", "orchestrator").strip() or "orchestrator"
     orchestrator_daily_digest_seconds = int(
         os.environ.get("BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS", str(6 * 60 * 60))
     )
@@ -6659,6 +6864,10 @@ def _load_config() -> BotConfig:
         )
     ).expanduser().resolve()
     screenshot_enabled = os.environ.get("BOT_SCREENSHOT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    screenshot_allowed_hosts_raw = os.environ.get("BOT_SCREENSHOT_ALLOWED_HOSTS", "").strip()
+    screenshot_allowed_hosts = frozenset(
+        {h.strip().lower() for h in screenshot_allowed_hosts_raw.split(",") if h.strip()}
+    )
     transcribe_async = os.environ.get("BOT_TRANSCRIBE_ASYNC", "1").strip().lower() in ("1", "true", "yes", "on")
 
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
@@ -6734,6 +6943,7 @@ def _load_config() -> BotConfig:
         runbooks_enabled=runbooks_enabled,
         runbooks_path=runbooks_path,
         screenshot_enabled=screenshot_enabled,
+        screenshot_allowed_hosts=screenshot_allowed_hosts,
         transcribe_async=transcribe_async,
         codex_workdir=codex_workdir,
         codex_timeout_seconds=codex_timeout_seconds,
@@ -6881,6 +7091,26 @@ def main() -> None:
                         if not runbook_due(rb, last_run_at=last, now=now):
                             continue
                         t = runbook_to_task(rb, chat_id=int(notify_chat_id))
+                        # Apply role profile defaults so autonomous tasks behave like the same "agents".
+                        try:
+                            rb_role = _coerce_orchestrator_role(t.role)
+                            rb_profile = _orchestrator_profile(orchestrator_profiles, rb_role)
+                            rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
+                            rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
+                            rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (t.mode_hint == "full")
+                            rb_trace = dict(t.trace)
+                            rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
+                            rb_trace["profile_role"] = rb_role
+                            rb_trace["max_runtime_seconds"] = int(rb_profile.get("max_runtime_seconds") or 0)
+                            t = t.with_updates(
+                                role=rb_role,
+                                model=rb_model,
+                                effort=rb_effort,
+                                requires_approval=rb_requires_approval,
+                                trace=rb_trace,
+                            )
+                        except Exception:
+                            pass
                         if not (t.artifacts_dir or "").strip():
                             t = t.with_updates(artifacts_dir=str((cfg.artifacts_root / t.job_id).resolve()))
                         orchestrator_queue.submit_task(t)
