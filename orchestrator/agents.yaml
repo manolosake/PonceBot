@@ -17,7 +17,7 @@
     - Everything else should be visible via the ticket card (/ticket, /agents, /dashboard).
   model: gpt-5.2
   effort: high
-  mode_hint: ro
+  mode_hint: rw
   allowed_tools:
     - plan
     - delegate

@@ -167,6 +167,113 @@ def _normalize_slash_aliases(text: str) -> str:
     return text
 
 
+_GREETING_PREFIXES = (
+    "hola",
+    "buenos dias",
+    "buenos días",
+    "buenas tardes",
+    "buenas noches",
+    "buen dia",
+    "buenas",
+    "hey",
+    "hi",
+    "hello",
+    "hello,",
+    "hi,",
+    "hey,",
+    "hola,",
+)
+
+
+def _is_greeting(text: str) -> bool:
+    """
+    Identify short pleasantries that should be answered immediately.
+
+    This avoids enqueueing tiny greetings as full Jarvis tasks and avoids showing
+    only a ticket card for a plain "hola" message.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+
+    t = raw.lower()
+    # Keep it strict: short text or explicit greeting prefixes only.
+    compact = re.sub(r"\s+", " ", t).strip(" .,!¿?¡")
+    if not compact:
+        return False
+
+    if compact in _GREETING_PREFIXES:
+        return True
+    for pfx in _GREETING_PREFIXES:
+        if compact.startswith(f"{pfx} "):
+            return True
+    return False
+
+
+def _humanize_orchestrator_role(role: str) -> str:
+    """Human-readable role label for bot responses."""
+    r = (role or "").strip().lower()
+    if r == "jarvis":
+        return "Jarvis"
+    if r == "product_ops":
+        return "Product Ops"
+    if r == "release_mgr":
+        return "Release Manager"
+    return " ".join(part.capitalize() for part in re.split(r"[_-]", r) if part) or "Jarvis"
+
+
+def _parse_employee_forward(text: str) -> tuple[str | None, str]:
+    """
+    Optional "Empleado:" forwarded-message mode.
+
+    Supported formats (robust to extra ':' and newlines):
+    - "Empleado: Juan Perez\\n<message...>"
+    - "Empleado: Juan Perez: <message...>"
+    - "Empleado:\\nJuan Perez\\n<message...>"
+
+    Returns (employee_name_or_none, message_text).
+    If no employee forwarding is detected, returns (None, original_text).
+    """
+    raw = text if isinstance(text, str) else ""
+    if not raw:
+        return None, ""
+
+    # Only trigger on an explicit label to avoid breaking common "Riesgo: ..." style inputs.
+    stripped = raw.lstrip()
+    low = stripped.lower()
+    if not (low.startswith("empleado:") or low.startswith("employee:")):
+        return None, raw
+
+    # Split the first line as "Empleado: <rest...>".
+    first_line, _sep_nl, rest_lines = stripped.partition("\n")
+    _label, _sep_colon, after = first_line.partition(":")
+    after = after.strip()
+
+    # If the first line has no payload, treat the next non-empty line as the employee name.
+    if not after:
+        lines = rest_lines.splitlines()
+        name = ""
+        idx = 0
+        while idx < len(lines) and not lines[idx].strip():
+            idx += 1
+        if idx < len(lines):
+            name = lines[idx].strip()
+            msg = "\n".join(lines[idx + 1 :])
+        else:
+            msg = ""
+        return (name or None), msg
+
+    # If the first line contains an additional ":" then interpret it as "name: message".
+    name, c2, msg_inline = after.partition(":")
+    name = name.strip()
+    msg_inline = msg_inline.lstrip() if c2 else ""
+
+    msg = msg_inline
+    if rest_lines:
+        msg = (msg + ("\n" if msg else "") + rest_lines) if msg is not None else rest_lines
+    return (name or None), (msg or "")
+
+
 def _markdownish_to_telegram_html(text: str) -> str:
     """
     Convert a minimal, safe subset of markdown-ish text to Telegram HTML:
@@ -579,6 +686,10 @@ class BotConfig:
     transcribe_async: bool = True
     # Display/name used in prompts and documentation for the CEO user.
     ceo_name: str = "Alejandro Ponce"
+    # Optional extra guardrails for destructive bot actions (e.g. /job del).
+    # If empty, the bot falls back to profile-based permissions (when BOT_AUTH_ENABLED=1).
+    admin_user_ids: frozenset[int] = frozenset()
+    admin_chat_ids: frozenset[int] = frozenset()
 
 
 class TelegramAPI:
@@ -2710,6 +2821,7 @@ def _maybe_handle_ceo_query(
     cfg: BotConfig,
     msg: IncomingMessage,
     orchestrator_profiles: dict[str, dict[str, Any]] | None,
+    orchestrator_queue: OrchestratorQueue | None,
 ) -> bool:
     """
     Deterministic "CEO queries" that should not go to Codex and should not delegate.
@@ -2727,7 +2839,8 @@ def _maybe_handle_ceo_query(
     if "@" in t and any(m in t for m in ("@jarvis", "@frontend", "@backend", "@qa", "@sre", "@orchestrator", "@ceo")):
         return False
 
-    if detect_request_type(t) != "query":
+    req_type = detect_request_type(t)
+    if req_type not in ("query", "status"):
         return False
 
     # Helpers (best-effort; no secrets).
@@ -2739,16 +2852,115 @@ def _maybe_handle_ceo_query(
     else:
         display_user = "(no username)"
 
+    # Status requests: answer from the orchestrator directly (no Codex, no ticket).
+    if req_type == "status":
+        if orchestrator_queue is None:
+            return False
+        try:
+            health = orchestrator_queue.get_role_health()
+            queued = int(orchestrator_queue.get_queued_count())
+            running_n = int(orchestrator_queue.get_running_count())
+            blocked = 0
+            for rec in (health or {}).values():
+                try:
+                    blocked += int((rec or {}).get("blocked", 0))
+                except Exception:
+                    pass
+            running = orchestrator_queue.jobs_by_state(state="running", limit=5)
+        except Exception:
+            health = {}
+            queued = 0
+            running_n = 0
+            blocked = 0
+            running = []
+
+        lines: list[str] = []
+        lines.append("Jarvis: status")
+        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
+        if running:
+            parts: list[str] = []
+            for r in running[:5]:
+                role_h = _humanize_orchestrator_role(r.role)
+                snippet = (r.input_text or "").strip().replace("\n", " ")
+                if len(snippet) > 70:
+                    snippet = snippet[:70] + "..."
+                parts.append(f"{role_h}: {snippet}")
+            lines.append("- running: " + " | ".join(parts))
+        api.send_message(
+            msg.chat_id,
+            "\n".join(lines),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
     if any(k in t for k in ("who am i", "quien soy", "quién soy")):
         api.send_message(
             msg.chat_id,
             "\n".join(
                 [
-                    f"CEO: {cfg.ceo_name}",
-                    f"Telegram: user_id={msg.user_id} chat_id={msg.chat_id} username={display_user}",
-                    "Tip: /whoami shows raw ids.",
+                    f"Jarvis: CEO = {cfg.ceo_name}",
+                    f"Jarvis: Telegram user_id={msg.user_id} chat_id={msg.chat_id} username={display_user}",
                 ]
             ),
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+        )
+        return True
+
+    if any(
+        k in t
+        for k in (
+            "que tienes pendiente",
+            "qué tienes pendiente",
+            "pendientes",
+            "pending",
+            "backlog",
+            "que falta",
+            "qué falta",
+            "what's next",
+            "whats next",
+        )
+    ):
+        if orchestrator_queue is None:
+            api.send_message(
+                msg.chat_id,
+                "Jarvis: I can't read the orchestrator queue right now.",
+                reply_to_message_id=msg.message_id if msg.message_id else None,
+            )
+            return True
+        try:
+            active = orchestrator_queue.list_orders(chat_id=int(msg.chat_id), status="active", limit=6)
+            queued = int(orchestrator_queue.get_queued_count())
+            running_n = int(orchestrator_queue.get_running_count())
+            health = orchestrator_queue.get_role_health()
+            blocked = 0
+            for rec in (health or {}).values():
+                try:
+                    blocked += int((rec or {}).get("blocked", 0))
+                except Exception:
+                    pass
+        except Exception:
+            active = []
+            queued = 0
+            running_n = 0
+            blocked = 0
+
+        lines: list[str] = []
+        lines.append("Jarvis: pending")
+        if active:
+            parts: list[str] = []
+            for o in active[:6]:
+                oid = str(o.get("order_id") or "")[:8]
+                title = str(o.get("title") or "").strip()
+                if len(title) > 60:
+                    title = title[:60] + "..."
+                parts.append(f"{oid} {title}".strip())
+            lines.append("- active_orders: " + " | ".join(parts))
+        else:
+            lines.append("- active_orders: (none)")
+        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
+        api.send_message(
+            msg.chat_id,
+            "\n".join(lines),
             reply_to_message_id=msg.message_id if msg.message_id else None,
         )
         return True
@@ -2767,8 +2979,8 @@ def _maybe_handle_ceo_query(
             msg.chat_id,
             "\n".join(
                 [
-                    f"Employees (agents): {len(roles)}",
-                    "Roles: " + ", ".join(roles),
+                    f"Jarvis: employees (agents) = {len(roles)}",
+                    "Jarvis: roles = " + ", ".join(roles),
                 ]
             ),
             reply_to_message_id=msg.message_id if msg.message_id else None,
@@ -2792,7 +3004,7 @@ def _maybe_handle_ceo_query(
             lines.append(f"- {role}: model={model} effort={effort}")
         api.send_message(
             msg.chat_id,
-            "\n".join(lines[:40]),
+            "Jarvis: models by role\n" + "\n".join(lines[1:40]),
             reply_to_message_id=msg.message_id if msg.message_id else None,
         )
         return True
@@ -2802,9 +3014,8 @@ def _maybe_handle_ceo_query(
             msg.chat_id,
             "\n".join(
                 [
-                    "SRE = Site Reliability Engineering.",
-                    "- They keep services reliable: monitoring, incidents, deploy safety, performance, and uptime.",
-                    "- In this bot: SRE watches system health and alerts Jarvis when something is red.",
+                    "Jarvis: SRE = Site Reliability Engineering.",
+                    "Jarvis: They keep services reliable (monitoring, incidents, deploy safety, performance, uptime).",
                 ]
             ),
             reply_to_message_id=msg.message_id if msg.message_id else None,
@@ -2823,7 +3034,7 @@ def _maybe_handle_ceo_query(
             return True
         api.send_message(
             msg.chat_id,
-            "Team (roles): " + ", ".join(roles),
+            "Jarvis: team roles = " + ", ".join(roles),
             reply_to_message_id=msg.message_id if msg.message_id else None,
         )
         return True
@@ -3294,11 +3505,13 @@ def _orchestrator_task_from_job(
     profiles: dict[str, dict[str, Any]] | None,
     user_id: int | None = None,
 ) -> Task:
+    employee_name, user_text = _parse_employee_forward(job.user_text)
+
     # CEO UX rule (grounded): Jarvis is the single front door.
     # Only explicit @role markers can override the default role for top-level messages.
     base_role = _coerce_orchestrator_role(cfg.orchestrator_default_role)
     pre = to_task(
-        job.user_text,
+        user_text,
         context={
             "chat_id": job.chat_id,
             "default_role": base_role,
@@ -3324,6 +3537,8 @@ def _orchestrator_task_from_job(
         "profile_role": role,
         "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
     }
+    if employee_name:
+        trace["employee_name"] = employee_name
     if job.reply_to_message_id is not None:
         trace["reply_to_message_id"] = int(job.reply_to_message_id)
 
@@ -3355,7 +3570,7 @@ def _orchestrator_task_from_job(
     }
 
     # role can still be overridden by explicit @role markers in the input text (dispatcher handles that).
-    task = to_task(job.user_text, context=context)
+    task = to_task(user_text, context=context)
     if task.role not in _ORCHESTRATOR_ROLES:
         task = task.with_updates(role=role)
     task = task.with_updates(
@@ -3370,7 +3585,7 @@ def _orchestrator_task_from_job(
     )
     # Snapshot hint: allow bot-side screenshot capture for frontend tasks.
     try:
-        txt = (job.user_text or "").strip()
+        txt = (user_text or "").strip()
         prefix = "@frontend Solicitud de snapshot:"
         if txt.lower().startswith(prefix.lower()):
             url = txt[len(prefix) :].strip().split(None, 1)[0].strip().strip(_PUNCT_TRIM)
@@ -3412,6 +3627,24 @@ def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
         return True
     return _profile_can_manage_bot(cfg, profile_name=profile)
 
+def _can_delete_jobs(cfg: BotConfig, *, chat_id: int, user_id: int | None) -> bool:
+    """
+    Destructive actions (delete) should be stricter than "manage orchestrator".
+    Preference order:
+    1) If BOT_ADMIN_* allow-lists are configured, require a match.
+    2) Else, if BOT_AUTH_ENABLED=1, require profile permission.
+    3) Else, deny.
+    """
+    if cfg.admin_chat_ids or cfg.admin_user_ids:
+        if cfg.admin_chat_ids and int(chat_id) in cfg.admin_chat_ids:
+            return True
+        if cfg.admin_user_ids and user_id is not None and int(user_id) in cfg.admin_user_ids:
+            return True
+        return False
+    if cfg.auth_enabled:
+        return _can_manage_orchestrator(cfg, chat_id=chat_id)
+    return False
+
 
 def _send_chunked_text(
     api: "TelegramAPI",
@@ -3436,6 +3669,7 @@ def _send_orchestrator_marker_response(
     cfg: BotConfig,
     api: "TelegramAPI",
     chat_id: int,
+    user_id: int | None,
     reply_to_message_id: int | None,
     orch_q: OrchestratorQueue | None,
     profiles: dict[str, dict[str, Any]] | None = None,
@@ -3617,10 +3851,86 @@ def _send_orchestrator_marker_response(
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
-        if not payload:
-            api.send_message(chat_id, "Uso: /job <id>", reply_to_message_id=reply_to_message_id)
+        raw = (payload or "").strip()
+        if not raw or raw.lower() == "list":
+            items = orch_q.peek(limit=25)
+            if not items:
+                api.send_message(chat_id, "Jobs: empty.", reply_to_message_id=reply_to_message_id)
+                return True
+
+            def _title(t: Task) -> str:
+                s = (t.input_text or "").strip().replace("\n", " ")
+                if len(s) > 80:
+                    s = s[:80] + "..."
+                return s
+
+            def _owner(t: Task) -> str:
+                if t.owner and str(t.owner).strip():
+                    return str(t.owner).strip()
+                if bool(t.is_autonomous):
+                    return "scheduler"
+                if t.user_id is not None:
+                    return f"user:{int(t.user_id)}"
+                return f"chat:{int(t.chat_id)}"
+
+            lines = ["Jobs (latest 25)", "================", ""]
+            for t in items:
+                created = time.strftime("%Y-%m-%d %H:%M", time.localtime(t.created_at))
+                lines.append(f"- {t.job_id[:8]}  {t.state}  role={t.role} owner={_owner(t)}  {created}  {_title(t)}")
+            lines.append("")
+            lines.append("Use: /job show <id>  |  /job del <id>")
+            _send_chunked_text(api, chat_id=chat_id, text="\n".join(lines), reply_to_message_id=reply_to_message_id)
             return True
-        task = orch_q.get_job(payload)
+
+        try:
+            parts = shlex.split(raw)
+        except Exception:
+            parts = raw.split()
+        if not parts:
+            api.send_message(chat_id, "Uso: /job [list|show <id>|del <id>]", reply_to_message_id=reply_to_message_id)
+            return True
+
+        cmd = parts[0].strip().lower()
+        if cmd in ("show", "get"):
+            if len(parts) < 2 or not parts[1].strip():
+                api.send_message(chat_id, "Uso: /job show <id>", reply_to_message_id=reply_to_message_id)
+                return True
+            jid = parts[1].strip()
+            task = orch_q.get_job(jid)
+            _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
+            return True
+
+        if cmd in ("del", "delete", "rm"):
+            if len(parts) < 2 or not parts[1].strip():
+                api.send_message(chat_id, "Uso: /job del <id>", reply_to_message_id=reply_to_message_id)
+                return True
+            jid = parts[1].strip()
+            confirm = len(parts) >= 3 and parts[2].strip().lower() == "confirm"
+            if not confirm:
+                api.send_message(chat_id, f"Confirm delete:\n/job del {jid} confirm", reply_to_message_id=reply_to_message_id)
+                return True
+            if not _can_delete_jobs(cfg, chat_id=chat_id, user_id=user_id):
+                api.send_message(
+                    chat_id,
+                    "No permitido: delete requiere admin allowlist (BOT_ADMIN_USER_IDS/BOT_ADMIN_CHAT_IDS) o permisos via auth profile.",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            task = orch_q.get_job(jid)
+            if task is None:
+                api.send_message(chat_id, f"No existe job: {jid}", reply_to_message_id=reply_to_message_id)
+                return True
+            if str(task.state) == "running":
+                api.send_message(chat_id, f"No borro jobs en running. Usa: /cancel {task.job_id[:8]}", reply_to_message_id=reply_to_message_id)
+                return True
+            ok = orch_q.delete_job(jid)
+            msg_txt = f"Deleted: {task.job_id[:8]}" if ok else f"No pude borrar: {jid}"
+            api.send_message(chat_id, msg_txt, reply_to_message_id=reply_to_message_id)
+            return True
+
+        # Back-compat: /job <id>
+        jid = parts[0].strip()
+        task = orch_q.get_job(jid)
         _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_job_text(task), reply_to_message_id=reply_to_message_id)
         return True
 
@@ -4323,7 +4633,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
     running = [c for c in children if c.state == "running"][:5]
 
     lines: list[str] = [
-        f"Ticket {root_id[:8]}  state={head.state}  role={head.role}  created={created}",
+        f"Jarvis: ticket {root_id[:8]} ({head.state})  created={created}",
     ]
     if order:
         lines.append(f"Order status: {str(order.get('status') or 'active')}")
@@ -4337,7 +4647,8 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
             snippet = (r.input_text or "").strip().replace("\n", " ")
             if len(snippet) > 90:
                 snippet = snippet[:90] + "..."
-            lines.append(f"- {r.job_id[:8]} role={r.role} phase={phase} text={snippet}")
+            role_h = _humanize_orchestrator_role(r.role)
+            lines.append(f"- {role_h} ({phase}): {snippet}")
     lines.append(f"Links: /ticket {root_id[:8]}  /job {root_id[:8]}  /agents  /dashboard")
     return "\n".join(lines)
 
@@ -4425,6 +4736,11 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if not text:
         return "", None
 
+    # Friendly local handling for greetings: avoid creating a ticket card for
+    # tiny social messages.
+    if not text.startswith("/") and _is_greeting(text):
+        return "Jarvis: ¡Hola! Soy tu mano derecha ejecutiva. ¿En qué puedo ayudar?", None
+
     if text in ("/start", "/help"):
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
         eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
@@ -4510,13 +4826,36 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         return _orch_marker("order", payload), None
 
     if text.startswith("/job "):
-        job_id = _orch_job_id(text[len("/job ") :])
+        raw = text[len("/job ") :].strip()
+        if not raw:
+            return "Uso: /job [list|show <id>|del <id>]", None
+        try:
+            parts = shlex.split(raw)
+        except Exception:
+            parts = raw.split()
+        if not parts:
+            return "Uso: /job [list|show <id>|del <id>]", None
+        cmd = parts[0].strip().lower()
+        if cmd in ("list",):
+            return _orch_marker("job", "list"), None
+        if cmd in ("show", "get"):
+            if len(parts) < 2 or not parts[1].strip():
+                return "Uso: /job show <id>", None
+            return _orch_marker("job", f"show {parts[1].strip()}"), None
+        if cmd in ("del", "delete", "rm"):
+            if len(parts) < 2 or not parts[1].strip():
+                return "Uso: /job del <id>", None
+            tail = " ".join(parts[2:]).strip()
+            payload = f"del {parts[1].strip()}" + (f" {tail}" if tail else "")
+            return _orch_marker("job", payload), None
+        # Back-compat: /job <id>
+        job_id = _orch_job_id(raw)
         if not job_id:
-            return "Uso: /job <id>", None
+            return "Uso: /job [list|show <id>|del <id>]", None
         return _orch_marker("job", job_id), None
 
     if text == "/job":
-        return "Uso: /job <id>", None
+        return _orch_marker("job", "list"), None
 
     if text.startswith("/ticket "):
         job_id = _orch_job_id(text[len("/ticket ") :])
@@ -5823,14 +6162,14 @@ def _orchestrator_run_codex(
             running = []
         lines: list[str] = []
         if not running:
-            lines.append("Estado: no hay jobs corriendo ahora.")
+            lines.append("No hay jobs corriendo ahora.")
         else:
-            lines.append(f"Estado: running={len(running)}")
+            lines.append(f"Jobs corriendo: {len(running)}")
             for t in running[:6]:
                 phase = str((t.trace or {}).get("live_phase") or "").strip() or "running"
-                snippet = (t.input_text or "").strip().replace("\n", " ")[:90]
-                lines.append(f"- {t.job_id[:8]} role={t.role} phase={phase} text={snippet}")
-        lines.append("Tip: /agents (texto), /dashboard (PNG), /ticket <id> (árbol).")
+                snippet = (t.input_text or "").strip().replace("\n", " ")[:110]
+                role_h = _humanize_orchestrator_role(t.role)
+                lines.append(f"- {role_h} ({phase}): {snippet}")
         return {
             "status": "ok",
             "summary": "\n".join(lines),
@@ -6127,6 +6466,17 @@ def _orchestrator_run_codex(
             LOG.exception("Failed to build autopilot context. job=%s", task.job_id)
 
     prompt = build_agent_prompt(task, profile=profile)
+    try:
+        # Safe logging: lengths only (never log prompt contents).
+        LOG.debug(
+            "Built codex prompt. job=%s role=%s input_chars=%s prompt_chars=%s",
+            task.job_id[:8],
+            role,
+            len(task.input_text or ""),
+            len(prompt or ""),
+        )
+    except Exception:
+        pass
 
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
     runner = CodexRunner(eff_cfg, chat_id=task.chat_id)
@@ -6431,16 +6781,30 @@ def _send_orchestrator_result(
             if len(summary) > max_summary:
                 summary = summary[:max_summary] + "...\n(details: /job %s)" % task.job_id[:8]
 
-            header = f"job={task.job_id[:8]} role={task.role} status={status}"
-            payload = [header, summary]
+            role_name = _humanize_orchestrator_role(task.role)
+            summary_lines = (summary or "").splitlines() or ["(no summary)"]
+            summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
+            payload = list(summary_lines)
             if next_action:
-                payload.append(f"next_action={next_action}")
+                payload.append(f"Next: {next_action}")
+
+            # If there's no ticket card to click, provide /job for errors only.
+            try:
+                has_ticket_card = (
+                    (not (task.parent_job_id or "").strip())
+                    and bool(str((task.trace or {}).get("ticket_card_message_id") or "").strip())
+                )
+            except Exception:
+                has_ticket_card = False
+            if status != "ok" and (not has_ticket_card):
+                payload.append(f"Details: /job {task.job_id[:8]}")
+
+            # Wrap-ups: include a short pointer back to the ticket tree.
             if kind == "wrapup":
                 root = (task.parent_job_id or "").strip()
                 if root:
-                    payload.append(f"ticket=/ticket {root[:8]}")
-            elif not (task.parent_job_id or "").strip():
-                payload.append(f"track: /ticket {task.job_id[:8]} | /agents")
+                    payload.append(f"Ticket: /ticket {root[:8]}")
+
             msg = "\n".join(payload)
             _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
 
@@ -7567,12 +7931,14 @@ def poll_loop(
                     text=incoming_text,
                 )
                 LOG.debug(
-                    "Incoming update_id=%s chat_id=%s user_id=%s message_id=%s kind=%s",
+                    "Incoming update_id=%s chat_id=%s user_id=%s message_id=%s kind=%s text_chars=%s text_lines=%s",
                     update_id,
                     chat_id,
                     user_id,
                     message_id,
                     "text" if incoming_text.strip() else "media/empty",
+                    len(incoming_text or ""),
+                    (incoming_text or "").count("\n") + 1 if (incoming_text or "") else 0,
                 )
 
                 if not _is_authorized(cfg, incoming):
@@ -7613,6 +7979,7 @@ def poll_loop(
                         cfg=cfg,
                         msg=incoming,
                         orchestrator_profiles=orchestrator_profiles,
+                        orchestrator_queue=orchestrator_queue,
                     ):
                         continue
                 except Exception:
@@ -7900,6 +8267,7 @@ def poll_loop(
                             cfg=cfg,
                             api=api,
                             chat_id=chat_id,
+                            user_id=incoming.user_id if incoming else None,
                             reply_to_message_id=message_id if message_id else None,
                             orch_q=orchestrator_queue,
                             profiles=orchestrator_profiles,
@@ -8090,6 +8458,8 @@ def _load_config() -> BotConfig:
 
     allowed_chat_ids = _parse_int_set(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS"))
     allowed_user_ids = _parse_int_set(os.environ.get("TELEGRAM_ALLOWED_USER_IDS"))
+    admin_user_ids = frozenset(_parse_int_set(os.environ.get("BOT_ADMIN_USER_IDS")))
+    admin_chat_ids = frozenset(_parse_int_set(os.environ.get("BOT_ADMIN_CHAT_IDS")))
 
     unsafe_direct_codex = os.environ.get("BOT_UNSAFE_DIRECT_CODEX", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -8294,12 +8664,25 @@ def _load_config() -> BotConfig:
         transcribe_language=transcribe_language,
         transcribe_prompt=transcribe_prompt,
         transcribe_max_bytes=transcribe_max_bytes,
-        telegram_parse_mode=telegram_parse_mode,
         state_file=state_file,
         notify_chat_id=notify_chat_id,
         notify_on_start=notify_on_start,
-        orchestrator_enabled=orchestrator_enabled,
+        codex_workdir=codex_workdir,
+        codex_timeout_seconds=codex_timeout_seconds,
+        codex_use_oss=codex_use_oss,
+        codex_local_provider=codex_local_provider,
+        codex_oss_model=codex_oss_model,
+        codex_openai_model=codex_openai_model,
+        codex_default_mode=codex_default_mode,
+        codex_force_full_access=codex_force_full_access,
+        codex_dangerous_bypass_sandbox=codex_dangerous_bypass_sandbox,
+        telegram_parse_mode=telegram_parse_mode,
+        auth_enabled=auth_enabled,
+        auth_session_ttl_seconds=auth_session_ttl_seconds,
+        auth_users_file=auth_users_file,
+        auth_profiles_file=auth_profiles_file,
         orchestrator_db_path=orchestrator_db_path,
+        orchestrator_enabled=orchestrator_enabled,
         orchestrator_default_priority=orchestrator_default_priority,
         orchestrator_default_max_cost_window_usd=orchestrator_default_max_cost_window_usd,
         orchestrator_default_role=orchestrator_default_role,
@@ -8317,19 +8700,8 @@ def _load_config() -> BotConfig:
         screenshot_allowed_hosts=screenshot_allowed_hosts,
         transcribe_async=transcribe_async,
         ceo_name=ceo_name,
-        codex_workdir=codex_workdir,
-        codex_timeout_seconds=codex_timeout_seconds,
-        codex_use_oss=codex_use_oss,
-        codex_local_provider=codex_local_provider,
-        codex_oss_model=codex_oss_model,
-        codex_openai_model=codex_openai_model,
-        codex_default_mode=codex_default_mode,
-        codex_force_full_access=codex_force_full_access,
-        codex_dangerous_bypass_sandbox=codex_dangerous_bypass_sandbox,
-        auth_enabled=auth_enabled,
-        auth_session_ttl_seconds=auth_session_ttl_seconds,
-        auth_users_file=auth_users_file,
-        auth_profiles_file=auth_profiles_file,
+        admin_user_ids=admin_user_ids,
+        admin_chat_ids=admin_chat_ids,
     )
 
 

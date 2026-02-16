@@ -14,6 +14,7 @@ from orchestrator.screenshot import validate_screenshot_url
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
+from orchestrator.dispatcher import detect_request_type
 import threading
 import time as _time
 
@@ -68,6 +69,8 @@ def _cfg(state_file: Path, workdir: Path | None = None) -> bot.BotConfig:
         codex_default_mode="ro",
         codex_force_full_access=False,
         codex_dangerous_bypass_sandbox=False,
+        admin_user_ids=frozenset(),
+        admin_chat_ids=frozenset(),
     )
 
 
@@ -91,6 +94,18 @@ class TestOrchestratorCommands(unittest.TestCase):
             resp_cancel, _ = bot._parse_job(cfg, msg_cancel)
             self.assertEqual(resp_cancel, "__orch_cancel_job:8f9c")
 
+            msg_job_list = bot.IncomingMessage(5, 1, 2, 14, "u", "/job")
+            resp_job_list, _ = bot._parse_job(cfg, msg_job_list)
+            self.assertEqual(resp_job_list, "__orch_job:list")
+
+            msg_job_show = bot.IncomingMessage(6, 1, 2, 15, "u", "/job show 8f9c")
+            resp_job_show, _ = bot._parse_job(cfg, msg_job_show)
+            self.assertEqual(resp_job_show, "__orch_job:show 8f9c")
+
+            msg_job_del = bot.IncomingMessage(7, 1, 2, 16, "u", "/job del 8f9c")
+            resp_job_del, _ = bot._parse_job(cfg, msg_job_del)
+            self.assertEqual(resp_job_del, "__orch_job:del 8f9c")
+
             msg_brief = bot.IncomingMessage(5, 1, 2, 14, "u", "/brief")
             resp_brief, _ = bot._parse_job(cfg, msg_brief)
             self.assertEqual(resp_brief, "__orch_brief__")
@@ -102,6 +117,23 @@ class TestOrchestratorCommands(unittest.TestCase):
             assert job_snapshot is not None
             self.assertEqual(job_snapshot.mode_hint, "rw")
             self.assertIn("@frontend", job_snapshot.user_text)
+
+
+class TestRequestTypeDetection(unittest.TestCase):
+    def test_fix_status_string_is_a_task_not_status(self) -> None:
+        self.assertEqual(detect_request_type("corrige lo que dice job role status"), "task")
+
+    def test_plain_server_status_is_status(self) -> None:
+        self.assertEqual(detect_request_type("quiero saber el estado del servidor"), "status")
+
+    def test_multi_intent_with_action_wins_over_status(self) -> None:
+        self.assertEqual(detect_request_type("quiero saber el estado del servidor y agrega mas detalles"), "task")
+
+    def test_still_running_is_status(self) -> None:
+        self.assertEqual(detect_request_type("estan trabajando?"), "status")
+
+    def test_whats_pending_is_query(self) -> None:
+        self.assertEqual(detect_request_type("que tienes pendiente jarvis?"), "query")
 
 
 class TestDelegationParsing(unittest.TestCase):
@@ -146,6 +178,7 @@ class TestOrchestratorMarkerResponse(unittest.TestCase):
                 cfg=cfg,
                 api=api,  # type: ignore[arg-type]
                 chat_id=1,
+                user_id=2,
                 reply_to_message_id=None,
                 orch_q=q,
                 profiles={"backend": {"role": "backend"}},
@@ -237,6 +270,31 @@ class TestOrchestratorStorage(unittest.TestCase):
             t.join(timeout=1.0)
             self.assertFalse(t.is_alive(), "approve deadlocked")
             self.assertEqual(done, [True])
+
+    def test_delete_job_removes_row(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            job_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="deploy",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=8.0,
+                    chat_id=1,
+                    state="queued",
+                )
+            )
+            self.assertIsNotNone(q.get_job(job_id))
+            ok = q.delete_job(job_id[:8])
+            self.assertTrue(ok)
+            self.assertIsNone(q.get_job(job_id))
 
     def test_role_pause_resumes_and_blocks_queue(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -685,6 +743,50 @@ class TestSendOrchestratorResult(unittest.TestCase):
             self.assertGreaterEqual(len(api.messages), 1)
             self.assertEqual(api.docs, [])
             self.assertEqual(api.photos, [])
+
+    def test_summary_uses_humanized_role_header(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            class API:
+                def __init__(self) -> None:
+                    self.messages: list[str] = []
+
+                def send_message(self, _chat_id: int, text: str, *, reply_to_message_id: int | None = None) -> None:
+                    self.messages.append(text)
+
+                def send_document(self, _chat_id: int, path: Path, *, filename: str, reply_to_message_id: int | None = None) -> None:
+                    self.messages.append(f"doc:{filename}")
+
+                def send_photo(self, _chat_id: int, path: Path, *, caption: str, reply_to_message_id: int | None = None) -> None:
+                    self.messages.append(f"photo:{caption}")
+
+            api = API()
+            task = Task.new(
+                source="telegram",
+                role="jarvis",
+                input_text="hola",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="done",
+            )
+            cfg = _cfg(Path(td) / "state.json")
+            bot._send_orchestrator_result(  # type: ignore[arg-type]
+                api,  # type: ignore[arg-type]
+                task,
+                {"status": "ok", "summary": "Resumen de prueba", "artifacts": []},
+                cfg=cfg,
+            )
+            self.assertTrue(api.messages)
+            self.assertTrue(api.messages[0].startswith("Jarvis:"))
+            self.assertIn("Resumen de prueba", api.messages[0])
+            self.assertNotIn("job=", api.messages[0])
+            self.assertNotIn("role=", api.messages[0])
+            self.assertNotIn("status=", api.messages[0])
 
 
 class TestCeoOrders(unittest.TestCase):

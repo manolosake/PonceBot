@@ -66,6 +66,8 @@ class TestStateHandling(unittest.TestCase):
             codex_default_mode="ro",
             codex_force_full_access=False,
             codex_dangerous_bypass_sandbox=False,
+            admin_user_ids=frozenset(),
+            admin_chat_ids=frozenset(),
         )
 
     def test_setnotify_preserves_existing_state(self) -> None:
@@ -122,6 +124,14 @@ class TestParseJob(unittest.TestCase):
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/cancel")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "__cancel__")
+            self.assertIsNone(job)
+
+    def test_plain_greeting_is_direct_response(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Hola")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIn("Jarvis:", resp)
             self.assertIsNone(job)
 
 
@@ -219,6 +229,32 @@ class TestSkillsCommands(unittest.TestCase):
             self.assertIn("/model", resp)
 
 
+class TestPromptConstruction(unittest.TestCase):
+    def test_2000_chars_reach_codex_prompt_without_truncation(self) -> None:
+        # Include ':' and newlines to catch accidental split/regex truncation.
+        prefix = "Riesgo: A:B:C\nDetalle: "
+        text = prefix + ("x" * (2000 - len(prefix)))
+        self.assertEqual(len(text), 2000)
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text=text)
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "")
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(len(job.user_text), 2000)
+
+            task = bot._orchestrator_task_from_job(cfg, job, profiles=None, user_id=2)
+            prompt = bot.build_agent_prompt(task, profile={})
+            self.assertIn(text, prompt)
+
+    def test_parse_employee_forward_is_robust_to_newlines_and_extra_colons(self) -> None:
+        raw = "Empleado: Juan Perez: Primer: linea\nSegunda: linea\nFin"
+        name, msg = bot._parse_employee_forward(raw)
+        self.assertEqual(name, "Juan Perez")
+        self.assertEqual(msg, "Primer: linea\nSegunda: linea\nFin")
+
 class _FakeTelegramAPI:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, int | None]] = []
@@ -252,11 +288,17 @@ class TestCeoQueryFastPath(unittest.TestCase):
                 text="Hola, quien soy yo?",
             )
 
-            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles={"jarvis": {"model": "gpt-5.2"}})
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles={"jarvis": {"model": "gpt-5.2"}},
+                orchestrator_queue=None,
+            )
             self.assertTrue(handled)
             self.assertTrue(api.sent)
             _chat_id, text, _rt = api.sent[-1]
-            self.assertIn("CEO: Alejandro Ponce", text)
+            self.assertIn("Jarvis: CEO = Alejandro Ponce", text)
             self.assertIn("user_id=20", text)
             self.assertIn("chat_id=10", text)
 
@@ -273,10 +315,16 @@ class TestCeoQueryFastPath(unittest.TestCase):
                 text="How many agents do we have?",
             )
             profs = {"jarvis": {"model": "gpt-5.2"}, "backend": {"model": "gpt-5.2"}, "qa": {"model": "gpt-5.2"}}
-            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles=profs)
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles=profs,
+                orchestrator_queue=None,
+            )
             self.assertTrue(handled)
             _chat_id, text, _rt = api.sent[-1]
-            self.assertIn("Employees (agents): 3", text)
+            self.assertIn("Jarvis: employees (agents) = 3", text)
             self.assertIn("jarvis", text)
 
     def test_queries_do_not_trigger_when_slash_command(self) -> None:
@@ -291,7 +339,13 @@ class TestCeoQueryFastPath(unittest.TestCase):
                 username=None,
                 text="/whoami",
             )
-            handled = bot._maybe_handle_ceo_query(api=api, cfg=cfg, msg=msg, orchestrator_profiles=None)
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles=None,
+                orchestrator_queue=None,
+            )
             self.assertFalse(handled)
             self.assertFalse(api.sent)
 

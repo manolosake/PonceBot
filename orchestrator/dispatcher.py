@@ -118,7 +118,18 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 _REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
 
-_TOKEN_RE = re.compile(r"[\\w]+", flags=re.UNICODE)
+_TOKEN_RE = re.compile(r"[\w]+", flags=re.UNICODE)
+_TASK_VERB_RE = re.compile(
+    # Conservative "do/change/build" intent. If present, treat as work even if the text contains
+    # words like "status"/"estado" (which otherwise cause false positives).
+    r"\b("
+    r"arregl\w*|corrig\w*|cambi\w*|modific\w*|ajust\w*|"
+    r"agreg\w*|anad\w*|añad\w*|quit\w*|elimin\w*|"
+    r"implement\w*|cre\w*|haz|hagan|"
+    r"fix\w*|remove\w*|add\w*|update\w*|format\w*|refactor\w*|improv\w*"
+    r")\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _score_role(text_l: str, role: str) -> int:
@@ -178,33 +189,66 @@ def detect_role(text: str, *, default_role: str = "backend") -> str:
 
 def detect_request_type(text_l: str) -> str:
     t = (text_l or "").lower()
-    if t.startswith("/status") or "estado" in t or "status" in t:
-        return "status"
-    # Natural-language status checks (Spanish + English).
-    if any(
-        k in t
-        for k in (
-            "estan trabajando",
-            "están trabajando",
-            "siguen trabajando",
-            "ya acabaron",
-            "ya terminaron",
-            "ya termino",
-            "ya terminó",
-            "en que van",
-            "en qué van",
-            "progreso",
-            "avance",
-            "que estan haciendo",
-            "qué están haciendo",
-            "que están haciendo",
-            "que hacen",
-            "qué hacen",
-            "still running",
-            "are you done",
-            "did you finish",
-        )
-    ):
+
+    def _looks_like_task() -> bool:
+        # "I want X changed" should be treated as work, not as a status/query fast-path.
+        if "quiero que " in t or "i want " in t:
+            return True
+        return _TASK_VERB_RE.search(t) is not None
+
+    def _looks_like_status() -> bool:
+        # Explicit command.
+        if t.startswith("/status"):
+            return True
+
+        # Natural-language status checks (Spanish + English).
+        if any(
+            k in t
+            for k in (
+                "estan trabajando",
+                "están trabajando",
+                "siguen trabajando",
+                "ya acabaron",
+                "ya terminaron",
+                "ya termino",
+                "ya terminó",
+                "en que van",
+                "en qué van",
+                "progreso",
+                "avance",
+                "que estan haciendo",
+                "qué están haciendo",
+                "que están haciendo",
+                "que hacen",
+                "qué hacen",
+                "still running",
+                "are you done",
+                "did you finish",
+            )
+        ):
+            return True
+
+        # Token-based: avoid substring false positives ("job role status", etc).
+        tokens = set(_TOKEN_RE.findall(t))
+        if "status" in tokens or "estado" in tokens:
+            # Status-like when it references the system/service/host.
+            if any(w in t for w in ("servidor", "server", "host", "service", "servicio", "bot")):
+                return True
+            # Also treat the bare "status"/"estado" as a status request.
+            bare = t.strip(" ?!.")
+            if bare in ("status", "estado"):
+                return True
+        return False
+
+    # IMPORTANT: task intent wins over status keywords.
+    if _looks_like_task():
+        if "revis" in t or "review" in t:
+            return "review"
+        if "mantenimiento" in t or "cron" in t or "monitor" in t:
+            return "maintenance"
+        return "task"
+
+    if _looks_like_status():
         return "status"
     # Queries (CEO questions) that should not auto-delegate.
     if any(
@@ -213,6 +257,12 @@ def detect_request_type(text_l: str) -> str:
             "quien soy",
             "quién soy",
             "who am i",
+            "que tienes pendiente",
+            "qué tienes pendiente",
+            "pendientes",
+            "backlog",
+            "what's pending",
+            "whats pending",
             "cuantos empleados",
             "cuántos empleados",
             "cuantos trabajadores",

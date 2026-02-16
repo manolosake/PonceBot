@@ -446,6 +446,25 @@ class SQLiteTaskStorage:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (resolved,)).fetchone()
             return self._row_to_task(row) if row is not None else None
 
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Delete a job (and its events) by full id or short prefix.
+
+        Note: job_events has ON DELETE CASCADE, so removing the job row removes its audit trail too.
+        """
+        with self._lock:
+            with self._conn() as conn:
+                resolved = self._resolve_job_id_in_conn(conn, str(job_id))
+                if not resolved:
+                    return False
+                cur = conn.execute("DELETE FROM jobs WHERE job_id = ?", (resolved,))
+                conn.commit()
+                try:
+                    return int(cur.rowcount or 0) > 0
+                except Exception:
+                    # Some sqlite3 builds may not populate rowcount reliably; treat as best-effort.
+                    return True
+
     def claim_next(
         self,
         *,

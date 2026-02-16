@@ -79,6 +79,9 @@ class OrchestratorQueue:
     def get_job(self, job_id: str) -> Task | None:
         return self._storage.get_job(job_id)
 
+    def delete_job(self, job_id: str) -> bool:
+        return self._storage.delete_job(job_id)
+
     def get_agent_thread(self, *, chat_id: int, role: str) -> str | None:
         return self._storage.get_agent_thread(chat_id=chat_id, role=role)
 
