@@ -58,6 +58,8 @@ from orchestrator.storage import SQLiteTaskStorage
 from orchestrator.scheduler import OrchestratorScheduler
 from orchestrator.runner import run_task as run_orchestrator_task
 from orchestrator.workspaces import WorktreeLease, collect_git_artifacts, ensure_worktree_pool, prepare_clean_workspace
+from orchestrator.status_service import StatusService
+from orchestrator.status_http import start_status_http_server
 
 try:
     import tomllib  # py3.11+
@@ -7223,6 +7225,18 @@ def orchestrator_worker_loop(
                             job_id=shot_id,
                         )
                         orch_q.submit_task(shot)
+                        try:
+                            orch_q.append_delegation_edge(
+                                root_ticket_id=root_ticket,
+                                from_job_id=task.job_id,
+                                to_job_id=shot.job_id,
+                                edge_type="evidence",
+                                to_role=shot.role,
+                                to_key=None,
+                                details={"snapshot_url": snap_url},
+                            )
+                        except Exception:
+                            pass
                         if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
                             api.send_message(
                                 task.chat_id,
@@ -7304,6 +7318,32 @@ def orchestrator_worker_loop(
                             children.append(child)
 
                         if children:
+                            # Persist delegation graph (delegated + depends_on edges).
+                            try:
+                                for c in children:
+                                    ckey = str((c.labels or {}).get("key") or "").strip() or None
+                                    orch_q.append_delegation_edge(
+                                        root_ticket_id=root_ticket,
+                                        from_job_id=task.job_id,
+                                        to_job_id=c.job_id,
+                                        edge_type="delegated",
+                                        to_role=c.role,
+                                        to_key=ckey,
+                                        details={"priority": int(c.priority or 2), "text": (c.input_text or "")[:400]},
+                                    )
+                                    for dep in (c.depends_on or []):
+                                        if dep:
+                                            orch_q.append_delegation_edge(
+                                                root_ticket_id=root_ticket,
+                                                from_job_id=c.job_id,
+                                                to_job_id=str(dep),
+                                                edge_type="depends_on",
+                                                to_role=None,
+                                                to_key=None,
+                                                details={},
+                                            )
+                            except Exception:
+                                pass
                             orch_q.submit_batch(children)
                             try:
                                 orch_q.update_trace(root_ticket, delegated_count=int(len(children)), live_at=time.time())
@@ -8982,6 +9022,64 @@ def main() -> None:
             orchestrator_queue = None
 
     if orchestrator_queue is not None:
+        # Optional localhost status API (snapshot + SSE stream). Disabled by default.
+        if os.environ.get("BOT_STATUS_HTTP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+            listen = os.environ.get("BOT_STATUS_HTTP_LISTEN", "127.0.0.1:8090").strip() or "127.0.0.1:8090"
+            host = "127.0.0.1"
+            port = 8090
+            if ":" in listen:
+                h, p = listen.rsplit(":", 1)
+                if h.strip():
+                    host = h.strip()
+                try:
+                    port = int(p.strip())
+                except Exception:
+                    port = 8090
+            else:
+                try:
+                    port = int(listen)
+                except Exception:
+                    port = 8090
+            try:
+                ttl_s = int(os.environ.get("BOT_STATUS_CACHE_TTL_SECONDS", "2"))
+            except Exception:
+                ttl_s = 2
+            try:
+                interval_s = float(os.environ.get("BOT_STATUS_STREAM_INTERVAL_SECONDS", "1.0"))
+            except Exception:
+                interval_s = 1.0
+
+            try:
+                svc = StatusService(orch_q=orchestrator_queue, role_profiles=orchestrator_profiles, cache_ttl_seconds=ttl_s)
+                auth_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
+                try:
+                    snap_rps = float(os.environ.get("BOT_STATUS_HTTP_SNAPSHOT_RPS", "2.0"))
+                except Exception:
+                    snap_rps = 2.0
+                try:
+                    snap_burst = float(os.environ.get("BOT_STATUS_HTTP_SNAPSHOT_BURST", "4.0"))
+                except Exception:
+                    snap_burst = 4.0
+                try:
+                    max_sse = int(os.environ.get("BOT_STATUS_HTTP_MAX_SSE_PER_IP", "2"))
+                except Exception:
+                    max_sse = 2
+                http_srv = start_status_http_server(
+                    host=host,
+                    port=port,
+                    status_service=svc,
+                    stream_interval_s=interval_s,
+                    auth_token=auth_token,
+                    snapshot_rate_per_s=snap_rps,
+                    snapshot_burst=snap_burst,
+                    max_sse_per_ip=max_sse,
+                )
+                th = threading.Thread(target=http_srv.serve_forever, daemon=True, name="status-http")
+                th.start()
+                LOG.info("Status HTTP API enabled on http://%s:%s (snapshot=/api/status/snapshot stream=/api/status/stream)", host, port)
+            except Exception:
+                LOG.exception("Failed to start status HTTP server")
+
         for i in range(max(1, cfg.orchestrator_worker_count)):
             t = threading.Thread(
                 target=orchestrator_worker_loop,

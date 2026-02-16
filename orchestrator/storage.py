@@ -242,6 +242,63 @@ class SQLiteTaskStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS status_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    updated_at REAL NOT NULL,
+                    ttl_seconds INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS decision_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    order_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    next_action TEXT,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(order_id, job_id, kind, state)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS delegation_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    root_ticket_id TEXT NOT NULL,
+                    from_job_id TEXT NOT NULL,
+                    to_job_id TEXT NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    to_role TEXT,
+                    to_key TEXT,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(root_ticket_id, from_job_id, to_job_id, edge_type)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worker_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    role TEXT NOT NULL,
+                    worker_slot INTEGER,
+                    worker_id TEXT,
+                    job_id TEXT,
+                    state TEXT,
+                    phase TEXT,
+                    details TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
 
             # Backward-compatible migration for older DBs that may exist in the field.
             self._migrate_jobs_table(conn)
@@ -255,6 +312,9 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_role ON agent_sessions(chat_id, role)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_leases_role ON workspace_leases(role, slot)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ceo_orders_chat_status ON ceo_orders(chat_id, status, priority, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_order_ts ON decision_log(order_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_log_root_ts ON delegation_log(root_ticket_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_activity_role_ts ON worker_activity(role, ts DESC)")
             conn.commit()
 
     def _migrate_roles(self, conn: sqlite3.Connection) -> None:
@@ -464,6 +524,278 @@ class SQLiteTaskStorage:
                 except Exception:
                     # Some sqlite3 builds may not populate rowcount reliably; treat as best-effort.
                     return True
+
+    def append_decision_log(
+        self,
+        *,
+        order_id: str,
+        job_id: str,
+        kind: str,
+        state: str,
+        summary: str,
+        next_action: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        oid = (order_id or "").strip()
+        jid = (job_id or "").strip()
+        if not oid or not jid:
+            return
+        k = (kind or "").strip() or "decision"
+        st = (state or "").strip() or "unknown"
+        sm = (summary or "").strip()
+        if len(sm) > 8000:
+            sm = sm[:8000] + "..."
+        na = (next_action or "").strip() or None
+        det = details or {}
+        now = time.time()
+        with self._lock:
+            with self._conn() as conn:
+                self._append_decision_log_in_conn(
+                    conn,
+                    ts=float(now),
+                    order_id=oid,
+                    job_id=jid,
+                    kind=k,
+                    state=st,
+                    summary=sm,
+                    next_action=na,
+                    details=det,
+                )
+                conn.commit()
+
+    def list_decision_log(self, *, order_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        oid = (order_id or "").strip()
+        if not oid:
+            return []
+        lim = max(1, min(500, int(limit)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, order_id, job_id, kind, state, summary, next_action, details FROM decision_log WHERE order_id = ? ORDER BY ts DESC LIMIT ?",
+                (oid, lim),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "ts": float(r["ts"]),
+                        "order_id": str(r["order_id"]),
+                        "job_id": str(r["job_id"]),
+                        "job_id_short": str(r["job_id"])[:8],
+                        "kind": str(r["kind"]),
+                        "state": str(r["state"]),
+                        "summary": str(r["summary"]),
+                        "next_action": (None if r["next_action"] is None else str(r["next_action"])),
+                        "details": _coerce_json_dict(r["details"]),
+                    }
+                )
+            return out
+
+    def append_delegation_edge(
+        self,
+        *,
+        root_ticket_id: str,
+        from_job_id: str,
+        to_job_id: str,
+        edge_type: str,
+        to_role: str | None = None,
+        to_key: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        root = (root_ticket_id or "").strip()
+        frm = (from_job_id or "").strip()
+        to = (to_job_id or "").strip()
+        et = (edge_type or "").strip() or "delegated"
+        if not root or not frm or not to:
+            return
+        now = time.time()
+        det = details or {}
+        with self._lock:
+            with self._conn() as conn:
+                self._append_delegation_edge_in_conn(
+                    conn,
+                    ts=float(now),
+                    root_ticket_id=root,
+                    from_job_id=frm,
+                    to_job_id=to,
+                    edge_type=et,
+                    to_role=to_role,
+                    to_key=to_key,
+                    details=det,
+                )
+                conn.commit()
+
+    def list_delegation_log(self, *, root_ticket_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        root = (root_ticket_id or "").strip()
+        if not root:
+            return []
+        lim = max(1, min(2000, int(limit)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, root_ticket_id, from_job_id, to_job_id, edge_type, to_role, to_key, details FROM delegation_log WHERE root_ticket_id = ? ORDER BY ts DESC LIMIT ?",
+                (root, lim),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "ts": float(r["ts"]),
+                        "root_ticket_id": str(r["root_ticket_id"]),
+                        "from_job_id": str(r["from_job_id"]),
+                        "from_job_id_short": str(r["from_job_id"])[:8],
+                        "to_job_id": str(r["to_job_id"]),
+                        "to_job_id_short": str(r["to_job_id"])[:8],
+                        "edge_type": str(r["edge_type"]),
+                        "to_role": (None if r["to_role"] is None else str(r["to_role"])),
+                        "to_key": (None if r["to_key"] is None else str(r["to_key"])),
+                        "details": _coerce_json_dict(r["details"]),
+                    }
+                )
+            return out
+
+    def append_worker_activity(
+        self,
+        *,
+        ts: float | None = None,
+        role: str,
+        worker_slot: int | None,
+        worker_id: str | None,
+        job_id: str | None,
+        state: str | None,
+        phase: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        r = (role or "").strip().lower()
+        if not r:
+            return
+        now = float(ts if ts is not None else time.time())
+        det = details or {}
+        with self._lock:
+            with self._conn() as conn:
+                self._append_worker_activity_in_conn(
+                    conn,
+                    ts=float(now),
+                    role=r,
+                    worker_slot=worker_slot,
+                    worker_id=worker_id,
+                    job_id=job_id,
+                    state=state,
+                    phase=phase,
+                    details=det,
+                )
+                conn.commit()
+
+    def _append_decision_log_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ts: float,
+        order_id: str,
+        job_id: str,
+        kind: str,
+        state: str,
+        summary: str,
+        next_action: str | None,
+        details: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO decision_log (ts, order_id, job_id, kind, state, summary, next_action, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (float(ts), order_id, job_id, kind, state, summary, next_action, json.dumps(details or {}, ensure_ascii=False)),
+        )
+
+    def _append_delegation_edge_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ts: float,
+        root_ticket_id: str,
+        from_job_id: str,
+        to_job_id: str,
+        edge_type: str,
+        to_role: str | None,
+        to_key: str | None,
+        details: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT OR IGNORE INTO delegation_log (ts, root_ticket_id, from_job_id, to_job_id, edge_type, to_role, to_key, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                float(ts),
+                root_ticket_id,
+                from_job_id,
+                to_job_id,
+                edge_type,
+                (to_role.strip() if isinstance(to_role, str) and to_role.strip() else None),
+                (to_key.strip() if isinstance(to_key, str) and to_key.strip() else None),
+                json.dumps(details or {}, ensure_ascii=False),
+            ),
+        )
+
+    def _append_worker_activity_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        ts: float,
+        role: str,
+        worker_slot: int | None,
+        worker_id: str | None,
+        job_id: str | None,
+        state: str | None,
+        phase: str | None,
+        details: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            "INSERT INTO worker_activity (ts, role, worker_slot, worker_id, job_id, state, phase, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                float(ts),
+                role,
+                (int(worker_slot) if worker_slot is not None else None),
+                (str(worker_id).strip() if isinstance(worker_id, str) and str(worker_id).strip() else None),
+                (str(job_id).strip() if isinstance(job_id, str) and str(job_id).strip() else None),
+                (str(state).strip() if isinstance(state, str) and str(state).strip() else None),
+                (str(phase).strip() if isinstance(phase, str) and str(phase).strip() else None),
+                json.dumps(details or {}, ensure_ascii=False),
+            ),
+        )
+
+    def list_worker_activity(
+        self,
+        *,
+        role: str | None = None,
+        since_ts: float | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if role:
+            where.append("role = ?")
+            params.append((role or "").strip().lower())
+        if since_ts is not None:
+            where.append("ts >= ?")
+            params.append(float(since_ts))
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        lim = max(1, min(5000, int(limit)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT ts, role, worker_slot, worker_id, job_id, state, phase, details FROM worker_activity{clause} ORDER BY ts DESC LIMIT ?",
+                [*params, lim],
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                jid = r["job_id"]
+                jid_s = None if jid is None else str(jid)
+                out.append(
+                    {
+                        "ts": float(r["ts"]),
+                        "role": str(r["role"]),
+                        "worker_slot": (_coerce_int(r["worker_slot"], default=None)),
+                        "worker_id": (None if r["worker_id"] is None else str(r["worker_id"])),
+                        "job_id": jid_s,
+                        "job_id_short": (jid_s[:8] if jid_s else None),
+                        "state": (None if r["state"] is None else str(r["state"])),
+                        "phase": (None if r["phase"] is None else str(r["phase"])),
+                        "details": _coerce_json_dict(r["details"]),
+                    }
+                )
+            return out
 
     def claim_next(
         self,
@@ -698,7 +1030,7 @@ class SQLiteTaskStorage:
 
     def _update_state_in_conn(self, conn: sqlite3.Connection, *, job_id: str, state: str, metadata: dict[str, Any]) -> bool:
         now = time.time()
-        row = conn.execute("SELECT state, trace FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+        row = conn.execute("SELECT state, trace, role, parent_job_id, labels, input_text FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
         if row is None:
             return False
 
@@ -710,8 +1042,70 @@ class SQLiteTaskStorage:
         )
         if cur.rowcount:
             self._append_event(conn, str(job_id), f"state:{state}", metadata)
+
+            # Structured logs for dashboard/audit.
+            try:
+                role = str(row["role"] or "").strip().lower()
+                parent_job_id = None if row["parent_job_id"] is None else str(row["parent_job_id"])
+                labels = _coerce_json_dict(row["labels"])
+                input_text = str(row["input_text"] or "")
+
+                # Activity log: whenever state changes, capture per-worker info if present.
+                tr = trace if isinstance(trace, dict) else {}
+                phase = str(tr.get("live_phase") or "").strip() or None
+                slot = tr.get("live_workspace_slot")
+                try:
+                    slot_i = int(slot) if slot is not None else None
+                except Exception:
+                    slot_i = None
+                worker_id = f"{role}:{slot_i}" if (role and slot_i) else None
+                self._append_worker_activity_in_conn(
+                    conn,
+                    ts=float(now),
+                    role=(role or "unknown"),
+                    worker_slot=slot_i,
+                    worker_id=worker_id,
+                    job_id=str(job_id),
+                    state=str(state),
+                    phase=phase,
+                    details={"parent_job_id": parent_job_id, "labels": labels},
+                )
+
+                # Decision log: primarily for Jarvis jobs, group by order/ticket.
+                if role == "jarvis" and str(state) in ("done", "failed", "blocked", "cancelled"):
+                    kind = str(labels.get("kind") or "").strip() or "jarvis"
+                    # order_id precedence: explicit trace order_id -> wrapup_for -> parent_job_id -> self job_id
+                    order_id = str(tr.get("order_id") or tr.get("wrapup_for") or parent_job_id or job_id).strip()
+                    summary = str(tr.get("result_summary") or "").strip() or self._task_title_fallback(input_text)
+                    next_action = str(tr.get("result_next_action") or "").strip() or None
+                    self._append_decision_log_in_conn(
+                        conn,
+                        ts=float(now),
+                        order_id=order_id,
+                        job_id=str(job_id),
+                        kind=kind,
+                        state=str(state),
+                        summary=summary,
+                        next_action=next_action,
+                        details={
+                            "parent_job_id": parent_job_id,
+                            "labels": labels,
+                            "request_type": str(tr.get("request_type") or ""),
+                            "result_status": str(tr.get("result_status") or ""),
+                        },
+                    )
+            except Exception:
+                pass
             return True
         return False
+
+
+    @staticmethod
+    def _task_title_fallback(input_text: str, *, max_chars: int = 160) -> str:
+        s = (input_text or "").strip().replace("\n", " ")
+        if len(s) > max_chars:
+            s = s[:max_chars] + "..."
+        return s
 
     def cancel(self, job_id: str) -> bool:
         return self.update_state(str(job_id), "cancelled", reason="user_requested")
@@ -1134,6 +1528,88 @@ class SQLiteTaskStorage:
                 )
                 conn.commit()
                 return True
+
+    def list_orders_global(self, *, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
+        """
+        List orders across all chats. Intended for localhost-only dashboards/status APIs.
+        """
+        st = (status or "").strip().lower() or None
+        params: list[Any] = []
+        where = ""
+        if st is not None:
+            if st not in ("active", "paused", "done"):
+                return []
+            where = " WHERE status = ?"
+            params.append(st)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ceo_orders{where} ORDER BY priority ASC, updated_at DESC LIMIT ?",
+                [*params, int(limit)],
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "order_id": str(r["order_id"]),
+                        "chat_id": int(r["chat_id"]),
+                        "title": str(r["title"]),
+                        "body": str(r["body"]),
+                        "status": str(r["status"]),
+                        "priority": int(r["priority"]),
+                        "created_at": float(r["created_at"]),
+                        "updated_at": float(r["updated_at"]),
+                    }
+                )
+            return out
+
+    def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:
+        """
+        Read cached JSON payload if unexpired. Returns parsed dict or None.
+        """
+        key = (cache_key or "").strip()
+        if not key:
+            return None
+        now = time.time()
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT updated_at, ttl_seconds, payload FROM status_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                updated_at = float(row["updated_at"])
+            except Exception:
+                updated_at = 0.0
+            try:
+                ttl = int(row["ttl_seconds"])
+            except Exception:
+                ttl = 0
+            if ttl > 0 and updated_at > 0 and (now - updated_at) > float(ttl):
+                return None
+            payload = str(row["payload"] or "")
+            if not payload.strip():
+                return None
+            try:
+                parsed = json.loads(payload)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+
+    def set_status_cache(self, cache_key: str, *, payload: dict[str, Any], ttl_seconds: int) -> None:
+        key = (cache_key or "").strip()
+        if not key:
+            return
+        ttl = max(0, int(ttl_seconds))
+        body = json.dumps(payload or {}, ensure_ascii=False)
+        now = time.time()
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO status_cache (cache_key, updated_at, ttl_seconds, payload) VALUES (?, ?, ?, ?)",
+                    (key, float(now), int(ttl), body),
+                )
+                conn.commit()
 
     def peek(
         self,

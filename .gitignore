@@ -4,6 +4,9 @@ codexbot.env
 data/jobs.sqlite
 data/artifacts/
 data/worktrees/
+data/*.json
+data/*.jsonl
+data/backups/
 state.json
 .codexbot_uploads/
 .codexbot_tmp/

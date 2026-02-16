@@ -183,11 +183,102 @@ class OrchestratorQueue:
     def list_orders(self, *, chat_id: int, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
         return self._storage.list_orders(chat_id=chat_id, status=status, limit=limit)
 
+    def list_orders_global(self, *, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
+        return self._storage.list_orders_global(status=status, limit=limit)
+
     def get_order(self, order_id: str, *, chat_id: int) -> dict[str, Any] | None:
         return self._storage.get_order(order_id, chat_id=chat_id)
 
     def set_order_status(self, order_id: str, *, chat_id: int, status: str) -> bool:
         return self._storage.set_order_status(order_id, chat_id=chat_id, status=status)
+
+    # Cached status snapshots (dashboard support).
+    def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:
+        return self._storage.get_status_cache(cache_key)
+
+    def set_status_cache(self, cache_key: str, *, payload: dict[str, Any], ttl_seconds: int) -> None:
+        self._storage.set_status_cache(cache_key, payload=payload, ttl_seconds=ttl_seconds)
+
+    # Structured logs (dashboard/audit).
+    def append_decision_log(
+        self,
+        *,
+        order_id: str,
+        job_id: str,
+        kind: str,
+        state: str,
+        summary: str,
+        next_action: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._storage.append_decision_log(
+            order_id=order_id,
+            job_id=job_id,
+            kind=kind,
+            state=state,
+            summary=summary,
+            next_action=next_action,
+            details=details,
+        )
+
+    def list_decision_log(self, *, order_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        return self._storage.list_decision_log(order_id=order_id, limit=limit)
+
+    def append_delegation_edge(
+        self,
+        *,
+        root_ticket_id: str,
+        from_job_id: str,
+        to_job_id: str,
+        edge_type: str,
+        to_role: str | None = None,
+        to_key: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._storage.append_delegation_edge(
+            root_ticket_id=root_ticket_id,
+            from_job_id=from_job_id,
+            to_job_id=to_job_id,
+            edge_type=edge_type,
+            to_role=to_role,
+            to_key=to_key,
+            details=details,
+        )
+
+    def list_delegation_log(self, *, root_ticket_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        return self._storage.list_delegation_log(root_ticket_id=root_ticket_id, limit=limit)
+
+    def append_worker_activity(
+        self,
+        *,
+        ts: float | None = None,
+        role: str,
+        worker_slot: int | None,
+        worker_id: str | None,
+        job_id: str | None,
+        state: str | None,
+        phase: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self._storage.append_worker_activity(
+            ts=ts,
+            role=role,
+            worker_slot=worker_slot,
+            worker_id=worker_id,
+            job_id=job_id,
+            state=state,
+            phase=phase,
+            details=details,
+        )
+
+    def list_worker_activity(
+        self,
+        *,
+        role: str | None = None,
+        since_ts: float | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return self._storage.list_worker_activity(role=role, since_ts=since_ts, limit=limit)
 
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
