@@ -150,4 +150,38 @@ In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
 ## OpenClaw Gap Notes (todo)
 
 This repo is optimized for Telegram-first CEO UX and a minimal control plane (ticket cards + `/watch`).
-After a direct code read of OpenClaw, document the main gaps and highest ROI next steps here.
+Grounded source for the notes below: `openclaw/openclaw` at `1f607be` (README + repo structure).
+
+### What OpenClaw Has That PonceBot Does Not (Yet)
+
+- Multi-channel inbox: WhatsApp, Slack, Discord, Google Chat, Signal, iMessage, Teams, WebChat, etc.
+- A Gateway WebSocket control plane + a first-class web UI, plus multiple clients (CLI, web, macOS app, mobile nodes).
+- Wizard-driven onboarding (`openclaw onboard`) and a diagnostic tool (`openclaw doctor`).
+- "Nodes" on macOS/iOS/Android for always-on voice ("Voice Wake" / Talk Mode), camera/screen recording, and local device actions.
+- A live visual "Canvas" / A2UI surface (agent-driven UI updates).
+- Strong default DM security via pairing codes and allowlists per channel.
+- Model auth + failover + rotation, plus richer usage/cost tracking.
+
+### What PonceBot Already Has (Today)
+
+- Telegram-first CEO experience:
+  - Single editable ticket cards (no spam)
+  - `/watch` live company status (single message, auto-updated)
+- Simple, inspectable runtime (Python stdlib + SQLite).
+- Multi-agent engineering org model:
+  - roles (`jarvis/frontend/backend/qa/sre/...`)
+  - per-role worktrees + per-role Codex sessions
+  - runbooks + 24/7 autopilot constrained to CEO orders
+
+### Highest-ROI Next Steps for PonceBot (CEO Experience)
+
+1. Multi-repo "Project Registry" + per-project worktrees
+   - Grounded gap: today, worktrees are based on a single `CODEX_WORKDIR` git repo.
+   - Outcome: Jarvis can work on `ExecutiveDashboard` (and future repos) without asking for a local path.
+2. Minimal local web control plane (read-only)
+   - Serve a small dashboard from the bot (localhost only) backed by SQLite, refreshed every 1-5 seconds.
+   - Keep Telegram as the main UI; the web UI is for deep inspection.
+3. Pairing-based access for unknown users (instead of hard Unauthorized)
+   - Grounded gap: today, allowlists are manual (`TELEGRAM_ALLOWED_*`).
+4. Optional voice replies (TTS local)
+   - Voice-in already exists; voice-out would complete the "Jarvis" feel.
