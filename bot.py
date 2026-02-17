@@ -740,6 +740,8 @@ class BotConfig:
     tts_backend: str = "none"
     # Max characters to speak (caption can still include text).
     tts_max_chars: int = 600
+    # Optional global pitch shift for voice notes (in semitones). Negative = lower (more masculine).
+    tts_voice_pitch_semitones: float = 0.0
     # OpenAI TTS settings.
     tts_openai_model: str = "tts-1"
     tts_openai_voice: str = "alloy"
@@ -8035,9 +8037,17 @@ def _piper_to_wav(
         raise RuntimeError(f"piper fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
 
 
-def _ffmpeg_to_ogg_opus_voip(*, ffmpeg_bin: str, input_path: Path, output_path: Path) -> None:
+def _ffmpeg_to_ogg_opus_voip(
+    *,
+    ffmpeg_bin: str,
+    input_path: Path,
+    output_path: Path,
+    pitch_ratio: float = 1.0,
+) -> None:
     if not _is_exec_available(ffmpeg_bin):
         raise RuntimeError(f"ffmpeg no encontrado: {ffmpeg_bin or '(empty)'}")
+    pr = float(pitch_ratio) if float(pitch_ratio) > 0 else 1.0
+    use_pitch = abs(pr - 1.0) >= 0.001
     argv = [
         ffmpeg_bin,
         "-y",
@@ -8046,6 +8056,12 @@ def _ffmpeg_to_ogg_opus_voip(*, ffmpeg_bin: str, input_path: Path, output_path: 
         "error",
         "-i",
         str(input_path),
+    ]
+    if use_pitch:
+        # Use rubberband filter (time-stretch + pitch shift) to keep duration while lowering pitch.
+        argv.extend(["-filter:a", f"rubberband=pitch={pr:.6f}"])
+    argv.extend(
+        [
         "-ac",
         "1",
         "-ar",
@@ -8057,7 +8073,8 @@ def _ffmpeg_to_ogg_opus_voip(*, ffmpeg_bin: str, input_path: Path, output_path: 
         "-application",
         "voip",
         str(output_path),
-    ]
+        ]
+    )
     p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"ffmpeg fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
@@ -8114,6 +8131,12 @@ def _synthesize_voice_note_ogg(
 
     # Normalize for clearer pronunciation (especially acronyms like E2E, CI/CD, etc).
     speak = _normalize_tts_speak_text(speak, backend=backend)
+    semis = float(getattr(cfg, "tts_voice_pitch_semitones", 0.0) or 0.0)
+    if semis > 12.0:
+        semis = 12.0
+    if semis < -12.0:
+        semis = -12.0
+    pitch_ratio = pow(2.0, semis / 12.0) if abs(semis) >= 0.001 else 1.0
 
     try:
         if cfg.voice_out_enabled and backend == "piper":
@@ -8130,7 +8153,12 @@ def _synthesize_voice_note_ogg(
                 text=speak,
                 output_wav_path=in_path,
             )
-            _ffmpeg_to_ogg_opus_voip(ffmpeg_bin=cfg.ffmpeg_bin, input_path=in_path, output_path=out_ogg)
+            _ffmpeg_to_ogg_opus_voip(
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                input_path=in_path,
+                output_path=out_ogg,
+                pitch_ratio=pitch_ratio,
+            )
             return out_ogg
 
         if cfg.voice_out_enabled and backend == "openai" and tts is not None and cfg.openai_api_key:
@@ -8143,7 +8171,12 @@ def _synthesize_voice_note_ogg(
             )
             in_path = tmp_dir / f"voice_in.{cfg.tts_openai_response_format}"
             in_path.write_bytes(raw)
-            _ffmpeg_to_ogg_opus_voip(ffmpeg_bin=cfg.ffmpeg_bin, input_path=in_path, output_path=out_ogg)
+            _ffmpeg_to_ogg_opus_voip(
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                input_path=in_path,
+                output_path=out_ogg,
+                pitch_ratio=pitch_ratio,
+            )
             return out_ogg
 
         if cfg.voice_out_enabled and backend == "tone":
@@ -9648,6 +9681,14 @@ def _load_config() -> BotConfig:
     tts_max_chars = int(os.environ.get("BOT_TTS_MAX_CHARS", "600"))
     if tts_max_chars < 0:
         tts_max_chars = 0
+    try:
+        tts_voice_pitch_semitones = float(os.environ.get("BOT_TTS_VOICE_PITCH_SEMITONES", "0").strip() or "0")
+    except Exception:
+        tts_voice_pitch_semitones = 0.0
+    if tts_voice_pitch_semitones > 12.0:
+        tts_voice_pitch_semitones = 12.0
+    if tts_voice_pitch_semitones < -12.0:
+        tts_voice_pitch_semitones = -12.0
     tts_openai_model = os.environ.get("BOT_TTS_OPENAI_MODEL", "tts-1").strip() or "tts-1"
     tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
@@ -9776,6 +9817,7 @@ def _load_config() -> BotConfig:
         voice_out_enabled=voice_out_enabled,
         tts_backend=tts_backend,
         tts_max_chars=tts_max_chars,
+        tts_voice_pitch_semitones=tts_voice_pitch_semitones,
         tts_openai_model=tts_openai_model,
         tts_openai_voice=tts_openai_voice,
         tts_openai_response_format=tts_openai_response_format,
