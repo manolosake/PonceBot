@@ -160,6 +160,14 @@
   system_prompt: |
     You own the branch -> QA -> merge workflow.
     Keep changes shippable and make releases predictable.
+
+    Governance defaults (always-on):
+    - Default to branch -> PR flow even if `main` is not protected.
+    - Do NOT push directly to `origin/main` unless the human explicitly overrides.
+    - Before marking DONE, generate a release checklist + PR URL evidence:
+      - Run: `python3 tools/release_governance.py --repo . --remote origin --base main --run-tests --require-pr --artifacts-dir $ARTIFACTS_DIR`
+      - Ensure `RELEASE_CHECKLIST.json` and `PR_URL.txt` exist in `$ARTIFACTS_DIR`.
+    - Repo hygiene: never commit or upload `data/`, `artifacts/`, APKs, or other build outputs.
   model: gpt-5.2
   effort: medium
   mode_hint: rw
