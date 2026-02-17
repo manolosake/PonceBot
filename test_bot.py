@@ -135,6 +135,32 @@ class TestParseJob(unittest.TestCase):
             self.assertIsNone(job)
 
 
+    def test_ack_is_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Ok")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "")
+            self.assertIsNone(job)
+
+    def test_dashboard_all_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/dashboard all")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_dashboard:all")
+            self.assertIsNone(job)
+
+    def test_orch_marker_no_payload_is_parsed(self) -> None:
+        m = bot._orch_marker("agents")
+        parsed = bot._parse_orchestrator_marker(m)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        kind, payload = parsed
+        self.assertEqual(kind, "agents")
+        self.assertEqual(payload, "")
+
+
 class TestQAEvidenceState(unittest.TestCase):
     def test_artifact_id_validation(self) -> None:
         self.assertTrue(bot._qa_is_safe_artifact_id("48b12907-bd85-4ce8-88af-2982a78ebcfc"))
@@ -420,6 +446,32 @@ class TestJarvisFirstRouting(unittest.TestCase):
             profiles = {"jarvis": {"model": "gpt-5.2", "effort": "high", "mode_hint": "ro"}}
             task = bot._orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=123)
             self.assertEqual(task.role, "frontend")
+
+    def test_query_tasks_are_ro_low_effort_and_suppress_ticket_card(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=0,
+                user_text="Que tenemos pendiente?",
+                argv=["exec", "Que tenemos pendiente?"],
+                mode_hint="rw",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+
+            task = bot._orchestrator_task_from_job(cfg, job, profiles=None, user_id=123)
+            self.assertEqual(task.request_type, "query")
+            self.assertEqual(task.mode_hint, "ro")
+            self.assertEqual(task.effort, "low")
+            self.assertFalse(task.requires_approval)
+            self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
+            self.assertEqual(int((task.trace or {}).get("max_runtime_seconds") or 0), 120)
+
 
     def test_alias_p_maps_to_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as td:

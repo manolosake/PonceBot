@@ -212,6 +212,57 @@ def _is_greeting(text: str) -> bool:
     return False
 
 
+_ACK_TOKENS: set[str] = {
+    "ok",
+    "okay",
+    "okey",
+    "va",
+    "dale",
+    "listo",
+    "gracias",
+    "thanks",
+    "thx",
+    "perfecto",
+    "bien",
+    "jaja",
+    "lol",
+}
+
+
+def _is_ack(text: str) -> bool:
+    """
+    Identify short acknowledgements that should be ignored (no ticket, no reply).
+
+    Grounded motivation: avoid spending Codex tokens and creating tickets for "ok/gracias/jaja".
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+
+    # Questions are not acknowledgements.
+    if "?" in raw or "¿" in raw:
+        return False
+
+    t = re.sub(r"\s+", " ", raw.lower()).strip()
+    t = t.strip(" .,!;:¿?¡")
+    if not t:
+        return False
+
+    # Keep it strict: very short messages only.
+    if len(t) > 48:
+        return False
+
+    parts = [p.strip(" .,!;:¿?¡") for p in t.split(" ") if p.strip(" .,!;:¿?¡")]
+    if not parts:
+        return False
+    if len(parts) > 4:
+        return False
+
+    return all(p in _ACK_TOKENS for p in parts)
+
+
 def _is_purge_queue_request(text: str) -> bool:
     """
     Detect "clear the queue" intents in natural language.
@@ -3853,6 +3904,12 @@ def _orchestrator_task_from_job(
     model = _orchestrator_model_for_profile(cfg, profile)
     effort = _orchestrator_effort_for_profile(profile, cfg)
 
+    req_type = str(pre.request_type or "task")
+    if req_type == "query":
+        # CEO UX policy: queries should be fast/cheap and never request writes.
+        mode_hint = "ro"
+        effort = "low"
+
     requires_approval = bool(profile.get("approval_required", False))
     if mode_hint == "full":
         requires_approval = True
@@ -3864,6 +3921,10 @@ def _orchestrator_task_from_job(
         "profile_role": role,
         "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
     }
+    if req_type == "query":
+        trace["max_runtime_seconds"] = 120
+        trace["suppress_ticket_card"] = True
+        requires_approval = False
     trace["prefer_voice_reply"] = bool(getattr(job, "prefer_voice_reply", False))
     if employee_name:
         trace["employee_name"] = employee_name
@@ -3948,7 +4009,10 @@ def _parse_orchestrator_marker(text: str) -> tuple[str, str] | None:
     if ":" in body:
         kind, payload = body.split(":", 1)
         return kind, payload.strip()
-    return body, ""
+    kind = body
+    if kind.endswith("__"):
+        kind = kind[:-2]
+    return kind, ""
 
 
 def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
@@ -4020,105 +4084,349 @@ def _send_orchestrator_marker_response(
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
-        if not cfg.screenshot_enabled:
-            api.send_message(chat_id, _orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
-            return True
-        now = time.time()
-        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-        health = orch_q.get_role_health() or {}
-        running = orch_q.jobs_by_state(state="running", limit=16)
 
-        def _pill(label: str, val: str) -> str:
+        scope = (payload or "").strip().lower()
+        scope_chat_id: int | None = int(chat_id)
+        scope_label = f"chat:{int(chat_id)}"
+        if scope in ("all", "global", "company"):
+            scope_chat_id = None
+            scope_label = "global"
+
+        now = time.time()
+
+        def _fmt_age(seconds: float | None) -> str:
+            if seconds is None:
+                return "n/a"
+            try:
+                s = int(seconds)
+            except Exception:
+                return "n/a"
+            if s < 60:
+                return f"{s}s"
+            m = s // 60
+            s2 = s % 60
+            if m < 60:
+                return f"{m}m{s2:02d}s"
+            h = m // 60
+            m2 = m % 60
+            return f"{h}h{m2:02d}m"
+
+        try:
+            svc = StatusService(orch_q=orch_q, role_profiles=profiles, cache_ttl_seconds=0)
+            snap = svc.snapshot(chat_id=scope_chat_id)
+        except Exception as e:
+            api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
+            return True
+
+        try:
+            gen_at = float(snap.get("generated_at") or now)
+        except Exception:
+            gen_at = now
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(gen_at))
+
+        def _as_int(v: object, default: int = 0) -> int:
+            try:
+                return int(v)  # type: ignore[arg-type]
+            except Exception:
+                return default
+
+        queued_total = _as_int(snap.get("queued_total"), 0)
+        running_total = _as_int(snap.get("running_total"), 0)
+        blocked_total = _as_int(snap.get("blocked_total"), 0)
+
+        staleness_s = snap.get("staleness_seconds")
+        try:
+            staleness_s = float(staleness_s) if staleness_s is not None else None
+        except Exception:
+            staleness_s = None
+
+        workers_raw = snap.get("workers") or []
+        workers: list[dict[str, Any]] = [w for w in workers_raw if isinstance(w, dict)]
+
+        def _wkey(w: dict[str, Any]) -> tuple[str, int]:
+            role = str(w.get("role") or "")
+            try:
+                slot = int(w.get("slot") or 0)
+            except Exception:
+                slot = 0
+            return (role, slot)
+
+        workers.sort(key=_wkey)
+
+        approvals_raw = snap.get("blocked_requires_approval") or []
+        approvals_all: list[dict[str, Any]] = [a for a in approvals_raw if isinstance(a, dict)]
+        approvals = [
+            a
+            for a in approvals_all
+            if bool(a.get("requires_approval")) and (not bool(a.get("approved")))
+        ][:12]
+
+        if not cfg.screenshot_enabled:
+            lines: list[str] = []
+            lines.append(f"Jarvis: dashboard ({scope_label})")
+            lines.append(f"Hecho (DB): queued={queued_total} running={running_total} blocked={blocked_total}")
+            if staleness_s is not None:
+                lines.append(f"Hecho (DB): staleness={_fmt_age(staleness_s)}")
+            lines.append(f"Hecho (DB): generated_at={ts}")
+            lines.append("")
+            lines.append("Workers:")
+
+            for w in workers:
+                role = str(w.get("role") or "")
+                slot = _as_int(w.get("slot"), 0)
+                wid = str(w.get("worker_id") or f"{role}:{slot}")
+
+                cur = w.get("current")
+                nxt = w.get("next")
+
+                if isinstance(cur, dict):
+                    jid = str(cur.get("job_id_short") or "")
+                    state = str(cur.get("state") or "")
+                    title = str(cur.get("title") or "")
+                    if len(title) > 80:
+                        title = title[:80] + "..."
+                    lines.append(f"- {wid} current={jid} state={state} title={title}")
+
+                    live_phase = str(cur.get("live_phase") or "").strip() or "(none)"
+                    live_at = cur.get("live_at")
+                    live_pid = cur.get("live_pid")
+                    live_workdir = str(cur.get("live_workdir") or "").strip() or ""
+
+                    age_s = None
+                    try:
+                        age_s = now - float(live_at) if live_at is not None else None
+                    except Exception:
+                        age_s = None
+
+                    if live_at is not None or live_pid is not None or live_workdir:
+                        lines.append(
+                            "  "
+                            + f"Hecho (live): phase={live_phase} age={_fmt_age(age_s)} pid={live_pid if live_pid is not None else 'n/a'}"
+                        )
+                        if live_workdir:
+                            lines.append("  " + f"Hecho (live): workdir={live_workdir}")
+                    elif state == "running":
+                        lines.append("  " + "Suposición: running (sin heartbeat live_*)")
+
+                    tail = str(cur.get("live_stdout_tail") or "").strip()
+                    if tail:
+                        if len(tail) > 220:
+                            tail = tail[-220:]
+                        tail_one = tail.replace("\n", " ").strip()
+                        lines.append("  " + f"stdout_tail: {tail_one}")
+                else:
+                    lines.append(f"- {wid} current=(idle)")
+
+                if isinstance(nxt, dict):
+                    nid = str(nxt.get("job_id_short") or "")
+                    ntitle = str(nxt.get("title") or "")
+                    if len(ntitle) > 90:
+                        ntitle = ntitle[:90] + "..."
+                    if nid or ntitle:
+                        lines.append("  " + f"next={nid} {ntitle}".strip())
+
+            if approvals:
+                lines.append("")
+                lines.append("Approvals needed:")
+                for a in approvals:
+                    jid = str(a.get("job_id_short") or "")
+                    role = str(a.get("role") or "")
+                    title = str(a.get("title") or "")
+                    if len(title) > 80:
+                        title = title[:80] + "..."
+                    reason = str(a.get("result_summary") or "")
+                    reason = (reason.splitlines()[0] if reason else "").strip()
+                    if len(reason) > 110:
+                        reason = reason[:110] + "..."
+                    base = f"- {jid} role={role} title={title}"
+                    if reason:
+                        base += f" reason={reason}"
+                    base += f"  Approve: /approve {jid}"
+                    lines.append(base)
+
+            lines.append("")
+            lines.append("Links: /agents  /orders  /job <id>")
+            _send_chunked_text(api, chat_id=chat_id, text="\n".join(lines), reply_to_message_id=reply_to_message_id)
+            return True
+
+        def _pill(label: str, val: str, cls: str = "") -> str:
+            c = f"pill {cls}".strip()
             return (
-                '<span class="pill">'
+                f"<span class='{_html_escape(c)}'>"
                 + _html_escape(label)
-                + ': <b>'
+                + ": <b>"
                 + _html_escape(val)
                 + "</b></span>"
             )
 
-        role_rows: list[str] = []
-        for role in sorted(health.keys()):
-            vals = health.get(role, {}) or {}
-            queued = int(vals.get("queued", 0) or 0)
-            running_n = int(vals.get("running", 0) or 0)
-            blocked = int(vals.get("blocked", 0) or 0)
-            failed = int(vals.get("failed", 0) or 0)
-            role_rows.append(
-                "<tr>"
-                + f"<td>{_html_escape(role)}</td>"
-                + f"<td>{queued}</td>"
-                + f"<td>{running_n}</td>"
-                + f"<td>{blocked}</td>"
-                + f"<td>{failed}</td>"
-                + "</tr>"
+        def _evidence(tag: str, text: str, cls: str = "") -> str:
+            c = f"tag {cls}".strip()
+            return "<div class='ev'><span class='%s'>%s</span> %s</div>" % (
+                _html_escape(c),
+                _html_escape(tag),
+                _html_escape(text),
             )
-        if not role_rows:
-            role_rows.append("<tr><td colspan='5' class='muted'>(no data yet)</td></tr>")
 
-        run_rows: list[str] = []
-        for t in running[:16]:
-            trace = t.trace or {}
-            phase = str(trace.get("live_phase") or "").strip() or "running"
-            tail = str(trace.get("live_stdout_tail") or "").strip()
-            if len(tail) > 600:
-                tail = tail[-600:]
-            title = (t.input_text or "").strip().replace("\n", " ")
-            if len(title) > 120:
-                title = title[:120] + "..."
-            run_rows.append(
-                "<div class='run'>"
-                + f"<div class='run-h'><b>{_html_escape(t.job_id[:8])}</b> <span class='muted'>role={_html_escape(t.role)} phase={_html_escape(phase)}</span></div>"
-                + f"<div class='run-t'>{_html_escape(title)}</div>"
-                + (f"<pre class='tail'>{_html_escape(tail)}</pre>" if tail else "")
+        cards: list[str] = []
+        for w in workers:
+            role = str(w.get("role") or "")
+            slot = _as_int(w.get("slot"), 0)
+            wid = str(w.get("worker_id") or f"{role}:{slot}")
+
+            cur = w.get("current")
+            nxt = w.get("next")
+
+            badges: list[str] = []
+            body: list[str] = []
+
+            if isinstance(cur, dict):
+                jid = str(cur.get("job_id_short") or "")
+                state = str(cur.get("state") or "")
+                phase = str(cur.get("live_phase") or "").strip() or "(none)"
+                title = str(cur.get("title") or "")
+
+                live_at = cur.get("live_at")
+                live_pid = cur.get("live_pid")
+                live_workdir = str(cur.get("live_workdir") or "").strip() or ""
+
+                age_s = None
+                try:
+                    age_s = now - float(live_at) if live_at is not None else None
+                except Exception:
+                    age_s = None
+
+                badges.append(_pill("state", state or "n/a", cls=state or ""))
+                badges.append(_pill("job", jid or "n/a"))
+
+                body.append("<div class='t'><b>" + _html_escape(title) + "</b></div>")
+                body.append(_evidence("Hecho (DB)", f"state={state} role={role} slot={slot}"))
+                if live_at is not None or live_pid is not None or live_workdir:
+                    body.append(_evidence("Hecho (live)", f"phase={phase} age={_fmt_age(age_s)} pid={live_pid if live_pid is not None else 'n/a'}"))
+                    if live_workdir:
+                        body.append(_evidence("Hecho (live)", f"workdir={live_workdir}"))
+                elif state == "running":
+                    body.append(_evidence("Suposición", "running (sin heartbeat live_*)", cls="warn"))
+
+                tail = str(cur.get("live_stdout_tail") or "").strip()
+                if tail:
+                    if len(tail) > 900:
+                        tail = tail[-900:]
+                    body.append("<pre class='tail'>" + _html_escape(tail) + "</pre>")
+            else:
+                badges.append(_pill("state", "idle", cls="idle"))
+                body.append("<div class='t muted'>(idle)</div>")
+
+            if isinstance(nxt, dict):
+                nid = str(nxt.get("job_id_short") or "")
+                ntitle = str(nxt.get("title") or "")
+                if len(ntitle) > 160:
+                    ntitle = ntitle[:160] + "..."
+                if nid or ntitle:
+                    body.append("<div class='next'><span class='muted'>next:</span> <b>" + _html_escape(nid) + "</b> " + _html_escape(ntitle) + "</div>")
+
+            cards.append(
+                "<div class='card w'>"
+                + "<div class='wh'><div class='wid'>"
+                + _html_escape(wid)
+                + "</div><div class='badges'>"
+                + "".join(badges)
+                + "</div></div>"
+                + "".join(body)
                 + "</div>"
             )
-        if not run_rows:
-            run_rows.append("<div class='muted'>(no running jobs)</div>")
+
+        approvals_html: str
+        if approvals:
+            rows: list[str] = []
+            for a in approvals[:12]:
+                jid = str(a.get("job_id_short") or "")
+                role = str(a.get("role") or "")
+                title = str(a.get("title") or "")
+                if len(title) > 120:
+                    title = title[:120] + "..."
+                reason = str(a.get("result_summary") or "")
+                reason = (reason.splitlines()[0] if reason else "").strip()
+                if len(reason) > 140:
+                    reason = reason[:140] + "..."
+                rows.append(
+                    "<div class='ap'>"
+                    + "<div class='ap-h'><b>"
+                    + _html_escape(jid)
+                    + "</b> <span class='muted'>role="
+                    + _html_escape(role)
+                    + "</span></div>"
+                    + "<div class='ap-t'>"
+                    + _html_escape(title)
+                    + "</div>"
+                    + ("<div class='ap-r muted'>" + _html_escape(reason) + "</div>" if reason else "")
+                    + "<div class='ap-c'>Approve: <code>/approve "
+                    + _html_escape(jid)
+                    + "</code></div>"
+                    + "</div>"
+                )
+            approvals_html = "<div class='card'><div class='sect'>Approvals needed</div>" + "".join(rows) + "</div>"
+        else:
+            approvals_html = ""
 
         html = (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<style>"
             "body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; margin:0; background:#0b0f14; color:#e8eef6}"
             ".wrap{padding:18px}"
-            ".h{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:14px}"
-            ".title{font-size:18px;font-weight:700}"
+            ".h{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:14px}"
+            ".title{font-size:18px;font-weight:800;letter-spacing:.2px}"
             ".sub{font-size:12px;color:#9fb0c3}"
-            ".grid{display:grid;grid-template-columns:1fr 1.2fr;gap:14px}"
+            ".stats{display:flex;flex-wrap:wrap;gap:8px;align-items:center}"
+            ".pill{display:inline-flex;gap:6px;align-items:baseline;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.10);font-size:12px}"
+            ".pill.running{border-color:rgba(46,204,113,.35)}"
+            ".pill.blocked{border-color:rgba(231,76,60,.35)}"
+            ".pill.failed{border-color:rgba(231,76,60,.35)}"
+            ".pill.idle{border-color:rgba(159,176,195,.25)}"
+            ".grid{display:grid;grid-template-columns:1fr;gap:14px}"
+            ".workers{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}"
             ".card{background:#121a24;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px;box-shadow:0 10px 30px rgba(0,0,0,.35)}"
-            ".pill{display:inline-flex;gap:6px;align-items:baseline;padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);margin-right:8px;font-size:12px}"
-            "table{width:100%;border-collapse:collapse;font-size:12px}"
-            "th,td{padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}"
-            "th{color:#9fb0c3;font-weight:600}"
+            ".w{padding:12px}"
+            ".wh{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:10px}"
+            ".wid{font-size:13px;font-weight:800}"
+            ".badges{display:flex;flex-wrap:wrap;gap:6px}"
+            ".t{font-size:12px;color:#cfe0f3;margin:6px 0 8px}"
             ".muted{color:#9fb0c3}"
-            ".run{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}"
-            ".run:last-child{border-bottom:none}"
-            ".run-h{font-size:12px}"
-            ".run-t{font-size:12px;margin-top:4px;color:#cfe0f3}"
-            "pre.tail{margin:8px 0 0; padding:10px; border-radius:10px; background:#0b0f14; border:1px solid rgba(255,255,255,.06); font-size:11px; white-space:pre-wrap; max-height:160px; overflow:hidden}"
+            ".ev{font-size:11px;color:#cfe0f3;margin:4px 0}"
+            ".tag{display:inline-block;font-size:10px;padding:2px 6px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.10);margin-right:6px;color:#9fb0c3}"
+            ".tag.warn{border-color:rgba(241,196,15,.35);color:#f1c40f}"
+            ".next{font-size:11px;margin-top:10px;color:#cfe0f3}"
+            "pre.tail{margin:10px 0 0; padding:10px; border-radius:10px; background:#0b0f14; border:1px solid rgba(255,255,255,.06); font-size:11px; white-space:pre-wrap; max-height:180px; overflow:hidden}"
+            ".sect{font-size:13px;font-weight:800;margin-bottom:10px}"
+            ".ap{padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}"
+            ".ap:last-child{border-bottom:none}"
+            ".ap-h{font-size:12px}"
+            ".ap-t{font-size:12px;margin-top:4px;color:#cfe0f3}"
+            ".ap-c{margin-top:6px;font-size:11px}"
+            "code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.10)}"
             "</style></head><body><div class='wrap'>"
             "<div class='h'>"
             "<div><div class='title'>PonceBot Dashboard</div><div class='sub'>"
             + _html_escape(ts)
+            + " | scope="
+            + _html_escape(scope_label)
             + "</div></div>"
-            "<div class='sub'>"
-            + _pill("queued", str(orch_q.get_queued_count()))
-            + _pill("running", str(orch_q.get_running_count()))
+            "<div class='stats'>"
+            + _pill("Hecho (DB)", f"queued={queued_total}")
+            + _pill("Hecho (DB)", f"running={running_total}")
+            + _pill("Hecho (DB)", f"blocked={blocked_total}")
+            + ("" if staleness_s is None else _pill("Hecho (DB)", f"staleness={_fmt_age(staleness_s)}"))
             + "</div></div>"
             "<div class='grid'>"
-            "<div class='card'><div class='title' style='font-size:14px'>Roles</div>"
-            "<table><thead><tr><th>role</th><th>queued</th><th>running</th><th>blocked</th><th>failed</th></tr></thead><tbody>"
-            + "".join(role_rows)
-            + "</tbody></table></div>"
-            "<div class='card'><div class='title' style='font-size:14px'>Running Now</div>"
-            + "".join(run_rows)
-            + "</div>"
+            + (approvals_html + "" if approvals_html else "")
+            + "<div class='card'><div class='sect'>Workers</div><div class='workers'>"
+            + "".join(cards)
+            + "</div></div>"
             "</div></div></body></html>"
         )
 
         out_dir = (cfg.artifacts_root / "dashboard").resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_png = out_dir / f"dashboard_{int(now)}.png"
+        out_png = out_dir / f"dashboard_{scope_label}_{int(now)}.png"
         try:
             capture_screenshot_html(
                 html,
@@ -4128,10 +4436,12 @@ def _send_orchestrator_marker_response(
                 allow_private=False,
                 block_network=True,
             )
-            api.send_photo(chat_id, out_png, caption="dashboard", reply_to_message_id=reply_to_message_id)
+            caption = f"dashboard ({scope_label})"
+            api.send_photo(chat_id, out_png, caption=caption, reply_to_message_id=reply_to_message_id)
         except Exception as e:
             api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
         return True
+
 
     if kind == "watch":
         if orch_q is None:
@@ -5072,6 +5382,26 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
                 snippet = snippet[:90] + "..."
             role_h = _humanize_orchestrator_role(r.role)
             lines.append(f"- {role_h} ({phase}): {snippet}")
+    # Latest outcome signals across subtasks so the CEO can track progress without opening /job.
+    try:
+        recent = [c for c in children if c.state in ("done", "failed", "blocked")]
+        recent_sorted = sorted(recent, key=lambda c: float(c.updated_at), reverse=True)
+        if recent_sorted:
+            lines.append("Latest updates:")
+            for c in recent_sorted[:6]:
+                role_h = _humanize_orchestrator_role(c.role)
+                st = str(c.state or "")
+                res = str((c.trace or {}).get("result_summary") or "").strip()
+                first = (res.splitlines()[0] if res else "").strip()
+                if len(first) > 160:
+                    first = first[:160] + "..."
+                line = f"- {c.job_id[:8]} {role_h} {st}" + (f": {first}" if first else "")
+                if st == "blocked":
+                    line += f"  Approve: /approve {c.job_id[:8]}"
+                lines.append(line)
+    except Exception:
+        pass
+
     lines.append(f"Links: /ticket {root_id[:8]}  /job {root_id[:8]}  /agents  /dashboard")
     return "\n".join(lines)
 
@@ -5164,6 +5494,10 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if not text.startswith("/") and _is_greeting(text):
         return "Jarvis: ¡Hola! Soy tu mano derecha ejecutiva. ¿En qué puedo ayudar?", None
 
+    # Ignore acks (ok/gracias/jaja) to avoid ticket/cost spam.
+    if not text.startswith("/") and _is_ack(text):
+        return "", None
+
     # CEO control-plane: clear queue/backlog should be immediate and deterministic.
     if not text.startswith("/") and _is_purge_queue_request(text):
         return _orch_marker("purge_queue", "global"), None
@@ -5245,8 +5579,13 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/agents":
         return _orch_marker("agents"), None
 
-    if text == "/dashboard":
-        return _orch_marker("dashboard"), None
+    if text.startswith("/dashboard"):
+        tail = (text[len("/dashboard") :] or "").strip()
+        if not tail:
+            return _orch_marker("dashboard"), None
+        if tail.lower() in ("all", "global", "company"):
+            return _orch_marker("dashboard", "all"), None
+        return "Usage: /dashboard [all]", None
 
     if text == "/watch":
         return _orch_marker("watch", "on"), None
@@ -9323,6 +9662,10 @@ def poll_loop(
                         "/effort",
                         "/setnotify",
                         "/agents",
+                        "/dashboard",
+                        "/orders",
+                        "/watch",
+                        "/unwatch",
                         "/daily",
                         "/brief",
                         "/snapshot",
@@ -9347,6 +9690,9 @@ def poll_loop(
                         "/model ",
                         "/effort ",
                         "/notify ",
+                        "/dashboard ",
+                        "/order ",
+                        "/watch ",
                         "/login ",
                         "/skills ",
                         "/ro ",
@@ -9526,24 +9872,47 @@ def poll_loop(
                             LOG.exception("Failed to submit orchestrator task")
                         if did_submit:
                             enqueued_to_orchestrator = True
+
+                            suppress_ticket_card = False
                             try:
-                                card = _ticket_card_text(orchestrator_queue, ticket_id=orch_job_id)
+                                task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
+                                tr = (task.trace or {}) if task is not None else {}
+                                suppress_ticket_card = bool(tr.get("suppress_ticket_card", False)) or (
+                                    task is not None and str(task.request_type or "") == "query"
+                                )
                             except Exception:
-                                card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
-                            mid = api.send_message(
-                                chat_id,
-                                card,
-                                reply_to_message_id=message_id if message_id else None,
-                            )
-                            try:
-                                if mid is not None and orchestrator_queue is not None:
-                                    orchestrator_queue.update_trace(
-                                        orch_job_id,
-                                        ticket_card_message_id=int(mid),
-                                        ticket_card_created_at=time.time(),
-                                    )
-                            except Exception:
-                                pass
+                                suppress_ticket_card = False
+
+                            if suppress_ticket_card:
+                                # Audit-only: keep trace evidence without spamming a ticket card.
+                                try:
+                                    if orchestrator_queue is not None:
+                                        orchestrator_queue.update_trace(
+                                            orch_job_id,
+                                            suppress_ticket_card=True,
+                                            ticket_card_suppressed_at=time.time(),
+                                        )
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    card = _ticket_card_text(orchestrator_queue, ticket_id=orch_job_id)
+                                except Exception:
+                                    card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
+                                mid = api.send_message(
+                                    chat_id,
+                                    card,
+                                    reply_to_message_id=message_id if message_id else None,
+                                )
+                                try:
+                                    if mid is not None and orchestrator_queue is not None:
+                                        orchestrator_queue.update_trace(
+                                            orch_job_id,
+                                            ticket_card_message_id=int(mid),
+                                            ticket_card_created_at=time.time(),
+                                        )
+                                except Exception:
+                                    pass
 
                     if enqueued_to_orchestrator:
                         continue
