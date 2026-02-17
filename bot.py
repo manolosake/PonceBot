@@ -736,7 +736,7 @@ class BotConfig:
     admin_chat_ids: frozenset[int] = frozenset()
     # Voice-out (reply as Telegram voice note).
     voice_out_enabled: bool = False
-    # TTS backend: "none" | "openai" | "tone"
+    # TTS backend: "none" | "piper" | "openai" | "tone"
     tts_backend: str = "none"
     # Max characters to speak (caption can still include text).
     tts_max_chars: int = 600
@@ -744,6 +744,11 @@ class BotConfig:
     tts_openai_model: str = "tts-1"
     tts_openai_voice: str = "alloy"
     tts_openai_response_format: str = "mp3"
+    # Piper (local/free) TTS settings.
+    tts_piper_bin: str = "piper"
+    tts_piper_model_path: str = ""
+    # Optional (multi-speaker models). Empty = default.
+    tts_piper_speaker: str = ""
 
 
 class TelegramAPI:
@@ -7806,6 +7811,70 @@ def _is_exec_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _piper_to_wav(
+    *,
+    piper_bin: str,
+    model_path: str,
+    speaker: str,
+    text: str,
+    output_wav_path: Path,
+) -> None:
+    """
+    Run Piper locally to synthesize `text` into a WAV file.
+    Uses stdin (no shell) and sets env vars so the bundled Piper release works reliably.
+    """
+    if not _is_exec_available(piper_bin):
+        raise RuntimeError(f"piper no encontrado: {piper_bin or '(empty)'}")
+    mp = (model_path or "").strip()
+    if not mp or not Path(mp).expanduser().exists():
+        raise RuntimeError(f"modelo piper no encontrado: {model_path or '(empty)'}")
+    t = (text or "").strip()
+    if not t:
+        raise RuntimeError("Empty TTS input")
+
+    out = output_wav_path
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    argv = [
+        piper_bin,
+        "--model",
+        str(Path(mp).expanduser()),
+        "--output_file",
+        str(out),
+    ]
+    spk = (speaker or "").strip()
+    if spk:
+        argv.extend(["--speaker", spk])
+
+    env = dict(os.environ)
+    try:
+        # When running from the bundled tarball, shared libs and espeak data live next to the binary.
+        piper_dir = Path(piper_bin).expanduser().resolve().parent
+        if piper_dir.exists():
+            env["LD_LIBRARY_PATH"] = str(piper_dir) + (
+                (":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else ""
+            )
+            espeak_data = piper_dir / "espeak-ng-data"
+            if espeak_data.exists():
+                env["ESPEAK_DATA_PATH"] = str(espeak_data)
+    except Exception:
+        pass
+
+    p = subprocess.run(
+        argv,
+        input=(t + "\n"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=str(Path(piper_bin).expanduser().resolve().parent)
+        if Path(piper_bin).expanduser().exists()
+        else None,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"piper fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
+
+
 def _ffmpeg_to_ogg_opus_voip(*, ffmpeg_bin: str, input_path: Path, output_path: Path) -> None:
     if not _is_exec_available(ffmpeg_bin):
         raise RuntimeError(f"ffmpeg no encontrado: {ffmpeg_bin or '(empty)'}")
@@ -7884,6 +7953,19 @@ def _synthesize_voice_note_ogg(
         speak = speak[: cfg.tts_max_chars].rstrip() + "..."
 
     try:
+        if cfg.voice_out_enabled and backend == "piper":
+            # Local/free speech via Piper, then transcode to Telegram-voice friendly OGG/Opus.
+            in_path = tmp_dir / "voice_in.wav"
+            _piper_to_wav(
+                piper_bin=cfg.tts_piper_bin,
+                model_path=cfg.tts_piper_model_path,
+                speaker=cfg.tts_piper_speaker,
+                text=speak,
+                output_wav_path=in_path,
+            )
+            _ffmpeg_to_ogg_opus_voip(ffmpeg_bin=cfg.ffmpeg_bin, input_path=in_path, output_path=out_ogg)
+            return out_ogg
+
         if cfg.voice_out_enabled and backend == "openai" and tts is not None and cfg.openai_api_key:
             # Ask OpenAI for audio, then transcode to Telegram-voice friendly OGG/Opus.
             raw = tts.synthesize(
@@ -9265,7 +9347,7 @@ def _load_config() -> BotConfig:
 
     voice_out_enabled = os.environ.get("BOT_VOICE_OUT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     tts_backend = os.environ.get("BOT_TTS_BACKEND", "none").strip().lower() or "none"
-    if tts_backend not in ("none", "openai", "tone"):
+    if tts_backend not in ("none", "piper", "openai", "tone"):
         tts_backend = "none"
     tts_max_chars = int(os.environ.get("BOT_TTS_MAX_CHARS", "600"))
     if tts_max_chars < 0:
@@ -9273,6 +9355,11 @@ def _load_config() -> BotConfig:
     tts_openai_model = os.environ.get("BOT_TTS_OPENAI_MODEL", "tts-1").strip() or "tts-1"
     tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
+    piper_default = str(bin_dir / "piper" / "piper") if (bin_dir / "piper" / "piper").exists() else "piper"
+    piper_model_default = str(models_dir / "piper" / "es_MX-ald-medium.onnx") if (models_dir / "piper" / "es_MX-ald-medium.onnx").exists() else ""
+    tts_piper_bin = os.environ.get("BOT_TTS_PIPER_BIN", piper_default).strip() or piper_default
+    tts_piper_model_path = os.environ.get("BOT_TTS_PIPER_MODEL_PATH", piper_model_default).strip() or piper_model_default
+    tts_piper_speaker = os.environ.get("BOT_TTS_PIPER_SPEAKER", "").strip()
 
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
@@ -9370,6 +9457,9 @@ def _load_config() -> BotConfig:
         tts_openai_model=tts_openai_model,
         tts_openai_voice=tts_openai_voice,
         tts_openai_response_format=tts_openai_response_format,
+        tts_piper_bin=tts_piper_bin,
+        tts_piper_model_path=tts_piper_model_path,
+        tts_piper_speaker=tts_piper_speaker,
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
