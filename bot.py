@@ -736,7 +736,7 @@ class BotConfig:
     admin_chat_ids: frozenset[int] = frozenset()
     # Voice-out (reply as Telegram voice note).
     voice_out_enabled: bool = False
-    # TTS backend: "none" | "piper" | "openai" | "tone"
+    # TTS backend: "none" | "piper" | "edge" | "openai" | "tone"
     tts_backend: str = "none"
     # Max characters to speak (caption can still include text).
     tts_max_chars: int = 600
@@ -745,6 +745,12 @@ class BotConfig:
     # Optional ffmpeg filter chain applied to voice notes (after pitch shift).
     # Example: "highpass=f=90,lowpass=f=12000,loudnorm=I=-16:TP=-1.5:LRA=11"
     tts_voice_ffmpeg_filter: str = ""
+    # Edge TTS (Microsoft) settings (free, online). Requires `edge-tts` installed in the venv.
+    # Voice examples: "es-MX-JorgeNeural" (male), "es-MX-DaliaNeural" (female).
+    tts_edge_voice: str = "es-MX-JorgeNeural"
+    # Rate and pitch formats follow edge-tts: e.g. "+10%", "-5%", "+0Hz".
+    tts_edge_rate: str = "+0%"
+    tts_edge_pitch: str = "+0Hz"
     # OpenAI TTS settings.
     tts_openai_model: str = "tts-1"
     tts_openai_voice: str = "alloy"
@@ -8053,6 +8059,40 @@ def _piper_to_wav(
         raise RuntimeError(f"piper fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
 
 
+def _edge_tts_to_mp3(
+    *,
+    text: str,
+    voice: str,
+    rate: str,
+    pitch: str,
+    output_mp3_path: Path,
+) -> None:
+    """
+    Online/free TTS using Microsoft Edge voices via the `edge-tts` Python package.
+    Writes an MP3 to `output_mp3_path`.
+    """
+    try:
+        import asyncio
+        import edge_tts  # type: ignore
+    except Exception as e:
+        raise RuntimeError("edge-tts no instalado (pip install edge-tts)") from e
+
+    t = (text or "").strip()
+    if not t:
+        raise RuntimeError("Empty TTS input")
+    v = (voice or "").strip() or "es-MX-JorgeNeural"
+    r = (rate or "").strip() or "+0%"
+    p = (pitch or "").strip() or "+0Hz"
+
+    output_mp3_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _run() -> None:
+        communicate = edge_tts.Communicate(text=t, voice=v, rate=r, pitch=p)
+        await communicate.save(str(output_mp3_path))
+
+    asyncio.run(_run())
+
+
 def _ffmpeg_to_ogg_opus_voip(
     *,
     ffmpeg_bin: str,
@@ -8176,6 +8216,25 @@ def _synthesize_voice_note_ogg(
                 sentence_silence=cfg.tts_piper_sentence_silence,
                 text=speak,
                 output_wav_path=in_path,
+            )
+            _ffmpeg_to_ogg_opus_voip(
+                ffmpeg_bin=cfg.ffmpeg_bin,
+                input_path=in_path,
+                output_path=out_ogg,
+                pitch_ratio=pitch_ratio,
+                extra_filter=extra_filter,
+            )
+            return out_ogg
+
+        if cfg.voice_out_enabled and backend == "edge":
+            # High-quality free online TTS (Microsoft) via edge-tts, then transcode to OGG/Opus.
+            in_path = tmp_dir / "voice_in.mp3"
+            _edge_tts_to_mp3(
+                text=speak,
+                voice=cfg.tts_edge_voice,
+                rate=cfg.tts_edge_rate,
+                pitch=cfg.tts_edge_pitch,
+                output_mp3_path=in_path,
             )
             _ffmpeg_to_ogg_opus_voip(
                 ffmpeg_bin=cfg.ffmpeg_bin,
@@ -9702,7 +9761,7 @@ def _load_config() -> BotConfig:
 
     voice_out_enabled = os.environ.get("BOT_VOICE_OUT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
     tts_backend = os.environ.get("BOT_TTS_BACKEND", "none").strip().lower() or "none"
-    if tts_backend not in ("none", "piper", "openai", "tone"):
+    if tts_backend not in ("none", "piper", "edge", "openai", "tone"):
         tts_backend = "none"
     tts_max_chars = int(os.environ.get("BOT_TTS_MAX_CHARS", "600"))
     if tts_max_chars < 0:
@@ -9720,6 +9779,9 @@ def _load_config() -> BotConfig:
         # Default: mild cleanup + loudness normalization for clearer/stronger voice notes.
         "highpass=f=90,lowpass=f=12000,loudnorm=I=-16:TP=-1.5:LRA=11",
     ).strip()
+    tts_edge_voice = os.environ.get("BOT_TTS_EDGE_VOICE", "es-MX-JorgeNeural").strip() or "es-MX-JorgeNeural"
+    tts_edge_rate = os.environ.get("BOT_TTS_EDGE_RATE", "+0%").strip() or "+0%"
+    tts_edge_pitch = os.environ.get("BOT_TTS_EDGE_PITCH", "+0Hz").strip() or "+0Hz"
     tts_openai_model = os.environ.get("BOT_TTS_OPENAI_MODEL", "tts-1").strip() or "tts-1"
     tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
@@ -9850,6 +9912,9 @@ def _load_config() -> BotConfig:
         tts_max_chars=tts_max_chars,
         tts_voice_pitch_semitones=tts_voice_pitch_semitones,
         tts_voice_ffmpeg_filter=tts_voice_ffmpeg_filter,
+        tts_edge_voice=tts_edge_voice,
+        tts_edge_rate=tts_edge_rate,
+        tts_edge_pitch=tts_edge_pitch,
         tts_openai_model=tts_openai_model,
         tts_openai_voice=tts_openai_voice,
         tts_openai_response_format=tts_openai_response_format,
