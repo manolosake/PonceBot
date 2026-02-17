@@ -9424,7 +9424,12 @@ def _load_config() -> BotConfig:
     tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
     piper_default = str(bin_dir / "piper" / "piper") if (bin_dir / "piper" / "piper").exists() else "piper"
-    piper_model_default = str(models_dir / "piper" / "es_MX-ald-medium.onnx") if (models_dir / "piper" / "es_MX-ald-medium.onnx").exists() else ""
+    piper_model_default = ""
+    # Prefer a more natural Spanish (Mexico) voice if the model is already present.
+    if (models_dir / "piper" / "es_MX-claude-high.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_MX-claude-high.onnx")
+    elif (models_dir / "piper" / "es_MX-ald-medium.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_MX-ald-medium.onnx")
     tts_piper_bin = os.environ.get("BOT_TTS_PIPER_BIN", piper_default).strip() or piper_default
     tts_piper_model_path = os.environ.get("BOT_TTS_PIPER_MODEL_PATH", piper_model_default).strip() or piper_model_default
     tts_piper_speaker = os.environ.get("BOT_TTS_PIPER_SPEAKER", "").strip()
