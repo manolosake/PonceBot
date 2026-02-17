@@ -742,6 +742,9 @@ class BotConfig:
     tts_max_chars: int = 600
     # Optional global pitch shift for voice notes (in semitones). Negative = lower (more masculine).
     tts_voice_pitch_semitones: float = 0.0
+    # Optional ffmpeg filter chain applied to voice notes (after pitch shift).
+    # Example: "highpass=f=90,lowpass=f=12000,loudnorm=I=-16:TP=-1.5:LRA=11"
+    tts_voice_ffmpeg_filter: str = ""
     # OpenAI TTS settings.
     tts_openai_model: str = "tts-1"
     tts_openai_voice: str = "alloy"
@@ -7921,6 +7924,16 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Slash commands: "/ticket 123" -> "ticket 123"
     t = re.sub(r"\b/(ticket|job|agents|dashboard|restart|say)\b", r"\1", t, flags=re.IGNORECASE)
 
+    # Strip markdown / symbols that shouldn't be spoken.
+    # Links: [text](url) -> text
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    # Inline code: `code` -> code
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    # Emphasis markers
+    t = t.replace("*", "").replace("_", "").replace("~", "")
+    # Bullets/headings/quotes at line start
+    t = re.sub(r"(?m)^\s*([>#-]+|\*+)\s*", "", t)
+
     # Common acronyms and terms. Keep this short to avoid "spelled out" / staccato speech.
     # CEO preference: E2E is read in English ("end to end").
     repl: list[tuple[str, str]] = [
@@ -7936,6 +7949,8 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     t = re.sub(r"[,:;]+", " ", t)
     t = re.sub(r"\s*[|/]\s*", " ", t)
     t = re.sub(r"\s+\.\s+", ". ", t)
+    # Remove stray symbols (keep it conservative; avoid changing normal words)
+    t = re.sub(r"[{}\[\]()<>\u2022]+", " ", t)
 
     # Common English product/engineering terms: make them easier for Spanish TTS
     # without fully translating (keeps CEO preference of mixing ES + EN).
@@ -8044,11 +8059,19 @@ def _ffmpeg_to_ogg_opus_voip(
     input_path: Path,
     output_path: Path,
     pitch_ratio: float = 1.0,
+    extra_filter: str = "",
 ) -> None:
     if not _is_exec_available(ffmpeg_bin):
         raise RuntimeError(f"ffmpeg no encontrado: {ffmpeg_bin or '(empty)'}")
     pr = float(pitch_ratio) if float(pitch_ratio) > 0 else 1.0
     use_pitch = abs(pr - 1.0) >= 0.001
+    vf = (extra_filter or "").strip()
+    filter_parts: list[str] = []
+    if use_pitch:
+        # Use rubberband filter (time-stretch + pitch shift) to keep duration while lowering pitch.
+        filter_parts.append(f"rubberband=pitch={pr:.6f}")
+    if vf:
+        filter_parts.append(vf)
     argv = [
         ffmpeg_bin,
         "-y",
@@ -8058,13 +8081,12 @@ def _ffmpeg_to_ogg_opus_voip(
         "-i",
         str(input_path),
     ]
-    if use_pitch:
-        # Use rubberband filter (time-stretch + pitch shift) to keep duration while lowering pitch.
-        argv.extend(["-filter:a", f"rubberband=pitch={pr:.6f}"])
+    if filter_parts:
+        argv.extend(["-filter:a", ",".join(filter_parts)])
     argv.extend(
         [
-        "-ac",
-        "1",
+            "-ac",
+            "1",
         "-ar",
         "48000",
         "-c:a",
@@ -8138,6 +8160,7 @@ def _synthesize_voice_note_ogg(
     if semis < -12.0:
         semis = -12.0
     pitch_ratio = pow(2.0, semis / 12.0) if abs(semis) >= 0.001 else 1.0
+    extra_filter = (getattr(cfg, "tts_voice_ffmpeg_filter", "") or "").strip()
 
     try:
         if cfg.voice_out_enabled and backend == "piper":
@@ -8159,6 +8182,7 @@ def _synthesize_voice_note_ogg(
                 input_path=in_path,
                 output_path=out_ogg,
                 pitch_ratio=pitch_ratio,
+                extra_filter=extra_filter,
             )
             return out_ogg
 
@@ -8177,6 +8201,7 @@ def _synthesize_voice_note_ogg(
                 input_path=in_path,
                 output_path=out_ogg,
                 pitch_ratio=pitch_ratio,
+                extra_filter=extra_filter,
             )
             return out_ogg
 
@@ -9690,6 +9715,11 @@ def _load_config() -> BotConfig:
         tts_voice_pitch_semitones = 12.0
     if tts_voice_pitch_semitones < -12.0:
         tts_voice_pitch_semitones = -12.0
+    tts_voice_ffmpeg_filter = os.environ.get(
+        "BOT_TTS_VOICE_FFMPEG_FILTER",
+        # Default: mild cleanup + loudness normalization for clearer/stronger voice notes.
+        "highpass=f=90,lowpass=f=12000,loudnorm=I=-16:TP=-1.5:LRA=11",
+    ).strip()
     tts_openai_model = os.environ.get("BOT_TTS_OPENAI_MODEL", "tts-1").strip() or "tts-1"
     tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
@@ -9819,6 +9849,7 @@ def _load_config() -> BotConfig:
         tts_backend=tts_backend,
         tts_max_chars=tts_max_chars,
         tts_voice_pitch_semitones=tts_voice_pitch_semitones,
+        tts_voice_ffmpeg_filter=tts_voice_ffmpeg_filter,
         tts_openai_model=tts_openai_model,
         tts_openai_voice=tts_openai_voice,
         tts_openai_response_format=tts_openai_response_format,
