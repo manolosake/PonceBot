@@ -631,6 +631,8 @@ class Job:
     upload_paths: list[Path]
     # If true, forces a brand-new thread even if a thread_id exists for this chat.
     force_new_thread: bool
+    # If true, prefer replying as a Telegram voice note (if enabled/configured).
+    prefer_voice_reply: bool = False
 
 
 @dataclass(frozen=True)
@@ -732,6 +734,16 @@ class BotConfig:
     # If empty, the bot falls back to profile-based permissions (when BOT_AUTH_ENABLED=1).
     admin_user_ids: frozenset[int] = frozenset()
     admin_chat_ids: frozenset[int] = frozenset()
+    # Voice-out (reply as Telegram voice note).
+    voice_out_enabled: bool = False
+    # TTS backend: "none" | "openai" | "tone"
+    tts_backend: str = "none"
+    # Max characters to speak (caption can still include text).
+    tts_max_chars: int = 600
+    # OpenAI TTS settings.
+    tts_openai_model: str = "tts-1"
+    tts_openai_voice: str = "alloy"
+    tts_openai_response_format: str = "mp3"
 
 
 class TelegramAPI:
@@ -1151,6 +1163,40 @@ class TelegramAPI:
             content_type=ctype,
         )
 
+    def send_voice(
+        self,
+        chat_id: int,
+        file_path: Path,
+        *,
+        filename: str | None = None,
+        caption: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> int | None:
+        """
+        Send a Telegram voice note (OGG/Opus).
+        """
+        fields: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption:
+            # Telegram captions have a smaller limit than messages; keep it conservative.
+            fields["caption"] = caption[:900]
+        if reply_to_message_id is not None:
+            fields["reply_to_message_id"] = str(reply_to_message_id)
+        fn = filename or file_path.name or "voice.ogg"
+        res = self._request_multipart(
+            "sendVoice",
+            fields=fields,
+            file_field="voice",
+            file_path=file_path,
+            filename=fn,
+            content_type="audio/ogg",
+        )
+        try:
+            if isinstance(res, dict) and res.get("message_id") is not None:
+                return int(res["message_id"])
+        except Exception:
+            pass
+        return None
+
 
 class OpenAITranscriber:
     """
@@ -1310,6 +1356,100 @@ class OpenAITranscriber:
         )
         txt = parsed.get("text")
         return txt.strip() if isinstance(txt, str) else ""
+
+
+class OpenAITTS:
+    """
+    Minimal OpenAI text-to-speech client (stdlib-only).
+    Uses JSON POST to /v1/audio/speech and returns raw audio bytes.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_base_url: str,
+        timeout_seconds: int,
+        max_retries: int,
+        retry_initial_seconds: float,
+        retry_max_seconds: float,
+    ) -> None:
+        self._api_key = (api_key or "").strip()
+        self._base = (api_base_url or "https://api.openai.com").strip().rstrip("/")
+        self._timeout_seconds = int(timeout_seconds)
+        self._max_retries = max(0, int(max_retries))
+        self._retry_initial_seconds = max(0.0, float(retry_initial_seconds))
+        self._retry_max_seconds = max(0.0, float(retry_max_seconds))
+        self._ssl_context = ssl.create_default_context()
+
+    def synthesize(
+        self,
+        *,
+        text: str,
+        model: str,
+        voice: str,
+        response_format: str,
+    ) -> bytes:
+        if not self._api_key:
+            raise RuntimeError("Missing OpenAI API key")
+        t = (text or "").strip()
+        if not t:
+            raise RuntimeError("Empty TTS input")
+        m = (model or "").strip() or "tts-1"
+        v = (voice or "").strip() or "alloy"
+        fmt = (response_format or "").strip().lower() or "mp3"
+
+        url = self._base + "/v1/audio/speech"
+        u = urllib.parse.urlparse(url)
+        if u.scheme != "https" or not u.hostname or not u.path:
+            raise RuntimeError(f"Bad OpenAI URL: {url}")
+
+        body = json.dumps(
+            {
+                "model": m,
+                "input": t,
+                "voice": v,
+                "response_format": fmt,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        last_err: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            conn: http.client.HTTPSConnection | None = None
+            try:
+                conn = http.client.HTTPSConnection(u.hostname, timeout=self._timeout_seconds, context=self._ssl_context)
+                conn.putrequest("POST", u.path)
+                conn.putheader("Authorization", f"Bearer {self._api_key}")
+                conn.putheader("Content-Type", "application/json; charset=utf-8")
+                conn.putheader("Content-Length", str(len(body)))
+                conn.putheader("Connection", "close")
+                conn.endheaders()
+                conn.send(body)
+
+                resp = conn.getresponse()
+                raw = resp.read()
+                if resp.status >= 400:
+                    msg = raw.decode("utf-8", errors="replace")
+                    if resp.status in (429, 500, 502, 503, 504) and attempt < self._max_retries:
+                        _sleep_retry(attempt, self._retry_initial_seconds, self._retry_max_seconds, None)
+                        continue
+                    raise RuntimeError(f"OpenAI TTS HTTP error: {resp.status} {msg[:2000]}")
+                return raw
+            except Exception as e:
+                last_err = e
+                if attempt < self._max_retries:
+                    _sleep_retry(attempt, self._retry_initial_seconds, self._retry_max_seconds, None)
+                    continue
+                raise
+            finally:
+                try:
+                    if conn is not None:
+                        conn.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError(f"OpenAI TTS request failed: {last_err}")
 
 
 class WhisperCppTranscriber:
@@ -3615,6 +3755,7 @@ def _orchestrator_task_from_job(
         "profile_role": role,
         "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
     }
+    trace["prefer_voice_reply"] = bool(getattr(job, "prefer_voice_reply", False))
     if employee_name:
         trace["employee_name"] = employee_name
     if job.reply_to_message_id is not None:
@@ -6963,7 +7104,11 @@ def _send_orchestrator_result(
         # Evidence jobs: on success, send only the artifact(s) and skip the text message.
         artifacts_only = (kind == "evidence") and status == "ok" and mode != "verbose"
 
-        if _should_notify() and (not artifacts_only):
+        prefer_voice = bool((task.trace or {}).get("prefer_voice_reply", False))
+        force_notify = prefer_voice and bool(cfg.voice_out_enabled)
+        notify = _should_notify() or force_notify
+
+        if notify:
             # Keep chat updates short; details are always available via /job and /ticket.
             max_summary = 900
             if len(summary) > max_summary:
@@ -6994,7 +7139,36 @@ def _send_orchestrator_result(
                     payload.append(f"Ticket: /ticket {root[:8]}")
 
             msg = "\n".join(payload)
-            _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
+            sent_voice = False
+            if prefer_voice and cfg.voice_out_enabled:
+                try:
+                    tts_client: OpenAITTS | None = None
+                    if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
+                        tts_client = OpenAITTS(
+                            api_key=cfg.openai_api_key,
+                            api_base_url=cfg.openai_api_base_url,
+                            timeout_seconds=cfg.http_timeout_seconds,
+                            max_retries=cfg.http_max_retries,
+                            retry_initial_seconds=cfg.http_retry_initial_seconds,
+                            retry_max_seconds=cfg.http_retry_max_seconds,
+                        )
+                    speak_text = (summary_lines[0] if summary_lines else summary) or "(no summary)"
+                    _send_voice_note(
+                        api=api,
+                        cfg=cfg,
+                        chat_id=int(task.chat_id),
+                        reply_to_message_id=int(task.reply_to_message_id or 0),
+                        tts=tts_client,
+                        speak_text=str(speak_text),
+                        caption_text=msg,
+                    )
+                    sent_voice = True
+                except Exception:
+                    sent_voice = False
+                    LOG.exception("Failed to send orchestrator voice reply. job=%s", task.job_id)
+
+            if (not sent_voice) and (not artifacts_only):
+                _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
 
             # In minimal mode, don't spam stderr tails. Operators can inspect via /job and artifacts.
             if mode == "verbose" and status != "ok" and logs:
@@ -7006,7 +7180,7 @@ def _send_orchestrator_result(
                     except Exception:
                         LOG.exception("Failed to send orchestrator logs chunk. job=%s", task.job_id)
 
-        if not _should_notify() and (not artifacts_only):
+        if (not notify) and (not artifacts_only):
             return
 
         for raw in artifacts[:3]:
@@ -7568,6 +7742,7 @@ def _transcribe_worker_loop(
             image_paths=[],
             upload_paths=[],
             force_new_thread=False,
+            prefer_voice_reply=True,
         )
 
         # Prefer orchestrator if enabled; otherwise fall back to legacy queue.
@@ -7607,6 +7782,7 @@ def _transcribe_worker_loop(
             image_paths=job.image_paths,
             upload_paths=job.upload_paths,
             force_new_thread=job.force_new_thread,
+            prefer_voice_reply=job.prefer_voice_reply,
         )
         try:
             jobs.put(job, block=False)
@@ -7621,6 +7797,154 @@ def _transcribe_worker_loop(
             api.send_message(chat_id, "Queue is full; try again in a bit.", reply_to_message_id=message_id if message_id else None)
 
 
+def _is_exec_available(cmd: str) -> bool:
+    if not cmd:
+        return False
+    p = Path(cmd).expanduser()
+    if p.exists():
+        return True
+    return shutil.which(cmd) is not None
+
+
+def _ffmpeg_to_ogg_opus_voip(*, ffmpeg_bin: str, input_path: Path, output_path: Path) -> None:
+    if not _is_exec_available(ffmpeg_bin):
+        raise RuntimeError(f"ffmpeg no encontrado: {ffmpeg_bin or '(empty)'}")
+    argv = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_path),
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-application",
+        "voip",
+        str(output_path),
+    ]
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
+
+
+def _make_tone_ogg(*, ffmpeg_bin: str, output_path: Path, seconds: float = 1.2, freq_hz: int = 660) -> None:
+    if not _is_exec_available(ffmpeg_bin):
+        raise RuntimeError(f"ffmpeg no encontrado: {ffmpeg_bin or '(empty)'}")
+    # Generate an OGG/Opus voice-note friendly tone (works as a minimal voice-out fallback).
+    argv = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency={int(freq_hz)}:duration={float(seconds)}",
+        "-ac",
+        "1",
+        "-ar",
+        "48000",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "32k",
+        "-application",
+        "voip",
+        str(output_path),
+    ]
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg fallo: {(p.stderr or p.stdout or '').strip()[:2000]}")
+
+
+def _synthesize_voice_note_ogg(
+    *,
+    cfg: BotConfig,
+    tts: OpenAITTS | None,
+    text: str,
+) -> Path:
+    """
+    Returns a temp .ogg path suitable for Telegram sendVoice.
+    Falls back to a short tone if TTS isn't available.
+    """
+    tmp_dir = Path(tempfile.mkdtemp(prefix="poncebot_tts_"))
+    out_ogg = tmp_dir / "voice.ogg"
+
+    backend = (cfg.tts_backend or "none").strip().lower()
+    speak = (text or "").strip()
+    if cfg.tts_max_chars > 0 and len(speak) > cfg.tts_max_chars:
+        speak = speak[: cfg.tts_max_chars].rstrip() + "..."
+
+    try:
+        if cfg.voice_out_enabled and backend == "openai" and tts is not None and cfg.openai_api_key:
+            # Ask OpenAI for audio, then transcode to Telegram-voice friendly OGG/Opus.
+            raw = tts.synthesize(
+                text=speak,
+                model=cfg.tts_openai_model,
+                voice=cfg.tts_openai_voice,
+                response_format=cfg.tts_openai_response_format,
+            )
+            in_path = tmp_dir / f"voice_in.{cfg.tts_openai_response_format}"
+            in_path.write_bytes(raw)
+            _ffmpeg_to_ogg_opus_voip(ffmpeg_bin=cfg.ffmpeg_bin, input_path=in_path, output_path=out_ogg)
+            return out_ogg
+
+        if cfg.voice_out_enabled and backend == "tone":
+            _make_tone_ogg(ffmpeg_bin=cfg.ffmpeg_bin, output_path=out_ogg)
+            return out_ogg
+
+        # Default fallback: tone.
+        _make_tone_ogg(ffmpeg_bin=cfg.ffmpeg_bin, output_path=out_ogg)
+        return out_ogg
+    except Exception:
+        # Last resort: try a tone even if TTS failed.
+        try:
+            _make_tone_ogg(ffmpeg_bin=cfg.ffmpeg_bin, output_path=out_ogg)
+            return out_ogg
+        except Exception:
+            raise
+
+
+def _send_voice_note(
+    *,
+    api: TelegramAPI,
+    cfg: BotConfig,
+    chat_id: int,
+    reply_to_message_id: int,
+    tts: OpenAITTS | None,
+    speak_text: str,
+    caption_text: str,
+) -> int | None:
+    ogg_path = _synthesize_voice_note_ogg(cfg=cfg, tts=tts, text=speak_text)
+    try:
+        return api.send_voice(
+            chat_id,
+            ogg_path,
+            filename="jarvis.ogg",
+            caption=(caption_text or "").strip()[:900],
+            reply_to_message_id=reply_to_message_id if reply_to_message_id else None,
+        )
+    finally:
+        try:
+            ogg_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            # Remove the temp dir as well.
+            if ogg_path.parent and ogg_path.parent.name.startswith("poncebot_tts_"):
+                shutil.rmtree(ogg_path.parent, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def worker_loop(
     *,
     cfg: BotConfig,
@@ -7630,6 +7954,16 @@ def worker_loop(
     stop_event: threading.Event,
     thread_mgr: ThreadManager,
 ) -> None:
+    tts_client: OpenAITTS | None = None
+    if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
+        tts_client = OpenAITTS(
+            api_key=cfg.openai_api_key,
+            api_base_url=cfg.openai_api_base_url,
+            timeout_seconds=cfg.http_timeout_seconds,
+            max_retries=cfg.http_max_retries,
+            retry_initial_seconds=cfg.http_retry_initial_seconds,
+            retry_max_seconds=cfg.http_retry_max_seconds,
+        )
     while not stop_event.is_set():
         try:
             job = jobs.get(timeout=0.5)
@@ -7812,40 +8146,68 @@ def worker_loop(
                 except Exception:
                     LOG.exception("Failed to extract/set new thread id")
 
-            if cfg.send_as_file_threshold_chars > 0 and len(out) > cfg.send_as_file_threshold_chars:
-                tmp_f = tempfile.NamedTemporaryFile(prefix="codexbot_output_", suffix=".txt", delete=False)
-                tmp = Path(tmp_f.name)
-                tmp_f.close()
+            sent_voice = False
+            if job.prefer_voice_reply and cfg.voice_out_enabled:
                 try:
-                    tmp.write_text(out + "\n", encoding="utf-8", errors="replace")
+                    caption = (body or "").strip()
+                    if len(caption) > 850:
+                        caption = caption[:850].rstrip() + "..."
+                    speak_text = (body or "").strip() or "(empty)"
+                    if (cfg.tts_backend or "").strip().lower() == "openai" and not cfg.openai_api_key:
+                        caption = "TTS no configurado (OPENAI_API_KEY faltante). Enviando tono de prueba.\n\n" + caption
+                    _send_voice_note(
+                        api=api,
+                        cfg=cfg,
+                        chat_id=job.chat_id,
+                        reply_to_message_id=job.reply_to_message_id,
+                        tts=tts_client,
+                        speak_text=speak_text,
+                        caption_text=caption,
+                    )
+                    sent_voice = True
+                except Exception:
+                    sent_voice = False
+                    LOG.exception("Voice reply failed; falling back to text")
+
+            if not sent_voice:
+                if cfg.send_as_file_threshold_chars > 0 and len(out) > cfg.send_as_file_threshold_chars:
+                    tmp_f = tempfile.NamedTemporaryFile(prefix="codexbot_output_", suffix=".txt", delete=False)
+                    tmp = Path(tmp_f.name)
+                    tmp_f.close()
                     try:
-                        api.send_message(
-                            job.chat_id,
-                            f"{header}\n\n(Output too large; sent as file.)",
-                            reply_to_message_id=job.reply_to_message_id,
-                        )
-                        api.send_document(
-                            job.chat_id,
-                            tmp,
-                            filename="codex_output.txt",
-                            reply_to_message_id=job.reply_to_message_id,
-                        )
-                    except Exception:
-                        LOG.exception("Failed to send as file; falling back to chunked messages")
-                        chunks = _chunk_text(out, limit=TELEGRAM_MSG_LIMIT - 64)
-                        for idx, ch in enumerate(chunks, start=1):
-                            prefix = "" if len(chunks) == 1 else f"[{idx}/{len(chunks)}]\n"
-                            api.send_message(job.chat_id, prefix + ch, reply_to_message_id=job.reply_to_message_id)
-                finally:
-                    tmp.unlink(missing_ok=True)
-            else:
-                # Leave headroom for chunk headers like "[1/3]\n".
-                chunks = _chunk_text(out, limit=TELEGRAM_MSG_LIMIT - 64)
-                if len(chunks) == 1:
-                    api.send_message(job.chat_id, chunks[0], reply_to_message_id=job.reply_to_message_id)
+                        tmp.write_text(out + "\n", encoding="utf-8", errors="replace")
+                        try:
+                            api.send_message(
+                                job.chat_id,
+                                f"{header}\n\n(Output too large; sent as file.)",
+                                reply_to_message_id=job.reply_to_message_id,
+                            )
+                            api.send_document(
+                                job.chat_id,
+                                tmp,
+                                filename="codex_output.txt",
+                                reply_to_message_id=job.reply_to_message_id,
+                            )
+                        except Exception:
+                            LOG.exception("Failed to send as file; falling back to chunked messages")
+                            chunks = _chunk_text(out, limit=TELEGRAM_MSG_LIMIT - 64)
+                            for idx, ch in enumerate(chunks, start=1):
+                                prefix = "" if len(chunks) == 1 else f"[{idx}/{len(chunks)}]\n"
+                                api.send_message(job.chat_id, prefix + ch, reply_to_message_id=job.reply_to_message_id)
+                    finally:
+                        tmp.unlink(missing_ok=True)
                 else:
-                    for idx, ch in enumerate(chunks, start=1):
-                        api.send_message(job.chat_id, f"[{idx}/{len(chunks)}]\n{ch}", reply_to_message_id=job.reply_to_message_id)
+                    # Leave headroom for chunk headers like "[1/3]\n".
+                    chunks = _chunk_text(out, limit=TELEGRAM_MSG_LIMIT - 64)
+                    if len(chunks) == 1:
+                        api.send_message(job.chat_id, chunks[0], reply_to_message_id=job.reply_to_message_id)
+                    else:
+                        for idx, ch in enumerate(chunks, start=1):
+                            api.send_message(
+                                job.chat_id,
+                                f"[{idx}/{len(chunks)}]\n{ch}",
+                                reply_to_message_id=job.reply_to_message_id,
+                            )
 
             # If the run produced images in the workdir, attach them (previewable) after the main output.
             try:
@@ -7911,10 +8273,20 @@ def poll_loop(
     last_unauth_reply_at: dict[int, float] = {}
     next_command_sync_at = 0.0
     openai_transcriber: OpenAITranscriber | None = None
+    openai_tts: OpenAITTS | None = None
     if cfg.openai_api_key:
         # Initialize once; per-message selection is controlled by /voice state + cfg defaults.
         if cfg.transcribe_backend in ("openai", "auto", "whispercpp"):
             openai_transcriber = OpenAITranscriber(
+                api_key=cfg.openai_api_key,
+                api_base_url=cfg.openai_api_base_url,
+                timeout_seconds=cfg.http_timeout_seconds,
+                max_retries=cfg.http_max_retries,
+                retry_initial_seconds=cfg.http_retry_initial_seconds,
+                retry_max_seconds=cfg.http_retry_max_seconds,
+            )
+        if (cfg.tts_backend or "").strip().lower() == "openai":
+            openai_tts = OpenAITTS(
                 api_key=cfg.openai_api_key,
                 api_base_url=cfg.openai_api_base_url,
                 timeout_seconds=cfg.http_timeout_seconds,
@@ -7966,6 +8338,7 @@ def poll_loop(
 
                 msg = upd.get("message") or {}
                 text = msg.get("text")
+                incoming_prefer_voice_reply = False
 
                 chat = msg.get("chat") or {}
                 from_user = msg.get("from") or {}
@@ -7996,6 +8369,7 @@ def poll_loop(
                         orig_name = fn if isinstance(fn, str) and fn else "audio.bin"
 
                     if file_id:
+                        incoming_prefer_voice_reply = True
                         if cfg.transcribe_async and transcribe_requests is not None:
                             # Auth preflight: avoid downloading/transcribing for unauthorized chats.
                             incoming_stub = IncomingMessage(
@@ -8211,6 +8585,36 @@ def poll_loop(
                 except Exception:
                     # Best-effort only; fall back to normal routing.
                     pass
+
+                if incoming_text.strip().startswith("/say "):
+                    to_say = incoming_text.strip()[5:].strip()
+                    if not to_say:
+                        api.send_message(
+                            chat_id,
+                            "Uso: /say <texto>",
+                            reply_to_message_id=message_id if message_id else None,
+                        )
+                        continue
+                    if not cfg.voice_out_enabled:
+                        api.send_message(
+                            chat_id,
+                            "Voice-out deshabilitado (BOT_VOICE_OUT_ENABLED=0).",
+                            reply_to_message_id=message_id if message_id else None,
+                        )
+                        continue
+                    caption = to_say
+                    if (cfg.tts_backend or "").strip().lower() == "openai" and not cfg.openai_api_key:
+                        caption = "TTS no configurado (OPENAI_API_KEY faltante). Enviando tono de prueba.\n\n" + caption
+                    _send_voice_note(
+                        api=api,
+                        cfg=cfg,
+                        chat_id=chat_id,
+                        reply_to_message_id=message_id,
+                        tts=openai_tts,
+                        speak_text=to_say,
+                        caption_text=caption,
+                    )
+                    continue
 
                 if incoming_text.strip() in ("/new", "/reset"):
                     thread_mgr.clear(chat_id)
@@ -8585,6 +8989,20 @@ def poll_loop(
                     api.send_message(chat_id, response, reply_to_message_id=message_id if message_id else None)
 
                 if job is not None:
+                    if incoming_prefer_voice_reply and not job.prefer_voice_reply:
+                        job = Job(
+                            chat_id=job.chat_id,
+                            reply_to_message_id=job.reply_to_message_id,
+                            user_text=job.user_text,
+                            argv=job.argv,
+                            mode_hint=job.mode_hint,
+                            epoch=job.epoch,
+                            threaded=job.threaded,
+                            image_paths=job.image_paths,
+                            upload_paths=job.upload_paths,
+                            force_new_thread=job.force_new_thread,
+                            prefer_voice_reply=True,
+                        )
                     profile = _auth_effective_profile_name(cfg, chat_id=chat_id) if cfg.auth_enabled else ""
                     if profile:
                         # Enforce max_mode for /ro,/rw,/full and default messages.
@@ -8650,6 +9068,7 @@ def poll_loop(
                         image_paths=job.image_paths,
                         upload_paths=job.upload_paths,
                         force_new_thread=job.force_new_thread,
+                        prefer_voice_reply=job.prefer_voice_reply,
                     )
                     # Attach profile to job via a lightweight hack: embed in upload_paths? No.
                     # Instead, persist per-chat profile in auth session and re-resolve in worker.
@@ -8844,6 +9263,17 @@ def _load_config() -> BotConfig:
     )
     transcribe_async = os.environ.get("BOT_TRANSCRIBE_ASYNC", "1").strip().lower() in ("1", "true", "yes", "on")
 
+    voice_out_enabled = os.environ.get("BOT_VOICE_OUT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    tts_backend = os.environ.get("BOT_TTS_BACKEND", "none").strip().lower() or "none"
+    if tts_backend not in ("none", "openai", "tone"):
+        tts_backend = "none"
+    tts_max_chars = int(os.environ.get("BOT_TTS_MAX_CHARS", "600"))
+    if tts_max_chars < 0:
+        tts_max_chars = 0
+    tts_openai_model = os.environ.get("BOT_TTS_OPENAI_MODEL", "tts-1").strip() or "tts-1"
+    tts_openai_voice = os.environ.get("BOT_TTS_OPENAI_VOICE", "alloy").strip() or "alloy"
+    tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
+
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
         raise SystemExit(f"CODEX_WORKDIR must be an existing directory: {codex_workdir}")
@@ -8934,6 +9364,12 @@ def _load_config() -> BotConfig:
         screenshot_enabled=screenshot_enabled,
         screenshot_allowed_hosts=screenshot_allowed_hosts,
         transcribe_async=transcribe_async,
+        voice_out_enabled=voice_out_enabled,
+        tts_backend=tts_backend,
+        tts_max_chars=tts_max_chars,
+        tts_openai_model=tts_openai_model,
+        tts_openai_voice=tts_openai_voice,
+        tts_openai_response_format=tts_openai_response_format,
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
