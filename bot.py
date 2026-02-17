@@ -7942,7 +7942,8 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     eng_terms: list[tuple[str, str]] = [
         (r"\bbackend\b", "back end"),
         (r"\bfrontend\b", "front end"),
-        (r"\bdashboard\b", "dash board"),
+        # "dashboard" tends to get mangled by Spanish TTS ("dasvoard"). This spelling usually lands closer to "dashbord".
+        (r"\bdashboard\b", "dashbord"),
         (r"\bdeploy\b", "de ploy"),
         (r"\brelease\b", "re lease"),
         (r"\brollback\b", "roll back"),
