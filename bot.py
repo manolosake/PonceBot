@@ -1640,6 +1640,94 @@ def _clear_voice_state(cfg: "BotConfig") -> None:
     _atomic_write_json(cfg.state_file, st)
 
 
+def _get_qa_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    raw = st.get("qa")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _set_qa_state(cfg: "BotConfig", qa_state: dict[str, Any]) -> None:
+    st = _get_state(cfg)
+    st["qa"] = qa_state
+    _atomic_write_json(cfg.state_file, st)
+
+
+def _qa_chat_key(chat_id: int) -> str:
+    return str(int(chat_id))
+
+
+def _qa_is_safe_artifact_id(s: str) -> bool:
+    """
+    Defensive: artifacts dir ids should be plain UUID-ish tokens (no slashes, no traversal).
+    """
+    s = (s or "").strip()
+    if not s:
+        return False
+    if len(s) > 128:
+        return False
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_"):
+            continue
+        return False
+    # Common case: UUID with hyphens. Don't require exact UUID format to stay flexible.
+    if "/" in s or "\\" in s or ".." in s:
+        return False
+    return True
+
+
+def _qa_get_evidence_artifact_id(cfg: "BotConfig", *, chat_id: int) -> str:
+    qa = _get_qa_state(cfg)
+    by_chat = qa.get("evidence_artifact_by_chat")
+    if not isinstance(by_chat, dict):
+        return ""
+    raw = by_chat.get(_qa_chat_key(chat_id))
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _qa_set_evidence_artifact_id(cfg: "BotConfig", *, chat_id: int, artifact_id: str) -> None:
+    qa = _get_qa_state(cfg)
+    by_chat = qa.get("evidence_artifact_by_chat")
+    if not isinstance(by_chat, dict):
+        by_chat = {}
+    artifact_id = (artifact_id or "").strip()
+    if artifact_id:
+        by_chat[_qa_chat_key(chat_id)] = artifact_id
+    else:
+        by_chat.pop(_qa_chat_key(chat_id), None)
+    qa["evidence_artifact_by_chat"] = by_chat
+    _set_qa_state(cfg, qa)
+
+
+def _qa_evidence_dir(cfg: "BotConfig", *, chat_id: int) -> Path | None:
+    artifact_id = _qa_get_evidence_artifact_id(cfg, chat_id=chat_id)
+    if not artifact_id:
+        return None
+    if not _qa_is_safe_artifact_id(artifact_id):
+        return None
+    return (cfg.artifacts_root / artifact_id).resolve()
+
+
+def _qa_append_evidence(cfg: "BotConfig", *, chat_id: int, event: dict[str, Any]) -> None:
+    """
+    Best-effort JSONL evidence capture for human-in-the-loop Telegram QA.
+    Stored under: cfg.artifacts_root/<artifact_id>/telegram_qa.jsonl
+    """
+    out_dir = _qa_evidence_dir(cfg, chat_id=chat_id)
+    if out_dir is None:
+        return
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        p = out_dir / "telegram_qa.jsonl"
+        payload = dict(event or {})
+        payload.setdefault("ts", time.time())
+        payload.setdefault("chat_id", int(chat_id))
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        # Evidence capture should never break the bot.
+        LOG.exception("QA evidence append failed. chat_id=%s", chat_id)
+
+
 def _voice_bool(v: Any) -> bool | None:
     if isinstance(v, bool):
         return v
@@ -8086,13 +8174,29 @@ def _send_voice_note(
 ) -> int | None:
     ogg_path = _synthesize_voice_note_ogg(cfg=cfg, tts=tts, text=speak_text)
     try:
-        return api.send_voice(
+        mid = api.send_voice(
             chat_id,
             ogg_path,
             filename="jarvis.ogg",
             caption=(caption_text or "").strip()[:900],
             reply_to_message_id=reply_to_message_id if reply_to_message_id else None,
         )
+        try:
+            _qa_append_evidence(
+                cfg,
+                chat_id=chat_id,
+                event={
+                    "event_type": "voice_out",
+                    "reply_to_message_id": int(reply_to_message_id or 0),
+                    "voice_message_id": int(mid) if mid is not None else None,
+                    "tts_backend": (cfg.tts_backend or "").strip().lower(),
+                    "caption_len": len((caption_text or "").strip()),
+                    "speak_len": len((speak_text or "").strip()),
+                },
+            )
+        except Exception:
+            pass
+        return mid
     finally:
         try:
             ogg_path.unlink(missing_ok=True)
@@ -8531,6 +8635,26 @@ def poll_loop(
 
                     if file_id:
                         incoming_prefer_voice_reply = True
+                        try:
+                            dur = 0
+                            if isinstance(voice, dict) and isinstance(voice.get("duration"), (int, float)):
+                                dur = int(voice.get("duration") or 0)
+                            elif isinstance(audio, dict) and isinstance(audio.get("duration"), (int, float)):
+                                dur = int(audio.get("duration") or 0)
+                            _qa_append_evidence(
+                                cfg,
+                                chat_id=chat_id,
+                                event={
+                                    "event_type": "voice_in",
+                                    "message_id": int(message_id or 0),
+                                    "file_id": str(file_id),
+                                    "kind": "voice" if isinstance(voice, dict) else "audio",
+                                    "duration_s": dur,
+                                    "user_id": int(user_id or 0),
+                                },
+                            )
+                        except Exception:
+                            pass
                         if cfg.transcribe_async and transcribe_requests is not None:
                             # Auth preflight: avoid downloading/transcribing for unauthorized chats.
                             incoming_stub = IncomingMessage(
@@ -8731,6 +8855,99 @@ def poll_loop(
                     if active:
                         # Sliding session TTL: any message keeps the session alive.
                         _auth_touch_session(cfg, chat_id=chat_id)
+
+                # QA evidence capture (human-in-the-loop). Stores JSONL under cfg.artifacts_root/<id>/telegram_qa.jsonl.
+                # Safe: only affects authorized chats, and evidence writes are best-effort.
+                qa_txt = incoming_text.strip()
+                if qa_txt.startswith("/qa_evidence"):
+                    parts = qa_txt.split(None, 1)
+                    arg = parts[1].strip() if len(parts) > 1 else "status"
+                    if arg.lower() in ("status", "s"):
+                        cur = _qa_get_evidence_artifact_id(cfg, chat_id=chat_id)
+                        if cur:
+                            api.send_message(
+                                chat_id,
+                                f"QA evidence: ON ({cur})",
+                                reply_to_message_id=message_id if message_id else None,
+                            )
+                        else:
+                            api.send_message(
+                                chat_id,
+                                "QA evidence: OFF",
+                                reply_to_message_id=message_id if message_id else None,
+                            )
+                        continue
+                    if arg.lower() in ("off", "disable", "0"):
+                        _qa_set_evidence_artifact_id(cfg, chat_id=chat_id, artifact_id="")
+                        api.send_message(
+                            chat_id,
+                            "OK. QA evidence disabled.",
+                            reply_to_message_id=message_id if message_id else None,
+                        )
+                        continue
+                    if not _qa_is_safe_artifact_id(arg):
+                        api.send_message(
+                            chat_id,
+                            "Uso: /qa_evidence <artifact_id> | /qa_evidence status | /qa_evidence off",
+                            reply_to_message_id=message_id if message_id else None,
+                        )
+                        continue
+                    _qa_set_evidence_artifact_id(cfg, chat_id=chat_id, artifact_id=arg)
+                    _qa_append_evidence(
+                        cfg,
+                        chat_id=chat_id,
+                        event={
+                            "event_type": "qa_evidence_enabled",
+                            "artifact_id": arg,
+                            "tts_backend": (cfg.tts_backend or "").strip().lower(),
+                            "voice_out_enabled": bool(cfg.voice_out_enabled),
+                            "piper_model_path": str(cfg.tts_piper_model_path or ""),
+                            "piper_bin": str(cfg.tts_piper_bin or ""),
+                        },
+                    )
+                    api.send_message(
+                        chat_id,
+                        f"OK. QA evidence enabled: {arg}",
+                        reply_to_message_id=message_id if message_id else None,
+                    )
+                    continue
+
+                if qa_txt.startswith("/qa_feedback") or qa_txt.startswith("qa_ack_"):
+                    fb = ""
+                    if qa_txt.startswith("/qa_feedback"):
+                        parts = qa_txt.split(None, 1)
+                        fb = parts[1].strip() if len(parts) > 1 else ""
+                    tag = qa_txt if qa_txt.startswith("qa_ack_") else ""
+
+                    r = msg.get("reply_to_message") or {}
+                    rmid = int(r.get("message_id", 0)) if isinstance(r, dict) else 0
+                    r_has_voice = bool(isinstance(r, dict) and isinstance(r.get("voice"), dict))
+                    r_has_document = bool(isinstance(r, dict) and isinstance(r.get("document"), dict))
+                    r_caption = (r.get("caption") if isinstance(r, dict) else "") or ""
+                    if not isinstance(r_caption, str):
+                        r_caption = ""
+
+                    _qa_append_evidence(
+                        cfg,
+                        chat_id=chat_id,
+                        event={
+                            "event_type": "qa_feedback",
+                            "message_id": int(message_id or 0),
+                            "reply_to_message_id": int(rmid or 0),
+                            "reply_to_has_voice": bool(r_has_voice),
+                            "reply_to_has_document": bool(r_has_document),
+                            "reply_to_caption_preview": r_caption[:200],
+                            "tag": tag,
+                            "feedback": fb,
+                            "user_id": int(user_id or 0),
+                        },
+                    )
+                    api.send_message(
+                        chat_id,
+                        "OK. Feedback recorded.",
+                        reply_to_message_id=message_id if message_id else None,
+                    )
+                    continue
 
                 # Deterministic CEO queries (no Codex, no delegation).
                 # This runs after authorization/auth checks, so we don't leak info to unauthorized chats.

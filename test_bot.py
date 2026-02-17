@@ -135,6 +135,33 @@ class TestParseJob(unittest.TestCase):
             self.assertIsNone(job)
 
 
+class TestQAEvidenceState(unittest.TestCase):
+    def test_artifact_id_validation(self) -> None:
+        self.assertTrue(bot._qa_is_safe_artifact_id("48b12907-bd85-4ce8-88af-2982a78ebcfc"))
+        self.assertTrue(bot._qa_is_safe_artifact_id("abc_123-XYZ"))
+        self.assertFalse(bot._qa_is_safe_artifact_id(""))
+        self.assertFalse(bot._qa_is_safe_artifact_id("../x"))
+        self.assertFalse(bot._qa_is_safe_artifact_id("a/b"))
+        self.assertFalse(bot._qa_is_safe_artifact_id("a\\b"))
+
+    def test_evidence_artifact_id_persists_per_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_file = Path(td) / "state.json"
+            cfg = TestStateHandling()._cfg(state_file)
+            cfg = bot.BotConfig(**{**cfg.__dict__, "artifacts_root": Path(td) / "artifacts"})
+
+            self.assertEqual(bot._qa_get_evidence_artifact_id(cfg, chat_id=123), "")
+            self.assertIsNone(bot._qa_evidence_dir(cfg, chat_id=123))
+
+            bot._qa_set_evidence_artifact_id(cfg, chat_id=123, artifact_id="abc-123")
+            self.assertEqual(bot._qa_get_evidence_artifact_id(cfg, chat_id=123), "abc-123")
+            self.assertEqual(bot._qa_evidence_dir(cfg, chat_id=123), (cfg.artifacts_root / "abc-123").resolve())
+
+            bot._qa_set_evidence_artifact_id(cfg, chat_id=123, artifact_id="")
+            self.assertEqual(bot._qa_get_evidence_artifact_id(cfg, chat_id=123), "")
+            self.assertIsNone(bot._qa_evidence_dir(cfg, chat_id=123))
+
+
 class TestSkillsCommands(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
         return TestStateHandling()._cfg(state_file)
