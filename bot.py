@@ -7831,24 +7831,21 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Slash commands: "/ticket 123" -> "ticket 123"
     t = re.sub(r"\b/(ticket|job|agents|dashboard|restart|say)\b", r"\1", t, flags=re.IGNORECASE)
 
-    # Common acronyms and terms. Use word boundaries so we don't mangle normal words.
-    # Keep E2E as English phrase (CEO preference).
+    # Common acronyms and terms. Keep this short to avoid "spelled out" / staccato speech.
+    # CEO preference: E2E is read in English ("end to end").
     repl: list[tuple[str, str]] = [
         (r"\bE2E\b", "end to end"),
-        (r"\bCI/CD\b", "C I C D"),
-        (r"\bCI\b", "C I"),
-        (r"\bCD\b", "C D"),
-        (r"\bQA\b", "Q A"),
-        (r"\bSRE\b", "S R E"),
-        (r"\bPR\b", "P R"),
-        (r"\bAPI\b", "A P I"),
-        (r"\bHTTP\b", "H T T P"),
-        (r"\bHTTPS\b", "H T T P S"),
-        (r"\bJSON\b", "J S O N"),
-        (r"\bSQL\b", "S Q L"),
+        (r"\bPR\b", "pull request"),
+        (r"\bCI/CD\b", "ci cd"),
     ]
     for pat, rep in repl:
         t = re.sub(pat, rep, t)
+
+    # Reduce awkward pauses caused by punctuation / weird sequences.
+    t = t.replace("...", ".")
+    t = re.sub(r"[,:;]+", " ", t)
+    t = re.sub(r"\s*[|/]\s*", " ", t)
+    t = re.sub(r"\s+\.\s+", ". ", t)
 
     # Piper (Spanish) tends to sound better without excessive punctuation.
     if (backend or "").strip().lower() == "piper":
@@ -9425,8 +9422,12 @@ def _load_config() -> BotConfig:
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
     piper_default = str(bin_dir / "piper" / "piper") if (bin_dir / "piper" / "piper").exists() else "piper"
     piper_model_default = ""
-    # Prefer a more natural Spanish (Mexico) voice if the model is already present.
-    if (models_dir / "piper" / "es_MX-claude-high.onnx").exists():
+    # Prefer voices that tend to sound more "male" / less sing-songy if present.
+    if (models_dir / "piper" / "es_ES-carlfm-x_low.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_ES-carlfm-x_low.onnx")
+    elif (models_dir / "piper" / "es_ES-davefx-medium.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_ES-davefx-medium.onnx")
+    elif (models_dir / "piper" / "es_MX-claude-high.onnx").exists():
         piper_model_default = str(models_dir / "piper" / "es_MX-claude-high.onnx")
     elif (models_dir / "piper" / "es_MX-ald-medium.onnx").exists():
         piper_model_default = str(models_dir / "piper" / "es_MX-ald-medium.onnx")
