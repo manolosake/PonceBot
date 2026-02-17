@@ -7847,6 +7847,20 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     t = re.sub(r"\s*[|/]\s*", " ", t)
     t = re.sub(r"\s+\.\s+", ". ", t)
 
+    # Common English product/engineering terms: make them easier for Spanish TTS
+    # without fully translating (keeps CEO preference of mixing ES + EN).
+    eng_terms: list[tuple[str, str]] = [
+        (r"\bbackend\b", "back end"),
+        (r"\bfrontend\b", "front end"),
+        (r"\bdashboard\b", "dash board"),
+        (r"\bdeploy\b", "de ploy"),
+        (r"\brelease\b", "re lease"),
+        (r"\brollback\b", "roll back"),
+        (r"\bhotfix\b", "hot fix"),
+    ]
+    for pat, rep in eng_terms:
+        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
+
     # Piper (Spanish) tends to sound better without excessive punctuation.
     if (backend or "").strip().lower() == "piper":
         t = t.replace("_", " ").replace("|", " ")
@@ -9422,15 +9436,16 @@ def _load_config() -> BotConfig:
     tts_openai_response_format = os.environ.get("BOT_TTS_OPENAI_RESPONSE_FORMAT", "mp3").strip().lower() or "mp3"
     piper_default = str(bin_dir / "piper" / "piper") if (bin_dir / "piper" / "piper").exists() else "piper"
     piper_model_default = ""
-    # Prefer voices that tend to sound more "male" / less sing-songy if present.
-    if (models_dir / "piper" / "es_ES-carlfm-x_low.onnx").exists():
-        piper_model_default = str(models_dir / "piper" / "es_ES-carlfm-x_low.onnx")
-    elif (models_dir / "piper" / "es_ES-davefx-medium.onnx").exists():
-        piper_model_default = str(models_dir / "piper" / "es_ES-davefx-medium.onnx")
-    elif (models_dir / "piper" / "es_MX-claude-high.onnx").exists():
+    # Prefer Mexico/US-neutral Spanish voices if present.
+    if (models_dir / "piper" / "es_MX-claude-high.onnx").exists():
         piper_model_default = str(models_dir / "piper" / "es_MX-claude-high.onnx")
     elif (models_dir / "piper" / "es_MX-ald-medium.onnx").exists():
         piper_model_default = str(models_dir / "piper" / "es_MX-ald-medium.onnx")
+    # Fallback: Spain voices (often sound more "male" to some users).
+    elif (models_dir / "piper" / "es_ES-carlfm-x_low.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_ES-carlfm-x_low.onnx")
+    elif (models_dir / "piper" / "es_ES-davefx-medium.onnx").exists():
+        piper_model_default = str(models_dir / "piper" / "es_ES-davefx-medium.onnx")
     tts_piper_bin = os.environ.get("BOT_TTS_PIPER_BIN", piper_default).strip() or piper_default
     tts_piper_model_path = os.environ.get("BOT_TTS_PIPER_MODEL_PATH", piper_model_default).strip() or piper_model_default
     tts_piper_speaker = os.environ.get("BOT_TTS_PIPER_SPEAKER", "").strip()
