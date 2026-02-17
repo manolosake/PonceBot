@@ -749,6 +749,11 @@ class BotConfig:
     tts_piper_model_path: str = ""
     # Optional (multi-speaker models). Empty = default.
     tts_piper_speaker: str = ""
+    # Optional Piper tunables (empty/0 = defaults).
+    tts_piper_noise_scale: float = 0.0
+    tts_piper_length_scale: float = 0.0
+    tts_piper_noise_w: float = 0.0
+    tts_piper_sentence_silence: float = 0.0
 
 
 class TelegramAPI:
@@ -7811,11 +7816,58 @@ def _is_exec_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
+def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
+    """
+    Light normalization to improve pronunciation for local TTS.
+    Keep it conservative: the caption is still sent as text, this only affects spoken audio.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # Remove very long hex-like tokens (job ids, commit hashes) that sound bad.
+    t = re.sub(r"\b[0-9a-f]{8,}\b", "", t, flags=re.IGNORECASE)
+
+    # Slash commands: "/ticket 123" -> "ticket 123"
+    t = re.sub(r"\b/(ticket|job|agents|dashboard|restart|say)\b", r"\1", t, flags=re.IGNORECASE)
+
+    # Common acronyms and terms. Use word boundaries so we don't mangle normal words.
+    # Keep E2E as English phrase (CEO preference).
+    repl: list[tuple[str, str]] = [
+        (r"\bE2E\b", "end to end"),
+        (r"\bCI/CD\b", "C I C D"),
+        (r"\bCI\b", "C I"),
+        (r"\bCD\b", "C D"),
+        (r"\bQA\b", "Q A"),
+        (r"\bSRE\b", "S R E"),
+        (r"\bPR\b", "P R"),
+        (r"\bAPI\b", "A P I"),
+        (r"\bHTTP\b", "H T T P"),
+        (r"\bHTTPS\b", "H T T P S"),
+        (r"\bJSON\b", "J S O N"),
+        (r"\bSQL\b", "S Q L"),
+    ]
+    for pat, rep in repl:
+        t = re.sub(pat, rep, t)
+
+    # Piper (Spanish) tends to sound better without excessive punctuation.
+    if (backend or "").strip().lower() == "piper":
+        t = t.replace("_", " ").replace("|", " ")
+
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def _piper_to_wav(
     *,
     piper_bin: str,
     model_path: str,
     speaker: str,
+    noise_scale: float,
+    length_scale: float,
+    noise_w: float,
+    sentence_silence: float,
     text: str,
     output_wav_path: Path,
 ) -> None:
@@ -7845,6 +7897,15 @@ def _piper_to_wav(
     spk = (speaker or "").strip()
     if spk:
         argv.extend(["--speaker", spk])
+    # Tunables: only pass if explicitly set to a positive value.
+    if float(noise_scale) > 0:
+        argv.extend(["--noise_scale", str(float(noise_scale))])
+    if float(length_scale) > 0:
+        argv.extend(["--length_scale", str(float(length_scale))])
+    if float(noise_w) > 0:
+        argv.extend(["--noise_w", str(float(noise_w))])
+    if float(sentence_silence) > 0:
+        argv.extend(["--sentence_silence", str(float(sentence_silence))])
 
     env = dict(os.environ)
     try:
@@ -7952,6 +8013,9 @@ def _synthesize_voice_note_ogg(
     if cfg.tts_max_chars > 0 and len(speak) > cfg.tts_max_chars:
         speak = speak[: cfg.tts_max_chars].rstrip() + "..."
 
+    # Normalize for clearer pronunciation (especially acronyms like E2E, CI/CD, etc).
+    speak = _normalize_tts_speak_text(speak, backend=backend)
+
     try:
         if cfg.voice_out_enabled and backend == "piper":
             # Local/free speech via Piper, then transcode to Telegram-voice friendly OGG/Opus.
@@ -7960,6 +8024,10 @@ def _synthesize_voice_note_ogg(
                 piper_bin=cfg.tts_piper_bin,
                 model_path=cfg.tts_piper_model_path,
                 speaker=cfg.tts_piper_speaker,
+                noise_scale=cfg.tts_piper_noise_scale,
+                length_scale=cfg.tts_piper_length_scale,
+                noise_w=cfg.tts_piper_noise_w,
+                sentence_silence=cfg.tts_piper_sentence_silence,
                 text=speak,
                 output_wav_path=in_path,
             )
@@ -9360,6 +9428,22 @@ def _load_config() -> BotConfig:
     tts_piper_bin = os.environ.get("BOT_TTS_PIPER_BIN", piper_default).strip() or piper_default
     tts_piper_model_path = os.environ.get("BOT_TTS_PIPER_MODEL_PATH", piper_model_default).strip() or piper_model_default
     tts_piper_speaker = os.environ.get("BOT_TTS_PIPER_SPEAKER", "").strip()
+    try:
+        tts_piper_noise_scale = float(os.environ.get("BOT_TTS_PIPER_NOISE_SCALE", "0").strip() or "0")
+    except Exception:
+        tts_piper_noise_scale = 0.0
+    try:
+        tts_piper_length_scale = float(os.environ.get("BOT_TTS_PIPER_LENGTH_SCALE", "0").strip() or "0")
+    except Exception:
+        tts_piper_length_scale = 0.0
+    try:
+        tts_piper_noise_w = float(os.environ.get("BOT_TTS_PIPER_NOISE_W", "0").strip() or "0")
+    except Exception:
+        tts_piper_noise_w = 0.0
+    try:
+        tts_piper_sentence_silence = float(os.environ.get("BOT_TTS_PIPER_SENTENCE_SILENCE", "0").strip() or "0")
+    except Exception:
+        tts_piper_sentence_silence = 0.0
 
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
@@ -9460,6 +9544,10 @@ def _load_config() -> BotConfig:
         tts_piper_bin=tts_piper_bin,
         tts_piper_model_path=tts_piper_model_path,
         tts_piper_speaker=tts_piper_speaker,
+        tts_piper_noise_scale=tts_piper_noise_scale,
+        tts_piper_length_scale=tts_piper_length_scale,
+        tts_piper_noise_w=tts_piper_noise_w,
+        tts_piper_sentence_silence=tts_piper_sentence_silence,
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
