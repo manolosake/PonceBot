@@ -3977,9 +3977,9 @@ def _orchestrator_task_from_job(
         priority = 2
     if priority < 1:
         priority = 1
-    # CEO preemption: for manual top-level work requests, default to priority=1 so it
-    # doesn't sit behind an old backlog.
-    if not (user_text or "").lstrip().startswith("/") and str(pre.request_type or "task") == "task":
+    # CEO preemption: top-level manual requests should not queue behind autonomous work.
+    # Applies to task + query/status lanes so direct CEO asks stay responsive.
+    if not (user_text or "").lstrip().startswith("/") and str(pre.request_type or "task") in ("task", "query", "status"):
         priority = 1
 
     context = {

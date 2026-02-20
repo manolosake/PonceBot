@@ -493,6 +493,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             self.assertEqual(task.effort, "high")
             self.assertEqual(task.model, "gpt-5.3-codex-spark")
             self.assertFalse(task.requires_approval)
+            self.assertEqual(int(task.priority), 1)
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
             self.assertEqual(int((task.trace or {}).get("max_runtime_seconds") or 0), 120)
 
