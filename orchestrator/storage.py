@@ -1341,10 +1341,16 @@ class SQLiteTaskStorage:
             return False
         return bool(int(row["is_paused"]))
 
-    def get_role_health(self) -> dict[str, dict[str, int]]:
+    def get_role_health(self, *, chat_id: int | None = None) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
         with self._conn() as conn:
-            rows = conn.execute("SELECT role, state, COUNT(1) as c FROM jobs GROUP BY role, state").fetchall()
+            sql = "SELECT role, state, COUNT(1) as c FROM jobs"
+            params: list[Any] = []
+            if chat_id is not None:
+                sql += " WHERE chat_id = ?"
+                params.append(int(chat_id))
+            sql += " GROUP BY role, state"
+            rows = conn.execute(sql, params).fetchall()
             for row in rows:
                 role = str(row["role"])
                 state = str(row["state"])
@@ -1616,6 +1622,7 @@ class SQLiteTaskStorage:
         *,
         role: str | None = None,
         state: str | None = None,
+        chat_id: int | None = None,
         limit: int = 20,
     ) -> list[Task]:
         where: list[str] = []
@@ -1626,6 +1633,9 @@ class SQLiteTaskStorage:
         if state:
             where.append("state = ?")
             params.append(state)
+        if chat_id is not None:
+            where.append("chat_id = ?")
+            params.append(int(chat_id))
         clause = ""
         if where:
             clause = " WHERE " + " AND ".join(where)
@@ -1636,22 +1646,36 @@ class SQLiteTaskStorage:
             ).fetchall()
             return [self._row_to_task(r) for r in q]
 
-    def queued_count(self) -> int:
+    def queued_count(self, *, chat_id: int | None = None) -> int:
         with self._conn() as conn:
-            row = conn.execute("SELECT COUNT(1) as c FROM jobs WHERE state = 'queued'").fetchone()
+            sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'queued'"
+            params: list[object] = []
+            if chat_id is not None:
+                sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            row = conn.execute(sql, params).fetchone()
             return int(row["c"]) if row else 0
 
-    def running_count(self) -> int:
+    def running_count(self, *, chat_id: int | None = None) -> int:
         with self._conn() as conn:
-            row = conn.execute("SELECT COUNT(1) as c FROM jobs WHERE state = 'running'").fetchone()
+            sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'running'"
+            params: list[object] = []
+            if chat_id is not None:
+                sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            row = conn.execute(sql, params).fetchone()
             return int(row["c"]) if row else 0
 
-    def jobs_by_state(self, *, state: str, limit: int = 50) -> list[Task]:
+    def jobs_by_state(self, *, state: str, limit: int = 50, chat_id: int | None = None) -> list[Task]:
         with self._conn() as conn:
-            q = conn.execute(
-                "SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC LIMIT ?",
-                (str(state), int(limit)),
-            ).fetchall()
+            base_sql = "SELECT * FROM jobs WHERE state = ?"
+            params: list[object] = [str(state)]
+            if chat_id is not None:
+                base_sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            base_sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(int(limit))
+            q = conn.execute(base_sql, params).fetchall()
             return [self._row_to_task(r) for r in q]
 
     def _count_jobs(self, conn: sqlite3.Connection, *, role: str, state: str) -> int:

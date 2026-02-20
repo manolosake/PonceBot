@@ -81,3 +81,66 @@ class TestStatusService(unittest.TestCase):
 
             self.assertIsNotNone(snap["snapshot_hash"])
 
+    def test_snapshot_filters_by_chat_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+
+            order1 = "11111111-1111-1111-1111-111111111111"
+            order2 = "22222222-2222-2222-2222-222222222222"
+            q.upsert_order(order_id=order1, chat_id=1, title="Order1", body="Body", status="active", priority=2)
+            q.upsert_order(order_id=order2, chat_id=2, title="Order2", body="Body", status="active", priority=2)
+
+            t1 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat1 queued",
+                request_type="task",
+                priority=2,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                parent_job_id=order1,
+                job_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+            )
+            t2 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat2 queued",
+                request_type="task",
+                priority=2,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=2,
+                state="queued",
+                parent_job_id=order2,
+                job_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            )
+            q.submit_task(t1)
+            q.submit_task(t2)
+
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            snap1 = svc.snapshot(chat_id=1)
+            self.assertEqual(snap1["chat_id"], 1)
+            self.assertEqual(int(snap1["queued_total"]), 1)
+            workers1 = [w for w in snap1["workers"] if w["role"] == "backend"]
+            self.assertEqual(len(workers1), 1)
+            self.assertIsNotNone(workers1[0]["next"])
+            self.assertEqual(workers1[0]["next"]["job_id"], t1.job_id)
+
+            snap2 = svc.snapshot(chat_id=2)
+            self.assertEqual(snap2["chat_id"], 2)
+            self.assertEqual(int(snap2["queued_total"]), 1)
+            workers2 = [w for w in snap2["workers"] if w["role"] == "backend"]
+            self.assertEqual(len(workers2), 1)
+            self.assertIsNotNone(workers2[0]["next"])
+            self.assertEqual(workers2[0]["next"]["job_id"], t2.job_id)
+

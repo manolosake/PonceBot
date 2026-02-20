@@ -53,12 +53,48 @@ def _task_title(t: Task, *, max_chars: int = 120) -> str:
 
 def _task_to_status(t: Task) -> dict[str, Any]:
     tr = t.trace or {}
+
     live_phase = str(tr.get("live_phase") or "").strip() or None
+
     slot = tr.get("live_workspace_slot")
     try:
         slot_i = int(slot) if slot is not None else None
     except Exception:
         slot_i = None
+
+    live_at = tr.get("live_at")
+    try:
+        live_at_f = float(live_at) if live_at is not None else None
+    except Exception:
+        live_at_f = None
+
+    pid = tr.get("live_pid")
+    try:
+        pid_i = int(pid) if pid is not None else None
+    except Exception:
+        pid_i = None
+
+    live_workdir = str(tr.get("live_workdir") or "").strip() or None
+
+    stdout_tail = str(tr.get("live_stdout_tail") or "").strip()
+    if len(stdout_tail) > 1600:
+        stdout_tail = stdout_tail[-1600:]
+    stdout_tail = stdout_tail or None
+
+    stderr_tail = str(tr.get("live_stderr_tail") or "").strip()
+    if len(stderr_tail) > 1600:
+        stderr_tail = stderr_tail[-1600:]
+    stderr_tail = stderr_tail or None
+
+    result_summary = str(tr.get("result_summary") or "").strip()
+    if len(result_summary) > 600:
+        result_summary = result_summary[:600] + "..."
+    result_summary = result_summary or None
+
+    result_next_action = str(tr.get("result_next_action") or "").strip() or None
+
+    approved = bool(tr.get("approved", False))
+
     return {
         "job_id": t.job_id,
         "job_id_short": t.job_id[:8],
@@ -66,6 +102,9 @@ def _task_to_status(t: Task) -> dict[str, Any]:
         "state": t.state,
         "priority": int(t.priority or 2),
         "request_type": t.request_type,
+        "mode_hint": t.mode_hint,
+        "requires_approval": bool(t.requires_approval),
+        "approved": approved,
         "owner": t.owner,
         "chat_id": int(t.chat_id),
         "user_id": (int(t.user_id) if t.user_id is not None else None),
@@ -74,9 +113,15 @@ def _task_to_status(t: Task) -> dict[str, Any]:
         "updated_at": float(t.updated_at),
         "title": _task_title(t),
         "live_phase": live_phase,
+        "live_at": live_at_f,
+        "live_pid": pid_i,
+        "live_workdir": live_workdir,
         "live_workspace_slot": slot_i,
+        "live_stdout_tail": stdout_tail,
+        "live_stderr_tail": stderr_tail,
+        "result_summary": result_summary,
+        "result_next_action": result_next_action,
     }
-
 
 def _assign_running_to_workers(
     role: str,
@@ -187,12 +232,40 @@ class StatusService:
             )
 
         workers_out: list[dict[str, Any]] = []
+        # Scope counts: when chat_id is provided, only count jobs for that chat.
+        try:
+            role_health = self.orch_q.get_role_health(chat_id=chat_id)
+        except Exception:
+            role_health = {}
+        try:
+            queued_total = int(self.orch_q.get_queued_count(chat_id=chat_id))
+            running_total = int(self.orch_q.get_running_count(chat_id=chat_id))
+        except Exception:
+            queued_total = 0
+            running_total = 0
+        blocked_total = 0
+        try:
+            for rec in (role_health or {}).values():
+                blocked_total += int((rec or {}).get("blocked", 0) or 0)
+        except Exception:
+            blocked_total = 0
+
+        blocked_requires_approval: list[dict[str, Any]] = []
+        try:
+            blocked = self.orch_q.peek(state="blocked", limit=200, chat_id=chat_id)
+            blocked_sorted = sorted(blocked, key=lambda t: float(t.updated_at), reverse=True)
+            for t in blocked_sorted[:30]:
+                blocked_requires_approval.append(_task_to_status(t))
+                if len(blocked_requires_approval) >= 12:
+                    break
+        except Exception:
+            blocked_requires_approval = []
         newest_updated_at = 0.0
 
         for role in roles:
             n = int(max_parallel.get(role) or 1)
-            running = self.orch_q.peek(role=role, state="running", limit=200)
-            queued = self.orch_q.peek(role=role, state="queued", limit=200)
+            running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
+            queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
 
             # Sort queued by the scheduler's intended order (priority asc, created_at asc).
             queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
@@ -225,6 +298,10 @@ class StatusService:
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
             "workers": workers_out,
+            "queued_total": int(queued_total),
+            "running_total": int(running_total),
+            "blocked_total": int(blocked_total),
+            "blocked_requires_approval": blocked_requires_approval,
             "source_newest_updated_at": (float(newest_updated_at) if newest_updated_at > 0 else None),
             "staleness_seconds": staleness_seconds,
         }

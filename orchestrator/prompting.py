@@ -39,7 +39,9 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
     # Output contract: human summary + structured JSON.
     # Jarvis may be autonomous/child (autopilot) but still allowed to delegate when explicitly enabled.
     allow_delegation = bool((task.trace or {}).get("allow_delegation", False))
-    if role in ("jarvis", "orchestrator", "ceo") and ((not task.parent_job_id and not task.is_autonomous) or allow_delegation):
+    req_type = str(task.request_type or "task").strip().lower() or "task"
+    can_delegate = req_type in ("task", "maintenance", "review")
+    if role in ("jarvis", "orchestrator", "ceo") and can_delegate and ((not task.parent_job_id and not task.is_autonomous) or allow_delegation):
         schema_hint = (
             '{\n'
             '  "summary": "string",\n'

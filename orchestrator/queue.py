@@ -83,8 +83,8 @@ class OrchestratorQueue:
     def clear_job_approval(self, job_id: str) -> bool:
         return self._storage.clear_job_approval(job_id)
 
-    def get_role_health(self) -> dict[str, dict[str, int]]:
-        return self._storage.get_role_health()
+    def get_role_health(self, *, chat_id: int | None = None) -> dict[str, dict[str, int]]:
+        return self._storage.get_role_health(chat_id=chat_id)
 
     def get_job(self, job_id: str) -> Task | None:
         return self._storage.get_job(job_id)
@@ -125,20 +125,21 @@ class OrchestratorQueue:
     def inbox(self, *, role: str | None = None, limit: int = 25) -> list[Task]:
         return self._storage.inbox(role=role, limit=limit)
 
-    def get_queued_count(self) -> int:
-        return self._storage.queued_count()
+    def get_queued_count(self, *, chat_id: int | None = None) -> int:
+        return self._storage.queued_count(chat_id=chat_id)
 
-    def get_running_count(self) -> int:
-        return self._storage.running_count()
+    def get_running_count(self, *, chat_id: int | None = None) -> int:
+        return self._storage.running_count(chat_id=chat_id)
 
     def peek(
         self,
         *,
         role: str | None = None,
         state: str | None = None,
+        chat_id: int | None = None,
         limit: int = 20,
     ) -> list[Task]:
-        return self._storage.peek(role=role, state=state, limit=limit)
+        return self._storage.peek(role=role, state=state, chat_id=chat_id, limit=limit)
 
     def dequeue_with_budget(
         self,
@@ -161,8 +162,8 @@ class OrchestratorQueue:
     def set_cost_cap(self, role: str, max_cost_usd: float) -> None:
         self._storage.set_cost_cap(role, max_cost_usd)
 
-    def jobs_by_state(self, *, state: str, limit: int = 50) -> list[Task]:
-        return self._storage.jobs_by_state(state=state, limit=limit)
+    def jobs_by_state(self, *, state: str, limit: int = 50, chat_id: int | None = None) -> list[Task]:
+        return self._storage.jobs_by_state(state=state, limit=limit, chat_id=chat_id)
 
     def claim_autonomous_due_jobs(self, *, limit: int = 5) -> list[Task]:
         return self._storage.claim_autonomous_due_jobs(limit=limit)
