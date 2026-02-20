@@ -3240,56 +3240,9 @@ def _maybe_handle_ceo_query(
             "whats next",
         )
     ):
-        if orchestrator_queue is None:
-            api.send_message(
-                msg.chat_id,
-                "Jarvis: I can't read the orchestrator queue right now.",
-                reply_to_message_id=msg.message_id if msg.message_id else None,
-            )
-            return True
-        try:
-            active = orchestrator_queue.list_orders(chat_id=int(msg.chat_id), status="active", limit=6)
-            queued = int(orchestrator_queue.get_queued_count())
-            waiting_deps = int(orchestrator_queue.get_waiting_deps_count())
-            blocked_approval = int(orchestrator_queue.get_blocked_approval_count())
-            running_n = int(orchestrator_queue.get_running_count())
-            health = orchestrator_queue.get_role_health()
-            blocked = 0
-            for rec in (health or {}).values():
-                try:
-                    blocked += int((rec or {}).get("blocked", 0))
-                except Exception:
-                    pass
-        except Exception:
-            active = []
-            queued = 0
-            waiting_deps = 0
-            blocked_approval = 0
-            running_n = 0
-            blocked = 0
-
-        lines: list[str] = []
-        lines.append("Jarvis: pending")
-        if active:
-            parts: list[str] = []
-            for o in active[:6]:
-                oid = str(o.get("order_id") or "")[:8]
-                title = str(o.get("title") or "").strip()
-                if len(title) > 60:
-                    title = title[:60] + "..."
-                parts.append(f"{oid} {title}".strip())
-            lines.append("- active_orders: " + " | ".join(parts))
-        else:
-            lines.append("- active_orders: (none)")
-        lines.append(
-            f"- queue: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
-        )
-        api.send_message(
-            msg.chat_id,
-            "\n".join(lines),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
-        )
-        return True
+        # Let Jarvis answer backlog/pending questions with full conversational context
+        # (instead of a fixed local summary) so this interaction is reflected in orchestration.
+        return False
 
     if any(k in t for k in ("cuantos empleados", "cuántos empleados", "cuantos trabajadores", "how many employees", "how many agents")):
         profs = orchestrator_profiles or {}

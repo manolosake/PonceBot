@@ -403,6 +403,28 @@ class TestCeoQueryFastPath(unittest.TestCase):
             self.assertFalse(handled)
             self.assertFalse(api.sent)
 
+    def test_pending_query_falls_through_to_jarvis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username=None,
+                text="que tareas tenemos pendientes?",
+            )
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles={"jarvis": {"model": "gpt-5.3-codex-spark"}},
+                orchestrator_queue=None,
+            )
+            self.assertFalse(handled)
+            self.assertFalse(api.sent)
+
     def test_queries_do_not_trigger_when_slash_command(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
