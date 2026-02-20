@@ -125,8 +125,8 @@ _TASK_VERB_RE = re.compile(
     # words like "status"/"estado" (which otherwise cause false positives).
     r"\b("
     r"arregl\w*|corrig\w*|cambi\w*|modific\w*|ajust\w*|"
-    r"agreg\w*|anad\w*|añad\w*|quit\w*|elimin\w*|"
-    r"implement\w*|cre\w*|haz|hagan|"
+    r"agreg\w*|anad\w*|añad\w*|quit\w*|elimin\w*|actualiz\w*|mejor\w*|"
+    r"implement\w*|crea\w*|crear\w*|haz|hagan|"
     r"fix\w*|remove\w*|add\w*|update\w*|format\w*|refactor\w*|improv\w*"
     r")\b",
     flags=re.IGNORECASE,
@@ -215,8 +215,6 @@ def detect_request_type(text_l: str) -> str:
                 "ya terminó",
                 "en que van",
                 "en qué van",
-                "progreso",
-                "avance",
                 "que estan haciendo",
                 "qué están haciendo",
                 "que están haciendo",
@@ -255,6 +253,9 @@ def detect_request_type(text_l: str) -> str:
 
     if _looks_like_status():
         return "status"
+    # Conversational statements (non-imperative) should stay in Jarvis query lane.
+    if any(t.startswith(k) for k in ("creo que ", "pienso que ", "me parece ", "considero que ", "i think ")):
+        return "query"
     # Queries (CEO questions) that should not auto-delegate.
     if any(
         k in t

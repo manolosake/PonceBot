@@ -3208,91 +3208,10 @@ def _maybe_handle_ceo_query(
     else:
         display_user = "(no username)"
 
-    # Status requests: answer from the orchestrator directly (no Codex, no ticket).
+    # Let Jarvis handle natural-language status requests (query lane), so it can
+    # reason with project/order context instead of a fixed local summary.
     if req_type == "status":
-        if orchestrator_queue is None:
-            return False
-        try:
-            health = orchestrator_queue.get_role_health()
-            queued = int(orchestrator_queue.get_queued_count())
-            waiting_deps = int(orchestrator_queue.get_waiting_deps_count())
-            blocked_approval = int(orchestrator_queue.get_blocked_approval_count())
-            running_n = int(orchestrator_queue.get_running_count())
-            blocked = 0
-            for rec in (health or {}).values():
-                try:
-                    blocked += int((rec or {}).get("blocked", 0))
-                except Exception:
-                    pass
-            running = orchestrator_queue.jobs_by_state(state="running", limit=5)
-            queued_samples = orchestrator_queue.peek(state="queued", limit=30)
-            waiting_samples = orchestrator_queue.peek(state="waiting_deps", limit=30)
-            blocked_samples = orchestrator_queue.peek(state="blocked_approval", limit=30)
-        except Exception:
-            health = {}
-            queued = 0
-            waiting_deps = 0
-            blocked_approval = 0
-            running_n = 0
-            blocked = 0
-            running = []
-            queued_samples = []
-            waiting_samples = []
-            blocked_samples = []
-
-        lines: list[str] = []
-        lines.append("Jarvis: team status")
-        lines.append(
-            f"- queue: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
-        )
-        if running:
-            parts: list[str] = []
-            for r in running[:5]:
-                role_h = _humanize_orchestrator_role(r.role)
-                snippet = (r.input_text or "").strip().replace("\n", " ")
-                if len(snippet) > 70:
-                    snippet = snippet[:70] + "..."
-                parts.append(f"{role_h}: {snippet}")
-            lines.append("- running: " + " | ".join(parts))
-
-        def _sample_line(label: str, items: list[Task]) -> str | None:
-            by_role: dict[str, Task] = {}
-            for it in items:
-                r = str(it.role or "").strip().lower()
-                if not r or r in by_role:
-                    continue
-                by_role[r] = it
-                if len(by_role) >= 5:
-                    break
-            if not by_role:
-                return None
-            parts: list[str] = []
-            for r in sorted(by_role.keys()):
-                it = by_role[r]
-                role_h = _humanize_orchestrator_role(it.role)
-                snippet = (it.input_text or "").strip().replace("\n", " ")
-                if len(snippet) > 70:
-                    snippet = snippet[:70] + "..."
-                parts.append(f"{role_h}: {snippet}")
-            return f"- {label}: " + " | ".join(parts)
-
-        q_line = _sample_line("queued (examples)", queued_samples)
-        if q_line:
-            lines.append(q_line)
-        w_line = _sample_line("waiting_deps (examples)", waiting_samples)
-        if w_line:
-            lines.append(w_line)
-        b_line = _sample_line("blocked (examples)", blocked_samples)
-        if b_line:
-            lines.append(b_line)
-
-        lines.append("Links: /agents  /dashboard")
-        api.send_message(
-            msg.chat_id,
-            "\n".join(lines),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
-        )
-        return True
+        return False
 
     if any(k in t for k in ("who am i", "quien soy", "quién soy")):
         api.send_message(

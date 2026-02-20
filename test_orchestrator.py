@@ -147,6 +147,16 @@ class TestRequestTypeDetection(unittest.TestCase):
         self.assertEqual(detect_request_type("que tienes pendiente jarvis?"), "query")
 
 
+    def test_projects_in_progress_question_is_query(self) -> None:
+        self.assertEqual(detect_request_type("Que proyectos tienes ahorita en progreso?"), "query")
+
+    def test_spanish_update_question_is_task(self) -> None:
+        self.assertEqual(detect_request_type("podrias actualizar el dashboard?"), "task")
+
+    def test_conversational_creo_que_is_query(self) -> None:
+        self.assertEqual(detect_request_type("creo que el servidor esta bien"), "query")
+
+
 class TestDelegationParsing(unittest.TestCase):
     def test_orchestrator_subtasks_mode_hint_is_optional(self) -> None:
         specs = parse_orchestrator_subtasks({"subtasks": [{"key": "a", "role": "backend", "text": "do the thing"}]})
