@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.agents import load_agent_profiles
-from orchestrator.dispatcher import detect_request_type, to_task
+from orchestrator.dispatcher import detect_ceo_intent, detect_request_type, to_task
 from orchestrator.delegation import parse_orchestrator_subtasks
 from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
@@ -80,6 +80,14 @@ _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 _TICKET_CARD_LOCK = threading.Lock()
 _TICKET_CARD_LAST_EDIT: dict[tuple[int, str], float] = {}
 _TICKET_CARD_MIN_EDIT_INTERVAL_S = 2.0
+
+_MODEL_CEO_QUERY = "gpt-5.3-codex-spark"
+_MODEL_JARVIS_PLAN = "gpt-5.3-codex"
+_MODEL_AGENT_EXEC = "gpt-5.3-codex"
+
+_EFFORT_CEO_QUERY = "high"
+_EFFORT_JARVIS_PLAN = "xhigh"
+_EFFORT_AGENT_EXEC = "medium"
 
 
 def _codex_home_dir() -> Path:
@@ -664,6 +672,8 @@ class IncomingMessage:
     message_id: int
     username: str | None
     text: str
+    reply_to_message_id: int | None = None
+    reply_to_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -3005,7 +3015,8 @@ def _help_text(cfg: BotConfig) -> str:
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
         "- /cancel <id>        Cancel orchestrator task by id",
-        "- /purge [chat|global]  Purge queued+blocked orchestrator jobs (keeps running)",
+        "- /purge [chat|global]  Purge queued+waiting_deps+blocked_approval jobs (keeps running)",
+        "- /hardreset confirm  One-shot hard reset (cancel queue + close active orders)",
         "- /emergency_resume   Resume orchestrator after emergency stop",
         "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
         "- /new                Start a new Codex conversation thread for this chat",
@@ -3080,7 +3091,8 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("status", "Bot/model status"),
         ("s", "Alias for /status"),
         ("whoami", "Show your IDs"),
-        ("purge", "Clear queue (queued+blocked)"),
+        ("purge", "Clear queue (queued+waiting_deps+blocked_approval)"),
+        ("hardreset", "One-shot hard reset"),
     ]
     if cfg.auth_enabled:
         cmds += [
@@ -3203,6 +3215,8 @@ def _maybe_handle_ceo_query(
         try:
             health = orchestrator_queue.get_role_health()
             queued = int(orchestrator_queue.get_queued_count())
+            waiting_deps = int(orchestrator_queue.get_waiting_deps_count())
+            blocked_approval = int(orchestrator_queue.get_blocked_approval_count())
             running_n = int(orchestrator_queue.get_running_count())
             blocked = 0
             for rec in (health or {}).values():
@@ -3212,19 +3226,25 @@ def _maybe_handle_ceo_query(
                     pass
             running = orchestrator_queue.jobs_by_state(state="running", limit=5)
             queued_samples = orchestrator_queue.peek(state="queued", limit=30)
-            blocked_samples = orchestrator_queue.peek(state="blocked", limit=30)
+            waiting_samples = orchestrator_queue.peek(state="waiting_deps", limit=30)
+            blocked_samples = orchestrator_queue.peek(state="blocked_approval", limit=30)
         except Exception:
             health = {}
             queued = 0
+            waiting_deps = 0
+            blocked_approval = 0
             running_n = 0
             blocked = 0
             running = []
             queued_samples = []
+            waiting_samples = []
             blocked_samples = []
 
         lines: list[str] = []
         lines.append("Jarvis: team status")
-        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
+        lines.append(
+            f"- queue: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
+        )
         if running:
             parts: list[str] = []
             for r in running[:5]:
@@ -3259,6 +3279,9 @@ def _maybe_handle_ceo_query(
         q_line = _sample_line("queued (examples)", queued_samples)
         if q_line:
             lines.append(q_line)
+        w_line = _sample_line("waiting_deps (examples)", waiting_samples)
+        if w_line:
+            lines.append(w_line)
         b_line = _sample_line("blocked (examples)", blocked_samples)
         if b_line:
             lines.append(b_line)
@@ -3308,6 +3331,8 @@ def _maybe_handle_ceo_query(
         try:
             active = orchestrator_queue.list_orders(chat_id=int(msg.chat_id), status="active", limit=6)
             queued = int(orchestrator_queue.get_queued_count())
+            waiting_deps = int(orchestrator_queue.get_waiting_deps_count())
+            blocked_approval = int(orchestrator_queue.get_blocked_approval_count())
             running_n = int(orchestrator_queue.get_running_count())
             health = orchestrator_queue.get_role_health()
             blocked = 0
@@ -3319,6 +3344,8 @@ def _maybe_handle_ceo_query(
         except Exception:
             active = []
             queued = 0
+            waiting_deps = 0
+            blocked_approval = 0
             running_n = 0
             blocked = 0
 
@@ -3335,7 +3362,9 @@ def _maybe_handle_ceo_query(
             lines.append("- active_orders: " + " | ".join(parts))
         else:
             lines.append("- active_orders: (none)")
-        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
+        lines.append(
+            f"- queue: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
+        )
         api.send_message(
             msg.chat_id,
             "\n".join(lines),
@@ -3859,6 +3888,69 @@ def _orchestrator_profile(
     return out
 
 
+def _projects_root_dir() -> Path:
+    raw = os.environ.get("BOT_PROJECTS_ROOT", "").strip()
+    base = Path(raw) if raw else Path("/home/aponce/projects")
+    try:
+        return base.expanduser().resolve()
+    except Exception:
+        return base.expanduser()
+
+
+def _slug_token(value: str, *, max_len: int = 56) -> str:
+    slug = _SAFE_FILENAME_RE.sub("-", (value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-._")
+    if not slug:
+        slug = "project"
+    return slug[:max_len]
+
+
+def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> str:
+    line = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    if not line:
+        line = fallback
+    if len(line) > 120:
+        line = line[:120] + "..."
+    return line
+
+
+def _ensure_project_workspace(
+    *,
+    project_id: str,
+    title: str,
+    created_by: str,
+    runtime_mode: str = "venv",
+) -> dict[str, str]:
+    root = _projects_root_dir()
+    root.mkdir(parents=True, exist_ok=True)
+
+    pid = (project_id or "").strip() or str(uuid.uuid4())
+    slug = _slug_token(title or pid)
+    dirname = f"{time.strftime('%Y%m%d')}-{slug}-{pid[:8]}"
+    path = (root / dirname).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "project_id": pid,
+        "name": title or pid,
+        "path": str(path),
+        "runtime_mode": runtime_mode,
+        "ports": [],
+        "created_by": created_by or "jarvis",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "notes": "Isolated workspace scaffold created by PonceBot orchestration.",
+    }
+    try:
+        (path / "PROJECT_MANIFEST.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return {"project_id": pid, "path": str(path), "name": str(manifest["name"])}
+
+
 def _orchestrator_model_for_profile(cfg: BotConfig, profile: dict[str, Any]) -> str:
     model = str(profile.get("model") or "").strip()
     model = _sanitize_model_id(model)
@@ -3882,6 +3974,10 @@ def _orchestrator_task_from_job(
     *,
     profiles: dict[str, dict[str, Any]] | None,
     user_id: int | None = None,
+    intent_type: str | None = None,
+    source_message_id: int | None = None,
+    quoted_message_id: int | None = None,
+    quoted_message_text: str = "",
 ) -> Task:
     employee_name, user_text = _parse_employee_forward(job.user_text)
 
@@ -3905,10 +4001,19 @@ def _orchestrator_task_from_job(
     effort = _orchestrator_effort_for_profile(profile, cfg)
 
     req_type = str(pre.request_type or "task")
-    if req_type == "query":
-        # CEO UX policy: queries should be fast/cheap and never request writes.
+    if req_type in ("query", "status"):
+        # CEO/Jarvis conversational lane: fast model, no write mode, no ticket card spam.
+        model = _MODEL_CEO_QUERY
+        effort = _EFFORT_CEO_QUERY
         mode_hint = "ro"
-        effort = "low"
+    elif role == "jarvis":
+        # Jarvis planning lane.
+        model = _MODEL_JARVIS_PLAN
+        effort = _EFFORT_JARVIS_PLAN
+    else:
+        # Worker execution lane.
+        model = _MODEL_AGENT_EXEC
+        effort = _EFFORT_AGENT_EXEC
 
     requires_approval = bool(profile.get("approval_required", False))
     if mode_hint == "full":
@@ -3921,10 +4026,25 @@ def _orchestrator_task_from_job(
         "profile_role": role,
         "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
     }
-    if req_type == "query":
+    if req_type in ("query", "status"):
         trace["max_runtime_seconds"] = 120
         trace["suppress_ticket_card"] = True
         requires_approval = False
+    if intent_type:
+        trace["intent_type"] = str(intent_type).strip().lower()
+    if source_message_id is not None:
+        try:
+            trace["source_message_id"] = int(source_message_id)
+        except Exception:
+            pass
+    if quoted_message_id is not None:
+        try:
+            trace["quoted_message_id"] = int(quoted_message_id)
+        except Exception:
+            pass
+    qtxt = (quoted_message_text or "").strip()
+    if qtxt:
+        trace["quoted_message_text"] = qtxt[:800]
     trace["prefer_voice_reply"] = bool(getattr(job, "prefer_voice_reply", False))
     if employee_name:
         trace["employee_name"] = employee_name
@@ -3957,6 +4077,7 @@ def _orchestrator_task_from_job(
         "mode_hint": mode_hint,
         # Let dispatcher detect request_type (query/status/task), but keep our role fixed unless @role was explicit.
         "request_type": pre.request_type,
+        "intent_type": (str(intent_type or "").strip().lower() or None),
         "requires_approval": requires_approval,
         "max_cost_window_usd": float(cfg.orchestrator_default_max_cost_window_usd),
         "trace": trace,
@@ -4131,6 +4252,8 @@ def _send_orchestrator_marker_response(
                 return default
 
         queued_total = _as_int(snap.get("queued_total"), 0)
+        waiting_deps_total = _as_int(snap.get("waiting_deps_total"), 0)
+        blocked_approval_total = _as_int(snap.get("blocked_approval_total"), 0)
         running_total = _as_int(snap.get("running_total"), 0)
         blocked_total = _as_int(snap.get("blocked_total"), 0)
 
@@ -4164,7 +4287,9 @@ def _send_orchestrator_marker_response(
         if not cfg.screenshot_enabled:
             lines: list[str] = []
             lines.append(f"Jarvis: dashboard ({scope_label})")
-            lines.append(f"Hecho (DB): queued={queued_total} running={running_total} blocked={blocked_total}")
+            lines.append(
+                f"Hecho (DB): queued={queued_total} waiting_deps={waiting_deps_total} blocked_approval={blocked_approval_total} running={running_total} blocked={blocked_total}"
+            )
             if staleness_s is not None:
                 lines.append(f"Hecho (DB): staleness={_fmt_age(staleness_s)}")
             lines.append(f"Hecho (DB): generated_at={ts}")
@@ -4412,6 +4537,8 @@ def _send_orchestrator_marker_response(
             + "</div></div>"
             "<div class='stats'>"
             + _pill("Hecho (DB)", f"queued={queued_total}")
+            + _pill("Hecho (DB)", f"waiting_deps={waiting_deps_total}")
+            + _pill("Hecho (DB)", f"blocked_approval={blocked_approval_total}")
             + _pill("Hecho (DB)", f"running={running_total}")
             + _pill("Hecho (DB)", f"blocked={blocked_total}")
             + ("" if staleness_s is None else _pill("Hecho (DB)", f"staleness={_fmt_age(staleness_s)}"))
@@ -4704,6 +4831,42 @@ def _send_orchestrator_marker_response(
             api.send_message(chat_id, "Emergency stop liberado. Roles reanudados.", reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind == "hard_reset":
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para hard reset.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if (payload or "").strip().lower() != "confirm":
+            api.send_message(chat_id, "Uso: /hardreset confirm", reply_to_message_id=reply_to_message_id)
+            return True
+        try:
+            out = orch_q.hard_reset_bootstrap(reason="hard_reset_bootstrap")
+            queued = int(orch_q.get_queued_count())
+            waiting_deps = int(orch_q.get_waiting_deps_count())
+            blocked_approval = int(orch_q.get_blocked_approval_count())
+            running_n = int(orch_q.get_running_count())
+            api.send_message(
+                chat_id,
+                "\n".join(
+                    [
+                        "Hard reset executed.",
+                        f"- jobs_cancelled: {int(out.get('jobs_cancelled', 0))}",
+                        f"- orders_done: {int(out.get('orders_done', 0))}",
+                        f"- now: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n}",
+                    ]
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+        except Exception as e:
+            api.send_message(chat_id, f"Hard reset failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
     if kind == "approve":
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -4763,24 +4926,28 @@ def _send_orchestrator_marker_response(
         if scope in ("chat", "here", "aqui", "aquí", "this"):
             target_chat_id = int(chat_id)
         cancelled = orch_q.cancel_by_states(
-            states=("queued", "blocked"),
+            states=("queued", "waiting_deps", "blocked_approval", "blocked"),
             reason="purge_queue",
             chat_id=target_chat_id,
         )
         try:
-            health = orch_q.get_role_health()
-            queued = int(orch_q.get_queued_count())
-            running_n = int(orch_q.get_running_count())
+            health = orch_q.get_role_health(chat_id=target_chat_id)
+            queued = int(orch_q.get_queued_count(chat_id=target_chat_id))
+            running_n = int(orch_q.get_running_count(chat_id=target_chat_id))
+            waiting_deps = int(orch_q.get_waiting_deps_count(chat_id=target_chat_id))
+            blocked_approval = int(orch_q.get_blocked_approval_count(chat_id=target_chat_id))
             blocked = 0
             for rec in (health or {}).values():
                 try:
                     blocked += int((rec or {}).get("blocked", 0))
                 except Exception:
                     pass
-            running = orch_q.jobs_by_state(state="running", limit=5)
+            running = orch_q.jobs_by_state(state="running", limit=5, chat_id=target_chat_id)
         except Exception:
             queued = 0
             running_n = 0
+            waiting_deps = 0
+            blocked_approval = 0
             blocked = 0
             running = []
 
@@ -4790,8 +4957,10 @@ def _send_orchestrator_marker_response(
             lines.append(f"- scope: global")
         else:
             lines.append(f"- scope: chat_id={target_chat_id}")
-        lines.append(f"- cancelled: {int(cancelled)} (queued+blocked)")
-        lines.append(f"- now: queued={queued} running={running_n} blocked={blocked}")
+        lines.append(f"- cancelled: {int(cancelled)} (queued+waiting_deps+blocked_approval+blocked)")
+        lines.append(
+            f"- now: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
+        )
         if running:
             parts: list[str] = []
             for r in running[:5]:
@@ -4813,7 +4982,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
     if not health:
         return "No orchestrator jobs yet."
 
-    states = ("queued", "running", "blocked", "done", "failed", "cancelled")
+    states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked", "done", "failed", "cancelled")
     system_state = "paused" if orch_q.is_paused_globally() else "active"
     lines = ["Jarvis role health:", f"system: {system_state}", ""]
     for role in sorted(health.keys()):
@@ -4883,10 +5052,14 @@ def _watch_status_text(orch_q: OrchestratorQueue) -> str:
         for role in sorted(health.keys()):
             vals = health.get(role, {}) or {}
             queued = int(vals.get("queued", 0) or 0)
+            waiting_deps = int(vals.get("waiting_deps", 0) or 0)
+            blocked_approval = int(vals.get("blocked_approval", 0) or 0)
             running = int(vals.get("running", 0) or 0)
             blocked = int(vals.get("blocked", 0) or 0)
             failed = int(vals.get("failed", 0) or 0)
-            lines.append(f"- {role}: queued={queued} running={running} blocked={blocked} failed={failed}")
+            lines.append(
+                f"- {role}: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running} blocked={blocked} failed={failed}"
+            )
     else:
         lines.append("roles: (no data yet)")
 
@@ -4953,6 +5126,9 @@ def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
     for it in items[:50]:
         oid = str(it.get("order_id") or "").strip()
         status = str(it.get("status") or "").strip() or "active"
+        phase = str(it.get("phase") or "").strip() or "planning"
+        intent = str(it.get("intent_type") or "").strip() or "order_project_new"
+        project_id = str(it.get("project_id") or "").strip()
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -4961,7 +5137,8 @@ def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
         title = str(it.get("title") or "").strip().replace("\n", " ")
         if len(title) > 80:
             title = title[:80] + "..."
-        lines.append(f"- {oid[:8]} status={status} priority={pr_s} title={title}")
+        project_part = f" project={project_id[:8]}" if project_id else ""
+        lines.append(f"- {oid[:8]} status={status} phase={phase} intent={intent} priority={pr_s}{project_part} title={title}")
     lines.append("")
     lines.append("Usage:")
     lines.append("- /order show <id>")
@@ -4983,6 +5160,9 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
         title = str(it.get("title") or "").strip()
         body = str(it.get("body") or "").strip()
         status = str(it.get("status") or "").strip()
+        phase = str(it.get("phase") or "").strip() or "planning"
+        intent = str(it.get("intent_type") or "").strip() or "order_project_new"
+        project_id = str(it.get("project_id") or "").strip() or "n/a"
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -4994,7 +5174,10 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
                 "=" * 5,
                 f"id: {str(it.get('order_id') or '')}",
                 f"status: {status}",
+                f"phase: {phase}",
+                f"intent_type: {intent}",
                 f"priority: {pr_s}",
+                f"project_id: {project_id}",
                 "",
                 "title:",
                 title,
@@ -5005,9 +5188,19 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
         )
     if cmd in ("pause", "paused"):
         ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="paused")
+        if ok:
+            try:
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="paused")
+            except Exception:
+                pass
         return "OK." if ok else f"No such order: {oid}"
     if cmd in ("done", "complete", "completed"):
         ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+        if ok:
+            try:
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+            except Exception:
+                pass
         return "OK." if ok else f"No such order: {oid}"
     return "Usage: /order show|pause|done <id>"
 
@@ -5050,14 +5243,14 @@ def _autopilot_tick(
         children = orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
         if any(
             str((c.labels or {}).get("kind") or "").strip().lower() == "autopilot"
-            and c.state in ("queued", "running")
+            and c.state in ("queued", "waiting_deps", "blocked_approval", "running")
             for c in children
         ):
             continue
 
         # If there is any real work already queued/running for this order, do nothing.
         has_active_work = any(
-            c.state in ("queued", "running")
+            c.state in ("queued", "waiting_deps", "blocked_approval", "running")
             and str((c.labels or {}).get("kind") or "").strip().lower() not in ("autopilot", "wrapup", "evidence")
             for c in children
         )
@@ -5135,9 +5328,116 @@ def _autopilot_tick(
             pass
 
         orch_q.submit_task(t)
+        try:
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
+        except Exception:
+            pass
         created += 1
         # Cap per tick to avoid spam / runaway job creation.
         if created >= 1:
+            break
+
+    return created
+
+
+def _stalled_replan_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Escalate stalled dependency/approval chains to Jarvis for automatic replanning.
+    """
+    try:
+        stale_after_s = max(300.0, float(os.environ.get("BOT_STALLED_TTL_SECONDS", "1800").strip() or "1800"))
+    except Exception:
+        stale_after_s = 1800.0
+
+    stalled = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=80)
+    if not stalled:
+        return 0
+
+    dedup_roots: set[str] = set()
+    created = 0
+    for item in stalled:
+        root_ticket = (item.parent_job_id or item.job_id or "").strip() or item.job_id
+        if not root_ticket or root_ticket in dedup_roots:
+            continue
+        dedup_roots.add(root_ticket)
+
+        root_job = orch_q.get_job(root_ticket)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            escalated_at = float(root_trace.get("stalled_escalated_at", 0.0) or 0.0)
+        except Exception:
+            escalated_at = 0.0
+        if escalated_at > 0 and (now - escalated_at) < 600.0:
+            continue
+
+        profile = _orchestrator_profile(profiles, "jarvis")
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+
+        reason = str(item.blocked_reason or item.state or "stalled").strip()
+        task_id = str(uuid.uuid4())
+        escalation = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=(
+                "STALL ESCALATION\n"
+                f"Order/Ticket: {root_ticket}\n"
+                f"Stalled job: {item.job_id}\n"
+                f"Stalled state: {item.state}\n"
+                f"Reason: {reason}\n"
+                "Action required:\n"
+                "- Re-plan remaining work to unblock delivery.\n"
+                "- If approvals are required, prepare explicit approval request.\n"
+                "- Reassign dependencies so runnable work remains in queued.\n"
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(item.chat_id),
+            user_id=item.user_id,
+            reply_to_message_id=item.reply_to_message_id,
+            parent_job_id=root_ticket,
+            labels={"ticket": root_ticket, "kind": "stalled_replan"},
+            artifacts_dir=str((cfg.artifacts_root / task_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": root_ticket,
+                "stalled_job_id": item.job_id,
+                "stalled_state": item.state,
+                "stalled_reason": reason,
+            },
+            job_id=task_id,
+        )
+        orch_q.submit_task(escalation)
+        created += 1
+        try:
+            orch_q.update_trace(root_ticket, stalled_escalated_at=float(now), stalled_job_id=item.job_id, live_at=now)
+            orch_q.set_order_phase(root_ticket, chat_id=int(item.chat_id), phase="planning")
+            orch_q.append_audit_event(
+                event_type="task.stalled",
+                actor="jarvis",
+                details={
+                    "order_id": root_ticket,
+                    "job_id": item.job_id,
+                    "state": item.state,
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            pass
+
+        if created >= 8:
             break
 
     return created
@@ -5362,7 +5662,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
             first = (head_res.splitlines()[0] if head_res else "").strip()
             if len(first) > 220:
                 first = first[:220] + "..."
-            label = "Result" if head.state in ("done", "failed", "cancelled", "blocked") else "Latest"
+            label = "Result" if head.state in ("done", "failed", "cancelled", "blocked", "blocked_approval") else "Latest"
             lines.append(f"{label}: {first}")
         head_next = str(head_trace.get("result_next_action") or "").strip()
         if head_next:
@@ -5384,7 +5684,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
             lines.append(f"- {role_h} ({phase}): {snippet}")
     # Latest outcome signals across subtasks so the CEO can track progress without opening /job.
     try:
-        recent = [c for c in children if c.state in ("done", "failed", "blocked")]
+        recent = [c for c in children if c.state in ("done", "failed", "blocked", "blocked_approval")]
         recent_sorted = sorted(recent, key=lambda c: float(c.updated_at), reverse=True)
         if recent_sorted:
             lines.append("Latest updates:")
@@ -5396,7 +5696,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
                 if len(first) > 160:
                     first = first[:160] + "..."
                 line = f"- {c.job_id[:8]} {role_h} {st}" + (f": {first}" if first else "")
-                if st == "blocked":
+                if st in ("blocked", "blocked_approval"):
                     line += f"  Approve: /approve {c.job_id[:8]}"
                 lines.append(line)
     except Exception:
@@ -5539,6 +5839,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         if scope in ("all", "global", "company"):
             return _orch_marker("purge_queue", "global"), None
         return "Usage: /purge [chat|global]", None
+
+    if text in ("/hardreset", "/hard_reset"):
+        return "Usage: /hardreset confirm", None
+
+    if text in ("/hardreset confirm", "/hard_reset confirm"):
+        return _orch_marker("hard_reset", "confirm"), None
 
     if text == "/synccommands":
         return "__synccommands__", None
@@ -6847,36 +7153,125 @@ def _submit_orchestrator_task(
     job: Job,
     *,
     user_id: int | None = None,
+    source_message_id: int | None = None,
+    quoted_message_id: int | None = None,
+    quoted_message_text: str = "",
 ) -> tuple[bool, str]:
     if not cfg.orchestrator_enabled or orch_q is None:
         return False, ""
     if not _should_route_to_orchestrator(cfg, job):
         return False, ""
     try:
-        task = _orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=user_id)
+        intent_type = detect_ceo_intent(
+            job.user_text,
+            reply_context={
+                "reply_to_message_id": quoted_message_id,
+                "reply_to_text": (quoted_message_text or "").strip()[:400],
+            },
+        )
+
+        task = _orchestrator_task_from_job(
+            cfg,
+            job,
+            profiles=profiles,
+            user_id=user_id,
+            intent_type=intent_type,
+            source_message_id=source_message_id,
+            quoted_message_id=quoted_message_id,
+            quoted_message_text=quoted_message_text,
+        )
+
+        is_top_level_jarvis = (
+            _coerce_orchestrator_role(task.role) == "jarvis"
+            and not task.is_autonomous
+            and not (task.parent_job_id or "").strip()
+        )
+        order_id = ""
+        project_id: str | None = None
+        order_phase = "planning"
+
+        if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
+            if intent_type == "order_project_change":
+                active = orch_q.latest_active_order(chat_id=int(task.chat_id))
+                if active and str(active.get("order_id") or "").strip():
+                    order_id = str(active.get("order_id") or "").strip()
+                    project_id = str(active.get("project_id") or "").strip() or None
+                    ttrace = dict(task.trace or {})
+                    ttrace["order_id"] = order_id
+                    ttrace["intent_type"] = "order_project_change"
+                    if quoted_message_id is not None:
+                        ttrace["reply_to_message_id"] = int(quoted_message_id)
+                    task = task.with_updates(parent_job_id=order_id, trace=ttrace, priority=1)
+                else:
+                    intent_type = "order_project_new"
+
+            if intent_type == "order_project_new":
+                order_id = task.job_id
+                title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+                workspace = _ensure_project_workspace(
+                    project_id=str(uuid.uuid4()),
+                    title=title_guess,
+                    created_by="ceo",
+                    runtime_mode="venv",
+                )
+                project_id = str(workspace.get("project_id") or "").strip() or None
+                if project_id:
+                    orch_q.upsert_project(
+                        project_id=project_id,
+                        name=str(workspace.get("name") or title_guess),
+                        path=str(workspace.get("path") or ""),
+                        runtime_mode="venv",
+                        ports=[],
+                        status="active",
+                        created_by="ceo",
+                    )
+                    orch_q.append_audit_event(
+                        event_type="project.created",
+                        actor="jarvis",
+                        details={
+                            "project_id": project_id,
+                            "order_id": order_id,
+                            "path": str(workspace.get("path") or ""),
+                            "runtime_mode": "venv",
+                        },
+                    )
+                ttrace = dict(task.trace or {})
+                ttrace["order_id"] = order_id
+                if project_id:
+                    ttrace["project_id"] = project_id
+                task = task.with_updates(trace=ttrace)
+
         job_id = orch_q.submit_task(task)
 
-        # Autopilot scope: any top-level Jarvis ticket (except pure queries) becomes an "active order".
-        try:
-            if (
-                _coerce_orchestrator_role(task.role) == "jarvis"
-                and not task.is_autonomous
-                and not (task.parent_job_id or "").strip()
-                and (task.request_type or "task") != "query"
-            ):
-                title = (task.input_text or "").strip().splitlines()[0].strip()
-                if len(title) > 120:
-                    title = title[:120] + "..."
-                orch_q.upsert_order(
-                    order_id=task.job_id,
-                    chat_id=int(task.chat_id),
-                    title=title or f"Order {task.job_id[:8]}",
-                    body=(task.input_text or "").strip(),
-                    status="active",
-                    priority=int(task.priority or cfg.orchestrator_default_priority),
-                )
-        except Exception:
-            pass
+        # Only actionable project orders become CEO orders; conversational queries never create orders.
+        if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
+            if not order_id:
+                order_id = task.job_id
+            title = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+            orch_q.upsert_order(
+                order_id=order_id,
+                chat_id=int(task.chat_id),
+                title=title,
+                body=(task.input_text or "").strip(),
+                status="active",
+                priority=int(task.priority or cfg.orchestrator_default_priority),
+                intent_type=intent_type,
+                source_message_id=source_message_id,
+                reply_to_message_id=quoted_message_id,
+                phase=order_phase,
+                project_id=project_id,
+            )
+            orch_q.append_audit_event(
+                event_type="order.created",
+                actor="jarvis",
+                details={
+                    "order_id": order_id,
+                    "intent_type": intent_type,
+                    "project_id": project_id,
+                    "source_message_id": source_message_id,
+                    "reply_to_message_id": quoted_message_id,
+                },
+            )
 
         return True, job_id
     except Exception as e:
@@ -7214,7 +7609,7 @@ def _orchestrator_run_codex(
                     counts[c.state] = counts.get(c.state, 0) + 1
                 ctx_lines.append("order_children_counts=" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
                 # Show a few most recent failures/blocked items as unblock targets.
-                blockers = [c for c in children if c.state in ("blocked", "failed")][:8]
+                blockers = [c for c in children if c.state in ("blocked", "blocked_approval", "failed")][:8]
                 if blockers:
                     ctx_lines.append("blockers:")
                     for c in blockers[:8]:
@@ -7227,7 +7622,7 @@ def _orchestrator_run_codex(
                 for r in sorted(health.keys()):
                     vals = health.get(r, {}) or {}
                     ctx_lines.append(
-                        f"- {r}: queued={int(vals.get('queued',0) or 0)} running={int(vals.get('running',0) or 0)} blocked={int(vals.get('blocked',0) or 0)}"
+                        f"- {r}: queued={int(vals.get('queued',0) or 0)} waiting_deps={int(vals.get('waiting_deps',0) or 0)} blocked_approval={int(vals.get('blocked_approval',0) or 0)} running={int(vals.get('running',0) or 0)} blocked={int(vals.get('blocked',0) or 0)}"
                     )
             if running:
                 ctx_lines.append("running_jobs:")
@@ -7727,7 +8122,7 @@ def orchestrator_worker_loop(
 
             raw_status = str(getattr(result, "status", "") or "")
             orch_state = raw_status or "failed"
-            if orch_state not in {"ok", "blocked", "done", "failed", "cancelled"}:
+            if orch_state not in {"ok", "blocked", "blocked_approval", "done", "failed", "cancelled"}:
                 orch_state = "failed"
             if orch_state == "ok":
                 orch_state = "done"
@@ -7741,6 +8136,13 @@ def orchestrator_worker_loop(
             next_action = getattr(result, "next_action", None)
             if next_action is not None:
                 next_action = str(next_action).strip() or None
+
+            if orch_state == "blocked":
+                na = str(next_action or "").strip().lower()
+                if na in ("approve", "approve_screenshot", "approval", "await_approval"):
+                    orch_state = "blocked_approval"
+                elif bool(task.requires_approval):
+                    orch_state = "blocked_approval"
 
             structured_digest: Any = getattr(result, "structured_digest", None)
             if structured_digest is None and isinstance(result, dict):
@@ -7764,40 +8166,62 @@ def orchestrator_worker_loop(
                         result_meta["result_workspace_slot"] = int(slot)
                 except Exception:
                     pass
+            if orch_state == "blocked_approval":
+                result_meta["blocked_reason"] = "requires_approval"
 
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
-                if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
-                    retry_n = int(task.retry_count or 0) + 1
-                    base = 30.0
-                    delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
-                    due_at = time.time() + delay
-                    err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
-                    scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
-                    if scheduled:
-                        try:
-                            orch_q.update_trace(
-                                task.job_id,
-                                retry_scheduled_at=time.time(),
-                                retry_due_at=float(due_at),
-                                retry_delay_s=float(delay),
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
-                            _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
-                        except Exception:
-                            pass
-                        # In minimal mode, avoid extra spam; the ticket card reflects the state.
-                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
-                            api.send_message(
-                                task.chat_id,
-                                f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
-                                reply_to_message_id=task.reply_to_message_id,
-                            )
-                        continue
+            if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
+                retry_n = int(task.retry_count or 0) + 1
+                base = 30.0
+                delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
+                due_at = time.time() + delay
+                err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
+                scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
+                if scheduled:
+                    try:
+                        orch_q.update_trace(
+                            task.job_id,
+                            retry_scheduled_at=time.time(),
+                            retry_due_at=float(due_at),
+                            retry_delay_s=float(delay),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                        _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
+                    except Exception:
+                        pass
+                    # In minimal mode, avoid extra spam; the ticket card reflects the state.
+                    if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                        api.send_message(
+                            task.chat_id,
+                            f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
+                            reply_to_message_id=task.reply_to_message_id,
+                        )
+                    continue
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            # Keep CEO order phase aligned with real execution state.
+            try:
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                kind = str((task.labels or {}).get("kind") or "").strip().lower()
+                if root_ticket:
+                    if kind == "wrapup":
+                        if orch_state == "done":
+                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="done")
+                            orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="done")
+                        elif orch_state in ("failed", "blocked", "blocked_approval"):
+                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
+                    elif orch_state in ("blocked", "blocked_approval"):
+                        orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
+                    elif orch_state == "done":
+                        if _coerce_orchestrator_role(task.role) == "jarvis" and not (task.parent_job_id or "").strip():
+                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="planning")
+                        else:
+                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="executing")
+            except Exception:
+                pass
             # Update ticket card after the state transition so it reflects latest progress/result.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -7887,11 +8311,19 @@ def orchestrator_worker_loop(
                     }
 
                     specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
+                    current_plan_revision = 0
+                    try:
+                        current_plan_revision = int((task.trace or {}).get("plan_revision", 0) or 0)
+                    except Exception:
+                        current_plan_revision = 0
+                    next_plan_revision = current_plan_revision
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
                         # Key-based dedupe: allows multiple waves (autopilot) without duplicating keys.
                         specs = [s for s in specs if s.key not in existing_keys]
+                        if specs:
+                            next_plan_revision = max(1, current_plan_revision + 1)
 
                     if specs:
                         key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
@@ -7935,6 +8367,7 @@ def orchestrator_worker_loop(
                                 labels={"ticket": root_ticket, "kind": "subtask", "key": spec.key},
                                 artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
                                 trace=trace,
+                                plan_revision=int(next_plan_revision),
                                 job_id=key_to_job[spec.key],
                             )
                             children.append(child)
@@ -7968,7 +8401,24 @@ def orchestrator_worker_loop(
                                 pass
                             orch_q.submit_batch(children)
                             try:
-                                orch_q.update_trace(root_ticket, delegated_count=int(len(children)), live_at=time.time())
+                                orch_q.update_trace(
+                                    root_ticket,
+                                    delegated_count=int(len(children)),
+                                    plan_revision=int(next_plan_revision),
+                                    live_at=time.time(),
+                                )
+                                orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="delegated")
+                                if next_plan_revision > current_plan_revision:
+                                    orch_q.append_audit_event(
+                                        event_type="plan.revised",
+                                        actor="jarvis",
+                                        details={
+                                            "order_id": root_ticket,
+                                            "from_revision": int(current_plan_revision),
+                                            "to_revision": int(next_plan_revision),
+                                            "delegated_jobs": int(len(children)),
+                                        },
+                                    )
                             except Exception:
                                 pass
 
@@ -8011,11 +8461,13 @@ def orchestrator_worker_loop(
                                 labels={"ticket": root_ticket, "kind": "wrapup"},
                                 artifacts_dir=str((cfg.artifacts_root / wrap_id).resolve()),
                                 trace=wrap_trace,
+                                plan_revision=int(next_plan_revision),
                                 job_id=wrap_id,
                             )
                             orch_q.submit_task(wrap)
                             try:
                                 orch_q.update_trace(root_ticket, wrapup_job_id=wrap.job_id, live_at=time.time())
+                                orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
                             except Exception:
                                 pass
             except Exception:
@@ -8202,6 +8654,9 @@ def _transcribe_worker_loop(
                     profiles=orchestrator_profiles,
                     job=job,
                     user_id=req.user_id,
+                    source_message_id=message_id,
+                    quoted_message_id=None,
+                    quoted_message_text="",
                 )
             except Exception:
                 did_submit = False
@@ -9264,6 +9719,21 @@ def poll_loop(
                                 pass
 
                 incoming_text = _normalize_slash_aliases(incoming_text)
+                reply_to = msg.get("reply_to_message") if isinstance(msg, dict) else None
+                reply_to_message_id = None
+                reply_to_text = ""
+                if isinstance(reply_to, dict):
+                    try:
+                        rid = reply_to.get("message_id")
+                        if rid is not None:
+                            reply_to_message_id = int(rid)
+                    except Exception:
+                        reply_to_message_id = None
+                    rtxt = reply_to.get("text")
+                    if not isinstance(rtxt, str) or not rtxt.strip():
+                        rtxt = reply_to.get("caption")
+                    if isinstance(rtxt, str):
+                        reply_to_text = rtxt.strip()
                 incoming = IncomingMessage(
                     update_id=update_id,
                     chat_id=chat_id,
@@ -9271,6 +9741,8 @@ def poll_loop(
                     message_id=message_id,
                     username=username,
                     text=incoming_text,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_to_text=reply_to_text,
                 )
                 LOG.debug(
                     "Incoming update_id=%s chat_id=%s user_id=%s message_id=%s kind=%s text_chars=%s text_lines=%s",
@@ -9865,6 +10337,9 @@ def poll_loop(
                                 profiles=orchestrator_profiles,
                                 job=job,
                                 user_id=user_id,
+                                source_message_id=message_id,
+                                quoted_message_id=incoming.reply_to_message_id,
+                                quoted_message_text=incoming.reply_to_text,
                             )
                         except Exception:
                             did_submit = False
@@ -9878,7 +10353,7 @@ def poll_loop(
                                 task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
                                 tr = (task.trace or {}) if task is not None else {}
                                 suppress_ticket_card = bool(tr.get("suppress_ticket_card", False)) or (
-                                    task is not None and str(task.request_type or "") == "query"
+                                    task is not None and str(task.request_type or "") in ("query", "status")
                                 )
                             except Exception:
                                 suppress_ticket_card = False
@@ -9896,9 +10371,15 @@ def poll_loop(
                                     pass
                             else:
                                 try:
-                                    card = _ticket_card_text(orchestrator_queue, ticket_id=orch_job_id)
+                                    card_task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
+                                    ticket_target_id = (
+                                        str((card_task.parent_job_id if card_task is not None else "") or "").strip()
+                                        or orch_job_id
+                                    )
+                                    card = _ticket_card_text(orchestrator_queue, ticket_id=ticket_target_id)
                                 except Exception:
                                     card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
+                                    ticket_target_id = orch_job_id
                                 mid = api.send_message(
                                     chat_id,
                                     card,
@@ -9907,7 +10388,7 @@ def poll_loop(
                                 try:
                                     if mid is not None and orchestrator_queue is not None:
                                         orchestrator_queue.update_trace(
-                                            orch_job_id,
+                                            ticket_target_id,
                                             ticket_card_message_id=int(mid),
                                             ticket_card_created_at=time.time(),
                                         )
@@ -10471,7 +10952,7 @@ def main() -> None:
             orchestrator_scheduler.start()
 
         # Runbooks scheduler: enqueues autonomous tasks periodically to the notify chat.
-        if cfg.runbooks_enabled and _configured_notify_chat_id(cfg):
+        if cfg.runbooks_enabled:
             notify_chat_id = _configured_notify_chat_id(cfg)
 
             def _tick_runbooks() -> None:
@@ -10483,6 +10964,16 @@ def main() -> None:
                     _tick_watch_messages(cfg=cfg, api=api, orch_q=orchestrator_queue)
                 except Exception:
                     pass
+
+                try:
+                    _stalled_replan_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Stalled replan tick failed")
 
                 if notify_chat_id is None:
                     return

@@ -131,6 +131,20 @@ class OrchestratorQueue:
     def get_running_count(self, *, chat_id: int | None = None) -> int:
         return self._storage.running_count(chat_id=chat_id)
 
+    def get_waiting_deps_count(self, *, chat_id: int | None = None) -> int:
+        return self._storage.waiting_deps_count(chat_id=chat_id)
+
+    def get_blocked_approval_count(self, *, chat_id: int | None = None) -> int:
+        return self._storage.blocked_approval_count(chat_id=chat_id)
+
+    def list_stalled_tasks(
+        self,
+        *,
+        stale_after_seconds: float = 1800.0,
+        limit: int = 100,
+    ) -> list[Task]:
+        return self._storage.list_stalled_tasks(stale_after_seconds=stale_after_seconds, limit=limit)
+
     def peek(
         self,
         *,
@@ -178,8 +192,25 @@ class OrchestratorQueue:
         body: str,
         status: str = "active",
         priority: int = 2,
+        intent_type: str | None = None,
+        source_message_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        phase: str | None = None,
+        project_id: str | None = None,
     ) -> None:
-        self._storage.upsert_order(order_id=order_id, chat_id=chat_id, title=title, body=body, status=status, priority=priority)
+        self._storage.upsert_order(
+            order_id=order_id,
+            chat_id=chat_id,
+            title=title,
+            body=body,
+            status=status,
+            priority=priority,
+            intent_type=intent_type,
+            source_message_id=source_message_id,
+            reply_to_message_id=reply_to_message_id,
+            phase=phase,
+            project_id=project_id,
+        )
 
     def list_orders(self, *, chat_id: int, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
         return self._storage.list_orders(chat_id=chat_id, status=status, limit=limit)
@@ -192,6 +223,45 @@ class OrchestratorQueue:
 
     def set_order_status(self, order_id: str, *, chat_id: int, status: str) -> bool:
         return self._storage.set_order_status(order_id, chat_id=chat_id, status=status)
+
+    def latest_active_order(self, *, chat_id: int) -> dict[str, Any] | None:
+        return self._storage.latest_active_order(chat_id=chat_id)
+
+    def set_order_phase(self, order_id: str, *, chat_id: int, phase: str) -> bool:
+        return self._storage.set_order_phase(order_id, chat_id=chat_id, phase=phase)
+
+    def append_audit_event(self, *, event_type: str, actor: str = "system", details: dict[str, Any] | None = None) -> None:
+        self._storage.append_audit_event(event_type=event_type, actor=actor, details=details)
+
+    def list_audit_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return self._storage.list_audit_events(limit=limit)
+
+    def upsert_project(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        path: str,
+        runtime_mode: str = "venv",
+        ports: list[str] | None = None,
+        status: str = "active",
+        created_by: str = "jarvis",
+    ) -> None:
+        self._storage.upsert_project(
+            project_id=project_id,
+            name=name,
+            path=path,
+            runtime_mode=runtime_mode,
+            ports=ports,
+            status=status,
+            created_by=created_by,
+        )
+
+    def list_projects(self, *, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        return self._storage.list_projects(status=status, limit=limit)
+
+    def hard_reset_bootstrap(self, *, reason: str = "hard_reset_bootstrap") -> dict[str, int]:
+        return self._storage.hard_reset_bootstrap(reason=reason)
 
     # Cached status snapshots (dashboard support).
     def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:

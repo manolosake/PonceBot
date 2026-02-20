@@ -42,6 +42,9 @@ class Task:
     labels: dict[str, str | int | float | bool] = field(default_factory=dict)
     requires_review: bool = False
     artifacts_dir: str | None = None
+    blocked_reason: str | None = None
+    plan_revision: int = 0
+    stalled_since: float | None = None
     trace: dict[str, str | int | float | bool | list[str]] = field(default_factory=dict)
 
     @classmethod
@@ -73,6 +76,9 @@ class Task:
         labels: dict[str, str | int | float | bool] | None = None,
         requires_review: bool = False,
         artifacts_dir: str | None = None,
+        blocked_reason: str | None = None,
+        plan_revision: int = 0,
+        stalled_since: float | None = None,
         trace: dict[str, str | int | float | bool | list[str]] | None = None,
         job_id: str | None = None,
         created_at: float | None = None,
@@ -107,6 +113,9 @@ class Task:
             labels=labels or {},
             requires_review=bool(requires_review),
             artifacts_dir=artifacts_dir,
+            blocked_reason=(str(blocked_reason).strip() if isinstance(blocked_reason, str) and str(blocked_reason).strip() else None),
+            plan_revision=max(0, int(plan_revision or 0)),
+            stalled_since=(float(stalled_since) if stalled_since is not None else None),
             trace=trace or {},
         )
 
@@ -140,6 +149,9 @@ class Task:
             labels=dict(kwargs.get("labels", self.labels)),
             requires_review=kwargs.get("requires_review", self.requires_review),
             artifacts_dir=kwargs.get("artifacts_dir", self.artifacts_dir),
+            blocked_reason=kwargs.get("blocked_reason", self.blocked_reason),
+            plan_revision=int(kwargs.get("plan_revision", self.plan_revision)),
+            stalled_since=kwargs.get("stalled_since", self.stalled_since),
             trace=kwargs.get("trace", dict(self.trace)),
         )
 

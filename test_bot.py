@@ -447,7 +447,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             task = bot._orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=123)
             self.assertEqual(task.role, "frontend")
 
-    def test_query_tasks_are_ro_low_effort_and_suppress_ticket_card(self) -> None:
+    def test_query_tasks_use_spark_high_and_suppress_ticket_card(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
@@ -467,7 +467,8 @@ class TestJarvisFirstRouting(unittest.TestCase):
             task = bot._orchestrator_task_from_job(cfg, job, profiles=None, user_id=123)
             self.assertEqual(task.request_type, "query")
             self.assertEqual(task.mode_hint, "ro")
-            self.assertEqual(task.effort, "low")
+            self.assertEqual(task.effort, "high")
+            self.assertEqual(task.model, "gpt-5.3-codex-spark")
             self.assertFalse(task.requires_approval)
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
             self.assertEqual(int((task.trace or {}).get("max_runtime_seconds") or 0), 120)

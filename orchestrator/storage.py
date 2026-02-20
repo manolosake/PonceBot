@@ -18,7 +18,9 @@ class SQLiteStorageError(RuntimeError):
 
 _ALLOWED_TASK_STATES = (
     "queued",
+    "waiting_deps",
     "running",
+    "blocked_approval",
     "blocked",
     "done",
     "failed",
@@ -151,6 +153,9 @@ class SQLiteTaskStorage:
                     labels TEXT NOT NULL DEFAULT '{}',
                     requires_review INTEGER NOT NULL DEFAULT 0,
                     artifacts_dir TEXT,
+                    blocked_reason TEXT,
+                    plan_revision INTEGER NOT NULL DEFAULT 0,
+                    stalled_since REAL,
                     trace TEXT NOT NULL DEFAULT '{}'
                 )
                 """
@@ -237,8 +242,39 @@ class SQLiteTaskStorage:
                     body TEXT NOT NULL,
                     status TEXT NOT NULL,
                     priority INTEGER NOT NULL,
+                    intent_type TEXT NOT NULL DEFAULT 'order_project_new',
+                    source_message_id INTEGER,
+                    reply_to_message_id INTEGER,
+                    phase TEXT NOT NULL DEFAULT 'planning',
+                    project_id TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS projects_registry (
+                    project_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    runtime_mode TEXT NOT NULL,
+                    ports TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL DEFAULT 'system',
+                    details TEXT NOT NULL DEFAULT '{}'
                 )
                 """
             )
@@ -302,6 +338,7 @@ class SQLiteTaskStorage:
 
             # Backward-compatible migration for older DBs that may exist in the field.
             self._migrate_jobs_table(conn)
+            self._migrate_orders_table(conn)
             self._migrate_roles(conn)
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state_due ON jobs(state, due_at)")
@@ -312,6 +349,10 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_chat_role ON agent_sessions(chat_id, role)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_leases_role ON workspace_leases(role, slot)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ceo_orders_chat_status ON ceo_orders(chat_id, status, priority, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ceo_orders_phase ON ceo_orders(phase, status, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ceo_orders_project_id ON ceo_orders(project_id, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_projects_registry_status ON projects_registry(status, updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_order_ts ON decision_log(order_id, ts DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_log_root_ts ON delegation_log(root_ticket_id, ts DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_activity_role_ts ON worker_activity(role, ts DESC)")
@@ -383,10 +424,26 @@ class SQLiteTaskStorage:
             "labels": "TEXT NOT NULL DEFAULT '{}'",
             "requires_review": "INTEGER NOT NULL DEFAULT 0",
             "artifacts_dir": "TEXT",
+            "blocked_reason": "TEXT",
+            "plan_revision": "INTEGER NOT NULL DEFAULT 0",
+            "stalled_since": "REAL",
         }
         for col, ddl in required_cols.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+
+    def _migrate_orders_table(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(ceo_orders)").fetchall()}
+        required_cols = {
+            "intent_type": "TEXT NOT NULL DEFAULT 'order_project_new'",
+            "source_message_id": "INTEGER",
+            "reply_to_message_id": "INTEGER",
+            "phase": "TEXT NOT NULL DEFAULT 'planning'",
+            "project_id": "TEXT",
+        }
+        for col, ddl in required_cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE ceo_orders ADD COLUMN {col} {ddl}")
 
     def submit_task(self, task: Task) -> str:
         with self._lock:
@@ -421,6 +478,9 @@ class SQLiteTaskStorage:
                     "labels",
                     "requires_review",
                     "artifacts_dir",
+                    "blocked_reason",
+                    "plan_revision",
+                    "stalled_since",
                     "trace",
                 )
                 artifacts_dir = task.artifacts_dir
@@ -456,6 +516,9 @@ class SQLiteTaskStorage:
                     json.dumps(dict(task.labels or {}), ensure_ascii=False),
                     1 if task.requires_review else 0,
                     artifacts_dir,
+                    (str(task.blocked_reason).strip() if isinstance(task.blocked_reason, str) and str(task.blocked_reason).strip() else None),
+                    int(task.plan_revision or 0),
+                    (float(task.stalled_since) if task.stalled_since is not None else None),
                     task.trace_json(),
                 )
                 query = (
@@ -844,6 +907,87 @@ class SQLiteTaskStorage:
             return []
         return tasks if isinstance(tasks, list) else [tasks]
 
+    def _is_trace_approved(self, trace_raw: Any) -> bool:
+        try:
+            trace = Task.from_trace_json(trace_raw)
+            return bool(trace.get("approved", False))
+        except Exception:
+            return False
+
+    def _mark_waiting_deps(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        missing_deps: list[str],
+        now: float,
+    ) -> None:
+        row = conn.execute("SELECT stalled_since FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        stalled_since = None
+        if row is not None:
+            stalled_since = _coerce_float(row["stalled_since"], None)
+        if stalled_since is None or stalled_since <= 0:
+            stalled_since = float(now)
+        conn.execute(
+            "UPDATE jobs SET state = ?, updated_at = ?, blocked_reason = ?, stalled_since = ?, due_at = NULL WHERE job_id = ? AND state = 'queued'",
+            (
+                "waiting_deps",
+                float(now),
+                ("dependencies_pending:" + ",".join(missing_deps[:20])) if missing_deps else "dependencies_pending",
+                float(stalled_since),
+                job_id,
+            ),
+        )
+        self._append_event(
+            conn,
+            job_id,
+            "state:waiting_deps",
+            {"reason": "dependencies_pending", "missing_deps": missing_deps[:20]},
+        )
+
+    def _mark_blocked_approval(self, conn: sqlite3.Connection, *, job_id: str, now: float) -> None:
+        row = conn.execute("SELECT stalled_since FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        stalled_since = None
+        if row is not None:
+            stalled_since = _coerce_float(row["stalled_since"], None)
+        if stalled_since is None or stalled_since <= 0:
+            stalled_since = float(now)
+        conn.execute(
+            "UPDATE jobs SET state = ?, updated_at = ?, blocked_reason = ?, stalled_since = ?, due_at = NULL WHERE job_id = ? AND state = 'queued'",
+            ("blocked_approval", float(now), "requires_approval", float(stalled_since), job_id),
+        )
+        self._append_event(conn, job_id, "state:blocked_approval", {"reason": "requires_approval"})
+
+    def _reconcile_waiting_jobs_in_conn(self, conn: sqlite3.Connection, *, now: float) -> None:
+        rows = conn.execute(
+            "SELECT job_id, depends_on, trace FROM jobs WHERE state = 'waiting_deps' ORDER BY created_at ASC LIMIT 500"
+        ).fetchall()
+        for row in rows:
+            jid = str(row["job_id"])
+            deps = _coerce_json_list(row["depends_on"])
+            allow_terminal = False
+            try:
+                trace = Task.from_trace_json(row["trace"])
+                allow_terminal = bool(trace.get("wrapup_for"))
+            except Exception:
+                allow_terminal = False
+            if deps and not self._deps_satisfied(conn, deps, allow_terminal=allow_terminal):
+                continue
+            conn.execute(
+                "UPDATE jobs SET state = ?, updated_at = ?, blocked_reason = NULL, stalled_since = NULL WHERE job_id = ? AND state = 'waiting_deps'",
+                ("queued", float(now), jid),
+            )
+            self._append_event(conn, jid, "deps_ready", {})
+            conn.execute(
+                "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+                (
+                    float(now),
+                    "task.unblocked",
+                    "scheduler",
+                    json.dumps({"job_id": jid, "reason": "dependencies_satisfied"}, ensure_ascii=False),
+                ),
+            )
+
     def _claim(
         self,
         *,
@@ -862,6 +1006,10 @@ class SQLiteTaskStorage:
             with self._conn() as conn:
                 if self._is_global_pause(conn):
                     return None
+                # Keep queue semantics strict:
+                # - waiting_deps jobs are promoted back to queued only when dependencies are satisfied.
+                # - queued stays runnable (or immediately demoted below).
+                self._reconcile_waiting_jobs_in_conn(conn, now=now)
 
                 roles_csv = None
                 if role:
@@ -904,10 +1052,13 @@ class SQLiteTaskStorage:
                     return [] if max_rows > 1 else None
 
                 out: list[Task] = []
-                touched_due = False
                 for row in rows:
                     role_name = str(row["role"])
                     if self._is_role_paused(conn, role_name):
+                        continue
+
+                    if _coerce_bool(row["requires_approval"], False) and (not self._is_trace_approved(row["trace"])):
+                        self._mark_blocked_approval(conn, job_id=str(row["job_id"]), now=now)
                         continue
 
                     deps = _coerce_json_list(row["depends_on"])
@@ -918,15 +1069,13 @@ class SQLiteTaskStorage:
                     except Exception:
                         allow_terminal = False
                     if deps and not self._deps_satisfied(conn, deps, allow_terminal=allow_terminal):
-                        # Avoid "spin": push due_at forward a bit so other ready tasks can be scanned/claimed.
-                        try:
-                            conn.execute(
-                                "UPDATE jobs SET due_at = ?, updated_at = ? WHERE job_id = ? AND state = ?",
-                                (now + 10.0, time.time(), str(row["job_id"]), "queued"),
-                            )
-                            touched_due = True
-                        except Exception:
-                            pass
+                        missing: list[str] = []
+                        for dep in deps:
+                            dep_row = conn.execute("SELECT state FROM jobs WHERE job_id = ?", (dep,)).fetchone()
+                            dep_state = str(dep_row["state"] or "") if dep_row is not None else ""
+                            if dep_state != "done" and not (allow_terminal and dep_state in ("failed", "cancelled")):
+                                missing.append(dep)
+                        self._mark_waiting_deps(conn, job_id=str(row["job_id"]), missing_deps=missing, now=now)
                         continue
 
                     running = self._count_jobs(conn, role=role_name, state="running")
@@ -949,11 +1098,10 @@ class SQLiteTaskStorage:
                         break
 
                 if not out:
-                    if touched_due:
-                        try:
-                            conn.commit()
-                        except Exception:
-                            pass
+                    try:
+                        conn.commit()
+                    except Exception:
+                        pass
                     return [] if max_rows > 1 else None
                 if max_rows == 1:
                     return out[0]
@@ -1030,15 +1178,28 @@ class SQLiteTaskStorage:
 
     def _update_state_in_conn(self, conn: sqlite3.Connection, *, job_id: str, state: str, metadata: dict[str, Any]) -> bool:
         now = time.time()
-        row = conn.execute("SELECT state, trace, role, parent_job_id, labels, input_text FROM jobs WHERE job_id = ?", (str(job_id),)).fetchone()
+        row = conn.execute(
+            "SELECT state, trace, role, parent_job_id, labels, input_text, blocked_reason, stalled_since FROM jobs WHERE job_id = ?",
+            (str(job_id),),
+        ).fetchone()
         if row is None:
             return False
 
         trace = Task.from_trace_json(row["trace"])
         trace.update(metadata)
+        blocked_reason = str(metadata.get("blocked_reason") or "").strip() or None
+        stalled_since = _coerce_float(row["stalled_since"], None)
+        if str(state) in ("waiting_deps", "blocked_approval", "blocked"):
+            if blocked_reason is None:
+                blocked_reason = str(row["blocked_reason"] or "").strip() or None
+            if stalled_since is None or stalled_since <= 0:
+                stalled_since = float(now)
+        else:
+            blocked_reason = None
+            stalled_since = None
         cur = conn.execute(
-            "UPDATE jobs SET state = ?, updated_at = ?, trace = ? WHERE job_id = ?",
-            (str(state), now, json.dumps(trace, ensure_ascii=False), str(job_id)),
+            "UPDATE jobs SET state = ?, updated_at = ?, trace = ?, blocked_reason = ?, stalled_since = ? WHERE job_id = ?",
+            (str(state), now, json.dumps(trace, ensure_ascii=False), blocked_reason, stalled_since, str(job_id)),
         )
         if cur.rowcount:
             self._append_event(conn, str(job_id), f"state:{state}", metadata)
@@ -1072,7 +1233,7 @@ class SQLiteTaskStorage:
                 )
 
                 # Decision log: primarily for Jarvis jobs, group by order/ticket.
-                if role == "jarvis" and str(state) in ("done", "failed", "blocked", "cancelled"):
+                if role == "jarvis" and str(state) in ("done", "failed", "blocked", "blocked_approval", "cancelled"):
                     kind = str(labels.get("kind") or "").strip() or "jarvis"
                     # order_id precedence: explicit trace order_id -> wrapup_for -> parent_job_id -> self job_id
                     order_id = str(tr.get("order_id") or tr.get("wrapup_for") or parent_job_id or job_id).strip()
@@ -1355,11 +1516,14 @@ class SQLiteTaskStorage:
                 role = str(row["role"])
                 state = str(row["state"])
                 out.setdefault(role, {})[state] = int(row["c"])
+                if state in ("blocked", "blocked_approval"):
+                    out.setdefault(role, {})["blocked"] = int(out.setdefault(role, {}).get("blocked", 0) or 0) + int(row["c"] or 0)
 
             for role in self._known_roles(conn):
                 out.setdefault(role, {})
                 for state in _ALLOWED_TASK_STATES:
                     out[role].setdefault(state, 0)
+                out[role].setdefault("blocked", 0)
 
             for role in out:
                 out[role].setdefault("paused", 1 if self._is_role_paused(conn, role) else 0)
@@ -1379,10 +1543,13 @@ class SQLiteTaskStorage:
                 role = str(row["role"])
                 st = str(row["state"])
                 out.setdefault(role, {})[st] = int(row["c"])
+                if st in ("blocked", "blocked_approval"):
+                    out.setdefault(role, {})["blocked"] = int(out.setdefault(role, {}).get("blocked", 0) or 0) + int(row["c"] or 0)
             for role in self._known_roles(conn):
                 out.setdefault(role, {})
                 for st in _ALLOWED_TASK_STATES:
                     out[role].setdefault(st, 0)
+                out[role].setdefault("blocked", 0)
             return out
 
     def set_cost_cap(self, role: str, cost_usd: float) -> None:
@@ -1442,6 +1609,11 @@ class SQLiteTaskStorage:
         body: str,
         status: str = "active",
         priority: int = 2,
+        intent_type: str | None = None,
+        source_message_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        phase: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """
         Persist a CEO "order" (an ongoing objective) for autopilot.
@@ -1456,6 +1628,12 @@ class SQLiteTaskStorage:
         except Exception:
             pr = 2
         pr = max(1, min(3, pr))
+        intent = (intent_type or "").strip().lower() or "order_project_new"
+        if intent not in ("query", "order_project_new", "order_project_change"):
+            intent = "order_project_new"
+        ph = (phase or "").strip().lower() or "planning"
+        if ph not in ("planning", "delegated", "executing", "review", "done", "paused"):
+            ph = "planning"
 
         oid = str(order_id).strip()
         if not oid:
@@ -1470,8 +1648,8 @@ class SQLiteTaskStorage:
                 ).fetchone()
                 created_at = float(existing["created_at"]) if existing is not None else float(now)
                 conn.execute(
-                    "INSERT OR REPLACE INTO ceo_orders(order_id, chat_id, title, body, status, priority, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO ceo_orders(order_id, chat_id, title, body, status, priority, intent_type, source_message_id, reply_to_message_id, phase, project_id, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         oid,
                         int(chat_id),
@@ -1479,6 +1657,11 @@ class SQLiteTaskStorage:
                         str(body or "").strip(),
                         st,
                         int(pr),
+                        intent,
+                        (None if source_message_id is None else int(source_message_id)),
+                        (None if reply_to_message_id is None else int(reply_to_message_id)),
+                        ph,
+                        (str(project_id).strip() if isinstance(project_id, str) and str(project_id).strip() else None),
                         float(created_at),
                         float(now),
                     ),
@@ -1562,11 +1745,198 @@ class SQLiteTaskStorage:
                         "body": str(r["body"]),
                         "status": str(r["status"]),
                         "priority": int(r["priority"]),
+                        "intent_type": str(r["intent_type"] or ""),
+                        "source_message_id": (_coerce_int(r["source_message_id"], None)),
+                        "reply_to_message_id": (_coerce_int(r["reply_to_message_id"], None)),
+                        "phase": str(r["phase"] or ""),
+                        "project_id": (None if r["project_id"] is None else str(r["project_id"])),
                         "created_at": float(r["created_at"]),
                         "updated_at": float(r["updated_at"]),
                     }
                 )
             return out
+
+    def latest_active_order(self, *, chat_id: int) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM ceo_orders WHERE chat_id = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1",
+                (int(chat_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return {str(k): row[k] for k in row.keys()}
+
+    def set_order_phase(self, order_id: str, *, chat_id: int, phase: str) -> bool:
+        ph = (phase or "").strip().lower()
+        if ph not in ("planning", "delegated", "executing", "review", "done", "paused"):
+            return False
+        with self._lock:
+            with self._conn() as conn:
+                resolved = self._resolve_order_id_in_conn(conn, str(order_id), chat_id=int(chat_id))
+                if not resolved:
+                    return False
+                conn.execute(
+                    "UPDATE ceo_orders SET phase = ?, updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                    (ph, time.time(), resolved, int(chat_id)),
+                )
+                conn.commit()
+                return True
+
+    def append_audit_event(self, *, event_type: str, actor: str = "system", details: dict[str, Any] | None = None) -> None:
+        et = (event_type or "").strip()
+        if not et:
+            return
+        det = details or {}
+        with self._lock:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+                    (float(time.time()), et, (actor or "system").strip() or "system", json.dumps(det, ensure_ascii=False)),
+                )
+                conn.commit()
+
+    def list_audit_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        lim = max(1, min(1000, int(limit)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT ts, event_type, actor, details FROM audit_log ORDER BY ts DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "ts": float(r["ts"]),
+                        "event_type": str(r["event_type"]),
+                        "actor": str(r["actor"]),
+                        "details": _coerce_json_dict(r["details"]),
+                    }
+                )
+            return out
+
+    def upsert_project(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        path: str,
+        runtime_mode: str = "venv",
+        ports: list[str] | None = None,
+        status: str = "active",
+        created_by: str = "jarvis",
+    ) -> None:
+        pid = (project_id or "").strip()
+        if not pid:
+            raise ValueError("project_id required")
+        runtime = (runtime_mode or "").strip().lower() or "venv"
+        st = (status or "").strip().lower() or "active"
+        by = (created_by or "").strip() or "jarvis"
+        with self._lock:
+            with self._conn() as conn:
+                now = float(time.time())
+                existing = conn.execute(
+                    "SELECT created_at FROM projects_registry WHERE project_id = ?",
+                    (pid,),
+                ).fetchone()
+                created_at = float(existing["created_at"]) if existing is not None else now
+                conn.execute(
+                    "INSERT OR REPLACE INTO projects_registry(project_id, name, path, runtime_mode, ports, status, created_by, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pid,
+                        str(name or "").strip() or pid,
+                        str(path or "").strip(),
+                        runtime,
+                        json.dumps([str(p) for p in (ports or []) if str(p).strip()], ensure_ascii=False),
+                        st,
+                        by,
+                        created_at,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+    def list_projects(self, *, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        st = (status or "").strip().lower() or None
+        lim = max(1, min(2000, int(limit)))
+        params: list[Any] = []
+        where = ""
+        if st:
+            where = " WHERE status = ?"
+            params.append(st)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT project_id, name, path, runtime_mode, ports, status, created_by, created_at, updated_at FROM projects_registry{where} ORDER BY updated_at DESC LIMIT ?",
+                [*params, lim],
+            ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "project_id": str(r["project_id"]),
+                        "name": str(r["name"]),
+                        "path": str(r["path"]),
+                        "runtime_mode": str(r["runtime_mode"]),
+                        "ports": _coerce_json_list(r["ports"]),
+                        "status": str(r["status"]),
+                        "created_by": str(r["created_by"]),
+                        "created_at": float(r["created_at"]),
+                        "updated_at": float(r["updated_at"]),
+                    }
+                )
+            return out
+
+    def hard_reset_bootstrap(self, *, reason: str = "hard_reset_bootstrap") -> dict[str, int]:
+        """
+        One-shot operational reset:
+        - jobs in queued/running/blocked/waiting_deps/blocked_approval => cancelled
+        - active CEO orders => done
+        - append audit event for traceability
+        """
+        rsn = (reason or "").strip() or "hard_reset_bootstrap"
+        with self._lock:
+            with self._conn() as conn:
+                now = float(time.time())
+                states = ("queued", "running", "blocked", "waiting_deps", "blocked_approval")
+                placeholders = ",".join("?" for _ in states)
+                rows = conn.execute(
+                    f"SELECT job_id, state, trace FROM jobs WHERE state IN ({placeholders})",
+                    list(states),
+                ).fetchall()
+                cancelled = 0
+                for row in rows:
+                    jid = str(row["job_id"])
+                    from_state = str(row["state"] or "")
+                    trace = Task.from_trace_json(row["trace"])
+                    if not isinstance(trace, dict):
+                        trace = {}
+                    trace["cancel_reason"] = rsn
+                    trace["reset_ts"] = now
+                    updated = conn.execute(
+                        "UPDATE jobs SET state = 'cancelled', updated_at = ?, blocked_reason = NULL, stalled_since = NULL, trace = ? WHERE job_id = ? AND state = ?",
+                        (now, json.dumps(trace, ensure_ascii=False), jid, from_state),
+                    )
+                    if updated.rowcount:
+                        cancelled += 1
+                        self._append_event(conn, jid, "hard_reset_cancel", {"reason": rsn, "from": from_state})
+
+                order_cur = conn.execute(
+                    "UPDATE ceo_orders SET status = 'done', phase = 'done', updated_at = ? WHERE status = 'active'",
+                    (now,),
+                )
+                orders_done = int(order_cur.rowcount or 0)
+
+                conn.execute(
+                    "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+                    (
+                        now,
+                        "hard_reset_bootstrap",
+                        "system",
+                        json.dumps({"reason": rsn, "jobs_cancelled": cancelled, "orders_done": orders_done}, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+                return {"jobs_cancelled": cancelled, "orders_done": orders_done}
 
     def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:
         """
@@ -1656,6 +2026,48 @@ class SQLiteTaskStorage:
             row = conn.execute(sql, params).fetchone()
             return int(row["c"]) if row else 0
 
+    def waiting_deps_count(self, *, chat_id: int | None = None) -> int:
+        with self._conn() as conn:
+            sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'waiting_deps'"
+            params: list[object] = []
+            if chat_id is not None:
+                sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            row = conn.execute(sql, params).fetchone()
+            return int(row["c"]) if row else 0
+
+    def blocked_approval_count(self, *, chat_id: int | None = None) -> int:
+        with self._conn() as conn:
+            sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'blocked_approval'"
+            params: list[object] = []
+            if chat_id is not None:
+                sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            row = conn.execute(sql, params).fetchone()
+            return int(row["c"]) if row else 0
+
+    def list_stalled_tasks(
+        self,
+        *,
+        stale_after_seconds: float = 1800.0,
+        limit: int = 100,
+    ) -> list[Task]:
+        threshold = float(time.time()) - max(60.0, float(stale_after_seconds))
+        lim = max(1, min(1000, int(limit)))
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM jobs
+                WHERE state IN ('waiting_deps', 'blocked_approval')
+                  AND stalled_since IS NOT NULL
+                  AND stalled_since <= ?
+                ORDER BY stalled_since ASC
+                LIMIT ?
+                """,
+                (threshold, lim),
+            ).fetchall()
+            return [self._row_to_task(r) for r in rows]
+
     def running_count(self, *, chat_id: int | None = None) -> int:
         with self._conn() as conn:
             sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'running'"
@@ -1714,6 +2126,22 @@ class SQLiteTaskStorage:
                 updated = self._update_state_in_conn(conn, job_id=resolved, state="queued", metadata=trace_payload)
                 if updated:
                     self._append_event(conn, resolved, "approved", {"approved": approved, "approved_by": approved_by, "reason": reason})
+                    conn.execute(
+                        "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+                        (
+                            float(time.time()),
+                            "task.unblocked",
+                            "manager",
+                            json.dumps(
+                                {
+                                    "job_id": resolved,
+                                    "reason": "approval_granted",
+                                    "approved_by": approved_by,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    )
                     conn.commit()
                 return updated
 
@@ -1870,7 +2298,7 @@ class SQLiteTaskStorage:
             return [self._row_to_task(r) for r in rows]
 
     def inbox(self, *, role: str | None = None, limit: int = 25) -> list[Task]:
-        where = ["state IN ('queued', 'blocked', 'failed')"]
+        where = ["state IN ('queued', 'waiting_deps', 'blocked_approval', 'blocked', 'failed')"]
         params: list[Any] = []
         if role:
             where.append("role = ?")
@@ -1947,5 +2375,8 @@ class SQLiteTaskStorage:
             labels=_coerce_json_dict(row["labels"]),
             requires_review=_coerce_bool(row["requires_review"], False),
             artifacts_dir=None if row["artifacts_dir"] is None else str(row["artifacts_dir"]),
+            blocked_reason=(None if row["blocked_reason"] is None else str(row["blocked_reason"])),
+            plan_revision=_coerce_int(row["plan_revision"], 0),
+            stalled_since=_coerce_float(row["stalled_since"], None),
             trace=trace,
         )

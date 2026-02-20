@@ -20,8 +20,8 @@
     - Do not spam. Prefer max 3 bullets.
     - If something needs a CEO decision, ask exactly one short question.
     - Everything else should be visible via the ticket card (/ticket, /agents, /dashboard).
-  model: gpt-5.2
-  effort: high
+  model: gpt-5.3-codex
+  effort: xhigh
   mode_hint: rw
   allowed_tools:
     - plan
@@ -40,7 +40,7 @@
     Always try to produce a runnable visual artifact:
     - Create a self-contained HTML preview at `.codexbot_preview/preview.html` inside your assigned workspace.
     - The bot will automatically screenshot it and send `preview.png` to Telegram.
-  model: gpt-5.2
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -57,7 +57,7 @@
   system_prompt: |
     You are the Backend engineer. Implement and debug services, APIs, storage, and tests.
     Work inside the assigned workspace (worktree). Leave the repo consistent and runnable.
-  model: gpt-5.2
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -74,8 +74,8 @@
   system_prompt: |
     You are QA. Your job is to catch regressions and enforce quality gates.
     Run tests in the assigned workspace and report failures by severity with reproduction steps.
-  model: gpt-5.2
-  effort: high
+  model: gpt-5.3-codex
+  effort: medium
   mode_hint: rw
   allowed_tools:
     - tests
@@ -94,7 +94,7 @@
     Reporting policy:
     - If everything is OK: 1 line.
     - Otherwise: only actionable findings (what, impact, next action, ETA).
-  model: gpt-5.2
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -116,8 +116,8 @@
     - Clear scope boundaries and assumptions
 
     Keep it short and concrete; use bullets and checklists.
-  model: gpt-5.2
-  effort: high
+  model: gpt-5.3-codex
+  effort: medium
   mode_hint: ro
   allowed_tools:
     - plan
@@ -135,8 +135,8 @@
     - Propose least-privilege improvements without breaking UX
 
     Always return actionable fixes with risk level and verification steps.
-  model: gpt-5.2
-  effort: high
+  model: gpt-5.3-codex
+  effort: medium
   mode_hint: ro
   allowed_tools:
     - review
@@ -150,7 +150,7 @@
   system_prompt: |
     You track state-of-the-art and competitor feature gaps (e.g. OpenClaw).
     Provide the highest ROI next improvements for Jarvis v1, without inventing new projects.
-  model: gpt-5.2
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -173,7 +173,7 @@
       - Run: `python3 tools/release_governance.py --repo . --remote origin --base main --run-tests --require-pr --artifacts-dir $ARTIFACTS_DIR`
       - Ensure `RELEASE_CHECKLIST.json` and `PR_URL.txt` exist in `$ARTIFACTS_DIR`.
     - Repo hygiene: never commit or upload `data/`, `artifacts/`, APKs, or other build outputs.
-  model: gpt-5.2
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: rw
   allowed_tools:

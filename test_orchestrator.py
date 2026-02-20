@@ -628,7 +628,7 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             assert taken is not None
             self.assertEqual(taken.job_id, wrap_id)
 
-    def test_non_wrapup_requires_done_dependencies_and_defers_due_at(self) -> None:
+    def test_non_wrapup_requires_done_dependencies_and_moves_to_waiting_deps(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
             q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -670,9 +670,10 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             refreshed = q.get_job(jid)
             self.assertIsNotNone(refreshed)
             assert refreshed is not None
-            self.assertIsNotNone(refreshed.due_at)
-            assert refreshed.due_at is not None
-            self.assertGreater(refreshed.due_at, now)
+            self.assertEqual(refreshed.state, "waiting_deps")
+            self.assertIsNone(refreshed.due_at)
+            self.assertTrue(str(refreshed.blocked_reason or "").startswith("dependencies_pending"))
+            self.assertGreater(float(refreshed.updated_at), now)
 
 
 class TestRetryScheduling(unittest.TestCase):

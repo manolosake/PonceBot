@@ -224,6 +224,11 @@ class StatusService:
                     "order_id_short": oid[:8],
                     "chat_id": int(o.get("chat_id") or 0),
                     "status": str(o.get("status") or ""),
+                    "phase": str(o.get("phase") or "planning"),
+                    "intent_type": str(o.get("intent_type") or "order_project_new"),
+                    "project_id": (str(o.get("project_id") or "").strip() or None),
+                    "source_message_id": o.get("source_message_id"),
+                    "reply_to_message_id": o.get("reply_to_message_id"),
                     "priority": int(o.get("priority") or 2),
                     "title": str(o.get("title") or ""),
                     "updated_at": float(o.get("updated_at") or 0.0),
@@ -239,9 +244,13 @@ class StatusService:
             role_health = {}
         try:
             queued_total = int(self.orch_q.get_queued_count(chat_id=chat_id))
+            waiting_deps_total = int(self.orch_q.get_waiting_deps_count(chat_id=chat_id))
+            blocked_approval_total = int(self.orch_q.get_blocked_approval_count(chat_id=chat_id))
             running_total = int(self.orch_q.get_running_count(chat_id=chat_id))
         except Exception:
             queued_total = 0
+            waiting_deps_total = 0
+            blocked_approval_total = 0
             running_total = 0
         blocked_total = 0
         try:
@@ -252,7 +261,7 @@ class StatusService:
 
         blocked_requires_approval: list[dict[str, Any]] = []
         try:
-            blocked = self.orch_q.peek(state="blocked", limit=200, chat_id=chat_id)
+            blocked = self.orch_q.peek(state="blocked_approval", limit=200, chat_id=chat_id)
             blocked_sorted = sorted(blocked, key=lambda t: float(t.updated_at), reverse=True)
             for t in blocked_sorted[:30]:
                 blocked_requires_approval.append(_task_to_status(t))
@@ -260,6 +269,33 @@ class StatusService:
                     break
         except Exception:
             blocked_requires_approval = []
+
+        try:
+            stalled_tasks = self.orch_q.list_stalled_tasks(stale_after_seconds=1800.0, limit=40)
+        except Exception:
+            stalled_tasks = []
+        stalled_out = [_task_to_status(t) for t in stalled_tasks[:20]]
+
+        try:
+            projects = self.orch_q.list_projects(status=None, limit=400)
+        except Exception:
+            projects = []
+
+        role_queue_rows: list[dict[str, Any]] = []
+        for role in sorted((role_health or {}).keys()):
+            rec = role_health.get(role) or {}
+            role_queue_rows.append(
+                {
+                    "role": role,
+                    "queued": int(rec.get("queued", 0) or 0),
+                    "waiting_deps": int(rec.get("waiting_deps", 0) or 0),
+                    "blocked_approval": int(rec.get("blocked_approval", 0) or 0),
+                    "running": int(rec.get("running", 0) or 0),
+                    "blocked": int(rec.get("blocked", 0) or 0),
+                    "done": int(rec.get("done", 0) or 0),
+                    "failed": int(rec.get("failed", 0) or 0),
+                }
+            )
         newest_updated_at = 0.0
 
         for role in roles:
@@ -297,11 +333,16 @@ class StatusService:
             "generated_at": float(now),
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
+            "projects": projects,
             "workers": workers_out,
             "queued_total": int(queued_total),
+            "waiting_deps_total": int(waiting_deps_total),
+            "blocked_approval_total": int(blocked_approval_total),
             "running_total": int(running_total),
             "blocked_total": int(blocked_total),
+            "queue_by_role": role_queue_rows,
             "blocked_requires_approval": blocked_requires_approval,
+            "stalled_tasks": stalled_out,
             "source_newest_updated_at": (float(newest_updated_at) if newest_updated_at > 0 else None),
             "staleness_seconds": staleness_seconds,
         }

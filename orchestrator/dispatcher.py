@@ -117,6 +117,7 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 _REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
+_INTENT_TYPES = {"query", "order_project_new", "order_project_change"}
 
 _TOKEN_RE = re.compile(r"[\w]+", flags=re.UNICODE)
 _TASK_VERB_RE = re.compile(
@@ -141,7 +142,7 @@ def _score_role(text_l: str, role: str) -> int:
     """
     score = 0
     tokens: set[str] | None = None
-    for k in _ROLE_KEYWORDS.get(role, ()):
+    for k in _ROLE_KEYWORDS.get(role, ()):  # pragma: no branch
         kk = (k or "").strip().lower()
         if not kk:
             continue
@@ -290,6 +291,69 @@ def detect_request_type(text_l: str) -> str:
     return "task"
 
 
+def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None) -> str:
+    """
+    Classify a top-level CEO message into:
+    - query
+    - order_project_new
+    - order_project_change
+
+    Grounded rule set:
+    - Queries never create/advance CEO orders.
+    - Replies/corrections default to `order_project_change`.
+    - Otherwise actionable work defaults to `order_project_new`.
+    """
+    req_type = detect_request_type(text)
+    if req_type in ("query", "status"):
+        return "query"
+
+    raw = (text or "").strip().lower()
+    has_reply = bool(reply_context and isinstance(reply_context, dict) and any(reply_context.values()))
+    if has_reply:
+        return "order_project_change"
+
+    if any(
+        k in raw
+        for k in (
+            "change ",
+            "update ",
+            "modify ",
+            "adjust ",
+            "fix this",
+            "sobre eso",
+            "de eso",
+            "ajusta",
+            "corrige",
+            "modifica",
+            "actualiza",
+            "cambia",
+            "iterate",
+            "iteration",
+            "follow up",
+        )
+    ):
+        return "order_project_change"
+
+    if any(
+        k in raw
+        for k in (
+            "new project",
+            "nuevo proyecto",
+            "start project",
+            "inicia proyecto",
+            "create project",
+            "crear proyecto",
+            "new order",
+            "nueva orden",
+            "build from scratch",
+            "desde cero",
+        )
+    ):
+        return "order_project_new"
+
+    return "order_project_new"
+
+
 def choose_model_by_role(role: str, model_override: str | None = None, default_model: str = "gpt-4.1") -> str:
     if model_override:
         return model_override.strip()
@@ -335,7 +399,8 @@ def to_task(
     if role not in ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
         role = "backend"
 
-    request_type = detect_request_type(text)
+    override_request_type = str(normalized_context.get("request_type") or "").strip().lower()
+    request_type = override_request_type or detect_request_type(text)
     if request_type not in _REQUEST_TYPES:
         request_type = "task"
 
@@ -349,6 +414,11 @@ def to_task(
     requires_approval = bool(normalized_context.get("requires_approval", False))
     if mode_hint == "full":
         requires_approval = True
+
+    trace = dict(normalized_context.get("trace") or {})
+    intent_type = str(trace.get("intent_type") or normalized_context.get("intent_type") or "").strip().lower()
+    if intent_type in _INTENT_TYPES:
+        trace["intent_type"] = intent_type
 
     return Task.new(
         source=str(source),
@@ -365,5 +435,5 @@ def to_task(
         user_id=user_id,
         reply_to_message_id=reply_to_message_id,
         due_at=due_at,
-        trace=dict(normalized_context.get("trace") or {}),
+        trace=trace,
     )

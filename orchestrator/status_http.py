@@ -221,6 +221,87 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"api_version": _API_VERSION, "role": role, "since_ts": since_ts, "items": items})
             return
 
+        if path in ("/api/v1/orchestration/overview", "/api/orchestration/overview"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "queue": {
+                        "queued_runnable": int(snap.get("queued_total") or 0),
+                        "waiting_deps": int(snap.get("waiting_deps_total") or 0),
+                        "blocked_approval": int(snap.get("blocked_approval_total") or 0),
+                        "running": int(snap.get("running_total") or 0),
+                        "blocked_legacy": int(snap.get("blocked_total") or 0),
+                        "by_role": snap.get("queue_by_role") or [],
+                    },
+                    "orders_active_count": len(list(snap.get("orders_active") or [])),
+                    "projects_count": len(list(snap.get("projects") or [])),
+                    "stalled_count": len(list(snap.get("stalled_tasks") or [])),
+                    "staleness_seconds": snap.get("staleness_seconds"),
+                },
+            )
+            return
+
+        if path in ("/api/v1/orchestration/orders", "/api/orchestration/orders"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            status = (qs.get("status") or [""])[0].strip().lower() or None
+            limit = _parse_limit(qs, 100, hi=2000)
+            if chat_id is None:
+                items = self.server.status_service.orch_q.list_orders_global(status=status, limit=limit)
+            else:
+                items = self.server.status_service.orch_q.list_orders(chat_id=int(chat_id), status=status, limit=limit)
+            self._send_json(200, {"api_version": _API_VERSION, "chat_id": chat_id, "status": status, "items": items})
+            return
+
+        if path in ("/api/v1/orchestration/projects", "/api/orchestration/projects"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            status = (qs.get("status") or [""])[0].strip().lower() or None
+            limit = _parse_limit(qs, 200, hi=5000)
+            items = self.server.status_service.orch_q.list_projects(status=status, limit=limit)
+            self._send_json(200, {"api_version": _API_VERSION, "status": status, "items": items})
+            return
+
+        if path in ("/api/v1/orchestration/agents-live", "/api/orchestration/agents-live"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            workers = list(snap.get("workers") or [])
+            running = 0
+            queued_next = 0
+            for w in workers:
+                if not isinstance(w, dict):
+                    continue
+                if isinstance(w.get("current"), dict):
+                    running += 1
+                if isinstance(w.get("next"), dict):
+                    queued_next += 1
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "summary": {
+                        "workers_total": len(workers),
+                        "running_workers": int(running),
+                        "workers_with_next": int(queued_next),
+                    },
+                    "workers": workers,
+                },
+            )
+            return
+
         if path in ("/api/status/snapshot", f"/api/{_API_VERSION}/status/snapshot"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
