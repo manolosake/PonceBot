@@ -81,6 +81,9 @@ _TICKET_CARD_LOCK = threading.Lock()
 _TICKET_CARD_LAST_EDIT: dict[tuple[int, str], float] = {}
 _TICKET_CARD_MIN_EDIT_INTERVAL_S = 2.0
 
+_APK_BUILD_LOCK = threading.Lock()
+_APK_BUILD_ACTIVE = False
+
 _MODEL_CEO_QUERY = "gpt-5.3-codex-spark"
 _MODEL_JARVIS_PLAN = "gpt-5.3-codex"
 _MODEL_AGENT_EXEC = "gpt-5.3-codex"
@@ -826,6 +829,14 @@ class BotConfig:
     tts_piper_length_scale: float = 0.0
     tts_piper_noise_w: float = 0.0
     tts_piper_sentence_silence: float = 0.0
+    # Mobile app (native Android) build + delivery config.
+    mobile_app_project_dir: Path = Path("/home/aponce/OmniCrewApp.android")
+    mobile_app_artifacts_dir: Path = Path(__file__).with_name("data") / "artifacts" / "mobile"
+    mobile_app_build_script: Path = Path(__file__).with_name("scripts") / "build_release_apk.sh"
+    mobile_app_keystore_path: Path = Path.home() / ".config" / "omnicrew-app" / "keystore.jks"
+    mobile_app_key_alias: str = "omnicrew_release"
+    mobile_app_keystore_pass: str = ""
+    mobile_app_key_pass: str = ""
 
 
 class TelegramAPI:
@@ -3005,6 +3016,8 @@ def _help_text(cfg: BotConfig) -> str:
         "- /status             Show legacy/system status and orchestrator queue",
         "- /agents             Show orchestrator role status and queue per role",
         "- /dashboard          Visual dashboard snapshot (PNG)",
+        "- /apk_build          Build/sign native Android APK and send to this chat",
+        "- /apk_latest         Re-send latest successful Android APK",
         "- /watch              Live company status (single message, auto-updated)",
         "- /unwatch            Disable /watch",
         "- /orders             List CEO orders (autopilot scope)",
@@ -3088,6 +3101,8 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("help", "Show help"),
         ("agents", "Orchestrator status"),
         ("dashboard", "Visual dashboard (PNG)"),
+        ("apk_build", "Build + send Android APK"),
+        ("apk_latest", "Send latest Android APK"),
         ("watch", "Live company status"),
         ("orders", "List CEO orders"),
         ("status", "Bot/model status"),
@@ -4054,6 +4069,122 @@ def _send_chunked_text(
             LOG.exception("Failed to send chunked message. chat_id=%s", chat_id)
 
 
+def _mobile_latest_apk(artifacts_dir: Path) -> Path | None:
+    try:
+        root = Path(artifacts_dir).expanduser().resolve()
+    except Exception:
+        return None
+    if not root.exists() or not root.is_dir():
+        return None
+    items = sorted(root.glob("omnicrewapp-*-universal-release.apk"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return items[0] if items else None
+
+
+def _mobile_read_build_report(artifacts_dir: Path) -> dict[str, Any]:
+    report_path = Path(artifacts_dir).expanduser().resolve() / "build_report.json"
+    if not report_path.exists():
+        return {}
+    try:
+        raw = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _mobile_apk_caption(report: dict[str, Any], apk_name: str) -> str:
+    version = str(report.get("version") or "-")
+    commit = str(report.get("git_sha") or "-")
+    built_at = str(report.get("built_at") or "-")
+    sha = str(report.get("sha256") or "-")
+    lines = [
+        "OmniCrew Android APK",
+        f"version: {version}",
+        f"commit: {commit}",
+        f"built_at: {built_at}",
+        f"sha256: {sha}",
+        f"file: {apk_name}",
+    ]
+    return "\n".join(lines)
+
+
+def _start_apk_build_worker(
+    *,
+    cfg: BotConfig,
+    api: "TelegramAPI",
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    global _APK_BUILD_ACTIVE
+
+    def _run() -> None:
+        global _APK_BUILD_ACTIVE
+        try:
+            api.send_message(chat_id, "apk_build: building", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "apk_build: testing", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "apk_build: signing", reply_to_message_id=reply_to_message_id)
+
+            env = os.environ.copy()
+            env["MOBILE_APP_PROJECT_DIR"] = str(cfg.mobile_app_project_dir)
+            env["MOBILE_APP_ARTIFACTS_DIR"] = str(cfg.mobile_app_artifacts_dir)
+            env["MOBILE_APP_BUILD_SCRIPT"] = str(cfg.mobile_app_build_script)
+            env["MOBILE_APP_KEYSTORE_PATH"] = str(cfg.mobile_app_keystore_path)
+            env["MOBILE_APP_KEY_ALIAS"] = str(cfg.mobile_app_key_alias)
+            env["MOBILE_APP_KEYSTORE_PASS"] = str(cfg.mobile_app_keystore_pass or "")
+            env["MOBILE_APP_KEY_PASS"] = str(cfg.mobile_app_key_pass or "")
+
+            proc = subprocess.run(
+                [str(cfg.mobile_app_build_script)],
+                cwd=str(cfg.mobile_app_project_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60 * 60,
+            )
+            if proc.returncode != 0:
+                tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                if len(tail) > 1600:
+                    tail = tail[-1600:]
+                api.send_message(
+                    chat_id,
+                    f"apk_build: failed (code={proc.returncode})\n{tail or 'No output captured.'}",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+
+            report = _mobile_read_build_report(cfg.mobile_app_artifacts_dir)
+            apk_path_raw = str(report.get("artifact_path") or "").strip()
+            apk_path = Path(apk_path_raw).expanduser().resolve() if apk_path_raw else None
+            if apk_path is None or not apk_path.exists():
+                apk_path = _mobile_latest_apk(cfg.mobile_app_artifacts_dir)
+
+            if apk_path is None or not apk_path.exists():
+                api.send_message(
+                    chat_id,
+                    "apk_build: failed (artifact not found after successful build)",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+
+            api.send_message(chat_id, "apk_build: sending", reply_to_message_id=reply_to_message_id)
+            caption = _mobile_apk_caption(report, apk_path.name)
+            api.send_document(
+                chat_id,
+                apk_path,
+                filename=apk_path.name,
+                caption=caption,
+                reply_to_message_id=reply_to_message_id,
+            )
+            api.send_message(chat_id, "apk_build: done", reply_to_message_id=reply_to_message_id)
+        except Exception as e:
+            api.send_message(chat_id, f"apk_build: failed ({e})", reply_to_message_id=reply_to_message_id)
+        finally:
+            with _APK_BUILD_LOCK:
+                _APK_BUILD_ACTIVE = False
+
+    t = threading.Thread(target=_run, daemon=True, name="apk-build-worker")
+    t.start()
+
+
 def _send_orchestrator_marker_response(
     kind: str,
     payload: str,
@@ -4441,6 +4572,41 @@ def _send_orchestrator_marker_response(
             api.send_photo(chat_id, out_png, caption=caption, reply_to_message_id=reply_to_message_id)
         except Exception as e:
             api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
+
+    if kind == "apk_latest":
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor para APK delivery.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        apk_path = _mobile_latest_apk(cfg.mobile_app_artifacts_dir)
+        if apk_path is None or not apk_path.exists():
+            api.send_message(chat_id, "No APK artifact found yet. Run /apk_build first.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        report = _mobile_read_build_report(cfg.mobile_app_artifacts_dir)
+        caption = _mobile_apk_caption(report, apk_path.name)
+        try:
+            api.send_document(chat_id, apk_path, filename=apk_path.name, caption=caption, reply_to_message_id=reply_to_message_id)
+        except Exception as e:
+            api.send_message(chat_id, f"/apk_latest failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "apk_build":
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor para APK build.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        with _APK_BUILD_LOCK:
+            global _APK_BUILD_ACTIVE
+            if _APK_BUILD_ACTIVE:
+                api.send_message(chat_id, "apk_build: already running", reply_to_message_id=reply_to_message_id)
+                return True
+            _APK_BUILD_ACTIVE = True
+
+        api.send_message(chat_id, "apk_build: queued", reply_to_message_id=reply_to_message_id)
+        _start_apk_build_worker(cfg=cfg, api=api, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
         return True
 
 
@@ -5766,6 +5932,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         if tail.lower() in ("all", "global", "company"):
             return _orch_marker("dashboard", "all"), None
         return "Usage: /dashboard [all]", None
+
+    if text == "/apk_build":
+        return _orch_marker("apk_build"), None
+
+    if text == "/apk_latest":
+        return _orch_marker("apk_latest"), None
 
     if text == "/watch":
         return _orch_marker("watch", "on"), None
@@ -10078,6 +10250,8 @@ def poll_loop(
                         "/setnotify",
                         "/agents",
                         "/dashboard",
+                        "/apk_build",
+                        "/apk_latest",
                         "/orders",
                         "/watch",
                         "/unwatch",
@@ -10613,6 +10787,14 @@ def _load_config() -> BotConfig:
     except Exception:
         tts_piper_sentence_silence = 0.0
 
+    mobile_app_project_dir = Path(os.environ.get("MOBILE_APP_PROJECT_DIR", "/home/aponce/OmniCrewApp.android")).expanduser().resolve()
+    mobile_app_artifacts_dir = Path(os.environ.get("MOBILE_APP_ARTIFACTS_DIR", str(Path(__file__).with_name("data") / "artifacts" / "mobile"))).expanduser().resolve()
+    mobile_app_build_script = Path(os.environ.get("MOBILE_APP_BUILD_SCRIPT", str(Path(__file__).with_name("scripts") / "build_release_apk.sh"))).expanduser().resolve()
+    mobile_app_keystore_path = Path(os.environ.get("MOBILE_APP_KEYSTORE_PATH", str(Path.home() / ".config" / "omnicrew-app" / "keystore.jks"))).expanduser().resolve()
+    mobile_app_key_alias = os.environ.get("MOBILE_APP_KEY_ALIAS", "omnicrew_release").strip() or "omnicrew_release"
+    mobile_app_keystore_pass = os.environ.get("MOBILE_APP_KEYSTORE_PASS", "").strip()
+    mobile_app_key_pass = os.environ.get("MOBILE_APP_KEY_PASS", "").strip()
+
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
         raise SystemExit(f"CODEX_WORKDIR must be an existing directory: {codex_workdir}")
@@ -10721,6 +10903,13 @@ def _load_config() -> BotConfig:
         tts_piper_length_scale=tts_piper_length_scale,
         tts_piper_noise_w=tts_piper_noise_w,
         tts_piper_sentence_silence=tts_piper_sentence_silence,
+        mobile_app_project_dir=mobile_app_project_dir,
+        mobile_app_artifacts_dir=mobile_app_artifacts_dir,
+        mobile_app_build_script=mobile_app_build_script,
+        mobile_app_keystore_path=mobile_app_keystore_path,
+        mobile_app_key_alias=mobile_app_key_alias,
+        mobile_app_keystore_pass=mobile_app_keystore_pass,
+        mobile_app_key_pass=mobile_app_key_pass,
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
