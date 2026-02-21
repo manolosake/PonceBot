@@ -57,6 +57,9 @@ docker run --rm \
     fi
 
     chmod +x ./gradlew
+    export GRADLE_USER_HOME="/tmp/gradle-home-$RANDOM-$RANDOM"
+    mkdir -p "$GRADLE_USER_HOME"
+    trap "rm -rf \"$GRADLE_USER_HOME\"" EXIT
     ./gradlew --no-daemon clean testDebugUnitTest assembleRelease
   '
 
