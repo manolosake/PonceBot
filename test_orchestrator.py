@@ -14,7 +14,7 @@ from orchestrator.screenshot import validate_screenshot_url
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
-from orchestrator.dispatcher import detect_request_type
+from orchestrator.dispatcher import detect_ceo_intent, detect_request_type
 import threading
 import time as _time
 
@@ -155,6 +155,26 @@ class TestRequestTypeDetection(unittest.TestCase):
 
     def test_conversational_creo_que_is_query(self) -> None:
         self.assertEqual(detect_request_type("creo que el servidor esta bien"), "query")
+
+
+class TestCeoIntentDetection(unittest.TestCase):
+    def test_ideation_prompt_is_query(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("ok, dame 15 proyectos interesantes que podemos hacer"),
+            "query",
+        )
+
+    def test_explicit_execution_project_is_new_order(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("quiero que crees un proyecto backend nuevo y lo despliegues"),
+            "order_project_new",
+        )
+
+    def test_reply_defaults_to_change(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("ajusta eso por favor", reply_context={"reply_to_message_id": 123}),
+            "order_project_change",
+        )
 
 
 class TestDelegationParsing(unittest.TestCase):
@@ -838,6 +858,56 @@ class TestCeoOrders(unittest.TestCase):
 
             bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
             self.assertFalse(bad)
+
+
+    def test_set_order_done_closes_linked_project_when_no_active_orders_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            pid = "proj-aaaaaaaa"
+            oid = "aaaaaaaa-1111-1111-1111-111111111111"
+
+            st.upsert_project(project_id=pid, name="Ideas project", path="/tmp/ideas", status="active", created_by="ceo")
+            st.upsert_order(
+                order_id=oid,
+                chat_id=1,
+                title="Ideation order",
+                body="dame ideas",
+                status="active",
+                priority=2,
+                intent_type="order_project_new",
+                project_id=pid,
+            )
+
+            ok = st.set_order_status(oid[:8], chat_id=1, status="done")
+            self.assertTrue(ok)
+
+            done_ids = {str(p["project_id"]) for p in st.list_projects(status="done", limit=20)}
+            self.assertIn(pid, done_ids)
+
+    def test_project_stays_active_while_another_order_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            pid = "proj-bbbbbbbb"
+            oid1 = "bbbbbbbb-1111-1111-1111-111111111111"
+            oid2 = "bbbbbbbb-2222-2222-2222-222222222222"
+
+            st.upsert_project(project_id=pid, name="Shared project", path="/tmp/shared", status="active", created_by="ceo")
+            st.upsert_order(order_id=oid1, chat_id=1, title="order 1", body="work 1", status="active", priority=2, intent_type="order_project_new", project_id=pid)
+            st.upsert_order(order_id=oid2, chat_id=1, title="order 2", body="work 2", status="active", priority=2, intent_type="order_project_change", project_id=pid)
+
+            ok1 = st.set_order_status(oid1, chat_id=1, status="done")
+            self.assertTrue(ok1)
+            active_ids = {str(p["project_id"]) for p in st.list_projects(status="active", limit=20)}
+            self.assertIn(pid, active_ids)
+
+            ok2 = st.set_order_status(oid2, chat_id=1, status="done")
+            self.assertTrue(ok2)
+            done_ids = {str(p["project_id"]) for p in st.list_projects(status="done", limit=20)}
+            self.assertIn(pid, done_ids)
 
 
 class TestBulkCancel(unittest.TestCase):

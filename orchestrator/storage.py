@@ -1711,10 +1711,50 @@ class SQLiteTaskStorage:
                 resolved = self._resolve_order_id_in_conn(conn, str(order_id), chat_id=int(chat_id))
                 if not resolved:
                     return False
-                conn.execute(
-                    "UPDATE ceo_orders SET status = ?, updated_at = ? WHERE order_id = ? AND chat_id = ?",
-                    (st, time.time(), resolved, int(chat_id)),
-                )
+
+                now = float(time.time())
+                row = conn.execute(
+                    "SELECT project_id FROM ceo_orders WHERE order_id = ? AND chat_id = ?",
+                    (resolved, int(chat_id)),
+                ).fetchone()
+                project_id = str((row["project_id"] if row is not None else "") or "").strip()
+
+                # Keep order lifecycle coherent when manually set from commands/APIs.
+                if st == "done":
+                    conn.execute(
+                        "UPDATE ceo_orders SET status = ?, phase = 'done', updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                        (st, now, resolved, int(chat_id)),
+                    )
+                elif st == "paused":
+                    conn.execute(
+                        "UPDATE ceo_orders SET status = ?, phase = 'paused', updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                        (st, now, resolved, int(chat_id)),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE ceo_orders SET status = ?, updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                        (st, now, resolved, int(chat_id)),
+                    )
+
+                # Auto-close project when the order is done and no active orders remain for that project.
+                if project_id:
+                    if st == "done":
+                        active_row = conn.execute(
+                            "SELECT COUNT(*) AS c FROM ceo_orders WHERE chat_id = ? AND project_id = ? AND status = 'active' AND order_id <> ?",
+                            (int(chat_id), project_id, resolved),
+                        ).fetchone()
+                        active_remaining = int((active_row["c"] if active_row is not None else 0) or 0)
+                        if active_remaining <= 0:
+                            conn.execute(
+                                "UPDATE projects_registry SET status = 'done', updated_at = ? WHERE project_id = ? AND status <> 'done'",
+                                (now, project_id),
+                            )
+                    elif st == "active":
+                        conn.execute(
+                            "UPDATE projects_registry SET status = 'active', updated_at = ? WHERE project_id = ?",
+                            (now, project_id),
+                        )
+
                 conn.commit()
                 return True
 

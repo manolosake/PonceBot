@@ -302,18 +302,48 @@ def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None)
     Grounded rule set:
     - Queries never create/advance CEO orders.
     - Replies/corrections default to `order_project_change`.
-    - Otherwise actionable work defaults to `order_project_new`.
+    - New orders/projects require explicit project scope signals.
+    - Plain one-shot asks (without project scope) stay in conversational lane.
     """
     req_type = detect_request_type(text)
     if req_type in ("query", "status"):
         return "query"
 
     raw = (text or "").strip().lower()
+
+    project_scope_terms = (
+        "project",
+        "proyecto",
+        "repo",
+        "repository",
+        "dashboard",
+        "feature",
+        "branch",
+        "pull request",
+        "merge",
+        "release",
+        "app",
+        "application",
+        "backend",
+        "frontend",
+        "api",
+        "database",
+        "db ",
+        "schema",
+        "migration",
+        "migracion",
+        "migración",
+        "deploy",
+        "infra",
+        "infrastructure",
+    )
+    has_project_scope = any(k in raw for k in project_scope_terms)
+
     has_reply = bool(reply_context and isinstance(reply_context, dict) and any(reply_context.values()))
     if has_reply:
         return "order_project_change"
 
-    if any(
+    has_change_signal = any(
         k in raw
         for k in (
             "change ",
@@ -332,7 +362,8 @@ def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None)
             "iteration",
             "follow up",
         )
-    ):
+    )
+    if has_change_signal and has_project_scope:
         return "order_project_change"
 
     if any(
@@ -352,7 +383,58 @@ def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None)
     ):
         return "order_project_new"
 
-    return "order_project_new"
+    ideation_signal = any(
+        k in raw
+        for k in (
+            "ideas",
+            "idea ",
+            "propuestas",
+            "suggest",
+            "suggestion",
+            "brainstorm",
+            "que proyectos",
+            "qué proyectos",
+            "proyectos interesantes",
+            "podemos hacer",
+        )
+    )
+    execution_signal = any(
+        k in raw
+        for k in (
+            "implement",
+            "build",
+            "develop",
+            "create",
+            "ship",
+            "deploy",
+            "setup",
+            "set up",
+            "execute",
+            "run",
+            "haz ",
+            "quiero que",
+            "agrega",
+            "añade",
+            "anade",
+            "pon ",
+            "ejecuta",
+            "implementa",
+            "desarrolla",
+            "construye",
+            "crea",
+            "inicia",
+            "asigna",
+            "deleg",
+        )
+    )
+    if ideation_signal and not execution_signal:
+        return "query"
+
+    # Safety: only create a persistent project/order when there is explicit execution intent.
+    if has_project_scope and req_type in ("task", "maintenance", "review") and execution_signal:
+        return "order_project_new"
+
+    return "query"
 
 
 def choose_model_by_role(role: str, model_override: str | None = None, default_model: str = "gpt-4.1") -> str:

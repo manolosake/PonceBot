@@ -2712,7 +2712,8 @@ class CodexRunner:
     ) -> "CodexRunner.Running":
         """
         Resumes an existing Codex thread (session) using `codex exec resume <thread_id>`.
-        This does not use `--output-last-message` (not supported by resume); the final response is read from stdout.
+        This does not use `--output-last-message` (not supported by resume).
+        We run with `--json` and reconstruct the final assistant message from JSONL stdout.
         """
         tid = (thread_id or "").strip()
         prompt = (prompt or "").strip()
@@ -2752,6 +2753,7 @@ class CodexRunner:
             for p in image_paths:
                 cmd += ["--image", str(p)]
 
+        cmd.append("--json")
         cmd.append(prompt)
         return self._start_with_cmd(cmd=cmd, last_msg_path=None)
 
@@ -6785,6 +6787,38 @@ def _extract_thread_id_from_jsonl_file(path: Path, *, max_bytes: int = 1_000_000
     return ""
 
 
+def _extract_last_agent_message_from_jsonl(text: str) -> str:
+    """
+    Best-effort extraction of the final assistant message from `codex exec --json` JSONL output.
+    """
+    last = ""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        t = str(obj.get("type") or "").strip().lower()
+        if t == "item.completed":
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+            it = str(item.get("type") or "").strip().lower()
+            if it == "agent_message":
+                msg = str(item.get("text") or "").strip()
+                if msg:
+                    last = msg
+        elif t in ("response.completed", "assistant.completed"):
+            msg = str(obj.get("text") or "").strip()
+            if msg:
+                last = msg
+
+    return last
+
+
 def _skill_installer_scripts_dir() -> Path:
     # skill-installer is a system skill that ships with this deployment.
     return _skills_root_dir() / ".system" / "skill-installer" / "scripts"
@@ -7052,6 +7086,11 @@ def _submit_orchestrator_task(
             quoted_message_id=quoted_message_id,
             quoted_message_text=quoted_message_text,
         )
+
+        # Safety guard: conversational lanes must not create persistent orders/projects.
+        task_req = str(task.request_type or "").strip().lower()
+        if task_req in ("query", "status"):
+            intent_type = "query"
 
         is_top_level_jarvis = (
             _coerce_orchestrator_role(task.role) == "jarvis"
@@ -7582,6 +7621,9 @@ def _orchestrator_run_codex(
                     live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
                     live_workdir=str(eff_cfg.codex_workdir),
                     live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                    live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                    live_stdout_path=str(proc.stdout_path),
+                    live_stderr_path=str(proc.stderr_path),
                     live_at=time.time(),
                 )
         except Exception:
@@ -7605,11 +7647,11 @@ def _orchestrator_run_codex(
                 now = time.time()
                 if now - last_live_update >= float(cfg.orchestrator_live_update_seconds):
                     try:
-                        stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=1200)).strip()
+                        stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=10000)).strip()
                     except Exception:
                         stdout_tail = ""
                     try:
-                        stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=1200)).strip()
+                        stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=10000)).strip()
                     except Exception:
                         stderr_tail = ""
                     try:
@@ -7619,6 +7661,9 @@ def _orchestrator_run_codex(
                             live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
                             live_workdir=str(eff_cfg.codex_workdir),
                             live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                            live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                            live_stdout_path=str(proc.stdout_path),
+                            live_stderr_path=str(proc.stderr_path),
                             live_stdout_tail=stdout_tail,
                             live_stderr_tail=stderr_tail,
                             live_at=now,
@@ -7630,6 +7675,33 @@ def _orchestrator_run_codex(
 
         try:
             proc.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+        # Final live snapshot so dashboard can render the full terminal tail even for short-lived jobs.
+        try:
+            if orch_q is not None:
+                try:
+                    final_stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=30000)).strip()
+                except Exception:
+                    final_stdout_tail = ""
+                try:
+                    final_stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=30000)).strip()
+                except Exception:
+                    final_stderr_tail = ""
+                orch_q.update_trace(
+                    task.job_id,
+                    live_phase="final",
+                    live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
+                    live_workdir=str(eff_cfg.codex_workdir),
+                    live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                    live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                    live_stdout_path=str(proc.stdout_path),
+                    live_stderr_path=str(proc.stderr_path),
+                    live_stdout_tail=final_stdout_tail,
+                    live_stderr_tail=final_stderr_tail,
+                    live_at=time.time(),
+                )
         except Exception:
             pass
 
@@ -7662,9 +7734,13 @@ def _orchestrator_run_codex(
             except OSError:
                 sz = 0
             if sz <= 256_000:
-                body = _strip_ansi(_read_text_file(proc.stdout_path)).strip()
+                stdout_text = _strip_ansi(_read_text_file(proc.stdout_path)).strip()
             else:
-                body = _tail_file_text(proc.stdout_path, max_chars=6000).strip()
+                stdout_text = _tail_file_text(proc.stdout_path, max_chars=6000).strip()
+
+            # When resume runs with --json, keep the user-facing body as the last assistant message.
+            json_last_msg = _extract_last_agent_message_from_jsonl(stdout_text)
+            body = (json_last_msg or stdout_text).strip()
         if not body:
             body = "(no output)"
 
@@ -7824,11 +7900,6 @@ def _send_orchestrator_result(
         notify = _should_notify() or force_notify
 
         if notify:
-            # Keep chat updates short; details are always available via /job and /ticket.
-            max_summary = 900
-            if len(summary) > max_summary:
-                summary = summary[:max_summary] + "...\n(details: /job %s)" % task.job_id[:8]
-
             role_name = _humanize_orchestrator_role(task.role)
             summary_lines = (summary or "").splitlines() or ["(no summary)"]
             summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
@@ -10446,9 +10517,12 @@ def _load_config() -> BotConfig:
     if orchestrator_worker_count < 1:
         orchestrator_worker_count = max(1, int(worker_count))
     orchestrator_sessions_enabled = os.environ.get("BOT_ORCH_SESSIONS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-    orchestrator_live_update_seconds = int(os.environ.get("BOT_ORCHESTRATOR_LIVE_UPDATE_SECONDS", "8"))
-    if orchestrator_live_update_seconds < 2:
-        orchestrator_live_update_seconds = 2
+    try:
+        orchestrator_live_update_seconds = float(os.environ.get("BOT_ORCHESTRATOR_LIVE_UPDATE_SECONDS", "0.35"))
+    except ValueError:
+        orchestrator_live_update_seconds = 0.35
+    if orchestrator_live_update_seconds < 0.2:
+        orchestrator_live_update_seconds = 0.2
     if orchestrator_live_update_seconds > 60:
         orchestrator_live_update_seconds = 60
     orchestrator_notify_mode = os.environ.get("BOT_ORCHESTRATOR_NOTIFY_MODE", "minimal").strip().lower() or "minimal"
