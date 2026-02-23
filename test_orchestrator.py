@@ -675,6 +675,60 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertEqual(str(got.get("status")), "done")
 
 
+class TestOrderBranchPolicy(unittest.TestCase):
+    def test_order_branch_name_uses_feature_prefix(self) -> None:
+        b = bot._order_branch_name("abcd1234-ffff", "Nuevo proyecto server core")
+        self.assertTrue(b.startswith("feature/order-abcd1234-"))
+
+    def test_resolve_order_branch_from_parent_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            root_id = "ord-branch-001"
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"order_branch": "feature/order-ord-bran-root"},
+                    job_id=root_id,
+                )
+            )
+            child_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="child",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=root_id,
+                    state="queued",
+                )
+            )
+            child = q.get_job(child_id)
+            self.assertIsNotNone(child)
+            assert child is not None
+            self.assertEqual(
+                bot._resolve_order_branch_from_task(child, q),
+                "feature/order-ord-bran-root",
+            )
+
+
 class TestYamlLikeParsing(unittest.TestCase):
     def test_agents_yaml_parses_lists(self) -> None:
         profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")

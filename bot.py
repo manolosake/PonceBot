@@ -3808,6 +3808,208 @@ def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> st
     return line
 
 
+def _order_branch_name(order_id: str, title: str) -> str:
+    oid = str(order_id or "").strip()[:8] or "order"
+    slug = _slug_token(title or f"order-{oid}", max_len=38)
+    return f"feature/order-{oid}-{slug}"
+
+
+def _run_git(
+    repo: Path,
+    args: list[str],
+    *,
+    check: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+        env=env,
+    )
+
+
+def _git_ref_exists(repo: Path, ref: str) -> bool:
+    p = _run_git(repo, ["rev-parse", "--verify", ref], check=False)
+    return int(p.returncode or 1) == 0
+
+
+def _git_pick_main_ref(repo: Path) -> str:
+    if _git_ref_exists(repo, "refs/remotes/origin/main"):
+        return "origin/main"
+    if _git_ref_exists(repo, "origin/main"):
+        return "origin/main"
+    if _git_ref_exists(repo, "refs/heads/main"):
+        return "main"
+    if _git_ref_exists(repo, "main"):
+        return "main"
+    return "HEAD"
+
+
+def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
+    b = str(branch or "").strip()
+    if not b:
+        return False, "branch_missing"
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    if _git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}"):
+        return True, "already_exists"
+    base = _git_pick_main_ref(repo)
+    src_ref = f"refs/heads/{b}"
+    p = _run_git(repo, ["push", "origin", f"{base}:{src_ref}"], check=False)
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout or "").strip()
+        return False, msg or "push_failed"
+    return True, "created_from_main"
+
+
+def _resolve_order_branch_from_task(task: Task, orch_q: OrchestratorQueue | None) -> str:
+    tr = dict(task.trace or {})
+    direct = str(tr.get("order_branch") or "").strip()
+    if direct:
+        return direct
+    if orch_q is None:
+        return ""
+    root_ticket = (task.parent_job_id or task.job_id or "").strip()
+    if not root_ticket:
+        return ""
+    try:
+        root = orch_q.get_job(root_ticket)
+    except Exception:
+        root = None
+    if root is None:
+        return ""
+    return str((root.trace or {}).get("order_branch") or "").strip()
+
+
+def _sync_worktree_to_order_branch(
+    *,
+    base_repo: Path,
+    worktree_dir: Path,
+    order_branch: str,
+) -> tuple[bool, str]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return True, "no_branch"
+    ok, msg = _git_ensure_branch_from_main(base_repo, b)
+    if not ok:
+        return False, f"ensure_branch_failed:{msg}"
+    _run_git(worktree_dir, ["fetch", "origin", "--prune"], check=False)
+    p = _run_git(worktree_dir, ["reset", "--hard", f"origin/{b}"], check=False)
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip()
+        return False, f"reset_failed:{err or 'unknown'}"
+    return True, "synced"
+
+
+def _autocommit_push_order_branch(
+    *,
+    worktree_dir: Path,
+    order_branch: str,
+    task: Task,
+) -> dict[str, Any]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return {"status": "skipped", "reason": "no_branch"}
+    st = _run_git(worktree_dir, ["status", "--porcelain"], check=False)
+    status_out = str(st.stdout or "").strip()
+    if not status_out:
+        return {"status": "skipped", "reason": "no_changes"}
+
+    # Ensure deterministic identity for autonomous commits.
+    env = dict(os.environ)
+    env.setdefault("GIT_AUTHOR_NAME", "PonceBot")
+    env.setdefault("GIT_AUTHOR_EMAIL", "poncebot@local")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+
+    add = _run_git(worktree_dir, ["add", "-A"], check=False, env=env)
+    if add.returncode != 0:
+        return {"status": "error", "reason": "git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+
+    key = str((task.labels or {}).get("key") or "").strip() or "work"
+    msg = f"order:{(task.parent_job_id or task.job_id)[:8]} job:{task.job_id[:8]} role:{task.role} key:{key}"
+    commit = _run_git(worktree_dir, ["commit", "-m", msg], check=False, env=env)
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        if "nothing to commit" in detail.lower():
+            return {"status": "skipped", "reason": "nothing_to_commit"}
+        return {"status": "error", "reason": "git_commit_failed", "detail": detail}
+
+    # Rebase onto latest canonical branch tip before push.
+    _run_git(worktree_dir, ["fetch", "origin", "--prune"], check=False, env=env)
+    if _git_ref_exists(worktree_dir, f"refs/remotes/origin/{b}") or _git_ref_exists(worktree_dir, f"origin/{b}"):
+        rb = _run_git(worktree_dir, ["rebase", f"origin/{b}"], check=False, env=env)
+        if rb.returncode != 0:
+            _run_git(worktree_dir, ["rebase", "--abort"], check=False, env=env)
+            return {
+                "status": "error",
+                "reason": "git_rebase_failed",
+                "detail": (rb.stderr or rb.stdout or "").strip(),
+            }
+
+    push = _run_git(worktree_dir, ["push", "origin", f"HEAD:refs/heads/{b}"], check=False, env=env)
+    if push.returncode != 0:
+        return {"status": "error", "reason": "git_push_failed", "detail": (push.stderr or push.stdout or "").strip()}
+
+    rev = _run_git(worktree_dir, ["rev-parse", "--short", "HEAD"], check=False, env=env)
+    sha = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+    return {
+        "status": "ok",
+        "branch": b,
+        "commit": sha,
+        "message": msg,
+    }
+
+
+def _merge_order_branch_to_main(
+    *,
+    repo: Path,
+    order_branch: str,
+    order_id: str,
+) -> tuple[bool, str]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return True, "no_branch"
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+        # If branch no longer exists remotely, treat as already integrated/closed.
+        return True, "branch_missing_remote"
+
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    merge_root.mkdir(parents=True, exist_ok=True)
+    merge_dir = (merge_root / f"{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
+    tmp_branch = f"poncebot/merge/{str(order_id or 'order')[:8]}-{int(time.time())}"
+
+    try:
+        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
+        if add.returncode != 0:
+            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed"
+
+        mg = _run_git(merge_dir, ["merge", "--no-ff", "--no-edit", f"origin/{b}"], check=False)
+        if mg.returncode != 0:
+            _run_git(merge_dir, ["merge", "--abort"], check=False)
+            return False, (mg.stderr or mg.stdout or "").strip() or "merge_failed"
+
+        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
+        if ps.returncode != 0:
+            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed"
+
+        # Hygiene: one branch per project/order, remove after successful merge.
+        _run_git(repo, ["push", "origin", "--delete", b], check=False)
+        _run_git(repo, ["branch", "-D", b], check=False)
+        return True, "merged_to_main"
+    finally:
+        try:
+            _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+            _run_git(repo, ["worktree", "prune"], check=False)
+            _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+        except Exception:
+            pass
+
+
 def _ensure_project_workspace(
     *,
     project_id: str,
@@ -7679,6 +7881,7 @@ def _submit_orchestrator_task(
         )
         order_id = ""
         project_id: str | None = None
+        order_branch: str | None = None
         order_phase = "planning"
 
         if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
@@ -7687,9 +7890,17 @@ def _submit_orchestrator_task(
                 if active and str(active.get("order_id") or "").strip():
                     order_id = str(active.get("order_id") or "").strip()
                     project_id = str(active.get("project_id") or "").strip() or None
+                    try:
+                        root_job = orch_q.get_job(order_id)
+                        if root_job is not None:
+                            order_branch = str((root_job.trace or {}).get("order_branch") or "").strip() or None
+                    except Exception:
+                        order_branch = None
                     ttrace = dict(task.trace or {})
                     ttrace["order_id"] = order_id
                     ttrace["intent_type"] = "order_project_change"
+                    if order_branch:
+                        ttrace["order_branch"] = str(order_branch)
                     if quoted_message_id is not None:
                         ttrace["reply_to_message_id"] = int(quoted_message_id)
                     task = task.with_updates(parent_job_id=order_id, trace=ttrace, priority=1)
@@ -7732,6 +7943,17 @@ def _submit_orchestrator_task(
                     ttrace["project_id"] = project_id
                 task = task.with_updates(trace=ttrace)
 
+            if order_id:
+                title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+                if not order_branch:
+                    order_branch = _order_branch_name(order_id, title_guess)
+                ok_branch, branch_msg = _git_ensure_branch_from_main(cfg.codex_workdir, str(order_branch))
+                if not ok_branch:
+                    raise RuntimeError(f"Cannot prepare order branch {order_branch}: {branch_msg}")
+                ttrace = dict(task.trace or {})
+                ttrace["order_branch"] = str(order_branch)
+                task = task.with_updates(trace=ttrace)
+
         job_id = orch_q.submit_task(task)
 
         # Only actionable project orders become CEO orders; conversational queries never create orders.
@@ -7759,6 +7981,7 @@ def _submit_orchestrator_task(
                     "order_id": order_id,
                     "intent_type": intent_type,
                     "project_id": project_id,
+                    "order_branch": (str(order_branch or "").strip() or None),
                     "source_message_id": source_message_id,
                     "reply_to_message_id": quoted_message_id,
                 },
@@ -7923,6 +8146,7 @@ def _orchestrator_run_codex(
         }
 
     # Worktree isolation (best-effort). If configured incorrectly, fail safe (no writes) by falling back.
+    order_branch = _resolve_order_branch_from_task(task, orch_q)
     eff_cfg = cfg
     worktree_dir: Path | None = None
     leased_slot: int | None = None
@@ -7947,6 +8171,14 @@ def _orchestrator_run_codex(
             ensure_worktree_pool(base_repo=cfg.codex_workdir, root=cfg.worktree_root, role=role, slots=slots)
             worktree_dir = (cfg.worktree_root / role / f"slot{leased_slot}").resolve()
             prepare_clean_workspace(worktree_dir)
+            if order_branch:
+                ok_sync, sync_msg = _sync_worktree_to_order_branch(
+                    base_repo=cfg.codex_workdir,
+                    worktree_dir=worktree_dir,
+                    order_branch=order_branch,
+                )
+                if not ok_sync:
+                    raise RuntimeError(f"order branch sync failed: {sync_msg}")
             eff_cfg = dataclasses.replace(cfg, codex_workdir=worktree_dir)
             try:
                 if orch_q is not None:
@@ -7955,6 +8187,7 @@ def _orchestrator_run_codex(
                         live_phase="workspace_ready",
                         live_workdir=str(worktree_dir),
                         live_workspace_slot=int(leased_slot),
+                        live_branch=(order_branch or None),
                         live_at=time.time(),
                     )
             except Exception:
@@ -8402,6 +8635,8 @@ def _orchestrator_run_codex(
             "visual_evidence_count": int(len(visual_artifacts)),
             "visual_evidence": visual_artifacts[:8],
         }
+        if order_branch:
+            structured["order_branch"] = str(order_branch)
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
         if used_thread_id:
@@ -8438,6 +8673,29 @@ def _orchestrator_run_codex(
                 "next_action": "add_evidence",
                 "structured_digest": structured,
             }
+
+        if code == 0 and worktree_dir is not None and order_branch and str(task.request_type or "").strip().lower() in (
+            "task",
+            "maintenance",
+            "review",
+        ):
+            branch_sync = _autocommit_push_order_branch(
+                worktree_dir=worktree_dir,
+                order_branch=order_branch,
+                task=task,
+            )
+            structured["branch_sync"] = branch_sync
+            if str(branch_sync.get("status") or "") == "error":
+                detail = str(branch_sync.get("detail") or "").strip()
+                reason = str(branch_sync.get("reason") or "branch_sync_failed")
+                return {
+                    "status": "blocked",
+                    "summary": f"Branch sync failed: {reason}.",
+                    "artifacts": artifacts_text,
+                    "logs": detail or (logs or body),
+                    "next_action": "resolve_branch_sync",
+                    "structured_digest": structured,
+                }
 
         if code == 0:
             return {
@@ -8785,6 +9043,69 @@ def orchestrator_worker_loop(
                 )
             except Exception:
                 pass
+            # Git policy: one order/project branch from main, merged back to main when wrap-up is done.
+            try:
+                labels_now = task.labels or {}
+                task_kind = str(labels_now.get("kind") or "").strip().lower()
+                if orch_state == "done" and task_kind == "wrapup":
+                    root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                    live_order_branch = _resolve_order_branch_from_task(task, orch_q)
+                    merged_ok, merged_msg = _merge_order_branch_to_main(
+                        repo=cfg.codex_workdir,
+                        order_branch=live_order_branch,
+                        order_id=root_ticket,
+                    )
+                    if merged_ok:
+                        try:
+                            orch_q.update_trace(
+                                root_ticket,
+                                merged_to_main=True,
+                                order_branch=(live_order_branch or None),
+                                merge_result=str(merged_msg),
+                                merged_at=time.time(),
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            orch_q.append_audit_event(
+                                event_type="order.merged",
+                                actor="jarvis",
+                                details={
+                                    "order_id": root_ticket,
+                                    "order_branch": (live_order_branch or None),
+                                    "result": str(merged_msg),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            _sync_order_phase_from_runtime(
+                                orch_q=orch_q,
+                                root_ticket=root_ticket,
+                                chat_id=int(task.chat_id),
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="active")
+                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
+                        except Exception:
+                            pass
+                        try:
+                            orch_q.append_audit_event(
+                                event_type="order.merge_failed",
+                                actor="jarvis",
+                                details={
+                                    "order_id": root_ticket,
+                                    "order_branch": (live_order_branch or None),
+                                    "error": str(merged_msg),
+                                },
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                LOG.exception("Failed to merge order branch after wrap-up. job=%s", task.job_id)
             # Update ticket card after the state transition so it reflects latest progress/result.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -8830,6 +9151,7 @@ def orchestrator_worker_loop(
                                 "screenshot_url": snap_url,
                                 "screenshot_only": True,
                                 "delegated_by": task.job_id,
+                                "order_branch": str(_resolve_order_branch_from_task(task, orch_q) or ""),
                             },
                             job_id=shot_id,
                         )
@@ -8864,6 +9186,7 @@ def orchestrator_worker_loop(
 
                 if orch_state == "done" and is_jarvis and (not is_query) and (is_top_level_manual or allow_delegation):
                     root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                    order_branch_for_root = _resolve_order_branch_from_task(task, orch_q)
                     existing = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=400)
                     existing_wrapup = any(str((c.labels or {}).get("kind") or "") == "wrapup" for c in existing)
                     existing_subtasks = [c for c in existing if str((c.labels or {}).get("kind") or "") != "wrapup"]
@@ -8964,6 +9287,8 @@ def orchestrator_worker_loop(
                                 "eta_minutes": int(spec.eta_minutes or 0),
                                 "sla_tier": str(spec.sla_tier or "normal"),
                             }
+                            if order_branch_for_root:
+                                trace["order_branch"] = str(order_branch_for_root)
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
@@ -9068,6 +9393,8 @@ def orchestrator_worker_loop(
                                 "profile_role": "jarvis",
                                 "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
                             }
+                            if order_branch_for_root:
+                                wrap_trace["order_branch"] = str(order_branch_for_root)
                             wrap = Task.new(
                                 source="telegram",
                                 role="jarvis",
