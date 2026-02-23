@@ -94,6 +94,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         + "IMPORTANT:\n"
         + "- Keep the JSON valid (double quotes, no trailing commas).\n"
         + "- If you cannot do something safely, explain and set next_action.\n"
-        + "- FRONTEND ONLY: if you can provide visual evidence, create a self-contained HTML preview at\n"
-        + "  `.codexbot_preview/preview.html` in the workspace. The bot will automatically screenshot it.\n"
+        + "- FRONTEND ONLY: visual evidence is mandatory before completion.\n"
+        + "  Create `.codexbot_preview/preview.html` in the workspace so the bot can capture it.\n"
+        + "  If live preview is not possible, include multiple screenshots (mobile/tablet/desktop).\n"
     )

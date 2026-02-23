@@ -107,7 +107,6 @@ def _iter_recent_changes(root: Path, since_ts: float, *, max_items: int) -> Iter
         ".mypy_cache",
         ".ruff_cache",
         ".codexbot_tmp",
-        ".codexbot_preview",
     }
 
     found: list[tuple[str, float]] = []
@@ -205,8 +204,12 @@ def main() -> int:
             activity_kinds: list[str] = []
             if wt_changes:
                 activity_kinds.append("worktree_edit")
+                if any(str(ch[0]).startswith(".codexbot_preview/") for ch in wt_changes):
+                    activity_kinds.append("visual_preview_update")
             if art_changes:
                 activity_kinds.append("artifacts_update")
+                if any("preview" in str(ch[0]).lower() or "snapshot" in str(ch[0]).lower() for ch in art_changes):
+                    activity_kinds.append("visual_artifact_update")
 
             if activity_kinds:
                 last_activity_by_job[j.job_id] = now
@@ -247,4 +250,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

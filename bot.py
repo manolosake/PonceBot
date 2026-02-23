@@ -3400,6 +3400,7 @@ def _move_skill_dir(*, src: Path, dst: Path) -> None:
 
 _PUNCT_TRIM = "`\"'()[]{}<>.,;:"
 _PNG_TOKEN_RE = re.compile(r"(?i)(?:^|\\s)([^\\s\"'<>]+\\.png)")
+_VISUAL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def _path_is_within_dir(path: Path, base_dir: Path) -> bool:
@@ -3408,6 +3409,10 @@ def _path_is_within_dir(path: Path, base_dir: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _is_visual_artifact(path: Path) -> bool:
+    return str(path.suffix or "").strip().lower() in _VISUAL_IMAGE_EXTS
 
 
 def _collect_png_artifacts(cfg: BotConfig, *, start_time: float, text: str) -> list[Path]:
@@ -7943,24 +7948,39 @@ def _orchestrator_run_codex(
                 LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
 
         # Frontend evidence: allow the agent to drop a self-contained preview HTML inside the workspace.
-        # The bot screenshots it (headless) and sends `preview.png` to Telegram as an artifact.
+        # The bot screenshots it (headless) and sends visual artifacts to Telegram/dashboard.
         if role == "frontend" and cfg.screenshot_enabled:
             try:
                 preview_html = Path(eff_cfg.codex_workdir) / ".codexbot_preview" / "preview.html"
                 if preview_html.exists() and preview_html.is_file():
                     dest_html = artifacts_dir / "preview.html"
                     shutil.copyfile(preview_html, dest_html)
-                    out_png = artifacts_dir / "preview.png"
-                    capture_screenshot_html_file(
-                        dest_html,
-                        out_png,
-                        viewport=Viewport(width=1280, height=720),
-                        allowed_hosts=cfg.screenshot_allowed_hosts,
-                        allow_private=False,
-                        block_network=True,
-                    )
+                    preview_root = (Path(eff_cfg.codex_workdir) / ".codexbot_preview").resolve()
+                    preview_root.mkdir(parents=True, exist_ok=True)
+
+                    # Multi-device captures for feedback before completion.
+                    capture_specs = [
+                        ("preview.png", Viewport(width=1366, height=768)),
+                        ("preview-tablet.png", Viewport(width=1024, height=1366)),
+                        ("preview-mobile.png", Viewport(width=412, height=915)),
+                    ]
                     artifacts.append(dest_html)
-                    artifacts.append(out_png)
+                    for filename, viewport in capture_specs:
+                        out_png = artifacts_dir / filename
+                        capture_screenshot_html_file(
+                            dest_html,
+                            out_png,
+                            viewport=viewport,
+                            allowed_hosts=cfg.screenshot_allowed_hosts,
+                            allow_private=False,
+                            block_network=True,
+                        )
+                        artifacts.append(out_png)
+                        # Keep latest visual proof directly in workspace so telemetry/dashboard can watch it live.
+                        try:
+                            shutil.copyfile(out_png, preview_root / filename)
+                        except Exception:
+                            pass
             except Exception as e:
                 LOG.exception("Failed to generate frontend preview screenshot. job=%s", task.job_id)
                 try:
@@ -7971,15 +7991,32 @@ def _orchestrator_run_codex(
                     pass
 
         artifacts_text = [str(p) for p in artifacts]
+        visual_artifacts = [str(p) for p in artifacts if _is_visual_artifact(Path(p))]
         structured: dict[str, Any] = {
             "role": role,
             "workdir": str(eff_cfg.codex_workdir),
             "artifacts_dir": str(artifacts_dir),
+            "visual_evidence_count": int(len(visual_artifacts)),
+            "visual_evidence": visual_artifacts[:8],
         }
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
         if used_thread_id:
             structured["thread_id"] = used_thread_id
+
+        # Quality gate: frontend work cannot complete without visual evidence.
+        if code == 0 and role == "frontend" and len(visual_artifacts) < 2:
+            return {
+                "status": "blocked",
+                "summary": (
+                    "Visual evidence gate not met. "
+                    "Provide live preview or at least 2 screenshots (mobile/tablet/desktop) before marking done."
+                ),
+                "artifacts": artifacts_text,
+                "logs": logs or body,
+                "next_action": "add_visual_evidence",
+                "structured_digest": structured,
+            }
 
         if code == 0:
             return {
