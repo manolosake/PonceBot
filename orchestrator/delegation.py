@@ -7,6 +7,7 @@ import json
 
 _ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr")
 _ALLOWED_MODES = ("ro", "rw", "full")
+_ALLOWED_SLA = ("normal", "high", "urgent")
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,26 @@ class TaskSpec:
     priority: int = 2
     depends_on: list[str] = field(default_factory=list)
     requires_approval: bool = False
+    acceptance_criteria: list[str] = field(default_factory=list)
+    definition_of_done: list[str] = field(default_factory=list)
+    eta_minutes: int | None = None
+    sla_tier: str = ""
+
+
+def _to_string_list(value: Any, *, max_items: int = 8, max_chars: int = 220) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for raw in value:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if len(s) > max_chars:
+            s = s[:max_chars].rstrip() + "..."
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
@@ -88,6 +109,22 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
         if mode == "full":
             requires_approval = True
 
+        acceptance = _to_string_list(raw.get("acceptance_criteria") or raw.get("acceptance") or [])
+        dod = _to_string_list(raw.get("definition_of_done") or raw.get("dod") or [])
+
+        eta_minutes: int | None = None
+        try:
+            if raw.get("eta_minutes") is not None:
+                eta_minutes = int(raw.get("eta_minutes"))
+        except Exception:
+            eta_minutes = None
+        if eta_minutes is not None:
+            eta_minutes = max(5, min(7 * 24 * 60, int(eta_minutes)))
+
+        sla_tier = str(raw.get("sla_tier") or "").strip().lower()
+        if sla_tier not in _ALLOWED_SLA:
+            sla_tier = ""
+
         out.append(
             TaskSpec(
                 key=key,
@@ -97,6 +134,10 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
                 priority=priority,
                 depends_on=deps,
                 requires_approval=requires_approval,
+                acceptance_criteria=acceptance,
+                definition_of_done=dod,
+                eta_minutes=eta_minutes,
+                sla_tier=sla_tier,
             )
         )
     return out

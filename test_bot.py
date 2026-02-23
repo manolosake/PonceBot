@@ -519,6 +519,36 @@ class TestJarvisFirstRouting(unittest.TestCase):
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
             self.assertEqual(int((task.trace or {}).get("max_runtime_seconds") or 0), 120)
 
+    def test_intent_query_forces_query_lane_even_if_request_type_looked_like_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=0,
+                user_text="ok, dame 15 proyectos interesantes que podemos hacer",
+                argv=["exec", "ok, dame 15 proyectos interesantes que podemos hacer"],
+                mode_hint="rw",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+
+            task = bot._orchestrator_task_from_job(
+                cfg,
+                job,
+                profiles=None,
+                user_id=123,
+                intent_type="query",
+            )
+            self.assertEqual(task.request_type, "query")
+            self.assertEqual(task.mode_hint, "ro")
+            self.assertEqual(task.effort, "high")
+            self.assertEqual(task.model, "gpt-5.3-codex-spark")
+            self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
+
 
     def test_alias_p_maps_to_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as td:

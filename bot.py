@@ -42,7 +42,7 @@ from typing import Any
 
 from orchestrator.agents import load_agent_profiles
 from orchestrator.dispatcher import detect_ceo_intent, detect_request_type, to_task
-from orchestrator.delegation import parse_orchestrator_subtasks
+from orchestrator.delegation import TaskSpec, parse_orchestrator_subtasks
 from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runbooks import Runbook, due as runbook_due, load_runbooks, to_task as runbook_to_task
@@ -3895,6 +3895,11 @@ def _orchestrator_task_from_job(
     effort = _orchestrator_effort_for_profile(profile, cfg)
 
     req_type = str(pre.request_type or "task")
+    normalized_intent = str(intent_type or "").strip().lower()
+    # Intent classifier is the source of truth for conversational asks. This prevents
+    # imperative-but-non-execution prompts (e.g. ideation) from entering delegation lanes.
+    if role == "jarvis" and normalized_intent == "query" and req_type not in ("query", "status"):
+        req_type = "query"
     if req_type in ("query", "status"):
         # CEO/Jarvis conversational lane: fast model, no write mode, no ticket card spam.
         model = _MODEL_CEO_QUERY
@@ -3924,8 +3929,8 @@ def _orchestrator_task_from_job(
         trace["max_runtime_seconds"] = 120
         trace["suppress_ticket_card"] = True
         requires_approval = False
-    if intent_type:
-        trace["intent_type"] = str(intent_type).strip().lower()
+    if normalized_intent:
+        trace["intent_type"] = normalized_intent
     if source_message_id is not None:
         try:
             trace["source_message_id"] = int(source_message_id)
@@ -3970,8 +3975,8 @@ def _orchestrator_task_from_job(
         "due_at": None,
         "mode_hint": mode_hint,
         # Let dispatcher detect request_type (query/status/task), but keep our role fixed unless @role was explicit.
-        "request_type": pre.request_type,
-        "intent_type": (str(intent_type or "").strip().lower() or None),
+        "request_type": req_type,
+        "intent_type": (normalized_intent or None),
         "requires_approval": requires_approval,
         "max_cost_window_usd": float(cfg.orchestrator_default_max_cost_window_usd),
         "trace": trace,
@@ -5385,6 +5390,248 @@ def _autopilot_tick(
     return created
 
 
+def _normalize_contract_lines(value: list[str] | None, *, fallback: list[str]) -> list[str]:
+    lines: list[str] = []
+    for raw in (value or []):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if len(s) > 240:
+            s = s[:240].rstrip() + "..."
+        lines.append(s)
+        if len(lines) >= 8:
+            break
+    if lines:
+        return lines
+    out: list[str] = []
+    for raw in fallback:
+        s = str(raw or "").strip()
+        if s:
+            out.append(s)
+    return out[:4]
+
+
+def _normalize_sla_tier(value: str | None, *, priority: int) -> str:
+    v = str(value or "").strip().lower()
+    if v in ("normal", "high", "urgent"):
+        return v
+    if int(priority or 2) <= 1:
+        return "high"
+    return "normal"
+
+
+def _default_eta_minutes_for_spec(spec: TaskSpec) -> int:
+    role = str(spec.role or "").strip().lower()
+    base_by_role: dict[str, int] = {
+        "jarvis": 45,
+        "qa": 60,
+        "sre": 75,
+        "research": 90,
+        "product_ops": 90,
+        "security": 105,
+        "release_mgr": 120,
+        "frontend": 150,
+        "backend": 150,
+    }
+    base = int(base_by_role.get(role, 120))
+    pr = max(1, min(3, int(spec.priority or 2)))
+    if pr == 1:
+        return max(20, int(base * 0.6))
+    if pr == 3:
+        return int(base * 1.25)
+    return base
+
+
+def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSpec:
+    base_text = str(spec.text or "").strip()
+    acceptance = _normalize_contract_lines(
+        list(spec.acceptance_criteria or []),
+        fallback=[
+            f"Deliver the requested outcome for key `{spec.key}` without breaking existing behavior.",
+            "Include verifiable output/evidence in summary and artifacts.",
+        ],
+    )
+    dod = _normalize_contract_lines(
+        list(spec.definition_of_done or []),
+        fallback=[
+            "Implementation completed and validated in assigned workspace.",
+            "Residual risks and next action explicitly documented.",
+        ],
+    )
+    eta = int(spec.eta_minutes) if spec.eta_minutes is not None else _default_eta_minutes_for_spec(spec)
+    eta = max(5, min(7 * 24 * 60, eta))
+    sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
+
+    # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
+    return TaskSpec(
+        key=spec.key,
+        role=spec.role,
+        text=base_text,
+        mode_hint=spec.mode_hint,
+        priority=int(spec.priority or 2),
+        depends_on=list(spec.depends_on or []),
+        requires_approval=bool(spec.requires_approval),
+        acceptance_criteria=acceptance,
+        definition_of_done=dod,
+        eta_minutes=int(eta),
+        sla_tier=sla,
+    )
+
+
+def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
+    acceptance = [f"- {x}" for x in (spec.acceptance_criteria or []) if str(x).strip()]
+    dod = [f"- {x}" for x in (spec.definition_of_done or []) if str(x).strip()]
+    deps = [str(x).strip() for x in (spec.depends_on or []) if str(x).strip()]
+    contract_lines: list[str] = [
+        "",
+        "Execution contract:",
+        f"- Ticket: {root_ticket}",
+        f"- Key: {spec.key}",
+        f"- ETA (minutes): {int(spec.eta_minutes or 0)}",
+        f"- SLA tier: {spec.sla_tier or 'normal'}",
+    ]
+    if deps:
+        contract_lines.append("- Depends on keys: " + ", ".join(deps))
+    if acceptance:
+        contract_lines.append("- Acceptance criteria:")
+        contract_lines.extend(acceptance[:8])
+    if dod:
+        contract_lines.append("- Definition of done:")
+        contract_lines.extend(dod[:8])
+    return (str(spec.text or "").strip() + "\n" + "\n".join(contract_lines)).strip()
+
+
+def _ttl_seconds_from_spec(spec: TaskSpec) -> int:
+    eta_m = max(5, int(spec.eta_minutes or _default_eta_minutes_for_spec(spec)))
+    sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
+    mult = 2.0
+    if sla == "high":
+        mult = 1.6
+    elif sla == "urgent":
+        mult = 1.25
+    ttl = int(max(300, eta_m * 60 * mult))
+    return min(ttl, 7 * 24 * 60 * 60)
+
+
+def _sync_order_phase_from_runtime(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    chat_id: int,
+) -> None:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return
+    order = orch_q.get_order(rid, chat_id=int(chat_id))
+    if not order:
+        return
+    status = str(order.get("status") or "").strip().lower()
+    if status == "done":
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+        return
+    if status == "paused":
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="paused")
+        return
+
+    children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
+    if not children:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
+        return
+
+    states = [str(c.state or "").strip().lower() for c in children]
+    wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
+    wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
+    wrapup_active = any(str(w.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for w in wrapups)
+
+    if any(s in ("blocked", "blocked_approval", "failed") for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+        return
+    if any(s == "running" for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="executing")
+        return
+    if any(s in ("queued", "waiting_deps") for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="delegated")
+        return
+    if wrapup_active:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+        return
+    if wrapup_done:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+        orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        return
+
+    # If there are no active/blocked jobs, close only when all children reached terminal states.
+    terminal_ok = all(s in ("done", "cancelled") for s in states)
+    if terminal_ok:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+        orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        return
+    orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+
+
+def _orchestrator_min_evidence_gate(
+    *,
+    task: Task,
+    summary: str,
+    artifacts: list[str],
+    logs: str,
+    structured: dict[str, Any],
+) -> tuple[bool, str | None, dict[str, Any]]:
+    role = _coerce_orchestrator_role(task.role)
+    req = str(task.request_type or "").strip().lower()
+    kind = str((task.labels or {}).get("kind") or "").strip().lower()
+    if req in ("query", "status"):
+        return True, None, {"skipped": "conversational_lane"}
+    if role == "jarvis":
+        return True, None, {"skipped": f"jarvis_{kind or 'controller'}"}
+
+    summary_clean = str(summary or "").strip()
+    logs_clean = str(logs or "").strip()
+    artifacts_clean = [str(a).strip() for a in (artifacts or []) if str(a).strip()]
+    lower = summary_clean.lower()
+    weak_summary = lower in ("", "(no output)", "(no summary)", "ok", "done", "hecho")
+    summary_substantial = (len(summary_clean) >= 48) and (not weak_summary)
+    has_artifacts = len(artifacts_clean) > 0
+    has_logs = len(logs_clean) >= 100
+
+    evidence_meta: dict[str, Any] = {
+        "summary_chars": int(len(summary_clean)),
+        "artifacts_count": int(len(artifacts_clean)),
+        "logs_chars": int(len(logs_clean)),
+        "summary_substantial": bool(summary_substantial),
+    }
+
+    if role == "qa":
+        qa_tokens = ("pass", "fail", "blocked", "regression", "test", "coverage")
+        if not any(tok in lower for tok in qa_tokens):
+            return (
+                False,
+                "QA evidence gate not met. Include PASS/FAIL style validation with concrete findings.",
+                evidence_meta,
+            )
+
+    if role == "release_mgr":
+        by_name = any(
+            ("release_checklist" in p.lower()) or ("pr_url" in p.lower())
+            for p in artifacts_clean
+        )
+        by_summary = ("pull request" in lower) or ("pr " in lower) or ("checklist" in lower)
+        if not (by_name or by_summary):
+            return (
+                False,
+                "Release evidence gate not met. Include release checklist / PR evidence before closing.",
+                evidence_meta,
+            )
+
+    if not (summary_substantial or has_artifacts or has_logs):
+        return (
+            False,
+            "Evidence gate not met. Provide meaningful summary and/or artifacts/log evidence before closing.",
+            evidence_meta,
+        )
+    return True, None, evidence_meta
+
+
 def _stalled_replan_tick(
     *,
     cfg: BotConfig,
@@ -5482,6 +5729,162 @@ def _stalled_replan_tick(
         except Exception:
             pass
 
+        if created >= 8:
+            break
+
+    return created
+
+
+def _sla_overdue_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Escalate jobs that exceeded their delegated ETA/SLA (ttl_seconds) so Jarvis replans.
+    """
+    try:
+        cooldown_s = max(180.0, float(os.environ.get("BOT_SLA_ESCALATION_COOLDOWN_SECONDS", "900").strip() or "900"))
+    except Exception:
+        cooldown_s = 900.0
+    try:
+        grace_s = max(0.0, float(os.environ.get("BOT_SLA_OVERDUE_GRACE_SECONDS", "120").strip() or "120"))
+    except Exception:
+        grace_s = 120.0
+
+    active_states = ("running", "queued", "waiting_deps", "blocked_approval")
+    seen: set[str] = set()
+    overdue_items: list[tuple[float, Task]] = []
+    for st in active_states:
+        try:
+            rows = orch_q.peek(state=st, limit=800)
+        except Exception:
+            rows = []
+        for item in rows:
+            jid = str(item.job_id or "").strip()
+            if not jid or jid in seen:
+                continue
+            seen.add(jid)
+            try:
+                ttl_s = int(item.ttl_seconds or 0)
+            except Exception:
+                ttl_s = 0
+            if ttl_s <= 0:
+                continue
+            age_s = max(0.0, float(now - float(item.created_at or now)))
+            overdue_by = age_s - float(ttl_s)
+            if overdue_by <= grace_s:
+                continue
+            kind = str((item.labels or {}).get("kind") or "").strip().lower()
+            if kind in ("autopilot", "stalled_replan", "sla_replan", "wrapup", "evidence"):
+                continue
+            if str(item.request_type or "").strip().lower() in ("query", "status"):
+                continue
+            overdue_items.append((float(overdue_by), item))
+
+    if not overdue_items:
+        return 0
+    overdue_items.sort(key=lambda it: it[0], reverse=True)
+
+    created = 0
+    dedup_roots: set[str] = set()
+    for overdue_by, item in overdue_items:
+        root_ticket = (item.parent_job_id or item.job_id or "").strip() or item.job_id
+        if not root_ticket or root_ticket in dedup_roots:
+            continue
+        dedup_roots.add(root_ticket)
+
+        root_job = orch_q.get_job(root_ticket)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            escalated_at = float(root_trace.get("sla_escalated_at", 0.0) or 0.0)
+        except Exception:
+            escalated_at = 0.0
+        if escalated_at > 0 and (now - escalated_at) < cooldown_s:
+            continue
+
+        # Avoid duplicate active SLA replans.
+        children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=300)
+        if any(
+            str((c.labels or {}).get("kind") or "").strip().lower() == "sla_replan"
+            and str(c.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running")
+            for c in children
+        ):
+            continue
+
+        profile = _orchestrator_profile(profiles, "jarvis")
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+
+        task_id = str(uuid.uuid4())
+        escalation = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=(
+                "SLA OVERDUE ESCALATION\n"
+                f"Order/Ticket: {root_ticket}\n"
+                f"Overdue job: {item.job_id}\n"
+                f"Role: {item.role}\n"
+                f"State: {item.state}\n"
+                f"ETA budget (s): {int(item.ttl_seconds or 0)}\n"
+                f"Overdue by (s): {int(max(0.0, overdue_by))}\n"
+                "Action required:\n"
+                "- Re-plan remaining work and priorities.\n"
+                "- Keep runnable tasks in queued and isolate blockers.\n"
+                "- Update delegation contract with realistic ETA/SLA.\n"
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(item.chat_id),
+            user_id=item.user_id,
+            reply_to_message_id=item.reply_to_message_id,
+            parent_job_id=root_ticket,
+            labels={"ticket": root_ticket, "kind": "sla_replan"},
+            artifacts_dir=str((cfg.artifacts_root / task_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": root_ticket,
+                "overdue_job_id": item.job_id,
+                "overdue_role": item.role,
+                "overdue_state": item.state,
+                "overdue_by_s": float(overdue_by),
+                "sla_ttl_s": int(item.ttl_seconds or 0),
+            },
+            job_id=task_id,
+        )
+        orch_q.submit_task(escalation)
+        created += 1
+        try:
+            orch_q.update_trace(
+                root_ticket,
+                sla_escalated_at=float(now),
+                sla_overdue_job_id=item.job_id,
+                sla_overdue_by_s=float(overdue_by),
+                live_at=now,
+            )
+            _sync_order_phase_from_runtime(orch_q=orch_q, root_ticket=root_ticket, chat_id=int(item.chat_id))
+            orch_q.append_audit_event(
+                event_type="task.overdue",
+                actor="jarvis",
+                details={
+                    "order_id": root_ticket,
+                    "job_id": item.job_id,
+                    "role": item.role,
+                    "state": item.state,
+                    "ttl_seconds": int(item.ttl_seconds or 0),
+                    "overdue_by_s": float(overdue_by),
+                },
+            )
+        except Exception:
+            pass
         if created >= 8:
             break
 
@@ -8018,6 +8421,24 @@ def _orchestrator_run_codex(
                 "structured_digest": structured,
             }
 
+        evidence_ok, evidence_reason, evidence_meta = _orchestrator_min_evidence_gate(
+            task=task,
+            summary=body,
+            artifacts=artifacts_text,
+            logs=logs,
+            structured=structured,
+        )
+        structured["evidence"] = evidence_meta
+        if code == 0 and (not evidence_ok):
+            return {
+                "status": "blocked",
+                "summary": str(evidence_reason or "Evidence gate not met."),
+                "artifacts": artifacts_text,
+                "logs": logs or body,
+                "next_action": "add_evidence",
+                "structured_digest": structured,
+            }
+
         if code == 0:
             return {
                 "status": "ok",
@@ -8357,21 +8778,11 @@ def orchestrator_worker_loop(
             # Keep CEO order phase aligned with real execution state.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
-                kind = str((task.labels or {}).get("kind") or "").strip().lower()
-                if root_ticket:
-                    if kind == "wrapup":
-                        if orch_state == "done":
-                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="done")
-                            orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="done")
-                        elif orch_state in ("failed", "blocked", "blocked_approval"):
-                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
-                    elif orch_state in ("blocked", "blocked_approval"):
-                        orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
-                    elif orch_state == "done":
-                        if _coerce_orchestrator_role(task.role) == "jarvis" and not (task.parent_job_id or "").strip():
-                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="planning")
-                        else:
-                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="executing")
+                _sync_order_phase_from_runtime(
+                    orch_q=orch_q,
+                    root_ticket=root_ticket,
+                    chat_id=int(task.chat_id),
+                )
             except Exception:
                 pass
             # Update ticket card after the state transition so it reflects latest progress/result.
@@ -8476,6 +8887,53 @@ def orchestrator_worker_loop(
                         specs = [s for s in specs if s.key not in existing_keys]
                         if specs:
                             next_plan_revision = max(1, current_plan_revision + 1)
+                            # CEO orders should always pass through a QA gate before wrap-up.
+                            # If Jarvis did not include QA explicitly, inject one depending on all delegated keys.
+                            if is_top_level_manual:
+                                has_qa = any(str(s.role).strip().lower() == "qa" for s in specs)
+                                needs_qa = any(
+                                    str(s.role).strip().lower()
+                                    in ("frontend", "backend", "security", "research", "release_mgr", "product_ops", "sre")
+                                    for s in specs
+                                )
+                                if needs_qa and (not has_qa):
+                                    dep_keys = [str(s.key).strip() for s in specs if str(s.key).strip()]
+                                    qa_key_base = f"qa_gate_r{int(next_plan_revision)}"
+                                    qa_key = qa_key_base
+                                    suffix = 1
+                                    while qa_key in existing_keys or any(str(s.key).strip() == qa_key for s in specs):
+                                        qa_key = f"{qa_key_base}_{suffix}"
+                                        suffix += 1
+                                    qa_text = (
+                                        f"QA gate for ticket {root_ticket}: validate delegated deliverables, run targeted tests, "
+                                        "and report PASS/FAIL with evidence and residual risks."
+                                    )
+                                    if len(specs) >= 12:
+                                        specs = specs[:11]
+                                    specs.append(
+                                        TaskSpec(
+                                            key=qa_key,
+                                            role="qa",
+                                            text=qa_text,
+                                            mode_hint="rw",
+                                            priority=1,
+                                            depends_on=dep_keys,
+                                            requires_approval=False,
+                                            acceptance_criteria=[
+                                                "Validate delegated deliverables against acceptance criteria.",
+                                                "Run targeted tests and report PASS/FAIL with evidence.",
+                                            ],
+                                            definition_of_done=[
+                                                "QA verdict published with residual risks and next action.",
+                                            ],
+                                            eta_minutes=60,
+                                            sla_tier="high",
+                                        )
+                                    )
+                            specs = [
+                                _normalize_task_spec_contract(s, root_ticket=root_ticket)
+                                for s in specs
+                            ]
 
                     if specs:
                         key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
@@ -8492,6 +8950,8 @@ def orchestrator_worker_loop(
                                 or mode_hint == "full"
                             )
                             deps = [key_to_job[k] for k in spec.depends_on if k in key_to_job]
+                            contract_text = _compose_subtask_instruction(spec, root_ticket=root_ticket)
+                            ttl_seconds = _ttl_seconds_from_spec(spec)
                             trace: dict[str, str | int | float | bool | list[str]] = {
                                 "source": "telegram",
                                 "delegated_by": task.job_id,
@@ -8499,11 +8959,15 @@ def orchestrator_worker_loop(
                                 "profile_name": str(child_profile.get("name") or child_role),
                                 "profile_role": child_role,
                                 "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
+                                "acceptance_criteria": list(spec.acceptance_criteria or []),
+                                "definition_of_done": list(spec.definition_of_done or []),
+                                "eta_minutes": int(spec.eta_minutes or 0),
+                                "sla_tier": str(spec.sla_tier or "normal"),
                             }
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
-                                input_text=spec.text,
+                                input_text=contract_text,
                                 request_type="task",
                                 priority=int(spec.priority),
                                 model=model,
@@ -8516,6 +8980,7 @@ def orchestrator_worker_loop(
                                 reply_to_message_id=task.reply_to_message_id,
                                 parent_job_id=root_ticket,
                                 depends_on=deps,
+                                ttl_seconds=int(ttl_seconds),
                                 labels={"ticket": root_ticket, "kind": "subtask", "key": spec.key},
                                 artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
                                 trace=trace,
@@ -8536,7 +9001,12 @@ def orchestrator_worker_loop(
                                         edge_type="delegated",
                                         to_role=c.role,
                                         to_key=ckey,
-                                        details={"priority": int(c.priority or 2), "text": (c.input_text or "")[:400]},
+                                        details={
+                                            "priority": int(c.priority or 2),
+                                            "text": (c.input_text or "")[:400],
+                                            "eta_minutes": int((c.trace or {}).get("eta_minutes") or 0),
+                                            "sla_tier": str((c.trace or {}).get("sla_tier") or "normal"),
+                                        },
                                     )
                                     for dep in (c.depends_on or []):
                                         if dep:
@@ -8559,7 +9029,11 @@ def orchestrator_worker_loop(
                                     plan_revision=int(next_plan_revision),
                                     live_at=time.time(),
                                 )
-                                orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="delegated")
+                                _sync_order_phase_from_runtime(
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    chat_id=int(task.chat_id),
+                                )
                                 if next_plan_revision > current_plan_revision:
                                     orch_q.append_audit_event(
                                         event_type="plan.revised",
@@ -8619,9 +9093,21 @@ def orchestrator_worker_loop(
                             orch_q.submit_task(wrap)
                             try:
                                 orch_q.update_trace(root_ticket, wrapup_job_id=wrap.job_id, live_at=time.time())
-                                orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
+                                _sync_order_phase_from_runtime(
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    chat_id=int(task.chat_id),
+                                )
                             except Exception:
                                 pass
+                    try:
+                        _sync_order_phase_from_runtime(
+                            orch_q=orch_q,
+                            root_ticket=root_ticket,
+                            chat_id=int(task.chat_id),
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
         except Exception as e:
@@ -11146,6 +11632,15 @@ def main() -> None:
                     )
                 except Exception:
                     LOG.exception("Stalled replan tick failed")
+                try:
+                    _sla_overdue_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("SLA overdue tick failed")
 
                 if notify_chat_id is None:
                     return

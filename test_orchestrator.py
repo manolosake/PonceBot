@@ -195,6 +195,80 @@ class TestDelegationParsing(unittest.TestCase):
         # Invalid but explicit => fall back to a safe value.
         self.assertEqual(specs3[0].mode_hint, "ro")
 
+    def test_orchestrator_subtasks_contract_fields_are_parsed(self) -> None:
+        specs = parse_orchestrator_subtasks(
+            {
+                "subtasks": [
+                    {
+                        "key": "ship_api",
+                        "role": "backend",
+                        "text": "Implement endpoint",
+                        "acceptance_criteria": ["returns 200", "includes schema validation"],
+                        "definition_of_done": ["tests pass", "docs updated"],
+                        "eta_minutes": 95,
+                        "sla_tier": "high",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(specs), 1)
+        s = specs[0]
+        self.assertEqual(s.acceptance_criteria, ["returns 200", "includes schema validation"])
+        self.assertEqual(s.definition_of_done, ["tests pass", "docs updated"])
+        self.assertEqual(int(s.eta_minutes or 0), 95)
+        self.assertEqual(s.sla_tier, "high")
+
+
+class TestOrchestratorEvidenceGate(unittest.TestCase):
+    def test_backend_requires_meaningful_evidence(self) -> None:
+        t = Task.new(
+            source="telegram",
+            role="backend",
+            input_text="Do backend work",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=5.0,
+            chat_id=1,
+        )
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=t,
+            summary="ok",
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+        self.assertFalse(ok)
+        self.assertIn("Evidence gate", str(reason))
+        self.assertEqual(int(meta.get("artifacts_count") or 0), 0)
+
+    def test_qa_requires_pass_fail_style_language(self) -> None:
+        t = Task.new(
+            source="telegram",
+            role="qa",
+            input_text="Run tests",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=5.0,
+            chat_id=1,
+        )
+        ok, reason, _meta = bot._orchestrator_min_evidence_gate(
+            task=t,
+            summary="Checked things quickly.",
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+        self.assertFalse(ok)
+        self.assertIn("QA evidence gate", str(reason))
+
 
 class TestOrchestratorMarkerResponse(unittest.TestCase):
     def test_invalid_role_is_rejected(self) -> None:
@@ -539,6 +613,66 @@ class TestOrchestratorStorage(unittest.TestCase):
             recovered = q.recover_stale_running()
             self.assertEqual(recovered, 0)
             self.assertIsNone(q.get_workspace_lease(job_id="deadbeef"))
+
+    def test_sync_order_phase_marks_done_when_wrapup_done(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-12345678"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Test order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="subtask",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "subtask", "key": "impl"},
+                    state="done",
+                    job_id="job-subtask",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="wrap",
+                    request_type="review",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "wrapup"},
+                    state="done",
+                    job_id="job-wrapup",
+                )
+            )
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "done")
+            self.assertEqual(str(got.get("status")), "done")
 
 
 class TestYamlLikeParsing(unittest.TestCase):

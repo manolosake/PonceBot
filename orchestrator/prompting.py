@@ -53,7 +53,11 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
             '      "mode_hint": "ro|rw|full (optional; omit to use role defaults)",\n'
             '      "priority": 1,\n'
             '      "depends_on": ["other_key"],\n'
-            '      "requires_approval": false\n'
+            '      "requires_approval": false,\n'
+            '      "acceptance_criteria": ["measurable checks"],\n'
+            '      "definition_of_done": ["what must be true to close"],\n'
+            '      "eta_minutes": 120,\n'
+            '      "sla_tier": "normal|high|urgent"\n'
             "    }\n"
             "  ],\n"
             '  "next_action": null\n'
@@ -94,6 +98,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         + "IMPORTANT:\n"
         + "- Keep the JSON valid (double quotes, no trailing commas).\n"
         + "- If you cannot do something safely, explain and set next_action.\n"
+        + "- If you delegate subtasks, include acceptance_criteria + definition_of_done + eta_minutes + sla_tier for each subtask.\n"
         + "- FRONTEND ONLY: visual evidence is mandatory before completion.\n"
         + "  Create `.codexbot_preview/preview.html` in the workspace so the bot can capture it.\n"
         + "  If live preview is not possible, include multiple screenshots (mobile/tablet/desktop).\n"
