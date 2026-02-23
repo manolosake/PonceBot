@@ -310,6 +310,57 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, snap)
             return
 
+        if path in ("/api/status/alerts", f"/api/{_API_VERSION}/status/alerts"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("alerts") or []),
+                },
+            )
+            return
+
+        if path in ("/api/status/risks", f"/api/{_API_VERSION}/status/risks"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("risks") or []),
+                },
+            )
+            return
+
+        if path in ("/api/status/decisions", f"/api/{_API_VERSION}/status/decisions"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("decisions_pending") or []),
+                },
+            )
+            return
+
         if path in ("/api/status/stream", f"/api/{_API_VERSION}/status/stream"):
             if not self.server.sse_acquire(ip):
                 self._send_json(429, {"error": "too_many_streams"}, extra_headers={"Retry-After": "5"})

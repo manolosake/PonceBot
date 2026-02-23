@@ -182,6 +182,160 @@ class StatusService:
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
 
+    def _build_alerts(
+        self,
+        *,
+        queued_total: int,
+        blocked_approval_total: int,
+        failed_total: int,
+        stalled_tasks: list[dict[str, Any]],
+        staleness_seconds: float | None,
+    ) -> list[dict[str, Any]]:
+        alerts: list[dict[str, Any]] = []
+        if blocked_approval_total > 0:
+            alerts.append(
+                {
+                    "kind": "approval_blocked",
+                    "severity": "warning",
+                    "count": int(blocked_approval_total),
+                    "summary": f"{blocked_approval_total} job(s) esperando aprobación",
+                }
+            )
+        if failed_total > 0:
+            alerts.append(
+                {
+                    "kind": "failed_jobs",
+                    "severity": "critical",
+                    "count": int(failed_total),
+                    "summary": f"{failed_total} job(s) en estado failed",
+                }
+            )
+        if len(stalled_tasks) > 0:
+            alerts.append(
+                {
+                    "kind": "stalled_tasks",
+                    "severity": "warning",
+                    "count": int(len(stalled_tasks)),
+                    "summary": f"{len(stalled_tasks)} job(s) stale en waiting_deps/blocked_approval",
+                }
+            )
+        if queued_total >= 10:
+            alerts.append(
+                {
+                    "kind": "queue_pressure",
+                    "severity": "warning",
+                    "count": int(queued_total),
+                    "summary": f"Presión de cola: {queued_total} job(s) en queued",
+                }
+            )
+        if staleness_seconds is not None and float(staleness_seconds) > 60.0:
+            alerts.append(
+                {
+                    "kind": "snapshot_stale",
+                    "severity": "warning",
+                    "count": 1,
+                    "summary": f"Datos con staleness de {round(float(staleness_seconds), 1)}s",
+                }
+            )
+        return alerts
+
+    def _build_risks(
+        self,
+        *,
+        blocked_approval_total: int,
+        stalled_tasks: list[dict[str, Any]],
+        queued_total: int,
+    ) -> list[dict[str, Any]]:
+        risks: list[dict[str, Any]] = []
+        if blocked_approval_total > 0:
+            risks.append(
+                {
+                    "risk_id": "approval_dependency",
+                    "level": "medium",
+                    "source": "orchestrator",
+                    "summary": "Dependencia de aprobación humana puede frenar entregas.",
+                    "impact": "throughput",
+                    "count": int(blocked_approval_total),
+                }
+            )
+        if len(stalled_tasks) > 0:
+            risks.append(
+                {
+                    "risk_id": "stale_dependencies",
+                    "level": "high",
+                    "source": "orchestrator",
+                    "summary": "Jobs stale en dependencias incrementan lead time.",
+                    "impact": "latency",
+                    "count": int(len(stalled_tasks)),
+                }
+            )
+        if queued_total >= 10:
+            risks.append(
+                {
+                    "risk_id": "queue_backlog",
+                    "level": "medium",
+                    "source": "scheduler",
+                    "summary": "Backlog alto puede degradar SLA.",
+                    "impact": "sla",
+                    "count": int(queued_total),
+                }
+            )
+        return risks
+
+    def _build_pending_decisions(
+        self,
+        *,
+        orders: list[dict[str, Any]],
+        blocked_requires_approval: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for t in blocked_requires_approval[:20]:
+            out.append(
+                {
+                    "kind": "job_approval",
+                    "priority": int(t.get("priority") or 2),
+                    "state": str(t.get("state") or "blocked_approval"),
+                    "order_id": str(t.get("parent_job_id") or "").strip() or None,
+                    "job_id": str(t.get("job_id") or ""),
+                    "job_id_short": str(t.get("job_id_short") or ""),
+                    "title": str(t.get("title") or ""),
+                    "next_action": "Aprobar o rechazar ejecución",
+                    "updated_at": t.get("updated_at"),
+                }
+            )
+
+        seen: set[tuple[str, str]] = set()
+        for o in orders:
+            oid = str(o.get("order_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                rows = self.orch_q.list_decision_log(order_id=oid, limit=20)
+            except Exception:
+                rows = []
+            for row in rows:
+                action = str((row or {}).get("next_action") or "").strip()
+                if not action:
+                    continue
+                key = (oid, action.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    {
+                        "kind": "order_decision",
+                        "order_id": oid,
+                        "job_id": (row or {}).get("job_id"),
+                        "state": str((row or {}).get("state") or ""),
+                        "summary": str((row or {}).get("summary") or ""),
+                        "next_action": action,
+                        "updated_at": (row or {}).get("ts"),
+                    }
+                )
+                if len(out) >= 50:
+                    return out
+        return out
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.
@@ -282,8 +436,10 @@ class StatusService:
             projects = []
 
         role_queue_rows: list[dict[str, Any]] = []
+        failed_total = 0
         for role in sorted((role_health or {}).keys()):
             rec = role_health.get(role) or {}
+            failed_total += int(rec.get("failed", 0) or 0)
             role_queue_rows.append(
                 {
                     "role": role,
@@ -326,6 +482,28 @@ class StatusService:
             workers_out.extend(workers)
 
         staleness_seconds = max(0.0, float(now - newest_updated_at)) if newest_updated_at > 0 else None
+        alerts = self._build_alerts(
+            queued_total=int(queued_total),
+            blocked_approval_total=int(blocked_approval_total),
+            failed_total=int(failed_total),
+            stalled_tasks=stalled_out,
+            staleness_seconds=staleness_seconds,
+        )
+        risks = self._build_risks(
+            blocked_approval_total=int(blocked_approval_total),
+            stalled_tasks=stalled_out,
+            queued_total=int(queued_total),
+        )
+        decisions_pending = self._build_pending_decisions(
+            orders=orders_out,
+            blocked_requires_approval=blocked_requires_approval,
+        )
+        live_view = {
+            "transport": "sse",
+            "event": "snapshot",
+            "target_latency_seconds": max(1, min(5, int(self.cache_ttl_seconds) + 2)),
+            "staleness_seconds": staleness_seconds,
+        }
 
         payload: dict[str, Any] = {
             "api_version": "v1",
@@ -343,6 +521,10 @@ class StatusService:
             "queue_by_role": role_queue_rows,
             "blocked_requires_approval": blocked_requires_approval,
             "stalled_tasks": stalled_out,
+            "alerts": alerts,
+            "risks": risks,
+            "decisions_pending": decisions_pending,
+            "live_view": live_view,
             "source_newest_updated_at": (float(newest_updated_at) if newest_updated_at > 0 else None),
             "staleness_seconds": staleness_seconds,
         }

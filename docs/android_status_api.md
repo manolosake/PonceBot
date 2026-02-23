@@ -1,134 +1,217 @@
 # ExecutiveDashboard Status API (Android Contract)
 
-This API is intended for a lightweight Android client to read the current system status (workers + current/next tasks), sourced from Orders/Autopilot.
+Contrato de datos para Android (Live View, Snapshot, Alertas, Riesgos y Decisiones) compatible con web.
 
-**Transport**
-- Snapshot: HTTP `GET` returning JSON
-- Stream: **SSE** (`text/event-stream`) streaming JSON snapshots (recommended for Android; simple + works well over Tailscale)
+## Transporte y versionado
 
-**Versioning**
-- URL version: `/api/v1/...`
-- Response header: `X-ED-API-Version: v1`
-- Payload fields:
-  - `api_version`: `"v1"`
-  - `schema_version`: `1` (integer; increment on breaking payload changes)
+- Snapshot: `GET` JSON.
+- Live View: `SSE` (`text/event-stream`) con eventos `snapshot`.
+- Paths versionados (preferidos):
+  - `GET /api/v1/status/snapshot`
+  - `GET /api/v1/status/stream`
+  - `GET /api/v1/status/alerts`
+  - `GET /api/v1/status/risks`
+  - `GET /api/v1/status/decisions`
+- Back-compat aliases: `/api/status/*`.
+- Header: `X-ED-API-Version: v1`.
+- Payload:
+  - `api_version: "v1"`
+  - `schema_version: 1`
 
-Compatibility rule:
-- Clients should ignore unknown fields.
-- Breaking changes: new `schema_version`, and new `/api/v{N}` paths.
+Regla de compatibilidad:
+- Cambios aditivos: mismo `schema_version`.
+- Breaking changes: nuevo `/api/vN/*` y `schema_version`.
 
-## Auth (Token)
+## Auth ligera (token)
 
-Use a single shared token (lightweight) suitable for consumption from Android + Tailscale.
+Si `BOT_STATUS_HTTP_TOKEN` está definido:
+- Preferido: `Authorization: Bearer <token>`
+- Fallback: `?token=<token>`
 
-Supported:
-1. Header (preferred): `Authorization: Bearer <token>`
-2. Query param (fallback): `?token=<token>`
+Errores:
+- `401 {"error":"unauthorized"}`
 
-If `BOT_STATUS_HTTP_TOKEN` is empty, auth is disabled (not recommended unless the listener is strictly localhost-only).
+## Live View (SSE)
 
-## Endpoints
+`GET /api/v1/status/stream[?chat_id=<int>]`
+
+Frames:
+- `event: snapshot`
+- `id: <generated_at_ms>`
+- `data: <json snapshot>`
+- keepalive cuando no hay cambios: `: keep-alive`
+
+Objetivo de latencia (staging): `<= 5s`
+- Recomendado:
+  - `BOT_STATUS_STREAM_INTERVAL_SECONDS=0.5..1.5`
+  - `BOT_STATUS_CACHE_TTL_SECONDS=1..2`
+
+## Snapshot estable
+
+`GET /api/v1/status/snapshot[?chat_id=<int>]`
+
+Campos top-level (estables):
+- `api_version`, `schema_version`
+- `generated_at`, `chat_id`, `snapshot_hash`
+- `source_newest_updated_at`, `staleness_seconds`
+- `live_view`: `{ transport, event, target_latency_seconds, staleness_seconds }`
+- `orders_active[]`
+- `workers[]`
+- `alerts[]`
+- `risks[]`
+- `decisions_pending[]`
+
+`workers[]`:
+- `worker_id`, `role`, `slot`
+- `current` y `next` (`task_status|null`)
+
+`task_status`:
+- `job_id`, `job_id_short`, `role`, `state`, `priority`, `request_type`, `mode_hint`
+- `requires_approval`, `approved`
+- `owner`, `chat_id`, `user_id`, `parent_job_id`
+- `created_at`, `updated_at`, `title`
+- `live_phase`, `live_at`, `live_pid`, `live_workdir`, `live_workspace_slot`
+- `result_summary`, `result_next_action`
+
+## Alertas, Riesgos y Decisiones
+
+### Alertas
+
+`GET /api/v1/status/alerts[?chat_id=<int>]`
+
+Respuesta:
+- `items[]` con `{ kind, severity, count, summary }`
+- `kind` actuales: `approval_blocked`, `failed_jobs`, `stalled_tasks`, `queue_pressure`, `snapshot_stale`
+
+### Riesgos
+
+`GET /api/v1/status/risks[?chat_id=<int>]`
+
+Respuesta:
+- `items[]` con `{ risk_id, level, source, summary, impact, count }`
+
+### Decisiones
+
+`GET /api/v1/status/decisions[?chat_id=<int>]`
+
+Respuesta:
+- `items[]` con decisiones pendientes de:
+  - jobs bloqueados por aprobación (`job_approval`)
+  - decision logs con `next_action` (`order_decision`)
+
+## Ejemplos
 
 ### Snapshot
 
-`GET /api/v1/status/snapshot`
-
-Optional query:
-- `chat_id=<int>`: scope snapshot to a single Telegram chat. If omitted, returns global view.
-
-Responses:
-- `200` JSON snapshot
-- `401` if token missing/invalid (when enabled)
-- `429` rate limited, with `Retry-After` seconds header
-
-Example:
-```bash
-curl -sS \
-  -H "Authorization: Bearer $BOT_STATUS_HTTP_TOKEN" \
-  "http://127.0.0.1:8090/api/v1/status/snapshot?chat_id=123"
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "generated_at": 1760000000.25,
+  "chat_id": 123,
+  "snapshot_hash": "abc123",
+  "source_newest_updated_at": 1760000000.1,
+  "staleness_seconds": 0.15,
+  "live_view": {
+    "transport": "sse",
+    "event": "snapshot",
+    "target_latency_seconds": 4,
+    "staleness_seconds": 0.15
+  },
+  "alerts": [
+    {
+      "kind": "approval_blocked",
+      "severity": "warning",
+      "count": 1,
+      "summary": "1 job(s) esperando aprobación"
+    }
+  ],
+  "risks": [
+    {
+      "risk_id": "approval_dependency",
+      "level": "medium",
+      "source": "orchestrator",
+      "summary": "Dependencia de aprobación humana puede frenar entregas.",
+      "impact": "throughput",
+      "count": 1
+    }
+  ],
+  "decisions_pending": [
+    {
+      "kind": "order_decision",
+      "order_id": "11111111-1111-1111-1111-111111111111",
+      "job_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "state": "blocked",
+      "summary": "Falta evidencia QA",
+      "next_action": "Aprobar evidencia o pedir corrección",
+      "updated_at": 1760000000.1
+    }
+  ],
+  "orders_active": [],
+  "workers": []
+}
 ```
 
-### Stream (SSE)
+### Alerts
 
-`GET /api/v1/status/stream`
-
-Optional query:
-- `chat_id=<int>`
-
-Event format:
-- `event: snapshot`
-- `id: <ms_timestamp>` (monotonic-ish; useful for debugging/reconnect)
-- `data: <JSON snapshot>`
-
-Heartbeats:
-- Periodic comment frames `: keep-alive` when no data change is detected (prevents idle disconnects).
-
-Example:
-```bash
-curl -N \
-  -H "Authorization: Bearer $BOT_STATUS_HTTP_TOKEN" \
-  "http://127.0.0.1:8090/api/v1/status/stream"
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "generated_at": 1760000000.25,
+  "chat_id": 123,
+  "items": [
+    {
+      "kind": "failed_jobs",
+      "severity": "critical",
+      "count": 2,
+      "summary": "2 job(s) en estado failed"
+    }
+  ]
+}
 ```
 
-## Snapshot Payload (Stable)
+### Risks
 
-Top-level:
-- `api_version`: string (`"v1"`)
-- `schema_version`: int (`1`)
-- `generated_at`: float (unix seconds)
-- `snapshot_hash`: string (sha256 of canonicalized snapshot; used to detect changes)
-- `chat_id`: int|null (scope)
-- `source_newest_updated_at`: float|null (newest task `updated_at` observed)
-- `staleness_seconds`: float|null (`generated_at - source_newest_updated_at`)
-- `orders_active`: array of active orders
-- `workers`: array of worker slots across roles
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "generated_at": 1760000000.25,
+  "chat_id": 123,
+  "items": [
+    {
+      "risk_id": "queue_backlog",
+      "level": "medium",
+      "source": "scheduler",
+      "summary": "Backlog alto puede degradar SLA.",
+      "impact": "sla",
+      "count": 13
+    }
+  ]
+}
+```
 
-`orders_active[]`:
-- `order_id`: string (UUID)
-- `order_id_short`: string (first 8 chars)
-- `chat_id`: int
-- `status`: string (`active|paused|done`)
-- `priority`: int (1..3)
-- `title`: string
-- `updated_at`: float (unix seconds)
-- `children_counts`: object `{ queued: int, running: int, blocked: int, done: int, failed: int, cancelled: int }` (keys optional)
+### Decisions
 
-`workers[]` (one entry per `role:slot`):
-- `worker_id`: string (`"<role>:<slot>"`)
-- `role`: string (`jarvis|frontend|backend|qa|sre|product_ops|security|research|release_mgr`)
-- `slot`: int (1..N per role)
-- `current`: task_status|null
-- `next`: task_status|null
-
-`task_status` (for `current` and `next`):
-- `job_id`: string (UUID)
-- `job_id_short`: string (first 8 chars)
-- `role`: string
-- `state`: string (`queued|running|blocked|done|failed|cancelled`)
-- `priority`: int (1..3)
-- `request_type`: string (`status|query|review|maintenance|task`)
-- `owner`: string|null
-- `chat_id`: int
-- `user_id`: int|null
-- `parent_job_id`: string|null
-- `created_at`: float
-- `updated_at`: float
-- `title`: string (trimmed single-line summary)
-- `live_phase`: string|null
-- `live_workspace_slot`: int|null
-
-## Rate Limits / Limits
-
-Defaults (configurable):
-- Snapshot: token-bucket per source IP, default `2 rps` burst `4`
-- SSE: max concurrent streams per source IP, default `2`
-
-On limit:
-- `429` with `Retry-After` header.
-
-## Network Notes (Tailscale)
-
-Recommended deployment for Android:
-- Bind to tailnet interface/IP only, or to `0.0.0.0:<port>` and restrict via firewall + token.
-- Consume from Android via the machine tailnet IP/hostname, e.g. `http://100.x.y.z:8090/api/v1/status/snapshot`.
-
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "generated_at": 1760000000.25,
+  "chat_id": 123,
+  "items": [
+    {
+      "kind": "job_approval",
+      "priority": 2,
+      "state": "blocked_approval",
+      "order_id": "11111111-1111-1111-1111-111111111111",
+      "job_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "job_id_short": "bbbbbbbb",
+      "title": "Validar release",
+      "next_action": "Aprobar o rechazar ejecución",
+      "updated_at": 1760000000.15
+    }
+  ]
+}
+```

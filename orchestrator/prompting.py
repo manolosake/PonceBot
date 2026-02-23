@@ -20,12 +20,20 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
     tools_csv = ", ".join(str(x) for x in allowed_tools if str(x).strip())
 
     # Keep this short; Codex already has its own system instructions.
+    trace = dict(task.trace or {})
+    order_branch = str(trace.get("order_branch") or "").strip()
+    project_path = str(trace.get("project_path") or "").strip()
+
     header_lines: list[str] = [
         f"ROLE: {role}",
         f"REQUEST_TYPE: {task.request_type}",
         f"MODE_HINT: {task.mode_hint}",
         f"ARTIFACTS_DIR: {task.artifacts_dir}",
     ]
+    if order_branch:
+        header_lines.append(f"ORDER_BRANCH: {order_branch}")
+    if project_path:
+        header_lines.append(f"PROJECT_PATH: {project_path}")
     if tools_csv:
         header_lines.append(f"ALLOWED_TOOLS: {tools_csv}")
     if system_prompt:
@@ -82,6 +90,11 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
                 "}\n"
             )
 
+    android_guardrails = (
+        "- ANDROID RULES: if the request touches Android/mobile app, use existing repo `/home/aponce/OmniCrewApp.android` and the order branch context.\n"
+        "- ANDROID RULES: native UI only (Jetpack Compose/Material 3). Do NOT use WebView unless CEO explicitly asks for WebView.\n"
+    )
+
     return (
         header
         + "\n\n"
@@ -99,6 +112,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         + "- Keep the JSON valid (double quotes, no trailing commas).\n"
         + "- If you cannot do something safely, explain and set next_action.\n"
         + "- If you delegate subtasks, include acceptance_criteria + definition_of_done + eta_minutes + sla_tier for each subtask.\n"
+        + android_guardrails
         + "- FRONTEND ONLY: visual evidence is mandatory before completion.\n"
         + "  Create `.codexbot_preview/preview.html` in the workspace so the bot can capture it.\n"
         + "  If live preview is not possible, include multiple screenshots (mobile/tablet/desktop).\n"

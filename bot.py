@@ -3852,12 +3852,26 @@ def _git_pick_main_ref(repo: Path) -> str:
     return "HEAD"
 
 
+def _git_remote_branch_exists(repo: Path, branch: str) -> bool:
+    b = str(branch or "").strip()
+    if not b:
+        return False
+    p = _run_git(repo, ["ls-remote", "--heads", "origin", f"refs/heads/{b}"], check=False)
+    if p.returncode != 0:
+        return False
+    return bool(str(p.stdout or "").strip())
+
+
 def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
     b = str(branch or "").strip()
     if not b:
         return False, "branch_missing"
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-    if _git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}"):
+    if (
+        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+        or _git_ref_exists(repo, f"origin/{b}")
+        or _git_remote_branch_exists(repo, b)
+    ):
         return True, "already_exists"
     base = _git_pick_main_ref(repo)
     src_ref = f"refs/heads/{b}"
@@ -3899,11 +3913,26 @@ def _sync_worktree_to_order_branch(
     ok, msg = _git_ensure_branch_from_main(base_repo, b)
     if not ok:
         return False, f"ensure_branch_failed:{msg}"
-    _run_git(worktree_dir, ["fetch", "origin", "--prune"], check=False)
+
+    # Some repos use narrow fetch refspecs; fetch branch explicitly to guarantee local visibility.
+    f = _run_git(
+        worktree_dir,
+        ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"],
+        check=False,
+    )
+    if f.returncode != 0:
+        f2 = _run_git(worktree_dir, ["fetch", "origin", b], check=False)
+        if f2.returncode != 0:
+            ferr = (f2.stderr or f2.stdout or f.stderr or f.stdout or "").strip()
+            return False, f"fetch_failed:{ferr or 'unknown'}"
+
     p = _run_git(worktree_dir, ["reset", "--hard", f"origin/{b}"], check=False)
     if p.returncode != 0:
-        err = (p.stderr or p.stdout or "").strip()
-        return False, f"reset_failed:{err or 'unknown'}"
+        # Fallback for detached/narrow cases where FETCH_HEAD is available but origin/<branch> is not.
+        p2 = _run_git(worktree_dir, ["reset", "--hard", "FETCH_HEAD"], check=False)
+        if p2.returncode != 0:
+            err = (p2.stderr or p2.stdout or p.stderr or p.stdout or "").strip()
+            return False, f"reset_failed:{err or 'unknown'}"
     return True, "synced"
 
 
@@ -9045,6 +9074,20 @@ def _send_orchestrator_result(
         s = re.sub(r"\bcannot\b", "can proceed when we confirm", s, flags=re.IGNORECASE)
         return s
 
+    def _first_line(text: str, *, max_chars: int = 420) -> str:
+        line = (str(text or "").splitlines() or ["(no summary)"])[0].strip() or "(no summary)"
+        if len(line) > max_chars:
+            return line[:max_chars] + "..."
+        return line
+
+    def _is_visual_artifact(raw: str) -> bool:
+        p = Path(str(raw or "")).name.lower()
+        if not p:
+            return False
+        if p.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            return True
+        return any(k in p for k in ("snapshot", "screenshot", "preview"))
+
     try:
         if isinstance(result, dict):
             status = str(result.get("status", "error"))
@@ -9066,32 +9109,42 @@ def _send_orchestrator_result(
         if _coerce_orchestrator_role(task.role) == "jarvis":
             summary = _normalize_jarvis_reply(summary)
 
+        ticket_hint = (
+            (task.parent_job_id or "").strip()
+            or str(labels.get("ticket") or "").strip()
+            or str((task.trace or {}).get("order_id") or "").strip()
+        )
+        child_or_autonomous = bool((task.parent_job_id or "").strip()) or bool(task.is_autonomous)
+        visual_artifacts = [str(a) for a in artifacts if _is_visual_artifact(str(a))]
+
         def _should_notify() -> bool:
             if mode == "verbose":
                 return True
+            if status != "ok":
+                return True
             if kind == "wrapup":
                 return True
-            # Ticket-card UX: if a top-level ticket has an editable card message, do not send a separate
-            # "job=... status=ok" message on success. The card is updated in-place by the worker loop.
+            # CTO relay: when worker/autonomous work tied to an order/ticket completes, notify CEO.
+            if child_or_autonomous and ticket_hint:
+                return True
+            # Ticket-card UX: top-level ok updates are already reflected by editable card.
             try:
                 if (
-                    status == "ok"
-                    and not (task.parent_job_id or "").strip()
+                    not (task.parent_job_id or "").strip()
                     and str((task.trace or {}).get("ticket_card_message_id") or "").strip()
                 ):
                     return False
             except Exception:
                 pass
-            # Autonomous runbooks: only notify on non-ok outcomes.
-            if bool(task.is_autonomous):
-                return status != "ok"
-            # Subtasks: only notify on non-ok outcomes (details are visible via /ticket and /job).
-            if (task.parent_job_id or "").strip():
-                return status != "ok"
             return True
 
-        # Evidence jobs: on success, send only the artifact(s) and skip the text message.
-        artifacts_only = (kind == "evidence") and status == "ok" and mode != "verbose"
+        # For ticket-linked evidence jobs we want both text + attachments (not attachments-only).
+        artifacts_only = (
+            (kind == "evidence")
+            and status == "ok"
+            and mode != "verbose"
+            and not (child_or_autonomous and ticket_hint)
+        )
 
         prefer_voice = bool((task.trace or {}).get("prefer_voice_reply", False))
         force_notify = prefer_voice and bool(cfg.voice_out_enabled)
@@ -9099,57 +9152,72 @@ def _send_orchestrator_result(
 
         if notify:
             role_name = _humanize_orchestrator_role(task.role)
-            summary_lines = (summary or "").splitlines() or ["(no summary)"]
-            summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
-            payload = list(summary_lines)
-            if next_action:
-                payload.append(f"Next: {next_action}")
+            # Compact CTO status format for child/autonomous completion events.
+            if mode != "verbose" and status == "ok" and child_or_autonomous and ticket_hint:
+                payload = [
+                    f"Jarvis: worker completed for ticket {ticket_hint[:8]}",
+                    f"Role: {role_name}",
+                    f"Result: {_first_line(summary)}",
+                ]
+                if visual_artifacts:
+                    payload.append(f"Visual evidence: {len(visual_artifacts)} screenshot(s) attached.")
+                if next_action:
+                    payload.append(f"Next: {next_action}")
+                payload.append(f"Links: /ticket {ticket_hint[:8]}  /job {task.job_id[:8]}  /agents  /dashboard")
+                msg = "\n".join(payload)
+                sent_voice = False
+            else:
+                summary_lines = (summary or "").splitlines() or ["(no summary)"]
+                summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
+                payload = list(summary_lines)
+                if next_action:
+                    payload.append(f"Next: {next_action}")
 
-            # If there's no ticket card to click, provide /job for errors only.
-            try:
-                has_ticket_card = (
-                    (not (task.parent_job_id or "").strip())
-                    and bool(str((task.trace or {}).get("ticket_card_message_id") or "").strip())
-                )
-            except Exception:
-                has_ticket_card = False
-            if status != "ok" and (not has_ticket_card):
-                payload.append(f"Details: /job {task.job_id[:8]}")
-
-            # Wrap-ups: include a short pointer back to the ticket tree.
-            if kind == "wrapup":
-                root = (task.parent_job_id or "").strip()
-                if root:
-                    payload.append(f"Ticket: /ticket {root[:8]}")
-
-            msg = "\n".join(payload)
-            sent_voice = False
-            if prefer_voice and cfg.voice_out_enabled:
+                # If there's no ticket card to click, provide /job for errors only.
                 try:
-                    tts_client: OpenAITTS | None = None
-                    if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
-                        tts_client = OpenAITTS(
-                            api_key=cfg.openai_api_key,
-                            api_base_url=cfg.openai_api_base_url,
-                            timeout_seconds=cfg.http_timeout_seconds,
-                            max_retries=cfg.http_max_retries,
-                            retry_initial_seconds=cfg.http_retry_initial_seconds,
-                            retry_max_seconds=cfg.http_retry_max_seconds,
-                        )
-                    speak_text = (summary_lines[0] if summary_lines else summary) or "(no summary)"
-                    _send_voice_note(
-                        api=api,
-                        cfg=cfg,
-                        chat_id=int(task.chat_id),
-                        reply_to_message_id=int(task.reply_to_message_id or 0),
-                        tts=tts_client,
-                        speak_text=str(speak_text),
-                        caption_text=msg,
+                    has_ticket_card = (
+                        (not (task.parent_job_id or "").strip())
+                        and bool(str((task.trace or {}).get("ticket_card_message_id") or "").strip())
                     )
-                    sent_voice = True
                 except Exception:
-                    sent_voice = False
-                    LOG.exception("Failed to send orchestrator voice reply. job=%s", task.job_id)
+                    has_ticket_card = False
+                if status != "ok" and (not has_ticket_card):
+                    payload.append(f"Details: /job {task.job_id[:8]}")
+
+                # Wrap-ups: include a short pointer back to the ticket tree.
+                if kind == "wrapup":
+                    root = (task.parent_job_id or "").strip()
+                    if root:
+                        payload.append(f"Ticket: /ticket {root[:8]}")
+
+                msg = "\n".join(payload)
+                sent_voice = False
+                if prefer_voice and cfg.voice_out_enabled:
+                    try:
+                        tts_client: OpenAITTS | None = None
+                        if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
+                            tts_client = OpenAITTS(
+                                api_key=cfg.openai_api_key,
+                                api_base_url=cfg.openai_api_base_url,
+                                timeout_seconds=cfg.http_timeout_seconds,
+                                max_retries=cfg.http_max_retries,
+                                retry_initial_seconds=cfg.http_retry_initial_seconds,
+                                retry_max_seconds=cfg.http_retry_max_seconds,
+                            )
+                        speak_text = (summary_lines[0] if summary_lines else summary) or "(no summary)"
+                        _send_voice_note(
+                            api=api,
+                            cfg=cfg,
+                            chat_id=int(task.chat_id),
+                            reply_to_message_id=int(task.reply_to_message_id or 0),
+                            tts=tts_client,
+                            speak_text=str(speak_text),
+                            caption_text=msg,
+                        )
+                        sent_voice = True
+                    except Exception:
+                        sent_voice = False
+                        LOG.exception("Failed to send orchestrator voice reply. job=%s", task.job_id)
 
             if (not sent_voice) and (not artifacts_only):
                 _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
@@ -9167,7 +9235,7 @@ def _send_orchestrator_result(
         if (not notify) and (not artifacts_only):
             return
 
-        for raw in artifacts[:3]:
+        for raw in artifacts[:4]:
             p = Path(str(raw))
             try:
                 if not p.exists() or p.is_dir():
@@ -9178,7 +9246,7 @@ def _send_orchestrator_result(
                 continue
 
             ext = p.suffix.lower()
-            is_img = ext in (".png", ".jpg", ".jpeg", ".webp")
+            is_img = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
             if is_img:
                 try:
                     api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
