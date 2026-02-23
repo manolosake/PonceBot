@@ -3021,11 +3021,13 @@ def _help_text(cfg: BotConfig) -> str:
         "- /watch              Live company status (single message, auto-updated)",
         "- /unwatch            Disable /watch",
         "- /orders             List CEO orders (autopilot scope)",
-        "- /order show|pause|done <id>   Manage an order",
+        "- /order show|pause|done|merge|rollback <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
         "- /brief              Executive brief (short digest)",
         "- /approve <id>       Approve a blocked task",
+        "- /approve_merge <id> Approve and execute merge to main for an order",
+        "- /rollback <id>      Revert latest merged commit associated to an order",
         "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
@@ -3117,7 +3119,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
             ("logout", "Logout"),
         ]
     cmds += [
-        ("order", "Show/pause/done order"),
+        ("order", "Show/pause/done/merge/rollback order"),
         ("job", "Show job status"),
         ("ticket", "Show ticket tree"),
         ("inbox", "Inbox by role"),
@@ -3129,6 +3131,8 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("brief", "Executive brief"),
         ("snapshot", "Request UI snapshot"),
         ("approve", "Approve blocked job"),
+        ("approve_merge", "Approve order merge to main"),
+        ("rollback", "Rollback latest merged order commit"),
         ("pause", "Pause role"),
         ("resume", "Resume role"),
         ("new", "New Codex thread"),
@@ -3968,15 +3972,15 @@ def _merge_order_branch_to_main(
     repo: Path,
     order_branch: str,
     order_id: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     b = str(order_branch or "").strip()
     if not b:
-        return True, "no_branch"
+        return True, "no_branch", None
 
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
     if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
         # If branch no longer exists remotely, treat as already integrated/closed.
-        return True, "branch_missing_remote"
+        return True, "branch_missing_remote", None
 
     merge_root = (repo / "data" / "merge_worktrees").resolve()
     merge_root.mkdir(parents=True, exist_ok=True)
@@ -3986,21 +3990,67 @@ def _merge_order_branch_to_main(
     try:
         add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
         if add.returncode != 0:
-            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed"
+            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
 
         mg = _run_git(merge_dir, ["merge", "--no-ff", "--no-edit", f"origin/{b}"], check=False)
         if mg.returncode != 0:
             _run_git(merge_dir, ["merge", "--abort"], check=False)
-            return False, (mg.stderr or mg.stdout or "").strip() or "merge_failed"
+            return False, (mg.stderr or mg.stdout or "").strip() or "merge_failed", None
+
+        rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+        merge_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
 
         ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
         if ps.returncode != 0:
-            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed"
+            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
 
         # Hygiene: one branch per project/order, remove after successful merge.
         _run_git(repo, ["push", "origin", "--delete", b], check=False)
         _run_git(repo, ["branch", "-D", b], check=False)
-        return True, "merged_to_main"
+        return True, "merged_to_main", (merge_commit or None)
+    finally:
+        try:
+            _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+            _run_git(repo, ["worktree", "prune"], check=False)
+            _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+        except Exception:
+            pass
+
+
+def _rollback_order_merge_on_main(
+    *,
+    repo: Path,
+    order_id: str,
+    merge_commit: str,
+) -> tuple[bool, str, str | None]:
+    mc = str(merge_commit or "").strip()
+    if not mc:
+        return False, "missing_merge_commit", None
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    merge_root.mkdir(parents=True, exist_ok=True)
+    merge_dir = (merge_root / f"rollback-{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
+    tmp_branch = f"poncebot/rollback/{str(order_id or 'order')[:8]}-{int(time.time())}"
+
+    try:
+        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
+        if add.returncode != 0:
+            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+
+        rv = _run_git(merge_dir, ["revert", "--no-edit", mc], check=False)
+        if rv.returncode != 0:
+            _run_git(merge_dir, ["revert", "--abort"], check=False)
+            return False, (rv.stderr or rv.stdout or "").strip() or "revert_failed", None
+
+        rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+        rollback_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+
+        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
+        if ps.returncode != 0:
+            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
+        return True, "rollback_pushed", (rollback_commit or None)
     finally:
         try:
             _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
@@ -4860,10 +4910,64 @@ def _send_orchestrator_marker_response(
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
+        cmd = ((payload or "").strip().split()[:1] or [""])[0].strip().lower()
+        if cmd in ("merge", "rollback", "revert") and (not _can_manage_orchestrator(cfg, chat_id=chat_id)):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para merge/rollback.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
         _send_chunked_text(
             api,
             chat_id=chat_id,
-            text=_order_command_text(orch_q, chat_id=chat_id, payload=payload),
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=payload, user_id=user_id),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
+    if kind == "approve_merge":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para merge.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        oid = str(payload or "").strip()
+        if not oid:
+            api.send_message(chat_id, "Uso: /approve_merge <order_id>", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=f"merge {oid}", user_id=user_id),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
+    if kind == "rollback_merge":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para rollback.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        oid = str(payload or "").strip()
+        if not oid:
+            api.send_message(chat_id, "Uso: /rollback <order_id>", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=f"rollback {oid}", user_id=user_id),
             reply_to_message_id=reply_to_message_id,
         )
         return True
@@ -5389,32 +5493,65 @@ def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
         title = str(it.get("title") or "").strip().replace("\n", " ")
         if len(title) > 80:
             title = title[:80] + "..."
+        branch_short = ""
+        merge_flag = ""
+        try:
+            root = orch_q.get_job(oid)
+            tr = dict((root.trace or {}) if root else {})
+            br = str(tr.get("order_branch") or "").strip()
+            if br:
+                branch_short = br
+            if bool(tr.get("merge_ready", False)):
+                merge_flag = " merge=ready"
+            elif bool(tr.get("merged_to_main", False)):
+                merge_flag = " merge=done"
+        except Exception:
+            pass
         project_part = f" project={project_id[:8]}" if project_id else ""
-        lines.append(f"- {oid[:8]} status={status} phase={phase} intent={intent} priority={pr_s}{project_part} title={title}")
+        branch_part = f" branch={branch_short}" if branch_short else ""
+        lines.append(
+            f"- {oid[:8]} status={status} phase={phase} intent={intent} priority={pr_s}{project_part}{branch_part}{merge_flag} title={title}"
+        )
     lines.append("")
     lines.append("Usage:")
     lines.append("- /order show <id>")
     lines.append("- /order pause <id>")
     lines.append("- /order done <id>")
+    lines.append("- /order merge <id>  (or /approve_merge <id>)")
+    lines.append("- /order rollback <id>  (or /rollback <id>)")
     return "\n".join(lines)
 
 
-def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str) -> str:
+def _order_command_text(
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    *,
+    chat_id: int,
+    payload: str,
+    user_id: int | None = None,
+) -> str:
     parts = (payload or "").strip().split()
     if len(parts) < 2:
-        return "Usage: /order show|pause|done <id>"
+        return "Usage: /order show|pause|done|merge|rollback <id>"
     cmd = parts[0].strip().lower()
     oid = parts[1].strip()
     if cmd == "show":
         it = orch_q.get_order(oid, chat_id=int(chat_id))
         if not it:
             return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        root = orch_q.get_job(root_id) if root_id else None
+        trace = dict((root.trace or {}) if root else {})
         title = str(it.get("title") or "").strip()
         body = str(it.get("body") or "").strip()
         status = str(it.get("status") or "").strip()
         phase = str(it.get("phase") or "").strip() or "planning"
         intent = str(it.get("intent_type") or "").strip() or "order_project_new"
         project_id = str(it.get("project_id") or "").strip() or "n/a"
+        order_branch = str(trace.get("order_branch") or "").strip() or "n/a"
+        merge_ready = bool(trace.get("merge_ready", False))
+        merged_to_main = bool(trace.get("merged_to_main", False))
+        merge_commit = str(trace.get("merge_commit") or "").strip() or "n/a"
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -5430,6 +5567,10 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
                 f"intent_type: {intent}",
                 f"priority: {pr_s}",
                 f"project_id: {project_id}",
+                f"order_branch: {order_branch}",
+                f"merge_ready: {'yes' if merge_ready else 'no'}",
+                f"merged_to_main: {'yes' if merged_to_main else 'no'}",
+                f"merge_commit: {merge_commit}",
                 "",
                 "title:",
                 title,
@@ -5454,7 +5595,127 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
             except Exception:
                 pass
         return "OK." if ok else f"No such order: {oid}"
-    return "Usage: /order show|pause|done <id>"
+    if cmd in ("merge", "approve_merge"):
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        if not root_id:
+            return f"Invalid order id: {oid}"
+        root = orch_q.get_job(root_id)
+        trace = dict((root.trace or {}) if root else {})
+        order_branch = str(trace.get("order_branch") or "").strip()
+        if not order_branch:
+            return f"Order {root_id[:8]} has no branch metadata yet."
+        merged_ok, merged_msg, merge_commit = _merge_order_branch_to_main(
+            repo=cfg.codex_workdir,
+            order_branch=order_branch,
+            order_id=root_id,
+        )
+        if merged_ok:
+            try:
+                orch_q.update_trace(
+                    root_id,
+                    merge_ready=False,
+                    merge_approved=True,
+                    merge_approved_by=(int(user_id) if user_id is not None else None),
+                    merge_approved_at=time.time(),
+                    merged_to_main=True,
+                    merge_result=str(merged_msg),
+                    merge_commit=(merge_commit or None),
+                    merged_at=time.time(),
+                )
+            except Exception:
+                pass
+            try:
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="order.merged",
+                    actor="ceo",
+                    details={
+                        "order_id": root_id,
+                        "order_branch": order_branch,
+                        "merge_commit": (merge_commit or None),
+                        "result": str(merged_msg),
+                    },
+                )
+            except Exception:
+                pass
+            commit_part = f" commit={merge_commit}" if merge_commit else ""
+            return f"Order {root_id[:8]} merged to main.{commit_part}"
+        try:
+            orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(root_id, merge_ready=True, merge_error=str(merged_msg), merge_failed_at=time.time())
+        except Exception:
+            pass
+        try:
+            orch_q.append_audit_event(
+                event_type="order.merge_failed",
+                actor="ceo",
+                details={
+                    "order_id": root_id,
+                    "order_branch": order_branch,
+                    "error": str(merged_msg),
+                },
+            )
+        except Exception:
+            pass
+        return f"Merge failed for order {root_id[:8]}: {merged_msg}"
+
+    if cmd in ("rollback", "revert"):
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        if not root_id:
+            return f"Invalid order id: {oid}"
+        root = orch_q.get_job(root_id)
+        trace = dict((root.trace or {}) if root else {})
+        merge_commit = str(trace.get("merge_commit") or "").strip()
+        if not merge_commit:
+            return f"Order {root_id[:8]} has no merge commit to rollback."
+        ok_rb, rb_msg, rb_commit = _rollback_order_merge_on_main(
+            repo=cfg.codex_workdir,
+            order_id=root_id,
+            merge_commit=merge_commit,
+        )
+        if ok_rb:
+            try:
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    root_id,
+                    rollback_commit=(rb_commit or None),
+                    rollback_of_merge_commit=merge_commit,
+                    rollback_at=time.time(),
+                    merged_to_main=False,
+                    merge_ready=False,
+                )
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="order.rollback",
+                    actor="ceo",
+                    details={
+                        "order_id": root_id,
+                        "merge_commit": merge_commit,
+                        "rollback_commit": (rb_commit or None),
+                        "result": str(rb_msg),
+                    },
+                )
+            except Exception:
+                pass
+            rb_part = f" rollback_commit={rb_commit}" if rb_commit else ""
+            return f"Rollback pushed for order {root_id[:8]}.{rb_part}"
+        return f"Rollback failed for order {root_id[:8]}: {rb_msg}"
+
+    return "Usage: /order show|pause|done|merge|rollback <id>"
 
 
 def _autopilot_tick(
@@ -5735,6 +5996,10 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="paused")
         return
 
+    root_job = orch_q.get_job(rid)
+    root_trace = dict((root_job.trace or {}) if root_job else {})
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     if not children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
@@ -5758,15 +6023,29 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
         return
     if wrapup_done:
-        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
-        orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        if merged_to_main:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        else:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            try:
+                orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
+            except Exception:
+                pass
         return
 
     # If there are no active/blocked jobs, close only when all children reached terminal states.
     terminal_ok = all(s in ("done", "cancelled") for s in states)
     if terminal_ok:
-        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
-        orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        if merged_to_main:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        else:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            try:
+                orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
+            except Exception:
+                pass
         return
     orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
 
@@ -6301,6 +6580,10 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
     ]
     if order:
         lines.append(f"Order status: {str(order.get('status') or 'active')}")
+        order_phase = str(order.get("phase") or "").strip().lower() or "planning"
+        lines.append(f"Order phase: {order_phase}")
+        if order_phase == "ready_for_merge":
+            lines.append(f"Action: /approve_merge {root_id[:8]}")
     lines.append(f"Goal: {goal or '(empty)'}")
     lines.append(f"Progress: {progress}")
 
@@ -6439,18 +6722,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if not text:
         return "", None
 
-    # Friendly local handling for greetings: avoid creating a ticket card for
-    # tiny social messages.
-    if not text.startswith("/") and _is_greeting(text):
-        return "Jarvis: ¡Hola! Soy tu mano derecha ejecutiva. ¿En qué puedo ayudar?", None
-
-    # Ignore acks (ok/gracias/jaja) to avoid ticket/cost spam.
-    if not text.startswith("/") and _is_ack(text):
-        return "", None
-
-    # CEO control-plane: clear queue/backlog should be immediate and deterministic.
-    if not text.startswith("/") and _is_purge_queue_request(text):
-        return _orch_marker("purge_queue", "global"), None
+    # CEO-first policy: all non-slash conversation goes through Jarvis/Codex.
 
     if text in ("/start", "/help"):
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
@@ -6561,8 +6833,26 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text.startswith("/order "):
         payload = text[len("/order ") :].strip()
         if not payload:
-            return "Usage: /order show|pause|done <id>", None
+            return "Usage: /order show|pause|done|merge|rollback <id>", None
         return _orch_marker("order", payload), None
+
+    if text == "/approve_merge":
+        return "Uso: /approve_merge <order_id>", None
+
+    if text.startswith("/approve_merge "):
+        oid = _orch_job_id(text[len("/approve_merge ") :])
+        if not oid:
+            return "Uso: /approve_merge <order_id>", None
+        return _orch_marker("approve_merge", oid), None
+
+    if text == "/rollback":
+        return "Uso: /rollback <order_id>", None
+
+    if text.startswith("/rollback "):
+        oid = _orch_job_id(text[len("/rollback ") :])
+        if not oid:
+            return "Uso: /rollback <order_id>", None
+        return _orch_marker("rollback_merge", oid), None
 
     if text.startswith("/job "):
         raw = text[len("/job ") :].strip()
@@ -8738,6 +9028,23 @@ def _send_orchestrator_result(
     *,
     cfg: BotConfig,
 ) -> None:
+    def _normalize_jarvis_reply(text: str) -> str:
+        """
+        CEO UX rule: avoid "No puedo / I can't" phrasing.
+        Keep responses actionable and operation-focused.
+        """
+        s = str(text or "").strip()
+        if not s:
+            return s
+        # Spanish variants
+        s = re.sub(r"\bno puedo\b", "Para avanzar necesito", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno puedo ejecutar\b", "Para ejecutar necesito", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno tengo acceso\b", "Para continuar con precisión necesito validar acceso", s, flags=re.IGNORECASE)
+        # English variants
+        s = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bcannot\b", "can proceed when we confirm", s, flags=re.IGNORECASE)
+        return s
+
     try:
         if isinstance(result, dict):
             status = str(result.get("status", "error"))
@@ -8755,6 +9062,9 @@ def _send_orchestrator_result(
         labels = task.labels or {}
         kind = str(labels.get("kind") or "").strip().lower()
         mode = (cfg.orchestrator_notify_mode or "minimal").strip().lower()
+
+        if _coerce_orchestrator_role(task.role) == "jarvis":
+            summary = _normalize_jarvis_reply(summary)
 
         def _should_notify() -> bool:
             if mode == "verbose":
@@ -8962,6 +9272,10 @@ def orchestrator_worker_loop(
             summary = str(getattr(result, "summary", "") or "").strip()
             if len(summary) > 4000:
                 summary = summary[:4000] + "..."
+            if _coerce_orchestrator_role(task.role) == "jarvis":
+                summary = re.sub(r"\bno puedo\b", "Para avanzar necesito", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bcannot\b", "can proceed when we confirm", summary, flags=re.IGNORECASE)
             artifacts = list(getattr(result, "artifacts", []) or [])
             artifacts = [str(a) for a in artifacts if str(a).strip()][:20]
             next_action = getattr(result, "next_action", None)
@@ -9043,69 +9357,45 @@ def orchestrator_worker_loop(
                 )
             except Exception:
                 pass
-            # Git policy: one order/project branch from main, merged back to main when wrap-up is done.
+            # Git policy: one order/project branch from main.
+            # Merge to main requires explicit CEO approval via Telegram command (/approve_merge or /order merge).
             try:
                 labels_now = task.labels or {}
                 task_kind = str(labels_now.get("kind") or "").strip().lower()
                 if orch_state == "done" and task_kind == "wrapup":
                     root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
                     live_order_branch = _resolve_order_branch_from_task(task, orch_q)
-                    merged_ok, merged_msg = _merge_order_branch_to_main(
-                        repo=cfg.codex_workdir,
-                        order_branch=live_order_branch,
-                        order_id=root_ticket,
-                    )
-                    if merged_ok:
-                        try:
-                            orch_q.update_trace(
-                                root_ticket,
-                                merged_to_main=True,
-                                order_branch=(live_order_branch or None),
-                                merge_result=str(merged_msg),
-                                merged_at=time.time(),
-                            )
-                        except Exception:
-                            pass
+                    root_job = orch_q.get_job(root_ticket)
+                    root_trace = dict((root_job.trace or {}) if root_job else {})
+                    announced = bool(root_trace.get("merge_ready_announced", False))
+                    try:
+                        orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="active")
+                        orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="ready_for_merge")
+                        orch_q.update_trace(
+                            root_ticket,
+                            merge_ready=True,
+                            merge_ready_at=time.time(),
+                            merge_ready_announced=True,
+                            order_branch=(live_order_branch or None),
+                            merged_to_main=False,
+                        )
+                    except Exception:
+                        pass
+                    if not announced:
                         try:
                             orch_q.append_audit_event(
-                                event_type="order.merged",
+                                event_type="order.ready_for_merge",
                                 actor="jarvis",
                                 details={
                                     "order_id": root_ticket,
                                     "order_branch": (live_order_branch or None),
-                                    "result": str(merged_msg),
-                                },
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            _sync_order_phase_from_runtime(
-                                orch_q=orch_q,
-                                root_ticket=root_ticket,
-                                chat_id=int(task.chat_id),
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="active")
-                            orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="review")
-                        except Exception:
-                            pass
-                        try:
-                            orch_q.append_audit_event(
-                                event_type="order.merge_failed",
-                                actor="jarvis",
-                                details={
-                                    "order_id": root_ticket,
-                                    "order_branch": (live_order_branch or None),
-                                    "error": str(merged_msg),
+                                    "next_action": f"/approve_merge {root_ticket[:8]}",
                                 },
                             )
                         except Exception:
                             pass
             except Exception:
-                LOG.exception("Failed to merge order branch after wrap-up. job=%s", task.job_id)
+                LOG.exception("Failed to prepare merge-ready state after wrap-up. job=%s", task.job_id)
             # Update ticket card after the state transition so it reflects latest progress/result.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -10843,20 +11133,8 @@ def poll_loop(
                     )
                     continue
 
-                # Deterministic CEO queries (no Codex, no delegation).
-                # This runs after authorization/auth checks, so we don't leak info to unauthorized chats.
-                try:
-                    if _maybe_handle_ceo_query(
-                        api=api,
-                        cfg=cfg,
-                        msg=incoming,
-                        orchestrator_profiles=orchestrator_profiles,
-                        orchestrator_queue=orchestrator_queue,
-                    ):
-                        continue
-                except Exception:
-                    # Best-effort only; fall back to normal routing.
-                    pass
+                # CEO-first policy: route all non-slash conversation through Jarvis/Codex.
+                # Keep deterministic shortcuts disabled so Telegram is the single operating surface.
 
                 if incoming_text.strip().startswith("/say "):
                     to_say = incoming_text.strip()[5:].strip()
@@ -11109,6 +11387,8 @@ def poll_loop(
                         "/brief",
                         "/snapshot",
                         "/approve",
+                        "/approve_merge",
+                        "/rollback",
                         "/emergency_stop",
                         "/emergency_resume",
                         "/pause",
@@ -11147,6 +11427,8 @@ def poll_loop(
                         "/snapshot ",
                         "/daily",
                         "/approve ",
+                        "/approve_merge ",
+                        "/rollback ",
                         "/pause ",
                         "/resume ",
                         "/cancel ",

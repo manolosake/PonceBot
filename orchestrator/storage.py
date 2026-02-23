@@ -1808,7 +1808,7 @@ class SQLiteTaskStorage:
 
     def set_order_phase(self, order_id: str, *, chat_id: int, phase: str) -> bool:
         ph = (phase or "").strip().lower()
-        if ph not in ("planning", "delegated", "executing", "review", "done", "paused"):
+        if ph not in ("planning", "delegated", "executing", "review", "ready_for_merge", "done", "paused"):
             return False
         with self._lock:
             with self._conn() as conn:

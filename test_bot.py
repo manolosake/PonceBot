@@ -126,22 +126,26 @@ class TestParseJob(unittest.TestCase):
             self.assertEqual(resp, "__cancel__")
             self.assertIsNone(job)
 
-    def test_plain_greeting_is_direct_response(self) -> None:
+    def test_plain_greeting_routes_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Hola")
             resp, job = bot._parse_job(cfg, msg)
-            self.assertIn("Jarvis:", resp)
-            self.assertIsNone(job)
+            self.assertEqual(resp, "")
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job.argv, ["exec", "Hola"])
 
 
-    def test_ack_is_silent(self) -> None:
+    def test_ack_routes_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Ok")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "")
-            self.assertIsNone(job)
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job.argv, ["exec", "Ok"])
 
     def test_dashboard_all_returns_marker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -149,6 +153,22 @@ class TestParseJob(unittest.TestCase):
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/dashboard all")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "__orch_dashboard:all")
+            self.assertIsNone(job)
+
+    def test_approve_merge_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/approve_merge abc12345")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_approve_merge:abc12345")
+            self.assertIsNone(job)
+
+    def test_rollback_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/rollback abc12345")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_rollback_merge:abc12345")
             self.assertIsNone(job)
 
     def test_orch_marker_no_payload_is_parsed(self) -> None:

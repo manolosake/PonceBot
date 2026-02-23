@@ -99,8 +99,11 @@ class TestOrchestratorCommands(unittest.TestCase):
             self.assertEqual(resp_purge, "__orch_purge_queue:global")
 
             msg_purge_nl = bot.IncomingMessage(6, 1, 2, 15, "u", "Vamos a limpiar la cola, que no haya tareas.")
-            resp_purge_nl, _ = bot._parse_job(cfg, msg_purge_nl)
-            self.assertEqual(resp_purge_nl, "__orch_purge_queue:global")
+            resp_purge_nl, job_purge_nl = bot._parse_job(cfg, msg_purge_nl)
+            self.assertEqual(resp_purge_nl, "")
+            self.assertIsNotNone(job_purge_nl)
+            assert job_purge_nl is not None
+            self.assertEqual(job_purge_nl.argv, ["exec", "Vamos a limpiar la cola, que no haya tareas."])
 
             msg_job_list = bot.IncomingMessage(7, 1, 2, 16, "u", "/job")
             resp_job_list, _ = bot._parse_job(cfg, msg_job_list)
@@ -614,7 +617,7 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertEqual(recovered, 0)
             self.assertIsNone(q.get_workspace_lease(job_id="deadbeef"))
 
-    def test_sync_order_phase_marks_done_when_wrapup_done(self) -> None:
+    def test_sync_order_phase_marks_ready_for_merge_when_wrapup_done(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
             q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -671,8 +674,89 @@ class TestOrchestratorStorage(unittest.TestCase):
             bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
             got = q.get_order(order_id, chat_id=1)
             assert got is not None
+            self.assertEqual(str(got.get("phase")), "ready_for_merge")
+            self.assertEqual(str(got.get("status")), "active")
+
+    def test_sync_order_phase_marks_done_when_wrapup_done_and_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-merged-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Merged order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"merged_to_main": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="wrap",
+                    request_type="review",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "wrapup"},
+                    state="done",
+                    job_id="job-wrapup",
+                )
+            )
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
             self.assertEqual(str(got.get("phase")), "done")
             self.assertEqual(str(got.get("status")), "done")
+
+    def test_set_order_phase_accepts_ready_for_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-rfm-001"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            ok = q.set_order_phase(order_id, chat_id=1, phase="ready_for_merge")
+            self.assertTrue(ok)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "ready_for_merge")
 
 
 class TestOrderBranchPolicy(unittest.TestCase):
