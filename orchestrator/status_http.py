@@ -46,16 +46,14 @@ def _parse_since_ts(qs: dict[str, list[str]]) -> float | None:
         return None
 
 
-def _extract_bearer_token(handler: BaseHTTPRequestHandler, qs: dict[str, list[str]]) -> str:
-    # Prefer Authorization header: "Bearer <token>"
+def _extract_bearer_token(handler: BaseHTTPRequestHandler) -> str:
+    # Authorization header only: "Bearer <token>"
     auth = handler.headers.get("Authorization") or ""
     if isinstance(auth, str):
         a = auth.strip()
         if a.lower().startswith("bearer "):
             return a.split(None, 1)[1].strip()
-    # Fallback: query param for constrained clients.
-    raw = (qs.get("token") or [""])[0]
-    return str(raw or "").strip()
+    return ""
 
 
 class _TokenBucket:
@@ -88,6 +86,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         svc: StatusService,
         stream_interval_s: float,
         auth_token: str,
+        allowed_origins: list[str] | None,
         snapshot_rate_per_s: float,
         snapshot_burst: float,
         max_sse_per_ip: int,
@@ -96,6 +95,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.status_service = svc
         self.stream_interval_s = max(0.25, float(stream_interval_s))
         self.auth_token = (auth_token or "").strip()
+        self.allowed_origins = tuple(sorted({str(o).strip() for o in (allowed_origins or []) if str(o).strip()}))
 
         self._rl_lock = threading.Lock()
         self._snap_buckets: dict[str, _TokenBucket] = {}
@@ -143,13 +143,34 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         # Keep server quiet by default; integrate with app logging if needed.
         return
 
-    def _send_json(self, code: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None) -> None:
+    def _resolve_cors(self) -> tuple[bool, dict[str, str]]:
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True, {}
+        allowed = tuple(self.server.allowed_origins or ())
+        if origin in allowed:
+            return True, {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+        return False, {}
+
+    def _send_json(
+        self,
+        code: int,
+        payload: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+        cors_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-ED-API-Version", _API_VERSION)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        use_cors = cors_headers
+        if use_cors is None:
+            use_cors = getattr(self, "_cors_headers", {})
+        if use_cors:
+            for k, v in use_cors.items():
+                self.send_header(str(k), str(v))
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(str(k), str(v))
@@ -158,8 +179,13 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:  # pragma: no cover
+        ok, cors_headers = self._resolve_cors()
+        if not ok:
+            self._send_json(403, {"error": "cors_origin_denied"}, cors_headers={})
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in cors_headers.items():
+            self.send_header(str(k), str(v))
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("X-ED-API-Version", _API_VERSION)
@@ -171,10 +197,16 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query or "")
         chat_id = _parse_chat_id(qs)
         ip = str(getattr(self, "client_address", ("unknown", 0))[0] or "unknown")
+        self._cors_headers = {}
+        cors_ok, cors_headers = self._resolve_cors()
+        self._cors_headers = cors_headers
+        if not cors_ok:
+            self._send_json(403, {"error": "cors_origin_denied"}, cors_headers={})
+            return
 
-        # Lightweight token auth (optional, but recommended for Tailscale/mobile).
+        # Token auth is mandatory when configured (Bearer header only).
         if self.server.auth_token:
-            tok = _extract_bearer_token(self, qs)
+            tok = _extract_bearer_token(self)
             if not tok or tok != self.server.auth_token:
                 self._send_json(401, {"error": "unauthorized"})
                 return
@@ -370,7 +402,8 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-ED-API-Version", _API_VERSION)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            for k, v in cors_headers.items():
+                self.send_header(str(k), str(v))
             self.end_headers()
 
             last_hash = ""
@@ -437,6 +470,7 @@ def start_status_http_server(
     status_service: StatusService,
     stream_interval_s: float = 1.0,
     auth_token: str = "",
+    allowed_origins: list[str] | None = None,
     snapshot_rate_per_s: float = 2.0,
     snapshot_burst: float = 4.0,
     max_sse_per_ip: int = 2,
@@ -447,6 +481,7 @@ def start_status_http_server(
         svc=status_service,
         stream_interval_s=stream_interval_s,
         auth_token=auth_token,
+        allowed_origins=allowed_origins,
         snapshot_rate_per_s=snapshot_rate_per_s,
         snapshot_burst=snapshot_burst,
         max_sse_per_ip=max_sse_per_ip,

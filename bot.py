@@ -38,7 +38,9 @@ import dataclasses
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from state_store import StateStore
 
 from orchestrator.agents import load_agent_profiles
 from orchestrator.dispatcher import detect_ceo_intent, detect_request_type, to_task
@@ -68,6 +70,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 LOG = logging.getLogger("codexbot")
+
+_STATE_STORES_LOCK = threading.Lock()
+_STATE_STORES_BY_PATH: dict[str, StateStore] = {}
 
 
 TELEGRAM_MSG_LIMIT = 4096
@@ -479,17 +484,177 @@ def _state_access_mode(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     return v if v in ("default", "full") else ""
 
 
+def _get_breakglass_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    raw = st.get("breakglass")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _append_security_audit_event(cfg: "BotConfig", *, event: str, details: dict[str, Any]) -> None:
+    row = {
+        "at": float(time.time()),
+        "event": str(event or "").strip() or "unknown",
+        "details": details if isinstance(details, dict) else {},
+    }
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("security_audit")
+        items = list(raw) if isinstance(raw, list) else []
+        items.append(row)
+        if len(items) > 80:
+            items = items[-80:]
+        st["security_audit"] = items
+
+    _update_state(cfg, _m)
+
+
+def _breakglass_is_active(cfg: "BotConfig", *, now_ts: float | None = None) -> tuple[bool, dict[str, Any]]:
+    raw = _get_breakglass_state(cfg)
+    now = float(now_ts if now_ts is not None else time.time())
+    exp_raw = raw.get("expires_at")
+    try:
+        exp = float(exp_raw)
+    except Exception:
+        exp = 0.0
+    reason = str(raw.get("reason") or "").strip()
+    active = bool(reason) and exp > now
+    return active, raw
+
+
+def _activate_breakglass(
+    cfg: "BotConfig",
+    *,
+    reason: str,
+    ttl_seconds: int,
+    chat_id: int,
+    user_id: int | None,
+    source: str,
+) -> float:
+    now = float(time.time())
+    ttl = int(ttl_seconds)
+    if ttl < 60:
+        ttl = 60
+    if ttl > 4 * 60 * 60:
+        ttl = 4 * 60 * 60
+    exp = now + float(ttl)
+    safe_reason = str(reason or "").strip()
+
+    def _m(st: dict[str, Any]) -> None:
+        st["breakglass"] = {
+            "enabled": True,
+            "enabled_at": now,
+            "expires_at": exp,
+            "reason": safe_reason,
+            "source": str(source or "telegram").strip() or "telegram",
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+        }
+
+    _update_state(cfg, _m)
+    _append_security_audit_event(
+        cfg,
+        event="breakglass.enabled",
+        details={
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "source": str(source or "telegram").strip() or "telegram",
+            "ttl_seconds": int(ttl),
+            "reason": safe_reason,
+        },
+    )
+    LOG.warning(
+        "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
+        str(source or "telegram").strip() or "telegram",
+        int(chat_id),
+        int(user_id) if user_id is not None else "",
+        int(ttl),
+        safe_reason,
+    )
+    return exp
+
+
+def _deactivate_breakglass(
+    cfg: "BotConfig",
+    *,
+    reason: str,
+    chat_id: int,
+    user_id: int | None,
+    source: str,
+) -> None:
+    old = _get_breakglass_state(cfg)
+
+    def _m(st: dict[str, Any]) -> None:
+        st.pop("breakglass", None)
+
+    _update_state(cfg, _m)
+    _append_security_audit_event(
+        cfg,
+        event="breakglass.disabled",
+        details={
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "source": str(source or "telegram").strip() or "telegram",
+            "reason": str(reason or "manual_off").strip() or "manual_off",
+            "previous": old,
+        },
+    )
+    LOG.warning(
+        "BREAKGLASS DISABLED source=%s chat_id=%s user_id=%s reason=%s",
+        str(source or "telegram").strip() or "telegram",
+        int(chat_id),
+        int(user_id) if user_id is not None else "",
+        str(reason or "manual_off").strip() or "manual_off",
+    )
+
+
 def _effective_bypass_sandbox(cfg: "BotConfig", *, chat_id: int | None = None) -> bool:
     """
     True means we pass `--dangerously-bypass-approvals-and-sandbox`.
-    State override (if set) wins over env config.
+    Breakglass must be active for this mode.
     """
     mode = _state_access_mode(cfg, chat_id=chat_id)
     if mode == "default":
         return False
-    if mode == "full":
-        return True
-    return bool(cfg.codex_dangerous_bypass_sandbox)
+    wants_dangerous = (mode == "full") or bool(cfg.codex_dangerous_bypass_sandbox)
+    if not wants_dangerous:
+        return False
+    active, _ = _breakglass_is_active(cfg)
+    return bool(active)
+
+
+def _parse_allowed_origins_env(raw: str) -> list[str]:
+    out: list[str] = []
+    for item in (raw or "").split(","):
+        v = item.strip()
+        if not v:
+            continue
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _security_startup_findings(cfg: "BotConfig") -> list[str]:
+    issues: list[str] = []
+    http_enabled = os.environ.get("BOT_STATUS_HTTP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    http_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
+    allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
+
+    if http_enabled and not http_token:
+        issues.append("BOT_STATUS_HTTP_ENABLED=1 but BOT_STATUS_HTTP_TOKEN is empty (API will be blocked).")
+    if http_enabled and "*" in allowed_origins:
+        issues.append("BOT_STATUS_HTTP_ALLOWED_ORIGINS contains '*' (insecure CORS).")
+
+    if cfg.codex_dangerous_bypass_sandbox:
+        active, bg = _breakglass_is_active(cfg)
+        if not active:
+            issues.append("Dangerous bypass requested but breakglass is inactive; bypass remains OFF.")
+        elif not str((bg or {}).get("reason") or "").strip():
+            issues.append("Breakglass is active without reason metadata.")
+
+    if not (cfg.admin_chat_ids or cfg.admin_user_ids):
+        issues.append("BOT_ADMIN_* allowlists are empty; breakglass command stays disabled until admin ids are configured.")
+
+    return issues
 
 
 def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None = None) -> None:
@@ -497,13 +662,15 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
     Persist access mode override to cfg.state_file.
     mode=None clears the override.
     """
-    st = _get_state(cfg)
-    if chat_id is None:
-        if mode is None:
-            st.pop("access_mode", None)
-        else:
-            st["access_mode"] = mode
-    else:
+
+    def _m(st: dict[str, Any]) -> None:
+        if chat_id is None:
+            if mode is None:
+                st.pop("access_mode", None)
+            else:
+                st["access_mode"] = mode
+            return
+
         by_chat = st.get("access_mode_by_chat")
         if not isinstance(by_chat, dict):
             by_chat = {}
@@ -513,24 +680,39 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
         else:
             by_chat[key] = mode
         st["access_mode_by_chat"] = by_chat
-    _atomic_write_json(cfg.state_file, st)
+
+    _update_state(cfg, _m)
 
 
 def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
     bypass = _effective_bypass_sandbox(cfg, chat_id=chat_id)
+    bg_active, bg = _breakglass_is_active(cfg)
     default_line = "- Default (current)" if not bypass else "- Default"
     full_line = "- Full access (current)" if bypass else "- Full access"
+    bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
+    bg_exp = (bg or {}).get("expires_at")
+    try:
+        rem_s = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
+    except Exception:
+        rem_s = 0
+    bg_status = f"active ({rem_s}s left)" if bg_active else "inactive"
     return "\n".join(
         [
             "Dos opciones:",
             default_line,
             full_line,
             "",
+            "Breakglass (dangerous bypass):",
+            f"- status: {bg_status}",
+            f"- reason: {bg_reason}",
+            "",
             "Uso:",
             "- /permissions default",
             "- /permissions full",
             "- /permissions clear",
+            "- /breakglass on <minutes> <reason>   (admin only)",
+            "- /breakglass off                     (admin only)",
         ]
     )
 
@@ -798,6 +980,10 @@ class BotConfig:
     # If empty, the bot falls back to profile-based permissions (when BOT_AUTH_ENABLED=1).
     admin_user_ids: frozenset[int] = frozenset()
     admin_chat_ids: frozenset[int] = frozenset()
+    # Breakglass guardrails for dangerous bypass mode.
+    # Startup env requires a reason when CODEX_DANGEROUS_BYPASS_SANDBOX=1.
+    breakglass_ttl_seconds: int = 900
+    breakglass_start_reason: str = ""
     # Voice-out (reply as Telegram voice note).
     voice_out_enabled: bool = False
     # TTS backend: "none" | "piper" | "edge" | "openai" | "tone"
@@ -1668,41 +1854,34 @@ class WhisperCppTranscriber:
                 pass
 
 
+def _state_store_for_path(path: Path) -> StateStore:
+    key = str(Path(path).expanduser().resolve())
+    with _STATE_STORES_LOCK:
+        store = _STATE_STORES_BY_PATH.get(key)
+        if store is None:
+            store = StateStore(Path(key))
+            _STATE_STORES_BY_PATH[key] = store
+        return store
+
+
+def _state_store(cfg: "BotConfig") -> StateStore:
+    return _state_store_for_path(cfg.state_file)
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Use a unique temp file in the same directory to keep replace() atomic and
-    # to avoid collisions if multiple processes write state concurrently.
-    tmp_f = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(path.parent),
-        delete=False,
-    )
-    try:
-        tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
-        tmp_f.flush()
-    finally:
-        tmp_f.close()
-    Path(tmp_f.name).replace(path)
+    _state_store_for_path(path).replace(data)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        LOG.exception("Failed to read json: %s", path)
-    return {}
+    return _state_store_for_path(path).read()
+
+
+def _update_state(cfg: "BotConfig", mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    return _state_store(cfg).update(mutator)
 
 
 def _get_state(cfg: "BotConfig") -> dict[str, Any]:
-    return _read_json(cfg.state_file)
+    return _state_store(cfg).read()
 
 
 def _get_voice_state(cfg: "BotConfig") -> dict[str, Any]:
@@ -1712,15 +1891,19 @@ def _get_voice_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_voice_state(cfg: "BotConfig", voice_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["voice"] = voice_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = voice_state if isinstance(voice_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["voice"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _clear_voice_state(cfg: "BotConfig") -> None:
-    st = _get_state(cfg)
-    st.pop("voice", None)
-    _atomic_write_json(cfg.state_file, st)
+    def _m(st: dict[str, Any]) -> None:
+        st.pop("voice", None)
+
+    _update_state(cfg, _m)
 
 
 def _get_qa_state(cfg: "BotConfig") -> dict[str, Any]:
@@ -1730,9 +1913,12 @@ def _get_qa_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_qa_state(cfg: "BotConfig", qa_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["qa"] = qa_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = qa_state if isinstance(qa_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["qa"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _qa_chat_key(chat_id: int) -> str:
@@ -1880,9 +2066,12 @@ def _get_auth_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_auth_state(cfg: "BotConfig", auth_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["auth"] = auth_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = auth_state if isinstance(auth_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["auth"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _get_auth_sessions(cfg: "BotConfig") -> dict[str, Any]:
@@ -1892,9 +2081,16 @@ def _get_auth_sessions(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_auth_sessions(cfg: "BotConfig", sessions: dict[str, Any]) -> None:
-    auth = _get_auth_state(cfg)
-    auth["sessions"] = sessions
-    _set_auth_state(cfg, auth)
+    safe = sessions if isinstance(sessions, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        auth["sessions"] = safe
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _auth_now() -> float:
@@ -1925,34 +2121,62 @@ def _auth_is_session_active(cfg: "BotConfig", *, chat_id: int) -> tuple[bool, di
 
 
 def _auth_touch_session(cfg: "BotConfig", *, chat_id: int) -> None:
-    sessions = _get_auth_sessions(cfg)
     key = _session_key(chat_id)
-    s = sessions.get(key)
-    if not isinstance(s, dict):
-        return
     now = _auth_now()
     ttl = int(cfg.auth_session_ttl_seconds) if int(cfg.auth_session_ttl_seconds) > 0 else 0
     if ttl <= 0:
         return
-    s["last_active_at"] = now
-    s["expires_at"] = now + ttl
-    sessions[key] = s
-    _set_auth_sessions(cfg, sessions)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            return
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            return
+        cur = sessions.get(key)
+        if not isinstance(cur, dict):
+            return
+        cur["last_active_at"] = now
+        cur["expires_at"] = now + ttl
+        sessions[key] = cur
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _auth_logout(cfg: "BotConfig", *, chat_id: int) -> None:
-    sessions = _get_auth_sessions(cfg)
-    sessions.pop(_session_key(chat_id), None)
-    _set_auth_sessions(cfg, sessions)
+    key = _session_key(chat_id)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            return
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            return
+        sessions.pop(key, None)
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
+
 
 def _auth_clear_all_sessions(cfg: "BotConfig") -> None:
     """
     Clears all auth sessions from state.
     Use this if you want every bot restart to require /login again.
     """
-    auth = _get_auth_state(cfg)
-    auth["sessions"] = {}
-    _set_auth_state(cfg, auth)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        auth["sessions"] = {}
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:
@@ -2024,15 +2248,26 @@ def _auth_login(cfg: "BotConfig", *, chat_id: int, username: str, password: str)
 
     ttl = int(cfg.auth_session_ttl_seconds) if int(cfg.auth_session_ttl_seconds) > 0 else 0
     now = _auth_now()
-    sessions = _get_auth_sessions(cfg)
-    sessions[_session_key(chat_id)] = {
-        "username": u,
-        "profile": profile_s,
-        "logged_in_at": now,
-        "last_active_at": now,
-        "expires_at": (now + ttl) if ttl else 0.0,
-    }
-    _set_auth_sessions(cfg, sessions)
+    key = _session_key(chat_id)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        sessions[key] = {
+            "username": u,
+            "profile": profile_s,
+            "logged_in_at": now,
+            "last_active_at": now,
+            "expires_at": (now + ttl) if ttl else 0.0,
+        }
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
     return True, f"OK. Login: {u} (perfil={profile_s or 'default'})"
 
 
@@ -2158,25 +2393,29 @@ def _persist_thread_id(cfg: "BotConfig", *, chat_id: int, thread_id: str) -> Non
     tid = (thread_id or "").strip()
     if not tid:
         return
-    st = _get_state(cfg)
-    raw = st.get("threads")
-    threads: dict[str, Any] = raw if isinstance(raw, dict) else {}
-    threads[str(int(chat_id))] = tid
-    st["threads"] = threads
-    _atomic_write_json(cfg.state_file, st)
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("threads")
+        threads: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        threads[str(int(chat_id))] = tid
+        st["threads"] = threads
+
+    _update_state(cfg, _m)
 
 
 def _clear_persisted_thread_id(cfg: "BotConfig", *, chat_id: int) -> None:
-    st = _get_state(cfg)
-    raw = st.get("threads")
-    if not isinstance(raw, dict):
-        return
     key = str(int(chat_id))
-    if key not in raw:
-        return
-    raw.pop(key, None)
-    st["threads"] = raw
-    _atomic_write_json(cfg.state_file, st)
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("threads")
+        if not isinstance(raw, dict):
+            return
+        if key not in raw:
+            return
+        raw.pop(key, None)
+        st["threads"] = raw
+
+    _update_state(cfg, _m)
 
 
 def _get_model_overrides(cfg: "BotConfig", *, chat_id: int | None = None) -> tuple[str, str]:
@@ -3142,6 +3381,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("m", "Alias for /model"),
         ("voice", "Voice transcription"),
         ("v", "Alias for /voice"),
+        ("breakglass", "Temporary dangerous bypass (admin)"),
         ("permissions", "Codex permissions"),
         ("p", "Alias for /permissions"),
         ("skills", "Manage skills"),
@@ -4324,6 +4564,18 @@ def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
         return True
     return _profile_can_manage_bot(cfg, profile_name=profile)
 
+def _is_admin_actor(cfg: BotConfig, *, chat_id: int, user_id: int | None) -> bool:
+    if cfg.admin_chat_ids or cfg.admin_user_ids:
+        if cfg.admin_chat_ids and int(chat_id) in cfg.admin_chat_ids:
+            return True
+        if cfg.admin_user_ids and user_id is not None and int(user_id) in cfg.admin_user_ids:
+            return True
+        return False
+    if cfg.auth_enabled:
+        return _can_manage_orchestrator(cfg, chat_id=chat_id)
+    return False
+
+
 def _can_delete_jobs(cfg: BotConfig, *, chat_id: int, user_id: int | None) -> bool:
     """
     Destructive actions (delete) should be stricter than "manage orchestrator".
@@ -4913,9 +5165,14 @@ def _send_orchestrator_marker_response(
         key = str(int(chat_id))
 
         if mode in ("off", "0", "false", "stop", "disable", "disabled"):
-            watch_by_chat.pop(key, None)
-            st["watch_by_chat"] = watch_by_chat
-            _atomic_write_json(cfg.state_file, st)
+            def _m_disable(s: dict[str, Any]) -> None:
+                wb = s.get("watch_by_chat")
+                if not isinstance(wb, dict):
+                    wb = {}
+                wb.pop(key, None)
+                s["watch_by_chat"] = wb
+
+            _update_state(cfg, _m_disable)
             api.send_message(chat_id, "OK. Watch disabled.", reply_to_message_id=reply_to_message_id)
             return True
 
@@ -4923,9 +5180,14 @@ def _send_orchestrator_marker_response(
         msg_txt = _watch_status_text(orch_q)
         mid = api.send_message(chat_id, msg_txt, reply_to_message_id=reply_to_message_id)
         if mid is not None:
-            watch_by_chat[key] = int(mid)
-            st["watch_by_chat"] = watch_by_chat
-            _atomic_write_json(cfg.state_file, st)
+            def _m_enable(s: dict[str, Any]) -> None:
+                wb = s.get("watch_by_chat")
+                if not isinstance(wb, dict):
+                    wb = {}
+                wb[key] = int(mid)
+                s["watch_by_chat"] = wb
+
+            _update_state(cfg, _m_enable)
         return True
 
     if kind == "orders":
@@ -5499,8 +5761,10 @@ def _tick_watch_messages(*, cfg: BotConfig, api: TelegramAPI, orch_q: Orchestrat
             changed = True
 
     if changed:
-        st["watch_by_chat"] = watch_by_chat
-        _atomic_write_json(cfg.state_file, st)
+        def _m(st2: dict[str, Any]) -> None:
+            st2["watch_by_chat"] = watch_by_chat
+
+        _update_state(cfg, _m)
 
 
 def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
@@ -6245,6 +6509,53 @@ def _stalled_replan_tick(
     return created
 
 
+def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Periodic hygiene: close very old blocked/waiting jobs so queues don't accumulate dead entries forever.
+    """
+    try:
+        stale_after_s = max(1800.0, float(os.environ.get("BOT_HYGIENE_STALE_BLOCKED_SECONDS", "86400").strip() or "86400"))
+    except Exception:
+        stale_after_s = 86400.0
+    try:
+        max_jobs = max(1, int(os.environ.get("BOT_HYGIENE_MAX_CLEANUP_PER_TICK", "12").strip() or "12"))
+    except Exception:
+        max_jobs = 12
+
+    candidates = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=max_jobs * 4)
+    if not candidates:
+        return 0
+
+    cleaned = 0
+    for task in candidates:
+        st = str(task.state or "").strip().lower()
+        if st not in ("waiting_deps", "blocked_approval", "blocked"):
+            continue
+        if cleaned >= max_jobs:
+            break
+        try:
+            orch_q.update_state(
+                task.job_id,
+                "failed",
+                blocked_reason="stale_cleanup",
+                result_summary="Auto-closed by hygiene: stale blocked job.",
+                result_next_action="manual_requeue_if_needed",
+            )
+            orch_q.append_audit_event(
+                event_type="task.hygiene_closed",
+                actor="scheduler",
+                details={
+                    "job_id": task.job_id,
+                    "state": st,
+                    "stale_after_seconds": float(stale_after_s),
+                },
+            )
+            cleaned += 1
+        except Exception:
+            continue
+    return cleaned
+
+
 def _sla_overdue_tick(
     *,
     cfg: BotConfig,
@@ -6831,6 +7142,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             f"heartbeat_seconds: {eff_cfg.heartbeat_seconds}",
             f"send_as_file_threshold_chars: {eff_cfg.send_as_file_threshold_chars}",
         ]
+        issues = _security_startup_findings(eff_cfg)
+        if issues:
+            lines.append("")
+            lines.append("security:")
+            for it in issues[:8]:
+                lines.append(f"- {it}")
         return "\n".join(lines), None
 
     if text == "/agents":
@@ -7039,8 +7356,18 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
         eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
         bypass = _effective_bypass_sandbox(eff_cfg, chat_id=msg.chat_id)
+        bg_active, bg = _breakglass_is_active(eff_cfg)
+        bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
+        bg_exp = (bg or {}).get("expires_at")
+        try:
+            bg_left = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
+        except Exception:
+            bg_left = 0
         lines = [
             f"permissions: {'full' if bypass else 'default'}",
+            f"breakglass: {'ACTIVE' if bg_active else 'inactive'}",
+            f"breakglass_left_seconds: {bg_left}",
+            f"breakglass_reason: {bg_reason}",
             f"profile: {profile or '(none)'}",
             f"strict_proxy: {'ON' if eff_cfg.strict_proxy else 'off'}",
             f"unsafe_direct_codex: {'ON' if eff_cfg.unsafe_direct_codex else 'off'}",
@@ -7055,6 +7382,78 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             lines.append("codex: -a never (no approval prompts)")
             lines.append(f"codex sandbox default: {_threaded_sandbox_mode_label(eff_cfg)}")
         return "\n".join(lines), None
+
+    if text == "/breakglass":
+        active, raw = _breakglass_is_active(cfg)
+        reason = str(raw.get("reason") or "").strip() or "(none)"
+        source = str(raw.get("source") or "").strip() or "(none)"
+        exp = raw.get("expires_at")
+        try:
+            left_s = max(0, int(float(exp) - time.time())) if exp is not None else 0
+        except Exception:
+            left_s = 0
+        lines = [
+            f"status: {'ACTIVE' if active else 'inactive'}",
+            f"seconds_left: {left_s}",
+            f"reason: {reason}",
+            f"source: {source}",
+            "",
+            "Usage:",
+            "- /breakglass on <minutes> <reason>",
+            "- /breakglass off",
+        ]
+        if not _is_admin_actor(cfg, chat_id=msg.chat_id, user_id=msg.user_id):
+            lines.append("(read-only: admin required for changes)")
+        return "\n".join(lines), None
+
+    if text.startswith("/breakglass "):
+        if not _is_admin_actor(cfg, chat_id=msg.chat_id, user_id=msg.user_id):
+            return "No permitido: /breakglass requiere admin allowlist o perfil con manage bot.", None
+        arg = text[len("/breakglass ") :].strip()
+        if not arg:
+            return _parse_job(cfg, IncomingMessage(**{**msg.__dict__, "text": "/breakglass"}))
+
+        parts = arg.split()
+        sub = parts[0].strip().lower()
+        if sub in ("off", "disable", "0"):
+            _deactivate_breakglass(
+                cfg,
+                reason="manual_off",
+                chat_id=msg.chat_id,
+                user_id=msg.user_id,
+                source="telegram",
+            )
+            return "OK. breakglass disabled.", None
+
+        if sub in ("status", "show"):
+            return _parse_job(cfg, IncomingMessage(**{**msg.__dict__, "text": "/breakglass"}))
+
+        if sub == "on":
+            ttl_minutes = max(1, int(cfg.breakglass_ttl_seconds // 60) if int(cfg.breakglass_ttl_seconds) > 0 else 15)
+            reason = ""
+            if len(parts) >= 2 and parts[1].isdigit():
+                ttl_minutes = int(parts[1])
+                reason = " ".join(parts[2:]).strip()
+            else:
+                reason = " ".join(parts[1:]).strip()
+            if ttl_minutes < 1:
+                ttl_minutes = 1
+            if ttl_minutes > 240:
+                ttl_minutes = 240
+            if not reason:
+                return "Usage: /breakglass on <minutes> <reason>", None
+            exp = _activate_breakglass(
+                cfg,
+                reason=reason,
+                ttl_seconds=int(ttl_minutes * 60),
+                chat_id=msg.chat_id,
+                user_id=msg.user_id,
+                source="telegram",
+            )
+            left = max(0, int(exp - time.time()))
+            return f"OK. breakglass enabled for {left}s. reason={reason}", None
+
+        return "Usage: /breakglass on <minutes> <reason> | /breakglass off | /breakglass status", None
 
     if text == "/format":
         return _format_preview_text(), None
@@ -7239,33 +7638,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
         # /model clear
         if len(args) == 2 and args[1].lower() == "clear":
-            st = _get_state(cfg)
-            by_chat_models = st.get("model_overrides_by_chat")
-            if not isinstance(by_chat_models, dict):
-                by_chat_models = {}
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if cfg.codex_use_oss:
-                rec_m.pop("oss_model", None)
-                rec_e.pop("oss_effort", None)
-            else:
-                rec_m.pop("openai_model", None)
-                rec_e.pop("openai_effort", None)
-            if rec_m:
-                by_chat_models[key] = rec_m
-            else:
-                by_chat_models.pop(key, None)
-            if rec_e:
-                by_chat_efforts[key] = rec_e
-            else:
-                by_chat_efforts.pop(key, None)
-            st["model_overrides_by_chat"] = by_chat_models
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_models = st.get("model_overrides_by_chat")
+                if not isinstance(by_chat_models, dict):
+                    by_chat_models = {}
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if cfg.codex_use_oss:
+                    rec_m.pop("oss_model", None)
+                    rec_e.pop("oss_effort", None)
+                else:
+                    rec_m.pop("openai_model", None)
+                    rec_e.pop("openai_effort", None)
+                if rec_m:
+                    by_chat_models[key] = rec_m
+                else:
+                    by_chat_models.pop(key, None)
+                if rec_e:
+                    by_chat_efforts[key] = rec_e
+                else:
+                    by_chat_efforts.pop(key, None)
+                st["model_overrides_by_chat"] = by_chat_models
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             return "OK. Cleared model/effort override for current mode.", None
 
         # /model openai <name> OR /model oss <name>
@@ -7276,33 +7677,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             name, default_eff = _resolve_model_token(name_raw)
             if not name:
                 return "Usage: /model openai <name> [effort] OR /model oss <name> [effort]", None
-            st = _get_state(cfg)
-            by_chat_models = st.get("model_overrides_by_chat")
-            if not isinstance(by_chat_models, dict):
-                by_chat_models = {}
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if scope == "openai":
-                rec_m["openai_model"] = name
-                if eff:
-                    rec_e["openai_effort"] = eff
-                elif default_eff:
-                    rec_e["openai_effort"] = default_eff
-            else:
-                rec_m["oss_model"] = name
-                if eff:
-                    rec_e["oss_effort"] = eff
-                elif default_eff:
-                    rec_e["oss_effort"] = default_eff
-            by_chat_models[key] = rec_m
-            by_chat_efforts[key] = rec_e
-            st["model_overrides_by_chat"] = by_chat_models
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_models = st.get("model_overrides_by_chat")
+                if not isinstance(by_chat_models, dict):
+                    by_chat_models = {}
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if scope == "openai":
+                    rec_m["openai_model"] = name
+                    if eff:
+                        rec_e["openai_effort"] = eff
+                    elif default_eff:
+                        rec_e["openai_effort"] = default_eff
+                else:
+                    rec_m["oss_model"] = name
+                    if eff:
+                        rec_e["oss_effort"] = eff
+                    elif default_eff:
+                        rec_e["oss_effort"] = default_eff
+                by_chat_models[key] = rec_m
+                by_chat_efforts[key] = rec_e
+                st["model_overrides_by_chat"] = by_chat_models
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             eff_set = eff or default_eff
             if eff_set:
                 return f"OK. Set {scope} model to: {name} (effort={eff_set})", None
@@ -7314,33 +7717,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         name, default_eff = _resolve_model_token(name_raw)
         if not name:
             return "Usage: /model <name> [effort]", None
-        st = _get_state(cfg)
-        by_chat_models = st.get("model_overrides_by_chat")
-        if not isinstance(by_chat_models, dict):
-            by_chat_models = {}
-        by_chat_efforts = st.get("effort_overrides_by_chat")
-        if not isinstance(by_chat_efforts, dict):
-            by_chat_efforts = {}
         key = str(int(msg.chat_id))
-        rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-        rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-        if cfg.codex_use_oss:
-            rec_m["oss_model"] = name
-            if eff:
-                rec_e["oss_effort"] = eff
-            elif default_eff:
-                rec_e["oss_effort"] = default_eff
-        else:
-            rec_m["openai_model"] = name
-            if eff:
-                rec_e["openai_effort"] = eff
-            elif default_eff:
-                rec_e["openai_effort"] = default_eff
-        by_chat_models[key] = rec_m
-        by_chat_efforts[key] = rec_e
-        st["model_overrides_by_chat"] = by_chat_models
-        st["effort_overrides_by_chat"] = by_chat_efforts
-        _atomic_write_json(cfg.state_file, st)
+
+        def _m(st: dict[str, Any]) -> None:
+            by_chat_models = st.get("model_overrides_by_chat")
+            if not isinstance(by_chat_models, dict):
+                by_chat_models = {}
+            by_chat_efforts = st.get("effort_overrides_by_chat")
+            if not isinstance(by_chat_efforts, dict):
+                by_chat_efforts = {}
+            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+            if cfg.codex_use_oss:
+                rec_m["oss_model"] = name
+                if eff:
+                    rec_e["oss_effort"] = eff
+                elif default_eff:
+                    rec_e["oss_effort"] = default_eff
+            else:
+                rec_m["openai_model"] = name
+                if eff:
+                    rec_e["openai_effort"] = eff
+                elif default_eff:
+                    rec_e["openai_effort"] = default_eff
+            by_chat_models[key] = rec_m
+            by_chat_efforts[key] = rec_e
+            st["model_overrides_by_chat"] = by_chat_models
+            st["effort_overrides_by_chat"] = by_chat_efforts
+
+        _update_state(cfg, _m)
         eff_set = eff or default_eff
         if eff_set:
             return f"OK. Set model for current mode to: {name} (effort={eff_set})", None
@@ -7493,45 +7898,49 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         if not val:
             return "Usage: /effort low|medium|high|xhigh OR /effort clear", None
         if val == "clear":
-            st = _get_state(cfg)
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if cfg.codex_use_oss:
-                rec_e.pop("oss_effort", None)
-            else:
-                rec_e.pop("openai_effort", None)
-            if rec_e:
-                by_chat_efforts[key] = rec_e
-            else:
-                by_chat_efforts.pop(key, None)
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if cfg.codex_use_oss:
+                    rec_e.pop("oss_effort", None)
+                else:
+                    rec_e.pop("openai_effort", None)
+                if rec_e:
+                    by_chat_efforts[key] = rec_e
+                else:
+                    by_chat_efforts.pop(key, None)
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             return "OK. Cleared effort override for current mode.", None
         if val not in ("low", "medium", "high", "xhigh"):
             return "Invalid effort. Use: low, medium, high, xhigh.", None
-        st = _get_state(cfg)
-        by_chat_efforts = st.get("effort_overrides_by_chat")
-        if not isinstance(by_chat_efforts, dict):
-            by_chat_efforts = {}
         key = str(int(msg.chat_id))
-        rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-        if cfg.codex_use_oss:
-            rec_e["oss_effort"] = val
-        else:
-            rec_e["openai_effort"] = val
-        by_chat_efforts[key] = rec_e
-        st["effort_overrides_by_chat"] = by_chat_efforts
-        _atomic_write_json(cfg.state_file, st)
+
+        def _m(st: dict[str, Any]) -> None:
+            by_chat_efforts = st.get("effort_overrides_by_chat")
+            if not isinstance(by_chat_efforts, dict):
+                by_chat_efforts = {}
+            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+            if cfg.codex_use_oss:
+                rec_e["oss_effort"] = val
+            else:
+                rec_e["openai_effort"] = val
+            by_chat_efforts[key] = rec_e
+            st["effort_overrides_by_chat"] = by_chat_efforts
+
+        _update_state(cfg, _m)
         return f"OK. Set effort for current mode to: {val}", None
 
     if text == "/setnotify":
         # Preserve any existing state (e.g. model overrides).
-        st = _get_state(cfg)
-        st["notify_chat_id"] = msg.chat_id
-        _atomic_write_json(cfg.state_file, st)
+        def _m(st: dict[str, Any]) -> None:
+            st["notify_chat_id"] = int(msg.chat_id)
+        _update_state(cfg, _m)
         return f"OK. notify_chat_id={msg.chat_id}", None
 
     if text.startswith("/notify "):
@@ -9105,6 +9514,7 @@ def _send_orchestrator_result(
         labels = task.labels or {}
         kind = str(labels.get("kind") or "").strip().lower()
         mode = (cfg.orchestrator_notify_mode or "minimal").strip().lower()
+        runbook_id = str((task.trace or {}).get("runbook_id") or labels.get("runbook") or "").strip().lower()
 
         if _coerce_orchestrator_role(task.role) == "jarvis":
             summary = _normalize_jarvis_reply(summary)
@@ -9120,6 +9530,9 @@ def _send_orchestrator_result(
         def _should_notify() -> bool:
             if mode == "verbose":
                 return True
+            # Keep periodic runbook chatter internal. Jarvis can escalate to CEO when relevant.
+            if runbook_id:
+                return False
             if status != "ok":
                 return True
             if kind == "wrapup":
@@ -9204,7 +9617,8 @@ def _send_orchestrator_result(
                                 retry_initial_seconds=cfg.http_retry_initial_seconds,
                                 retry_max_seconds=cfg.http_retry_max_seconds,
                             )
-                        speak_text = (summary_lines[0] if summary_lines else summary) or "(no summary)"
+                        raw_speak_line = ((summary or "").splitlines() or [""])[0].strip()
+                        speak_text = raw_speak_line or (summary_lines[0] if summary_lines else summary) or "(no summary)"
                         _send_voice_note(
                             api=api,
                             cfg=cfg,
@@ -9383,7 +9797,9 @@ def orchestrator_worker_loop(
                 result_meta["blocked_reason"] = "requires_approval"
 
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
-            if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
+            retry_policy = str(next_action or "").strip().lower()
+            retry_allowed = retry_policy in ("retry", "retry_transient", "retry_controlled", "")
+            if orch_state == "failed" and retry_allowed and int(task.retry_count or 0) < int(task.max_retries or 0):
                 retry_n = int(task.retry_count or 0) + 1
                 base = 30.0
                 delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
@@ -9986,11 +10402,6 @@ def _transcribe_worker_loop(
                 orch_job_id = ""
                 LOG.exception("Failed to submit transcribed task to orchestrator")
             if did_submit:
-                api.send_message(
-                    chat_id,
-                    f"Transcrito y encolado: task={orch_job_id[:8]}",
-                    reply_to_message_id=message_id if message_id else None,
-                )
                 continue
 
         ok, reason, epoch, q_after = tracker.try_mark_enqueued(chat_id, max_queued_per_chat=cfg.max_queued_per_chat)
@@ -10032,14 +10443,28 @@ def _is_exec_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
+def _normalize_tts_speak_text(text: str, *, backend: str, voice: str = "") -> str:
     """
-    Light normalization to improve pronunciation for local TTS.
+    Light normalization to improve pronunciation while preserving mixed ES/EN readability.
     Keep it conservative: the caption is still sent as text, this only affects spoken audio.
     """
     t = (text or "").strip()
     if not t:
         return ""
+
+    # Do not read sender label aloud (e.g. "Jarvis: ...").
+    t = re.sub(
+        r"^\s*(jarvis|sre|backend|frontend|qa|product[ _]ops|security|research|release[ _]manager|autopilot|subtask|wrapup)\s*:\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    b = (backend or "").strip().lower()
+    v = (voice or "").strip().lower()
+    spanish_voice = v.startswith("es-")
+    # Spanish TTS engines benefit from a few pronunciation hints for English technical words.
+    use_spanish_pronunciation_hints = (b == "piper") or spanish_voice
 
     # Remove very long hex-like tokens (job ids, commit hashes) that sound bad.
     t = re.sub(r"\b[0-9a-f]{8,}\b", "", t, flags=re.IGNORECASE)
@@ -10057,8 +10482,7 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Bullets/headings/quotes at line start
     t = re.sub(r"(?m)^\s*([>#-]+|\*+)\s*", "", t)
 
-    # Common acronyms and terms. Keep this short to avoid "spelled out" / staccato speech.
-    # CEO preference: E2E is read in English ("end to end").
+    # Common acronyms and terms. Keep this short to avoid staccato speech.
     repl: list[tuple[str, str]] = [
         (r"\bE2E\b", "end to end"),
         (r"\bPR\b", "pull request"),
@@ -10075,29 +10499,27 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Remove stray symbols (keep it conservative; avoid changing normal words)
     t = re.sub(r"[{}\[\]()<>\u2022]+", " ", t)
 
-    # Common English product/engineering terms: make them easier for Spanish TTS
-    # without fully translating (keeps CEO preference of mixing ES + EN).
-    eng_terms: list[tuple[str, str]] = [
-        (r"\bbackend\b", "back end"),
-        (r"\bfrontend\b", "front end"),
-        # "dashboard" tends to get mangled by Spanish TTS ("dasvoard"). This spelling usually lands closer to "dashbord".
-        (r"\bdashboard\b", "dashbord"),
-        (r"\bdeploy\b", "de ploy"),
-        (r"\brelease\b", "re lease"),
-        (r"\brollback\b", "roll back"),
-        (r"\bhotfix\b", "hot fix"),
-    ]
-    for pat, rep in eng_terms:
-        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
-
-    # Piper (Spanish) tends to sound better without excessive punctuation.
-    if (backend or "").strip().lower() == "piper":
-        t = t.replace("_", " ").replace("|", " ")
+    if use_spanish_pronunciation_hints:
+        # Keep ES + EN mix understandable for Spanish voices.
+        eng_terms: list[tuple[str, str]] = [
+            (r"\bbackend\b", "back end"),
+            (r"\bfrontend\b", "front end"),
+            (r"\bdashboard\b", "dashbord"),
+            (r"\bdeploy\b", "de ploy"),
+            (r"\brelease\b", "re lease"),
+            (r"\brollback\b", "roll back"),
+            (r"\bhotfix\b", "hot fix"),
+            (r"\brebase\b", "rei beis"),
+            (r"\bmerge\b", "merch"),
+            (r"\bbranch\b", "branch"),
+            (r"\bcommit\b", "comit"),
+        ]
+        for pat, rep in eng_terms:
+            t = re.sub(pat, rep, t, flags=re.IGNORECASE)
 
     # Collapse whitespace
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
 
 def _piper_to_wav(
     *,
@@ -10310,7 +10732,8 @@ def _synthesize_voice_note_ogg(
         speak = speak[: cfg.tts_max_chars].rstrip() + "..."
 
     # Normalize for clearer pronunciation (especially acronyms like E2E, CI/CD, etc).
-    speak = _normalize_tts_speak_text(speak, backend=backend)
+    voice_hint = cfg.tts_edge_voice if backend == "edge" else (cfg.tts_openai_voice if backend == "openai" else "")
+    speak = _normalize_tts_speak_text(speak, backend=backend, voice=voice_hint)
     semis = float(getattr(cfg, "tts_voice_pitch_semitones", 0.0) or 0.0)
     if semis > 12.0:
         semis = 12.0
@@ -10925,7 +11348,7 @@ def poll_loop(
 
                             api.send_message(
                                 chat_id,
-                                "Recibido, transcribiendo y encolando...",
+                                "Recibido, escuchando",
                                 reply_to_message_id=message_id if message_id else None,
                             )
                             try:
@@ -11442,6 +11865,7 @@ def poll_loop(
                         "/skills",
                         "/model",
                         "/voice",
+                        "/breakglass",
                         "/effort",
                         "/setnotify",
                         "/agents",
@@ -12017,6 +12441,14 @@ def _load_config() -> BotConfig:
 
     codex_force_full_access = os.environ.get("CODEX_FORCE_FULL_ACCESS", "0").strip().lower() in ("1", "true", "yes", "on")
     codex_dangerous_bypass_sandbox = os.environ.get("CODEX_DANGEROUS_BYPASS_SANDBOX", "0").strip().lower() in ("1", "true", "yes", "on")
+    breakglass_start_reason = os.environ.get("BOT_BREAKGLASS_REASON", "").strip()
+    breakglass_ttl_seconds = int(os.environ.get("BOT_BREAKGLASS_TTL_SECONDS", "900"))
+    if breakglass_ttl_seconds < 60:
+        breakglass_ttl_seconds = 60
+    if breakglass_ttl_seconds > 4 * 60 * 60:
+        breakglass_ttl_seconds = 4 * 60 * 60
+    if codex_dangerous_bypass_sandbox and not breakglass_start_reason:
+        raise SystemExit("CODEX_DANGEROUS_BYPASS_SANDBOX=1 requires BOT_BREAKGLASS_REASON and short TTL.")
 
     return BotConfig(
         telegram_token=token,
@@ -12113,6 +12545,8 @@ def _load_config() -> BotConfig:
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
+        breakglass_ttl_seconds=breakglass_ttl_seconds,
+        breakglass_start_reason=breakglass_start_reason,
     )
 
 
@@ -12156,6 +12590,28 @@ def _configured_notify_chat_id(cfg: BotConfig) -> int | None:
         return None
 
 
+def _migrate_state_schema(cfg: BotConfig) -> None:
+    """Best-effort backward-compatible migration for mutable bot state."""
+    def _m(st: dict[str, Any]) -> None:
+        cur = st.get("schema_version")
+        try:
+            version = int(cur) if cur is not None else 1
+        except Exception:
+            version = 1
+        if version < 2:
+            # Ensure expected container types exist or are cleaned up safely.
+            for key in ("threads", "watch_by_chat", "access_mode_by_chat", "model_overrides_by_chat", "effort_overrides_by_chat"):
+                if key in st and not isinstance(st.get(key), dict):
+                    st.pop(key, None)
+            if "auth" in st and not isinstance(st.get("auth"), dict):
+                st["auth"] = {}
+            if "voice" in st and not isinstance(st.get("voice"), dict):
+                st["voice"] = {}
+            st["schema_version"] = 2
+
+    _update_state(cfg, _m)
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -12163,6 +12619,27 @@ def main() -> None:
     )
 
     cfg = _load_config()
+    try:
+        _migrate_state_schema(cfg)
+    except Exception:
+        LOG.exception("State migration failed; continuing with existing state")
+
+    if cfg.codex_dangerous_bypass_sandbox and cfg.breakglass_start_reason:
+        try:
+            _activate_breakglass(
+                cfg,
+                reason=cfg.breakglass_start_reason,
+                ttl_seconds=int(cfg.breakglass_ttl_seconds),
+                chat_id=0,
+                user_id=None,
+                source="startup_env",
+            )
+        except Exception:
+            LOG.exception("Failed to initialize startup breakglass")
+
+    for issue in _security_startup_findings(cfg):
+        LOG.warning("SECURITY CHECK: %s", issue)
+
     api = TelegramAPI(
         cfg.telegram_token,
         http_timeout_seconds=cfg.http_timeout_seconds,
@@ -12228,6 +12705,9 @@ def main() -> None:
             try:
                 svc = StatusService(orch_q=orchestrator_queue, role_profiles=orchestrator_profiles, cache_ttl_seconds=ttl_s)
                 auth_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
+                allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
+                if not auth_token:
+                    raise RuntimeError("BOT_STATUS_HTTP_TOKEN is required when BOT_STATUS_HTTP_ENABLED=1")
                 try:
                     snap_rps = float(os.environ.get("BOT_STATUS_HTTP_SNAPSHOT_RPS", "2.0"))
                 except Exception:
@@ -12246,6 +12726,7 @@ def main() -> None:
                     status_service=svc,
                     stream_interval_s=interval_s,
                     auth_token=auth_token,
+                    allowed_origins=allowed_origins,
                     snapshot_rate_per_s=snap_rps,
                     snapshot_burst=snap_burst,
                     max_sse_per_ip=max_sse,
@@ -12318,6 +12799,10 @@ def main() -> None:
                     )
                 except Exception:
                     LOG.exception("SLA overdue tick failed")
+                try:
+                    _cleanup_stale_blocked_jobs(orch_q=orchestrator_queue, now=time.time())
+                except Exception:
+                    LOG.exception("Hygiene stale cleanup tick failed")
 
                 if notify_chat_id is None:
                     return
