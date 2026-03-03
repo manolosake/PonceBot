@@ -1,0 +1,25 @@
+- main "Executive Dashboard Wormhole cinematic preview" [ref=e2]:
+  - generic [ref=e3]:
+    - article [ref=e4]:
+      - paragraph [ref=e5]: Executive Dashboard · Wormhole R4
+      - heading "El túnel hiperboloide mantiene profundidad cósmica legible para operar con menos ruido visual y mejor respuesta por breakpoint." [level=1] [ref=e6]
+      - paragraph [ref=e7]: Reducimos sobrecarga de render en desktop y tablet con composición CSS, malla luminosa optimizada y animaciones condicionadas por viewport, preservando el look cinematic y la lectura de estado.
+      - generic [ref=e8]:
+        - generic [ref=e9]: "Modo escena: cinematic_r4_optimized"
+        - generic [ref=e10]: "Neck hyperboloid: activo"
+        - generic [ref=e11]: "Parallax multicapa: activo"
+        - generic [ref=e12]: "Post FX pesado: reducido"
+    - complementary "estado operativo" [ref=e13]:
+      - generic [ref=e14]:
+        - generic [ref=e15]:
+          - generic [ref=e16]: Render contract
+          - generic [ref=e17]: PASS
+        - generic [ref=e18]:
+          - generic [ref=e19]: Desktop tuning
+          - generic [ref=e20]: Applied
+        - generic [ref=e21]:
+          - generic [ref=e22]: Tablet tuning
+          - generic [ref=e23]: Applied
+        - generic [ref=e24]:
+          - generic [ref=e25]: Legibilidad
+          - generic [ref=e26]: Alta
