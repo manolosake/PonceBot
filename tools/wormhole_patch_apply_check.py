@@ -45,26 +45,45 @@ def main() -> int:
         if p:
             declared.append(p)
 
-    proc = subprocess.run(
-        ['git', 'apply', '--check', '--reverse', str(patch_path)],
-        cwd=str(repo),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    payload = {
-        'status': 'PASS' if proc.returncode == 0 else 'FAIL',
-        'exit_code': int(proc.returncode),
-        'patch_path': str(patch_path),
-        'declared_files': declared,
-        'stdout': (proc.stdout or '').strip(),
-        'stderr': (proc.stderr or '').strip(),
-    }
+    patch_size = patch_path.stat().st_size if patch_path.exists() else 0
+    if patch_size == 0 and not declared:
+        payload = {
+            'status': 'NO_CHANGES',
+            'exit_code': 0,
+            'patch_path': str(patch_path),
+            'declared_files': declared,
+            'stdout': '',
+            'stderr': '',
+        }
+    elif patch_size == 0 and declared:
+        payload = {
+            'status': 'FAIL',
+            'exit_code': 2,
+            'patch_path': str(patch_path),
+            'declared_files': declared,
+            'stdout': '',
+            'stderr': 'changes.patch is empty while declared_files is non-empty',
+        }
+    else:
+        proc = subprocess.run(
+            ['git', 'apply', '--check', '--reverse', str(patch_path)],
+            cwd=str(repo),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        payload = {
+            'status': 'PASS' if proc.returncode == 0 else 'FAIL',
+            'exit_code': int(proc.returncode),
+            'patch_path': str(patch_path),
+            'declared_files': declared,
+            'stdout': (proc.stdout or '').strip(),
+            'stderr': (proc.stderr or '').strip(),
+        }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if proc.returncode == 0 else 2
+    return 0 if payload['status'] in {'PASS', 'NO_CHANGES'} else 2
 
 
 if __name__ == '__main__':
