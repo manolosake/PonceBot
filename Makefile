@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent validate-s02-sanity bundle-s02-atomic perf-harness-v3 preview-integrity-gate
+.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent validate-s02-sanity bundle-s02-atomic perf-harness-v3 preview-integrity-gate local-smoke-pack
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
@@ -47,3 +47,9 @@ preview-integrity-gate:
 	EXP_SHA=$${EXPECTED_PREVIEW_SHA:-}; \
 	MANIFEST=$${MANIFEST_PATH:-}; \
 	$(PYTHON) tools/preview_integrity_gate.py --workspace "$$WS" --out "$$OUT" --expected-branch "$$ORDER" --expected-preview-sha "$$EXP_SHA" --manifest-path "$$MANIFEST"
+
+local-smoke-pack:
+	@WS=$${WORKSPACE:?set WORKSPACE}; \
+	ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	ORDER=$${ORDER_BRANCH:?set ORDER_BRANCH}; \
+	$(PYTHON) tools/local_smoke_pack.py --workspace "$$WS" --artifacts-dir "$$ART" --order-branch "$$ORDER"
