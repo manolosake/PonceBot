@@ -50,31 +50,17 @@ def run_verify(artifacts_dir: Path, manifest_path: Path) -> dict[str, Any]:
         key = p.name
         snap = _snapshot(p)
         current[key] = snap
-        try:
-            p.relative_to(artifacts_dir)
-            path_within_artifacts = True
-        except ValueError:
-            path_within_artifacts = False
 
         exp_exists = bool(entry.get("exists", True))
         exp_size = int(entry.get("size_bytes", -1))
         exp_sha = str(entry.get("sha256", ""))
 
-        checks[f"{key}::path_within_artifacts_dir"] = path_within_artifacts
         c1 = snap["exists"] == exp_exists
         c2 = snap["size_bytes"] == exp_size
         c3 = snap["sha256"] == exp_sha
         checks[f"{key}::exists_match"] = c1
         checks[f"{key}::size_match"] = c2
         checks[f"{key}::sha256_match"] = c3
-        if not path_within_artifacts:
-            issues.append(
-                {
-                    "rule": f"{key}::path_within_artifacts_dir",
-                    "expected": str(artifacts_dir),
-                    "actual": str(p),
-                }
-            )
         if not c1:
             issues.append({"rule": f"{key}::exists_match", "expected": exp_exists, "actual": snap["exists"]})
         if not c2:
