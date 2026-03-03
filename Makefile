@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export backend-republish-traceability-bundle
+.PHONY: verify test lint security coverage backend-traceability-runtime-export
 
 verify: lint security test coverage
 
@@ -19,19 +19,6 @@ backend-traceability-runtime-export:
 	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
 	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
 	python3 tools/backend_traceability_runtime_export.py \
-		--repo-root "." \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--ticket-id "$(TICKET_ID)" \
-		--expected-branch "$(ORDER_BRANCH)"
-
-backend-republish-traceability-bundle:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
-	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
-	@mkdir -p "$(ARTIFACTS_DIR)"
-	@git diff --name-status HEAD > "$(ARTIFACTS_DIR)/git_status.txt"
-	@git diff --binary HEAD > "$(ARTIFACTS_DIR)/changes.patch"
-	@python3 tools/backend_traceability_runtime_export.py \
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \

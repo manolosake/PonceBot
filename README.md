@@ -172,9 +172,13 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
+Backend traceability gate (`make backend-traceability-runtime-export`) fails when:
+- `observed_git_branch_actual` does not match `--expected-branch`.
+- `git_status.txt` / `changes.patch` are empty.
+- `missing_in_patch` or `orphan_in_patch` is non-empty.
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
 - Prefer user-level service with `Restart=always` and journal retention policies.
 - For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
-
