@@ -6513,6 +6513,92 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
     """
     Periodic hygiene: close very old blocked/waiting jobs so queues don't accumulate dead entries forever.
     """
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def _retry_blocking_dependencies_with_backoff(*, current_now: float) -> int:
+        if not _env_bool("BOT_DEPENDENCY_RETRY_BACKOFF_ENABLED", True):
+            return 0
+        try:
+            base_s = max(30.0, float(os.environ.get("BOT_DEPENDENCY_RETRY_BASE_SECONDS", "120").strip() or "120"))
+        except Exception:
+            base_s = 120.0
+        try:
+            max_s = max(base_s, float(os.environ.get("BOT_DEPENDENCY_RETRY_MAX_SECONDS", "1800").strip() or "1800"))
+        except Exception:
+            max_s = 1800.0
+        try:
+            max_per_tick = max(1, int(os.environ.get("BOT_DEPENDENCY_RETRY_MAX_PER_TICK", "3").strip() or "3"))
+        except Exception:
+            max_per_tick = 3
+
+        scheduled = 0
+        waiting = orch_q.peek(state="waiting_deps", limit=600)
+        for task in waiting:
+            deps = list(task.depends_on or [])
+            if not deps:
+                continue
+            for dep_id in deps:
+                dep = orch_q.get_job(dep_id)
+                if dep is None:
+                    continue
+                dep_state = str(dep.state or "").strip().lower()
+                if dep_state not in ("blocked", "failed"):
+                    continue
+                try:
+                    retry_count = int(dep.retry_count or 0)
+                except Exception:
+                    retry_count = 0
+                try:
+                    max_retries = int(dep.max_retries or 0)
+                except Exception:
+                    max_retries = 0
+                if max_retries <= 0 or retry_count >= max_retries:
+                    continue
+
+                dep_trace = dict(dep.trace or {})
+                try:
+                    not_before = float(dep_trace.get("dep_retry_not_before", 0.0) or 0.0)
+                except Exception:
+                    not_before = 0.0
+                if not_before > current_now:
+                    continue
+
+                retry_n = retry_count + 1
+                delay_s = min(max_s, base_s * (2.0 ** max(0, retry_n - 1)))
+                due_at = float(current_now + delay_s)
+                err = f"dependency_retry_from_waiting_deps:{task.job_id[:8]}"
+                if not orch_q.bump_retry(dep.job_id, due_at=due_at, error=err):
+                    continue
+                try:
+                    orch_q.update_trace(
+                        dep.job_id,
+                        dep_retry_source=task.job_id,
+                        dep_retry_scheduled_at=float(current_now),
+                        dep_retry_delay_s=float(delay_s),
+                        dep_retry_not_before=float(due_at),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="task.dependency_retry_scheduled",
+                        actor="scheduler",
+                        details={
+                            "source_job_id": task.job_id,
+                            "dependency_job_id": dep.job_id,
+                            "dependency_state": dep_state,
+                            "retry": int(retry_n),
+                            "max_retries": int(max_retries),
+                            "delay_s": float(delay_s),
+                        },
+                    )
+                except Exception:
+                    pass
+                scheduled += 1
+                break
+            if scheduled >= max_per_tick:
+                break
+        return scheduled
+
     try:
         stale_after_s = max(1800.0, float(os.environ.get("BOT_HYGIENE_STALE_BLOCKED_SECONDS", "86400").strip() or "86400"))
     except Exception:
@@ -6522,6 +6608,13 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
     except Exception:
         max_jobs = 12
 
+    # Avoid stale cascades: while dependencies are pending, proactively retry blocked deps with backoff.
+    try:
+        _retry_blocking_dependencies_with_backoff(current_now=float(now))
+    except Exception:
+        pass
+
+    close_waiting_deps = _env_bool("BOT_HYGIENE_CLOSE_WAITING_DEPS", False)
     candidates = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=max_jobs * 4)
     if not candidates:
         return 0
@@ -6530,6 +6623,9 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
     for task in candidates:
         st = str(task.state or "").strip().lower()
         if st not in ("waiting_deps", "blocked_approval", "blocked"):
+            continue
+        if st == "waiting_deps" and not close_waiting_deps:
+            # Default: preserve dependency waits; stale closure can cascade into false failures.
             continue
         if cleaned >= max_jobs:
             break
