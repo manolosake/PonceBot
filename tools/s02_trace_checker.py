@@ -40,12 +40,14 @@ def _snapshot(path: Path) -> dict[str, Any]:
         "exists": exists,
         "size_bytes": 0,
         "sha256": "",
+        "mtime_epoch": 0.0,
         "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     if not exists:
         return data
     st = path.stat()
     data["size_bytes"] = int(st.st_size)
+    data["mtime_epoch"] = float(st.st_mtime)
     if st.st_size > 0:
         data["sha256"] = _sha256(path)
     return data
@@ -139,7 +141,11 @@ def validate_s02_trace(artifacts_dir: Path) -> dict[str, Any]:
     for fname in ("git_status.txt", "changes.patch"):
         before = snap_before[fname]
         after = snap_after[fname]
-        unchanged = (before["size_bytes"] == after["size_bytes"]) and (before["sha256"] == after["sha256"])
+        unchanged = (
+            (before["size_bytes"] == after["size_bytes"])
+            and (before["sha256"] == after["sha256"])
+            and (float(before["mtime_epoch"]) == float(after["mtime_epoch"]))
+        )
         checks[f"{fname}_stable_during_validation"] = unchanged
         if not unchanged:
             errors.append(f"{fname} changed during validation (possible stale report)")

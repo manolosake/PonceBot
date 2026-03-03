@@ -35,11 +35,13 @@ def _sha256(path: Path) -> str:
 def _snapshot(path: Path) -> dict[str, Any]:
     exists = path.exists() and path.is_file()
     size = int(path.stat().st_size) if exists else 0
+    mtime = float(path.stat().st_mtime) if exists else 0.0
     return {
         "path": str(path),
         "exists": exists,
         "size_bytes": size,
         "sha256": _sha256(path) if size > 0 else "",
+        "mtime_epoch": mtime,
         "captured_at_utc": _utc_now(),
     }
 
@@ -47,6 +49,13 @@ def _snapshot(path: Path) -> dict[str, Any]:
 def _to_int(value: Any, default: int = -1) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float = -1.0) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -86,6 +95,7 @@ def _pre_execution_guard(
     required_files = [
         repo_root / "tools" / "s02_bundle_atomic.py",
         repo_root / "tools" / "s02_trace_checker.py",
+        repo_root / "tools" / "s02_independent_check.py",
         repo_root / "tools" / "security_check.py",
         repo_root / "Makefile",
     ]
@@ -301,6 +311,10 @@ def _post_publish_check(
         "changes_patch_size_matches_validation": actual_patch["size_bytes"] == _to_int(expected_patch.get("size_bytes", -1)),
         "git_status_hash_matches_validation": actual_gs["sha256"] == expected_gs.get("sha256", ""),
         "changes_patch_hash_matches_validation": actual_patch["sha256"] == expected_patch.get("sha256", ""),
+        "git_status_mtime_matches_validation": actual_gs["mtime_epoch"]
+        == _to_float(expected_gs.get("mtime_epoch", -1.0)),
+        "changes_patch_mtime_matches_validation": actual_patch["mtime_epoch"]
+        == _to_float(expected_patch.get("mtime_epoch", -1.0)),
         "validation_artifact_dir_matches_bundle_dir": validation.get("artifacts_dir", "") == str(artifacts_dir),
         "branch_matches_expected": trace_meta.get("branch", "") == expected_branch,
     }
@@ -327,11 +341,75 @@ def _post_publish_check(
     return report
 
 
+def _run_independent_check(artifacts_dir: Path, repo_root: Path, expected_branch: str) -> dict[str, Any]:
+    cmd = [
+        sys.executable,
+        str(repo_root / "tools" / "s02_independent_check.py"),
+        "--artifacts-dir",
+        str(artifacts_dir),
+        "--expected-branch",
+        expected_branch,
+    ]
+    code, output = _run(cmd, cwd=repo_root)
+    _atomic_write_text(
+        artifacts_dir / "s02_independent_check.log",
+        (
+            f"TIMESTAMP={_utc_now()}\n"
+            f"COMMAND={' '.join(cmd)}\n"
+            f"EXIT_CODE={code}\n"
+            "----- OUTPUT BEGIN -----\n"
+            f"{output.rstrip()}\n"
+            "----- OUTPUT END -----\n"
+        ),
+    )
+    result_path = artifacts_dir / "s02_independent_check.json"
+    result: dict[str, Any] = {"status": "FAIL", "exit_code": 1}
+    if result_path.exists():
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            result = {"status": "FAIL", "exit_code": 1, "error": "invalid_json"}
+    return {
+        "status": "PASS" if code == 0 and result.get("status") == "PASS" else "FAIL",
+        "exit_code": code,
+        "report_path": str(result_path),
+        "log_path": str(artifacts_dir / "s02_independent_check.log"),
+        "result": result,
+    }
+
+
+def _build_final_manifest(
+    artifacts_dir: Path,
+    *,
+    ticket_id: str,
+    expected_branch: str,
+    reported_branch: str,
+    files: list[str],
+) -> dict[str, Any]:
+    file_entries: dict[str, Any] = {}
+    for name in files:
+        file_entries[name] = _snapshot(artifacts_dir / name)
+    payload: dict[str, Any] = {
+        "artifacts_dir": str(artifacts_dir),
+        "ticket_id": ticket_id,
+        "order_branch_expected": expected_branch,
+        "order_branch_reported": reported_branch,
+        "generated_at_utc": _utc_now(),
+        "files": file_entries,
+        "status": "SEALED",
+    }
+    signing_blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    payload["manifest_sha256"] = hashlib.sha256(signing_blob).hexdigest()
+    payload["signature"] = payload["manifest_sha256"]
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate S-02 bundle with atomic publish guards.")
     parser.add_argument("--artifacts-dir", required=True)
     parser.add_argument("--qa-preview-dir", default=str(QA_PREVIEW_DIR_DEFAULT))
     parser.add_argument("--verify-cmd", default="make verify")
+    parser.add_argument("--ticket-id", default=(os.environ.get("TICKET_ID", "") or "").strip())
     parser.add_argument(
         "--expected-branch",
         default=(os.environ.get("ORDER_BRANCH", "") or "").strip(),
@@ -376,6 +454,26 @@ def main() -> int:
     )
 
     post_publish = _post_publish_check(artifacts_dir, validation, meta, expected_branch)
+    independent = _run_independent_check(artifacts_dir, repo_root, expected_branch)
+
+    final_manifest = _build_final_manifest(
+        artifacts_dir,
+        ticket_id=args.ticket_id.strip() or "unknown",
+        expected_branch=expected_branch,
+        reported_branch=meta.get("branch", ""),
+        files=[
+            "git_status.txt",
+            "changes.patch",
+            "s02_trace_validation.json",
+            "post_publish_check.json",
+            "evidence_validation.log",
+            "verify.log",
+            "preflight_report.json",
+            "s02_independent_check.json",
+            "s02_independent_check.log",
+        ],
+    )
+    _atomic_write_json(artifacts_dir / "s02_final_manifest_signed.json", final_manifest)
 
     base_pass = (
         pre_exec_guard["status"] == "PASS"
@@ -383,6 +481,7 @@ def main() -> int:
         and verify["status"] == "PASS"
         and validation.get("status") == "PASS"
         and post_publish["status"] == "PASS"
+        and independent["status"] == "PASS"
     )
     # Contract rule: when there are no tracked changes, S-02 cannot be marked PASS.
     if meta["no_changes"]:
@@ -396,12 +495,16 @@ def main() -> int:
         "status": status,
         "trace": meta,
         "expected_branch": expected_branch,
+        "ticket_id": args.ticket_id.strip() or "unknown",
         "preflight_report": str(artifacts_dir / "preflight_report.json"),
         "pre_execution_guard_report": str(artifacts_dir / "pre_execution_guard.json"),
         "pre_execution_guard_log": str(artifacts_dir / "pre_execution_guard.log"),
         "verify_log": str(artifacts_dir / "verify.log"),
         "trace_validation_report": str(artifacts_dir / "s02_trace_validation.json"),
         "post_publish_report": str(artifacts_dir / "post_publish_check.json"),
+        "independent_check_report": independent["report_path"],
+        "independent_check_log": independent["log_path"],
+        "final_manifest_signed": str(artifacts_dir / "s02_final_manifest_signed.json"),
         "captured_at_utc": _utc_now(),
     }
     _atomic_write_json(artifacts_dir / "bundle_s02_summary.json", summary)
