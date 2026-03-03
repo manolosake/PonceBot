@@ -177,6 +177,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     contract_path = Path(args.contract).resolve()
     artifacts_dir = Path(args.artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    source_file_sha256 = _sha256_file(contract_path)
 
     contract = _load_contract(contract_path)
     errors = validate_contract(contract)
