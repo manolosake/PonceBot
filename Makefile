@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage
+.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export
 
 verify: lint security test coverage
 
@@ -13,3 +13,17 @@ test:
 
 coverage:
 	python tools/coverage_gate.py --min 0.65
+
+wormhole-contract-validate:
+	python3 tools/wormhole_scene_contract.py validate --contract docs/contracts/wormhole_scene_contract.v1.json
+
+wormhole-contract-export:
+	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
+	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
+	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
+	python3 tools/wormhole_scene_contract.py export \
+		--repo-root . \
+		--contract docs/contracts/wormhole_scene_contract.v1.json \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--expected-branch "$(ORDER_BRANCH)"
