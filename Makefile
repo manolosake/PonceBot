@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent bundle-s02-atomic perf-harness-v3
+.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent validate-s02-sanity bundle-s02-atomic perf-harness-v3 preview-integrity-gate
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
@@ -25,6 +25,10 @@ validate-s02-independent:
 	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
 	$(PYTHON) tools/s02_independent_check.py --artifacts-dir "$$ART"
 
+validate-s02-sanity:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	$(PYTHON) tools/s02_sanity_gate.py --artifacts-dir "$$ART"
+
 bundle-s02-atomic:
 	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
 	$(PYTHON) tools/s02_bundle_atomic.py --artifacts-dir "$$ART"
@@ -35,3 +39,11 @@ perf-harness-v3:
 	CAND=$${CANDIDATE_WORKSPACE:?set CANDIDATE_WORKSPACE}; \
 	DUR=$${DURATION_SECONDS:-8}; \
 	$(PYTHON) tools/perf_harness_v3.py --baseline-workspace "$$BASE" --candidate-workspace "$$CAND" --out-dir "$$OUT" --duration-seconds "$$DUR"
+
+preview-integrity-gate:
+	@WS=$${WORKSPACE:?set WORKSPACE}; \
+	OUT=$${OUT:?set OUT}; \
+	ORDER=$${ORDER_BRANCH:-}; \
+	EXP_SHA=$${EXPECTED_PREVIEW_SHA:-}; \
+	MANIFEST=$${MANIFEST_PATH:-}; \
+	$(PYTHON) tools/preview_integrity_gate.py --workspace "$$WS" --out "$$OUT" --expected-branch "$$ORDER" --expected-preview-sha "$$EXP_SHA" --manifest-path "$$MANIFEST"
