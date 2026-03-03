@@ -120,6 +120,72 @@ def _check_non_empty(path: Path, key: str) -> Check:
     return Check(key, sz > 0, f"{path.name} bytes={sz}")
 
 
+def _normalize_path_like(value: str) -> str:
+    v = (value or "").strip().replace("\\", "/")
+    while v.startswith("./"):
+        v = v[2:]
+    return v
+
+
+def _iter_key_values(obj: object, *, target_key: str) -> list[object]:
+    out: list[object] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k) == target_key:
+                out.append(v)
+            out.extend(_iter_key_values(v, target_key=target_key))
+    elif isinstance(obj, list):
+        for it in obj:
+            out.extend(_iter_key_values(it, target_key=target_key))
+    return out
+
+
+def _extract_files_in_patch_claims(report_json: object) -> list[list[str]]:
+    claims: list[list[str]] = []
+    for value in _iter_key_values(report_json, target_key="files_in_patch"):
+        if isinstance(value, list):
+            cleaned = [_normalize_path_like(str(x)) for x in value if str(x).strip()]
+            claims.append(cleaned)
+    return claims
+
+
+def _extract_visual_file_claims(report_json: object) -> list[str]:
+    claims: list[str] = []
+    visual_keys = ("screenshot", "visual", "preview", "evidence")
+    valid_exts = (".png", ".jpg", ".jpeg", ".webp", ".html")
+
+    def walk(node: object, parent_key: str = "") -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, parent_key=str(k))
+            return
+        if isinstance(node, list):
+            for v in node:
+                walk(v, parent_key=parent_key)
+            return
+        if isinstance(node, str):
+            key = parent_key.lower()
+            if not any(token in key for token in visual_keys):
+                return
+            s = _normalize_path_like(node)
+            if "://" in s:
+                return
+            if not s.lower().endswith(valid_exts):
+                return
+            claims.append(s)
+
+    walk(report_json)
+    # de-dup preserving order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for c in claims:
+        if c in seen:
+            continue
+        seen.add(c)
+        deduped.append(c)
+    return deduped
+
+
 def _validate(
     *,
     artifacts_dir: Path,
@@ -160,6 +226,72 @@ def _validate(
             "required_reports_present",
             len(report_files) > 0,
             f"report_files={len(report_files)}",
+        )
+    )
+
+    report_patch_mismatches: list[dict[str, object]] = []
+    report_visual_mismatches: list[dict[str, str]] = []
+    all_rel_files = {str(p.relative_to(artifacts_dir)) for p in artifacts_dir.rglob("*") if p.is_file()}
+    all_basenames = {Path(p).name for p in all_rel_files}
+    for rp in report_files:
+        try:
+            parsed = json.loads(_read_text(rp))
+        except Exception as e:
+            report_patch_mismatches.append(
+                {
+                    "report": str(rp.relative_to(artifacts_dir)),
+                    "error": f"invalid_json: {e}",
+                }
+            )
+            continue
+
+        for claim in _extract_files_in_patch_claims(parsed):
+            claimed = {_normalize_path_like(x) for x in claim if x}
+            missing = sorted(p for p in claimed if p not in patch_paths)
+            unexpected = sorted(p for p in patch_paths if p not in claimed)
+            if missing or unexpected:
+                report_patch_mismatches.append(
+                    {
+                        "report": str(rp.relative_to(artifacts_dir)),
+                        "missing_in_patch": missing[:20],
+                        "extra_in_patch": unexpected[:20],
+                    }
+                )
+
+        for visual_claim in _extract_visual_file_claims(parsed):
+            normalized = _normalize_path_like(visual_claim)
+            exists_rel = normalized in all_rel_files
+            exists_basename = Path(normalized).name in all_basenames
+            if not (exists_rel or exists_basename):
+                report_visual_mismatches.append(
+                    {
+                        "report": str(rp.relative_to(artifacts_dir)),
+                        "declared_visual_file": normalized,
+                    }
+                )
+
+    checks.append(
+        Check(
+            "integrity_report_patch_alignment",
+            len(report_patch_mismatches) == 0,
+            (
+                "ok"
+                if len(report_patch_mismatches) == 0
+                else "mismatch_in_report="
+                + ", ".join(str(m.get("report")) for m in report_patch_mismatches[:5])
+            ),
+        )
+    )
+    checks.append(
+        Check(
+            "integrity_report_visual_alignment",
+            len(report_visual_mismatches) == 0,
+            (
+                "ok"
+                if len(report_visual_mismatches) == 0
+                else "missing_visual_declared_in_report="
+                + ", ".join(str(m.get("report")) for m in report_visual_mismatches[:5])
+            ),
         )
     )
 
@@ -207,6 +339,8 @@ def _validate(
         "missing_in_patch": missing_in_patch,
         "orphan_in_patch": orphan_in_patch[:50],
         "report_files": [str(p.relative_to(artifacts_dir)) for p in report_files],
+        "report_patch_mismatches": report_patch_mismatches[:20],
+        "report_visual_mismatches": report_visual_mismatches[:20],
         "telegram_files": [str(p.relative_to(artifacts_dir)) for p in telegram_files],
         "visual_images_total": len(all_images),
         "visual_matches": visual_by_kind,

@@ -177,6 +177,8 @@ Delivery evidence gate (for close-gate publishing):
 - Enforces mandatory artifacts and consistency:
   - `changes.patch` and `git_status.txt` must exist and be non-empty.
   - `changes.patch` must cover paths declared in `git_status.txt`.
+  - If any integrity report declares `files_in_patch`, it must exactly match the real patch paths.
+  - If reports declare visual evidence files, those files must exist in artifacts.
   - At least one JSON report file must exist.
   - Visual evidence must include `desktop`, `tablet`, and `mobile` screenshots.
   - `preview.html` must exist and look like valid HTML.
