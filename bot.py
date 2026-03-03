@@ -5132,9 +5132,9 @@ def _send_orchestrator_marker_response(
             + "</div></div>"
             "<div class='hero'>"
             "<div class='wormhole'><div class='throat-shell'></div><div class='neck'></div><div class='aperture top'></div><div class='aperture bottom'></div><div class='mesh'></div><div class='shear'></div><div class='depth-fog'></div></div>"
-            "<div class='hero-copy'><div class='hero-kicker'>Cinematic Wormhole Layer</div>"
-            "<div class='hero-title'>A living 3D portal that makes operations feel immediate and human.</div>"
-            "<div class='hero-text'>The tunnel breathes with a hyperboloid throat, curved luminous mesh, and deep-space parallax so teams can feel motion and depth at a glance. We kept typography and telemetry contrast calm, readable, and decision-ready across desktop and mobile.</div>"
+            "<div class='hero-copy'><div class='hero-kicker'>Executive Wormhole View</div>"
+            "<div class='hero-title'>A cinematic 3D corridor that turns system state into clear, human-readable momentum.</div>"
+            "<div class='hero-text'>The scene combines a hyperboloid throat, a luminous curved mesh, and deep-space parallax to make flow, load, and continuity legible at a glance. The visual language stays calm and decision-ready across desktop and mobile, so leadership can read risk and progress without decoding technical noise.</div>"
             "</div></div>"
             "<div class='grid'>"
             + (approvals_html + "" if approvals_html else "")
