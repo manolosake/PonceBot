@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage
+.PHONY: verify test lint security coverage validate-s02-trace
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
@@ -16,3 +16,7 @@ test:
 
 coverage:
 	$(PYTHON) tools/coverage_gate.py --min 0.65
+
+validate-s02-trace:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	$(PYTHON) tools/s02_trace_checker.py --artifacts-dir "$$ART"
