@@ -186,6 +186,9 @@ Delivery evidence gate (for close-gate publishing):
 - Writes:
   - `sre_evidence_gate_report.json` (machine-readable PASS/FAIL + reasons)
   - `sre_evidence_gate.log` (human-readable per-check log)
+- Negative smoke expectation:
+  - If `changes.patch` or `git_status.txt` are empty, guard must return exit code `2` and mark
+    `required_changes_patch_non_empty` / `required_git_status_non_empty` as failed.
 
 ## Deployment Notes
 

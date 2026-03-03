@@ -124,6 +124,35 @@ class DeliveryEvidenceGateTests(unittest.TestCase):
             failed = [c["key"] for c in report.get("checks", []) if not c.get("ok")]
             self.assertIn("integrity_report_patch_alignment", failed)
 
+    def test_fail_when_patch_and_status_are_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            art = Path(td)
+            (art / "git_status.txt").write_text("", encoding="utf-8")
+            (art / "changes.patch").write_text("", encoding="utf-8")
+            (art / "release_summary.json").write_text('{"status":"ok"}\n', encoding="utf-8")
+            (art / "integrity_report.json").write_text(
+                json.dumps({"files_in_patch": [], "visual_evidence": ["preview.html"]}),
+                encoding="utf-8",
+            )
+            (art / "preview.html").write_text("<!doctype html><html><body>x</body></html>\n", encoding="utf-8")
+            (art / "desktop_capture.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (art / "tablet_capture.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (art / "mobile_capture.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (art / "telegram_trace.jsonl").write_text('{"source":"telegram"}\n', encoding="utf-8")
+
+            p = subprocess.run(
+                [sys.executable, str(SCRIPT), "--artifacts-dir", str(art), "--workspace-dir", str(ROOT)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(p.returncode, 2, msg=p.stdout + "\n" + p.stderr)
+            report = json.loads((art / "sre_evidence_gate_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report.get("status"), "FAIL")
+            failed = [c["key"] for c in report.get("checks", []) if not c.get("ok")]
+            self.assertIn("required_changes_patch_non_empty", failed)
+            self.assertIn("required_git_status_non_empty", failed)
+
 
 if __name__ == "__main__":
     unittest.main()
