@@ -5044,9 +5044,12 @@ def _send_orchestrator_marker_response(
         html = (
             "<!doctype html><html><head><meta charset='utf-8'>"
             "<style>"
-            "body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; margin:0; background:#0b0f14; color:#e8eef6}"
-            ".wrap{padding:18px}"
-            ".h{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:14px}"
+            "body{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;margin:0;color:#e8eef6;"
+            "background:radial-gradient(120% 95% at 10% 8%,#132a55 0,transparent 56%),"
+            "radial-gradient(120% 100% at 88% 92%,#102748 0,transparent 54%),"
+            "linear-gradient(180deg,#070b14,#0b1220 52%,#0d1828)}"
+            ".wrap{padding:18px;position:relative;overflow:hidden}"
+            ".h{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:14px;position:relative;z-index:3}"
             ".title{font-size:18px;font-weight:800;letter-spacing:.2px}"
             ".sub{font-size:12px;color:#9fb0c3}"
             ".stats{display:flex;flex-wrap:wrap;gap:8px;align-items:center}"
@@ -5055,7 +5058,36 @@ def _send_orchestrator_marker_response(
             ".pill.blocked{border-color:rgba(231,76,60,.35)}"
             ".pill.failed{border-color:rgba(231,76,60,.35)}"
             ".pill.idle{border-color:rgba(159,176,195,.25)}"
-            ".grid{display:grid;grid-template-columns:1fr;gap:14px}"
+            ".hero{position:relative;z-index:2;display:grid;grid-template-columns:minmax(220px,340px) 1fr;gap:18px;"
+            "margin:0 0 14px;padding:14px;border-radius:14px;border:1px solid rgba(136,198,255,.22);"
+            "background:linear-gradient(160deg,rgba(7,16,32,.82),rgba(5,12,24,.5));box-shadow:0 14px 32px rgba(0,0,0,.42)}"
+            ".wormhole{position:relative;width:min(100%,320px);aspect-ratio:1;justify-self:center;overflow:hidden;"
+            "filter:drop-shadow(0 24px 48px rgba(3,12,30,.86));isolation:isolate}"
+            ".throat-shell{position:absolute;inset:0;border-radius:50%;transform:perspective(920px) rotateX(67deg) scale(1.12);"
+            "background:radial-gradient(circle at 50% 50%,rgba(223,252,255,.94) 0 8%,rgba(148,229,255,.86) 9% 14%,"
+            "rgba(72,182,255,.9) 15% 23%,rgba(23,89,190,.95) 24% 34%,rgba(8,36,98,.96) 35% 45%,rgba(2,10,32,.99) 46% 58%,transparent 59%),"
+            "conic-gradient(from 94deg,rgba(146,223,255,.08),rgba(43,133,249,.64),rgba(147,229,255,.22),rgba(43,133,249,.58),rgba(146,223,255,.08));"
+            "box-shadow:0 0 82px rgba(87,193,255,.44),inset 0 0 58px rgba(120,220,255,.26),inset 0 -36px 96px rgba(7,30,79,.86);"
+            "animation:spin 12s linear infinite;will-change:transform}"
+            ".neck{position:absolute;left:50%;top:50%;width:35%;height:58%;transform:translate(-50%,-50%) perspective(800px) rotateX(73deg);"
+            "border-radius:44% 44% 50% 50%/36% 36% 64% 64%;background:radial-gradient(ellipse at center,rgba(210,248,255,.42) 0 10%,rgba(95,196,255,.28) 18%,rgba(24,96,194,.36) 45%,rgba(6,20,58,.88) 78%,rgba(2,8,26,.98) 100%);"
+            "box-shadow:inset 0 0 44px rgba(156,235,255,.34),0 0 28px rgba(84,186,255,.28);animation:neckPulse 4.2s ease-in-out infinite}"
+            ".aperture{position:absolute;left:50%;width:44%;height:19%;transform:translateX(-50%);border-radius:50%;"
+            "border:1px solid rgba(150,231,255,.52);background:radial-gradient(ellipse at center,rgba(188,244,255,.58),rgba(67,167,255,.24) 58%,rgba(6,22,64,.76));"
+            "box-shadow:0 0 20px rgba(108,207,255,.44),inset 0 0 16px rgba(148,234,255,.34)}"
+            ".aperture.top{top:17%;transform:translateX(-50%) perspective(700px) rotateX(74deg)}"
+            ".aperture.bottom{bottom:17%;transform:translateX(-50%) perspective(700px) rotateX(106deg)}"
+            ".mesh{position:absolute;inset:12%;border-radius:50%;transform:perspective(900px) rotateX(74deg);mix-blend-mode:screen;"
+            "background:repeating-radial-gradient(circle at 50% 50%,rgba(158,232,255,.38) 0 1.2px,transparent 1.2px 9px),"
+            "repeating-conic-gradient(from 0deg,rgba(146,225,255,.3) 0 2deg,transparent 2deg 16deg);opacity:.82;filter:blur(.1px);animation:meshWave 7.4s ease-in-out infinite}"
+            ".shear{position:absolute;inset:2%;border-radius:50%;transform:perspective(900px) rotateX(72deg) rotateZ(18deg);"
+            "border:1px solid rgba(145,225,255,.34);box-shadow:0 0 28px rgba(90,193,255,.34);animation:wobble 6s ease-in-out infinite}"
+            ".depth-fog{position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle at 50% 56%,transparent 0 38%,rgba(2,8,24,.42) 60%,rgba(1,4,14,.72) 88%);pointer-events:none}"
+            ".hero-copy{display:flex;flex-direction:column;justify-content:center;gap:8px}"
+            ".hero-kicker{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#8cdfff}"
+            ".hero-title{font-size:16px;font-weight:700;color:#d7eeff}"
+            ".hero-text{font-size:12px;line-height:1.45;color:#9fb8d3}"
+            ".grid{display:grid;grid-template-columns:1fr;gap:14px;position:relative;z-index:2}"
             ".workers{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}"
             ".card{background:#121a24;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px;box-shadow:0 10px 30px rgba(0,0,0,.35)}"
             ".w{padding:12px}"
@@ -5076,24 +5108,37 @@ def _send_orchestrator_marker_response(
             ".ap-t{font-size:12px;margin-top:4px;color:#cfe0f3}"
             ".ap-c{margin-top:6px;font-size:11px}"
             "code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:6px;border:1px solid rgba(255,255,255,.10)}"
+            "@keyframes spin{from{transform:perspective(920px) rotateX(67deg) scale(1.12) rotateZ(0)}to{transform:perspective(920px) rotateX(67deg) scale(1.12) rotateZ(360deg)}}"
+            "@keyframes meshWave{0%,100%{transform:perspective(900px) rotateX(74deg) scale(1)}50%{transform:perspective(900px) rotateX(70deg) scale(1.04)}}"
+            "@keyframes wobble{0%,100%{transform:perspective(900px) rotateX(72deg) rotateZ(18deg)}50%{transform:perspective(900px) rotateX(69deg) rotateZ(22deg)}}"
+            "@keyframes neckPulse{0%,100%{transform:translate(-50%,-50%) perspective(800px) rotateX(73deg) scale(.97)}50%{transform:translate(-50%,-50%) perspective(800px) rotateX(69deg) scale(1.05)}}"
+            "@media (max-width:900px){.workers{grid-template-columns:1fr 1fr}.hero{grid-template-columns:1fr;gap:12px}.wormhole{width:min(82vw,300px)}}"
+            "@media (max-width:640px){.wrap{padding:12px}.title{font-size:16px}.sub{font-size:11px}.pill{font-size:11px;padding:5px 8px}.workers{grid-template-columns:1fr}.hero{padding:12px}.hero-title{font-size:14px}.hero-text{font-size:11px}.wormhole{width:min(92vw,280px)}}"
+            "@media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms !important;animation-iteration-count:1 !important}}"
             "</style></head><body><div class='wrap'>"
             "<div class='h'>"
-            "<div><div class='title'>PonceBot Dashboard</div><div class='sub'>"
+            "<div><div class='title'>PonceBot Executive Dashboard</div><div class='sub'>"
             + _html_escape(ts)
             + " | scope="
             + _html_escape(scope_label)
             + "</div></div>"
             "<div class='stats'>"
-            + _pill("Hecho (DB)", f"queued={queued_total}")
-            + _pill("Hecho (DB)", f"waiting_deps={waiting_deps_total}")
-            + _pill("Hecho (DB)", f"blocked_approval={blocked_approval_total}")
-            + _pill("Hecho (DB)", f"running={running_total}")
-            + _pill("Hecho (DB)", f"blocked={blocked_total}")
-            + ("" if staleness_s is None else _pill("Hecho (DB)", f"staleness={_fmt_age(staleness_s)}"))
+            + _pill("Snapshot", f"queued={queued_total}")
+            + _pill("Snapshot", f"waiting_deps={waiting_deps_total}")
+            + _pill("Snapshot", f"blocked_approval={blocked_approval_total}")
+            + _pill("Snapshot", f"running={running_total}")
+            + _pill("Snapshot", f"blocked={blocked_total}")
+            + ("" if staleness_s is None else _pill("Snapshot", f"staleness={_fmt_age(staleness_s)}"))
             + "</div></div>"
+            "<div class='hero'>"
+            "<div class='wormhole'><div class='throat-shell'></div><div class='neck'></div><div class='aperture top'></div><div class='aperture bottom'></div><div class='mesh'></div><div class='shear'></div><div class='depth-fog'></div></div>"
+            "<div class='hero-copy'><div class='hero-kicker'>Cinematic Wormhole Layer</div>"
+            "<div class='hero-title'>A living 3D portal that makes operations feel immediate and human.</div>"
+            "<div class='hero-text'>The tunnel breathes with a hyperboloid throat, curved luminous mesh, and deep-space parallax so teams can feel motion and depth at a glance. We kept typography and telemetry contrast calm, readable, and decision-ready across desktop and mobile.</div>"
+            "</div></div>"
             "<div class='grid'>"
             + (approvals_html + "" if approvals_html else "")
-            + "<div class='card'><div class='sect'>Workers</div><div class='workers'>"
+            + "<div class='card'><div class='sect'>Agents Panel</div><div class='workers'>"
             + "".join(cards)
             + "</div></div>"
             "</div></div></body></html>"
