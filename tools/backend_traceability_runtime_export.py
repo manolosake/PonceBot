@@ -134,6 +134,8 @@ def export_payload(
     ticket_id: str,
     expected_branch: str,
     execution_id: str,
+    frontend_job_id: str,
+    target_artifact_dir: str,
     runtime_metrics: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     observed_git_branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
@@ -156,12 +158,17 @@ def export_payload(
         "head_sha": head_sha,
         "execution_id": execution_id,
         "telegram_correlation_id": f"{ticket_id}:{execution_id}",
+        "frontend_job_id": frontend_job_id,
+        "target_artifact_dir": target_artifact_dir,
     }
 
     runtime_report = {
         "ticket_id": ticket_id,
         "execution_id": execution_id,
         "telegram_correlation_id": trace["telegram_correlation_id"],
+        "frontend_job_id": frontend_job_id,
+        "artifact_dir": str(artifacts_dir),
+        "target_artifact_dir": target_artifact_dir,
         "expected_branch": expected_branch,
         "reported_branch": reported_branch,
         "viewports": runtime_metrics,
@@ -175,6 +182,9 @@ def export_payload(
             "ticket_id": ticket_id,
             "execution_id": execution_id,
             "telegram_correlation_id": trace["telegram_correlation_id"],
+            "frontend_job_id": frontend_job_id,
+            "artifact_dir": str(artifacts_dir),
+            "target_artifact_dir": target_artifact_dir,
             "reported_branch": reported_branch,
         }
     ]
@@ -187,6 +197,9 @@ def export_payload(
                 "ticket_id": ticket_id,
                 "execution_id": execution_id,
                 "telegram_correlation_id": trace["telegram_correlation_id"],
+                "frontend_job_id": frontend_job_id,
+                "artifact_dir": str(artifacts_dir),
+                "target_artifact_dir": target_artifact_dir,
                 "viewport": vp,
                 "sample_count_frames": m.get("sample_count_frames"),
                 "avg_fps": m.get("avg_fps"),
@@ -203,10 +216,30 @@ def export_payload(
             "ticket_id": ticket_id,
             "execution_id": execution_id,
             "telegram_correlation_id": trace["telegram_correlation_id"],
+            "frontend_job_id": frontend_job_id,
+            "artifact_dir": str(artifacts_dir),
+            "target_artifact_dir": target_artifact_dir,
             "branch_matches_expected": trace["branch_matches_expected"],
         }
     )
     return trace, runtime_report, events
+
+
+def _binding_errors(*, trace: dict[str, Any], runtime_report: dict[str, Any], artifacts_dir: Path) -> list[str]:
+    errs: list[str] = []
+    target = str(trace.get("target_artifact_dir", "")).strip()
+    actual = str(artifacts_dir)
+    runtime_dir = str(runtime_report.get("artifact_dir", "")).strip()
+    frontend_job_id = str(trace.get("frontend_job_id", "")).strip()
+    if not frontend_job_id:
+        errs.append("frontend_job_id missing")
+    if not target:
+        errs.append("target_artifact_dir missing")
+    if target and target != actual:
+        errs.append(f"target_artifact_dir mismatch: target={target} actual={actual}")
+    if runtime_dir and runtime_dir != actual:
+        errs.append(f"runtime artifact_dir mismatch: runtime={runtime_dir} actual={actual}")
+    return errs
 
 
 def main() -> int:
@@ -216,12 +249,15 @@ def main() -> int:
     ap.add_argument("--ticket-id", required=True)
     ap.add_argument("--expected-branch", required=True)
     ap.add_argument("--execution-id", default="")
+    ap.add_argument("--frontend-job-id", required=True)
+    ap.add_argument("--target-artifact-dir", default="")
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
     artifacts_dir = Path(args.artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     execution_id = str(args.execution_id or f"exec-{int(time.time())}")
+    target_artifact_dir = str(Path(args.target_artifact_dir).resolve()) if args.target_artifact_dir else str(artifacts_dir)
 
     runtime_metrics = _default_runtime_metrics()
     runtime_errors = _validate_runtime_metrics(runtime_metrics)
@@ -232,8 +268,11 @@ def main() -> int:
         ticket_id=args.ticket_id,
         expected_branch=args.expected_branch,
         execution_id=execution_id,
+        frontend_job_id=args.frontend_job_id,
+        target_artifact_dir=target_artifact_dir,
         runtime_metrics=runtime_metrics,
     )
+    binding_errors = _binding_errors(trace=trace, runtime_report=runtime_report, artifacts_dir=artifacts_dir)
 
     trace_path = artifacts_dir / "wormhole_scene_trace.json"
     metrics_path = artifacts_dir / "backend_runtime_telemetry_report.json"
@@ -278,9 +317,19 @@ def main() -> int:
                 else "orphan_in_patch=" + ", ".join(coverage["orphan_in_patch"][:20])
             ),
         },
+        {
+            "key": "trace_binding_frontend_job_id_present",
+            "ok": bool(trace.get("frontend_job_id")),
+            "details": f"frontend_job_id={trace.get('frontend_job_id', '')}",
+        },
+        {
+            "key": "trace_binding_target_artifact_dir_matches_actual",
+            "ok": len([e for e in binding_errors if e.startswith("target_artifact_dir mismatch")]) == 0,
+            "details": "ok" if len([e for e in binding_errors if e.startswith('target_artifact_dir mismatch')]) == 0 else "; ".join(binding_errors),
+        },
     ]
     summary = {
-        "status": "PASS" if all(c["ok"] for c in checks) and not runtime_errors else "FAIL",
+        "status": "PASS" if all(c["ok"] for c in checks) and not runtime_errors and not binding_errors else "FAIL",
         "ticket_id": args.ticket_id,
         "expected_branch": args.expected_branch,
         "reported_branch": trace["reported_branch"],
@@ -291,6 +340,9 @@ def main() -> int:
         "patch_status_coverage": coverage,
         "execution_id": trace["execution_id"],
         "telegram_correlation_id": trace["telegram_correlation_id"],
+        "frontend_job_id": trace.get("frontend_job_id"),
+        "target_artifact_dir": trace.get("target_artifact_dir"),
+        "binding_errors": binding_errors,
         "runtime_viewports_present": sorted(runtime_report["viewports"].keys()),
         "runtime_validation_errors": runtime_errors,
         "trace_path": str(trace_path),

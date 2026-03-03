@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tools.backend_traceability_runtime_export import (
+    _binding_errors,
     _default_runtime_metrics,
     _patch_status_coverage,
     _validate_runtime_metrics,
@@ -62,6 +63,8 @@ class BackendTraceabilityRuntimeExportTests(unittest.TestCase):
                 ticket_id="470f8b7f-6f39-4fa9-9a30-75dae0a10bad",
                 expected_branch=branch,
                 execution_id="exec-test-470f",
+                frontend_job_id="fe-job-001",
+                target_artifact_dir=str(root),
                 runtime_metrics=_default_runtime_metrics(),
             )
             self.assertEqual(trace["reported_branch"], branch)
@@ -69,6 +72,8 @@ class BackendTraceabilityRuntimeExportTests(unittest.TestCase):
             self.assertTrue(trace["branch_matches_expected"])
             self.assertEqual(trace["execution_id"], "exec-test-470f")
             self.assertEqual(trace["telegram_correlation_id"], "470f8b7f-6f39-4fa9-9a30-75dae0a10bad:exec-test-470f")
+            self.assertEqual(trace["frontend_job_id"], "fe-job-001")
+            self.assertEqual(trace["target_artifact_dir"], str(root))
             self.assertEqual(sorted(runtime_report["viewports"].keys()), ["desktop", "mobile", "tablet"])
             self.assertGreaterEqual(len(events), 5)
 
@@ -101,10 +106,34 @@ class BackendTraceabilityRuntimeExportTests(unittest.TestCase):
                 ticket_id="470f8b7f-6f39-4fa9-9a30-75dae0a10bad",
                 expected_branch="feature/expected-branch",
                 execution_id="exec-test-mismatch",
+                frontend_job_id="fe-job-001",
+                target_artifact_dir=str(root),
                 runtime_metrics=_default_runtime_metrics(),
             )
             self.assertFalse(trace["branch_matches_expected"])
             self.assertEqual(trace["observed_git_branch_actual"], "feature/actual-branch")
+
+    def test_binding_errors_correct_and_incorrect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            branch = "feature/order-470f8b7f-nuevo-proyecto-ceo-wormhole-vnext-qual"
+            self._init_git_repo(root, branch)
+            trace, runtime_report, _events = export_payload(
+                repo_root=root,
+                artifacts_dir=root,
+                ticket_id="470f8b7f-6f39-4fa9-9a30-75dae0a10bad",
+                expected_branch=branch,
+                execution_id="exec-bind",
+                frontend_job_id="fe-job-bind",
+                target_artifact_dir=str(root),
+                runtime_metrics=_default_runtime_metrics(),
+            )
+            self.assertEqual(_binding_errors(trace=trace, runtime_report=runtime_report, artifacts_dir=root), [])
+
+            bad_trace = dict(trace)
+            bad_trace["target_artifact_dir"] = str(root / "other")
+            errs = _binding_errors(trace=bad_trace, runtime_report=runtime_report, artifacts_dir=root)
+            self.assertTrue(any("target_artifact_dir mismatch" in e for e in errs))
 
 
 if __name__ == "__main__":

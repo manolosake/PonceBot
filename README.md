@@ -182,3 +182,5 @@ Backend traceability gate (`make backend-traceability-runtime-export`) fails whe
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
 - Prefer user-level service with `Restart=always` and journal retention policies.
 - For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
+
+# binding-r5 staged
