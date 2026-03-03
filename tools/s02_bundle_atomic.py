@@ -103,9 +103,8 @@ def _write_trace_files(artifacts_dir: Path, repo_root: Path) -> dict[str, Any]:
     )
     _atomic_write_text(artifacts_dir / "git_status.txt", git_status_text.rstrip() + "\n")
 
-    if diff.strip():
-        patch_text = diff.rstrip() + "\n"
-    else:
+    no_changes = not bool(diff.strip())
+    if no_changes:
         patch_text = (
             "NO_DIFF=true\n"
             f"captured_at_utc={ts}\n"
@@ -113,8 +112,11 @@ def _write_trace_files(artifacts_dir: Path, repo_root: Path) -> dict[str, Any]:
             f"branch={branch}\n"
             "justification=no tracked changes to include in patch for this run\n"
         )
+    else:
+        patch_text = diff.rstrip() + "\n"
     _atomic_write_text(artifacts_dir / "changes.patch", patch_text)
-    return {"captured_at_utc": ts, "branch": branch, "head_sha": sha}
+
+    return {"captured_at_utc": ts, "branch": branch, "head_sha": sha, "no_changes": no_changes}
 
 
 def _run_preflight(artifacts_dir: Path, qa_preview_dir: Path) -> dict[str, Any]:
@@ -212,6 +214,7 @@ def _post_publish_check(artifacts_dir: Path, validation: dict[str, Any]) -> dict
         "changes_patch_size_gt_zero": actual_patch["size_bytes"] > 0,
         "git_status_hash_matches_validation": actual_gs["sha256"] == expected_gs.get("sha256", ""),
         "changes_patch_hash_matches_validation": actual_patch["sha256"] == expected_patch.get("sha256", ""),
+        "validation_artifact_dir_matches_bundle_dir": validation.get("artifacts_dir", "") == str(artifacts_dir),
     }
     status = "PASS" if all(checks.values()) else "FAIL"
     report = {
@@ -262,15 +265,22 @@ def main() -> int:
 
     post_publish = _post_publish_check(artifacts_dir, validation)
 
+    base_pass = (
+        preflight["status"] == "PASS"
+        and verify["status"] == "PASS"
+        and validation.get("status") == "PASS"
+        and post_publish["status"] == "PASS"
+    )
+    # Contract rule: when there are no tracked changes, S-02 cannot be marked PASS.
+    if meta["no_changes"]:
+        status = "NO_CHANGES"
+        exit_code = 2
+    else:
+        status = "PASS" if base_pass else "FAIL"
+        exit_code = 0 if status == "PASS" else 1
+
     summary = {
-        "status": "PASS"
-        if (
-            preflight["status"] == "PASS"
-            and verify["status"] == "PASS"
-            and validation.get("status") == "PASS"
-            and post_publish["status"] == "PASS"
-        )
-        else "FAIL",
+        "status": status,
         "trace": meta,
         "preflight_report": str(artifacts_dir / "preflight_report.json"),
         "verify_log": str(artifacts_dir / "verify.log"),
@@ -279,8 +289,7 @@ def main() -> int:
         "captured_at_utc": _utc_now(),
     }
     _atomic_write_json(artifacts_dir / "bundle_s02_summary.json", summary)
-
-    return 0 if summary["status"] == "PASS" else 1
+    return exit_code
 
 
 if __name__ == "__main__":
