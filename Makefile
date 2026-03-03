@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent validate-s02-sanity bundle-s02-atomic perf-harness-v3 preview-integrity-gate local-smoke-pack
+.PHONY: verify test lint security coverage validate-s02-trace validate-s02-independent validate-s02-sanity validate-s02-close-gate bundle-s02-atomic perf-harness-v3 preview-integrity-gate local-smoke-pack
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
@@ -28,6 +28,12 @@ validate-s02-independent:
 validate-s02-sanity:
 	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
 	$(PYTHON) tools/s02_sanity_gate.py --artifacts-dir "$$ART"
+
+validate-s02-close-gate:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	ORDER=$${ORDER_BRANCH:?set ORDER_BRANCH}; \
+	REPORTED=$${REPORTED_ORDER_BRANCH:-}; \
+	$(PYTHON) tools/s02_close_gate.py --artifacts-dir "$$ART" --expected-order-branch "$$ORDER" --reported-order-branch "$$REPORTED"
 
 bundle-s02-atomic:
 	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
