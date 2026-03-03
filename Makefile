@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage validate-s02-trace
+.PHONY: verify test lint security coverage validate-s02-trace bundle-s02-atomic
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
 
@@ -20,3 +20,7 @@ coverage:
 validate-s02-trace:
 	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
 	$(PYTHON) tools/s02_trace_checker.py --artifacts-dir "$$ART"
+
+bundle-s02-atomic:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	$(PYTHON) tools/s02_bundle_atomic.py --artifacts-dir "$$ART"
