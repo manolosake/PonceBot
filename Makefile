@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export wormhole-contract-integrity-gate wormhole-contract-publish visual-preview-audit visual-preview-smoke
+.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export wormhole-contract-integrity-gate publish-atomic-guard wormhole-contract-publish visual-preview-audit visual-preview-smoke
 
 verify: lint security test coverage
 
@@ -27,13 +27,10 @@ wormhole-contract-export:
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)"
-	git add -N .
-	git diff --name-status HEAD > "$(ARTIFACTS_DIR)/git_status.txt"
+	git status --short --untracked-files=no > "$(ARTIFACTS_DIR)/git_status.txt"
 	git diff --binary HEAD > "$(ARTIFACTS_DIR)/changes.patch"
-	python3 tools/wormhole_bundle_guard.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--repo-root . \
-		--report-out "$(ARTIFACTS_DIR)/wormhole_bundle_guard_report.json"
+	python3 tools/wormhole_patch_apply_check.py --artifacts-dir "$(ARTIFACTS_DIR)" --repo-root . --out "$(ARTIFACTS_DIR)/patch_apply_check.json"
+	$(MAKE) publish-atomic-guard ARTIFACTS_DIR="$(ARTIFACTS_DIR)"
 
 wormhole-contract-integrity-gate:
 	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
@@ -44,6 +41,13 @@ wormhole-contract-integrity-gate:
 		--contract-source docs/contracts/wormhole_scene_contract.v1.json \
 		--expected-branch "$(ORDER_BRANCH)" \
 		--expected-ticket-id "$(TICKET_ID)"
+
+publish-atomic-guard:
+	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
+	python3 tools/publish_atomic_guard.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--out "$(ARTIFACTS_DIR)/publish_atomic_guard_report.json" \
+		--log "$(ARTIFACTS_DIR)/publish_atomic_guard.log"
 
 wormhole-contract-publish:
 	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
