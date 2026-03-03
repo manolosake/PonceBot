@@ -191,6 +191,16 @@ For frontend `preview.html` evidence validation/capture with retry+backoff and a
 - smoke check: `make visual-preview-smoke`
 - real capture: `make visual-preview-audit PREVIEW_HTML=... ARTIFACTS_DIR=... TICKET_ID=... ORDER_BRANCH=...`
 
+## Atomic Publish Guard
+
+To block non-atomic publication inconsistencies between `git_status.txt`, `patch_apply_check.json`, and `changes.patch`:
+- run: `make publish-atomic-guard ARTIFACTS_DIR=/path/to/artifacts`
+- output: `publish_atomic_guard_report.json` and `publish_atomic_guard.log`
+- enforced failures:
+  - `changes.patch` is empty while `patch_apply_check` declares files
+  - paths listed by status/apply-check are missing in patch
+  - patch introduces paths not declared in status/apply-check
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
