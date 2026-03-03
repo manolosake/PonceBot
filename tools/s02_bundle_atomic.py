@@ -69,6 +69,66 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
     return int(proc.returncode), out
 
 
+def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: Path, verify_cmd: str) -> dict[str, Any]:
+    required_files = [
+        repo_root / "tools" / "s02_bundle_atomic.py",
+        repo_root / "tools" / "s02_trace_checker.py",
+        repo_root / "tools" / "security_check.py",
+        repo_root / "Makefile",
+    ]
+    file_checks = {}
+    errors: list[str] = []
+    for p in required_files:
+        ok = p.exists() and p.is_file()
+        file_checks[str(p)] = ok
+        if not ok:
+            errors.append(f"missing required file: {p}")
+
+    checks = {
+        "artifacts_dir_absolute": artifacts_dir.is_absolute(),
+        "artifacts_dir_writable": os.access(str(artifacts_dir), os.W_OK),
+        "qa_preview_dir_absolute": qa_preview_dir.is_absolute(),
+        "verify_cmd_non_empty": bool(verify_cmd.strip()),
+        "python_executable_exists": Path(sys.executable).exists(),
+        "required_files_present": all(file_checks.values()),
+    }
+    if not checks["artifacts_dir_absolute"]:
+        errors.append("artifacts_dir must be absolute")
+    if not checks["artifacts_dir_writable"]:
+        errors.append("artifacts_dir is not writable")
+    if not checks["qa_preview_dir_absolute"]:
+        errors.append("qa_preview_dir must be absolute")
+    if not checks["verify_cmd_non_empty"]:
+        errors.append("verify_cmd is empty")
+    if not checks["python_executable_exists"]:
+        errors.append("python executable not found")
+
+    report = {
+        "status": "PASS" if not errors else "FAIL",
+        "checks": checks,
+        "required_files": file_checks,
+        "errors": errors,
+        "artifacts_dir": str(artifacts_dir),
+        "qa_preview_dir": str(qa_preview_dir),
+        "verify_cmd": verify_cmd,
+        "captured_at_utc": _utc_now(),
+    }
+    _atomic_write_json(artifacts_dir / "pre_execution_guard.json", report)
+    _atomic_write_text(
+        artifacts_dir / "pre_execution_guard.log",
+        (
+            f"TIMESTAMP={_utc_now()}\n"
+            f"STATUS={report['status']}\n"
+            f"ARTIFACTS_DIR={artifacts_dir}\n"
+            f"QA_PREVIEW_DIR={qa_preview_dir}\n"
+            f"VERIFY_CMD={verify_cmd}\n"
+            f"ERRORS={json.dumps(errors, ensure_ascii=False)}\n"
+            f"EXIT_CODE={0 if report['status'] == 'PASS' else 1}\n"
+        ),
+    )
+    return report
+
+
 def _pick_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -246,6 +306,19 @@ def main() -> int:
     qa_preview_dir = Path(args.qa_preview_dir).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    pre_exec_guard = _pre_execution_guard(artifacts_dir, repo_root, qa_preview_dir, args.verify_cmd)
+    if pre_exec_guard["status"] != "PASS":
+        _atomic_write_json(
+            artifacts_dir / "bundle_s02_summary.json",
+            {
+                "status": "FAIL",
+                "reason": "pre_execution_guard_failed",
+                "pre_execution_guard_report": str(artifacts_dir / "pre_execution_guard.json"),
+                "captured_at_utc": _utc_now(),
+            },
+        )
+        return 1
+
     meta = _write_trace_files(artifacts_dir, repo_root)
     preflight = _run_preflight(artifacts_dir, qa_preview_dir)
     verify = _run_verify(artifacts_dir, repo_root, args.verify_cmd)
@@ -266,7 +339,8 @@ def main() -> int:
     post_publish = _post_publish_check(artifacts_dir, validation)
 
     base_pass = (
-        preflight["status"] == "PASS"
+        pre_exec_guard["status"] == "PASS"
+        and preflight["status"] == "PASS"
         and verify["status"] == "PASS"
         and validation.get("status") == "PASS"
         and post_publish["status"] == "PASS"
@@ -283,6 +357,8 @@ def main() -> int:
         "status": status,
         "trace": meta,
         "preflight_report": str(artifacts_dir / "preflight_report.json"),
+        "pre_execution_guard_report": str(artifacts_dir / "pre_execution_guard.json"),
+        "pre_execution_guard_log": str(artifacts_dir / "pre_execution_guard.log"),
         "verify_log": str(artifacts_dir / "verify.log"),
         "trace_validation_report": str(artifacts_dir / "s02_trace_validation.json"),
         "post_publish_report": str(artifacts_dir / "post_publish_check.json"),
