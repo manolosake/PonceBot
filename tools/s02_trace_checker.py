@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,36 @@ def _kv_map(text: str) -> dict[str, str]:
     return out
 
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _snapshot(path: Path) -> dict[str, Any]:
+    exists = path.exists() and path.is_file()
+    data: dict[str, Any] = {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": 0,
+        "sha256": "",
+        "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if not exists:
+        return data
+    st = path.stat()
+    data["size_bytes"] = int(st.st_size)
+    if st.st_size > 0:
+        data["sha256"] = _sha256(path)
+    return data
+
+
+def _valid_sha256(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{64}", value or ""))
+
+
 def validate_s02_trace(artifacts_dir: Path) -> dict[str, Any]:
     errors: list[str] = []
     checks: dict[str, Any] = {}
@@ -30,8 +62,13 @@ def validate_s02_trace(artifacts_dir: Path) -> dict[str, Any]:
     git_status = artifacts_dir / "git_status.txt"
     patch = artifacts_dir / "changes.patch"
 
-    checks["git_status_exists"] = git_status.exists() and git_status.is_file()
-    checks["changes_patch_exists"] = patch.exists() and patch.is_file()
+    snap_before = {
+        "git_status.txt": _snapshot(git_status),
+        "changes.patch": _snapshot(patch),
+    }
+
+    checks["git_status_exists"] = snap_before["git_status.txt"]["exists"]
+    checks["changes_patch_exists"] = snap_before["changes.patch"]["exists"]
     if not checks["git_status_exists"]:
         errors.append("missing git_status.txt")
     if not checks["changes_patch_exists"]:
@@ -41,6 +78,7 @@ def validate_s02_trace(artifacts_dir: Path) -> dict[str, Any]:
             "status": "FAIL",
             "errors": errors,
             "checks": checks,
+            "files": snap_before,
             "artifacts_dir": str(artifacts_dir),
         }
 
@@ -82,10 +120,36 @@ def validate_s02_trace(artifacts_dir: Path) -> dict[str, Any]:
         if sha and not checks["no_diff_sha_valid"]:
             errors.append("NO_DIFF head_sha must be 40-char lowercase hex")
 
+    # Hard guard: size/hash must be present and valid for both files.
+    for fname, snap in snap_before.items():
+        size = int(snap["size_bytes"])
+        digest = str(snap["sha256"])
+        checks[f"{fname}_size_gt_zero"] = size > 0
+        if size <= 0:
+            errors.append(f"{fname} size_bytes must be > 0")
+        checks[f"{fname}_sha256_valid"] = _valid_sha256(digest)
+        if not _valid_sha256(digest):
+            errors.append(f"{fname} sha256 missing/invalid")
+
+    # Re-snapshot at end to detect desynchronization during validation.
+    snap_after = {
+        "git_status.txt": _snapshot(git_status),
+        "changes.patch": _snapshot(patch),
+    }
+    for fname in ("git_status.txt", "changes.patch"):
+        before = snap_before[fname]
+        after = snap_after[fname]
+        unchanged = (before["size_bytes"] == after["size_bytes"]) and (before["sha256"] == after["sha256"])
+        checks[f"{fname}_stable_during_validation"] = unchanged
+        if not unchanged:
+            errors.append(f"{fname} changed during validation (possible stale report)")
+
     result = {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
         "checks": checks,
+        "files": snap_before,
+        "files_after_validation": snap_after,
         "artifacts_dir": str(artifacts_dir),
     }
     return result
