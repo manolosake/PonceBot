@@ -28,6 +28,8 @@ class BackendTraceabilityRuntimeExportTests(unittest.TestCase):
             self.assertTrue(trace["branch_matches_expected"])
             self.assertEqual(trace["execution_id"], "exec-test-470f")
             self.assertEqual(trace["telegram_correlation_id"], "470f8b7f-6f39-4fa9-9a30-75dae0a10bad:exec-test-470f")
+            self.assertEqual(trace["reported_branch_source"], "order_branch_lock")
+            self.assertEqual(trace["trace_contract_version"], "2.0")
             self.assertEqual(sorted(runtime_report["viewports"].keys()), ["desktop", "mobile", "tablet"])
             self.assertGreaterEqual(len(events), 5)
 
@@ -41,4 +43,3 @@ class BackendTraceabilityRuntimeExportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

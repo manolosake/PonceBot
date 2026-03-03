@@ -87,6 +87,7 @@ def export_payload(
 
     trace = {
         "schema_version": 1,
+        "trace_contract_version": "2.0",
         "generated_at_utc": _utc_now(),
         "ticket_id": ticket_id,
         "artifacts_dir": str(artifacts_dir),
@@ -95,6 +96,7 @@ def export_payload(
         "observed_branch": observed_branch,
         "branch_matches_expected": bool(expected_branch and reported_branch == expected_branch and observed_branch == expected_branch),
         "observed_git_branch_actual": observed_git_branch,
+        "reported_branch_source": "order_branch_lock",
         "head_sha": head_sha,
         "execution_id": execution_id,
         "telegram_correlation_id": f"{ticket_id}:{execution_id}",
@@ -208,4 +210,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
