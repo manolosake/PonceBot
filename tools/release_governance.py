@@ -104,7 +104,7 @@ def main() -> int:
     ap.add_argument("--base", default="main", help="base branch name (default: main)")
     ap.add_argument("--head", default="", help="head branch name (default: current branch)")
     ap.add_argument("--artifacts-dir", default="", help="optional artifacts dir to write checklist files")
-    ap.add_argument("--run-tests", action="store_true", help="run python -m unittest -q as part of checklist")
+    ap.add_argument("--run-tests", action="store_true", help="run python3 -m unittest -q as part of checklist")
     ap.add_argument("--require-pr", action="store_true", help="fail checklist if head==base")
     args = ap.parse_args()
 
@@ -177,4 +177,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
