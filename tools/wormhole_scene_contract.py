@@ -41,6 +41,14 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    return _sha256_bytes(path.read_bytes())
+
+
 def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -108,9 +116,19 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _build_trace(contract: dict[str, Any], *, root: Path, ticket_id: str, expected_branch: str, artifacts_dir: Path) -> dict[str, Any]:
+def _build_trace(
+    contract: dict[str, Any],
+    *,
+    root: Path,
+    ticket_id: str,
+    expected_branch: str,
+    artifacts_dir: Path,
+    canonical_json_sha256: str,
+) -> dict[str, Any]:
     canonical = _canonical_json(contract)
     scene_signature = _sha256_text(canonical)
+    if scene_signature != canonical_json_sha256:
+        raise ValueError("canonical hash mismatch while building trace")
 
     head_sha = _git(["git", "rev-parse", "HEAD"], root)
     reported_branch = _git(["git", "rev-parse", "--abbrev-ref", "HEAD"], root)
@@ -131,12 +149,14 @@ def _build_trace(contract: dict[str, Any], *, root: Path, ticket_id: str, expect
             "seed": contract.get("seed"),
         },
         "scene_signature_sha256": scene_signature,
+        "scene_signature_semantics": "canonical_json_sha256",
     }
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
     contract_path = Path(args.contract).resolve()
     contract = _load_contract(contract_path)
+    source_file_sha256 = _sha256_file(contract_path)
     errors = validate_contract(contract)
     payload = {
         "status": "PASS" if not errors else "FAIL",
@@ -175,7 +195,9 @@ def cmd_export(args: argparse.Namespace) -> int:
 
     contract_out_path = artifacts_dir / "wormhole_scene_contract.json"
     canonical = _canonical_json(contract)
+    canonical_json_sha256 = _sha256_text(canonical)
     contract_out_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    exported_file_sha256 = _sha256_file(contract_out_path)
 
     trace = _build_trace(
         contract,
@@ -183,13 +205,14 @@ def cmd_export(args: argparse.Namespace) -> int:
         ticket_id=args.ticket_id,
         expected_branch=args.expected_branch,
         artifacts_dir=artifacts_dir,
+        canonical_json_sha256=canonical_json_sha256,
     )
 
     trace_path = artifacts_dir / "wormhole_scene_trace.json"
     trace_path.write_text(json.dumps(trace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     signature_path = artifacts_dir / "wormhole_scene_contract.sha256"
-    signature_path.write_text(_sha256_text(canonical) + "\n", encoding="utf-8")
+    signature_path.write_text(canonical_json_sha256 + "\n", encoding="utf-8")
 
     report = {
         "status": "PASS",
@@ -197,6 +220,15 @@ def cmd_export(args: argparse.Namespace) -> int:
         "contract_exported": str(contract_out_path),
         "trace_report": str(trace_path),
         "signature_file": str(signature_path),
+        "hash_semantics": {
+            "canonical_json_sha256": "SHA-256 of canonicalized JSON object (sorted keys, compact separators); stable across whitespace and key ordering in files.",
+            "file_byte_sha256": "SHA-256 of raw file bytes; sensitive to formatting, key order, and newline differences.",
+        },
+        "hashes": {
+            "canonical_json_sha256": canonical_json_sha256,
+            "contract_source_file_sha256": source_file_sha256,
+            "contract_export_file_sha256": exported_file_sha256,
+        },
         "scene_signature_sha256": trace["scene_signature_sha256"],
         "branch_matches_expected": trace["branch_matches_expected"],
     }

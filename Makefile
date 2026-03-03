@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export visual-preview-audit visual-preview-smoke
+.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export wormhole-contract-integrity-gate visual-preview-audit visual-preview-smoke
 
 verify: lint security test coverage
 
@@ -27,6 +27,12 @@ wormhole-contract-export:
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)"
+
+wormhole-contract-integrity-gate:
+	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
+	python3 tools/wormhole_scene_integrity_gate.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--contract-source docs/contracts/wormhole_scene_contract.v1.json
 
 visual-preview-audit:
 	@test -n "$(PREVIEW_HTML)" || (echo "PREVIEW_HTML is required"; exit 2)
