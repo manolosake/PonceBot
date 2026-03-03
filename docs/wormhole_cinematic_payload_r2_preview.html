@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Executive Dashboard | Wormhole Cinematic</title>
+  <style>
+    :root {
+      --bg-0: #02030a;
+      --bg-1: #070d22;
+      --panel: rgba(7, 13, 31, 0.64);
+      --line: rgba(120, 219, 255, 0.52);
+      --accent: #8de7ff;
+      --text: #ecf6ff;
+      --muted: #adc2d8;
+      --ok: #78f9c3;
+      --warn: #ffd482;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      font-family: "Segoe UI", "SF Pro Text", "Helvetica Neue", sans-serif;
+      background: radial-gradient(circle at 20% 10%, #132347 0%, var(--bg-1) 35%, var(--bg-0) 100%);
+      color: var(--text);
+    }
+    body { display: grid; place-items: stretch; overflow: hidden; }
+    .scene { position: relative; width: 100vw; height: 100vh; isolation: isolate; }
+    canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%; display: block;
+      background:
+        radial-gradient(circle at 50% 46%, rgba(86, 170, 255, 0.12), transparent 36%),
+        radial-gradient(circle at 12% 12%, rgba(255, 255, 255, 0.08), transparent 24%),
+        radial-gradient(circle at 82% 26%, rgba(73, 163, 255, 0.11), transparent 30%),
+        linear-gradient(145deg, #050a16 0%, #040814 42%, #02040d 100%);
+      z-index: 1;
+    }
+    .vignette { position: absolute; inset: 0; background: radial-gradient(circle at center, transparent 34%, rgba(2, 3, 9, 0.54) 74%, rgba(0, 0, 0, 0.9) 100%); pointer-events: none; z-index: 2; }
+    .hud { position: absolute; inset: auto 2rem 1.7rem 2rem; display: grid; grid-template-columns: minmax(320px, 720px) minmax(220px, 360px); gap: 1rem; align-items: end; z-index: 3; }
+    .panel { background: var(--panel); border: 1px solid rgba(147, 201, 255, 0.28); border-radius: 18px; backdrop-filter: blur(8px); box-shadow: 0 10px 34px rgba(0, 0, 0, 0.42), inset 0 0 0 1px rgba(225, 244, 255, 0.06); padding: 1rem 1.1rem; }
+    .kicker { margin: 0 0 0.55rem; font-size: 0.72rem; letter-spacing: 0.13em; text-transform: uppercase; color: var(--accent); opacity: 0.95; }
+    h1 { margin: 0; font-size: clamp(1.05rem, 2vw, 1.52rem); line-height: 1.32; font-weight: 620; text-wrap: balance; }
+    .desc { margin: 0.72rem 0 0; color: var(--muted); font-size: clamp(0.87rem, 1.45vw, 1rem); line-height: 1.5; max-width: 65ch; }
+    .metrics { margin-top: 0.85rem; display: flex; flex-wrap: wrap; gap: 0.55rem; }
+    .pill { border: 1px solid rgba(150, 202, 255, 0.28); border-radius: 999px; padding: 0.34rem 0.64rem; font-size: 0.78rem; color: #d8ebff; background: rgba(22, 44, 78, 0.38); white-space: nowrap; }
+    .status-grid { display: grid; gap: 0.62rem; }
+    .status-row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.7rem; border-bottom: 1px solid rgba(165, 208, 255, 0.18); padding-bottom: 0.38rem; }
+    .status-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .label { font-size: 0.78rem; color: #b6cce3; text-transform: uppercase; letter-spacing: 0.08em; }
+    .value { font-size: 0.9rem; color: #f2f8ff; font-weight: 560; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    @media (max-width: 980px) { .hud { inset: auto 0.9rem 0.9rem; grid-template-columns: 1fr; } .panel { padding: 0.9rem; border-radius: 15px; } .status-grid { grid-template-columns: 1fr 1fr; column-gap: 0.8rem; } }
+    @media (max-width: 620px) { .hud { inset: auto 0.68rem 0.65rem; } .status-grid { grid-template-columns: 1fr; } h1 { font-size: 1rem; } .desc { font-size: 0.84rem; line-height: 1.42; } .pill { font-size: 0.73rem; } }
+  </style>
+</head>
+<body>
+  <main class="scene" aria-label="Executive Dashboard Wormhole Cinematic Preview">
+    <canvas id="wormhole" aria-hidden="true"></canvas>
+    <div class="vignette"></div>
+    <section class="hud">
+      <article class="panel">
+        <p class="kicker">Executive Dashboard · Wormhole Intelligence</p>
+        <h1>El nuevo wormhole cinematic convierte ruido operativo en una lectura clara de riesgo, capacidad y ventana de decisión para el equipo ejecutivo.</h1>
+        <p class="desc">El cuello hiperboloide y la malla luminosa no son decoración: representan continuidad de flujo, compresión temporal y profundidad de contexto para priorizar acciones sin perder legibilidad.</p>
+        <div class="metrics" aria-label="Métricas activas">
+          <span class="pill">Profundidad estimada: 4.6 AU visuales</span>
+          <span class="pill">Curvatura estable: 97.4%</span>
+          <span class="pill">Latencia de escena: 16 ms (objetivo desktop)</span>
+        </div>
+      </article>
+      <aside class="panel" aria-label="Estado de operación">
+        <div class="status-grid">
+          <div class="status-row"><span class="label">Render loop</span><span class="value ok">Estable</span></div>
+          <div class="status-row"><span class="label">Contraste texto</span><span class="value ok">Apto QA</span></div>
+          <div class="status-row"><span class="label">Viewport móvil</span><span class="value ok">Responsive</span></div>
+          <div class="status-row"><span class="label">Canal de energía</span><span class="value warn">Pico controlado</span></div>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    (function () {
+      const canvas = document.getElementById('wormhole');
+      const ctx = canvas.getContext('2d');
+      let width = 0, height = 0, dpr = 1, time = 0;
+      const stars = Array.from({ length: 220 }, () => ({ x: Math.random(), y: Math.random(), z: 0.25 + Math.random() * 0.75, s: 0.3 + Math.random() * 1.8 }));
+      function resize() { dpr = Math.min(window.devicePixelRatio || 1, 2); width = Math.floor(window.innerWidth); height = Math.floor(window.innerHeight); canvas.width = Math.floor(width * dpr); canvas.height = Math.floor(height * dpr); canvas.style.width = width + 'px'; canvas.style.height = height + 'px'; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); }
+      function drawStars(cx, cy, rMax) { for (const s of stars) { const drift = (time * 0.018 * s.z) % 1; const x = ((s.x + drift) % 1) * width; const y = ((s.y + 0.1 * Math.sin(time * 0.0007 + s.z * 7.2)) % 1) * height; const fall = Math.max(0, 1 - Math.hypot(x - cx, y - cy) / (rMax * 1.2)); const a = 0.12 + s.z * 0.35 + fall * 0.28; ctx.fillStyle = `rgba(206, 232, 255, ${a.toFixed(3)})`; const sz = s.s * (0.6 + s.z * 0.8 + fall * 0.5); ctx.fillRect(x, y, sz, sz); } }
+      function drawWormhole() {
+        const cx = width * 0.52, cy = height * (width < 760 ? 0.44 : 0.46), br = Math.min(width, height) * (width < 700 ? 0.22 : 0.29);
+        drawStars(cx, cy, br * 1.85);
+        const pulse = 1 + 0.028 * Math.sin(time * 0.0017);
+        const rings = width < 680 ? 30 : 42;
+        for (let i = 0; i < rings; i++) {
+          const t = i / (rings - 1), z = (t - 0.5) * 2, h = Math.sqrt(1 + 3.6 * z * z), p = 1 / (1 + t * 2.9);
+          const rx = br * h * p * pulse, ry = rx * (0.28 + t * 0.1), y = cy + (t - 0.5) * br * 1.3 + Math.sin(time * 0.0019 + t * 10.5) * br * 0.035;
+          const hue = 195 + t * 35, alpha = 0.075 + (1 - t) * 0.15;
+          ctx.strokeStyle = `hsla(${hue}, 98%, ${68 - t * 10}%, ${alpha})`; ctx.lineWidth = 0.65 + (1 - t) * 1.5;
+          ctx.beginPath(); ctx.ellipse(cx, y, Math.max(1, rx), Math.max(0.7, ry), 0, 0, Math.PI * 2); ctx.stroke();
+        }
+      const mer = width < 680 ? 14 : 20;
+      for (let m = 0; m < mer; m++) {
+        const a = (m / mer) * Math.PI * 2 + time * 0.00042; ctx.beginPath();
+        for (let i = 0; i <= 44; i++) {
+          const t = i / 44, z = (t - 0.5) * 2, h = Math.sqrt(1 + 3.6 * z * z), p = 1 / (1 + t * 2.9);
+          const rx = br * h * p * pulse, ry = rx * (0.28 + t * 0.1), x = cx + Math.cos(a + t * 2.4) * rx, y = cy + (t - 0.5) * br * 1.3 + Math.sin(a * 1.2 + t * 7.2 + time * 0.0015) * ry * 0.35;
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        const alpha = 0.035 + 0.04 * (0.5 + 0.5 * Math.sin(a * 2.3 + time * 0.001));
+        ctx.strokeStyle = `rgba(129, 232, 255, ${alpha.toFixed(3)})`; ctx.lineWidth = 0.7; ctx.stroke();
+      }
+      }
+      function frame(ts) { time = ts; ctx.clearRect(0, 0, width, height); drawWormhole(); requestAnimationFrame(frame); }
+      resize(); window.addEventListener('resize', resize, { passive: true }); requestAnimationFrame(frame);
+    })();
+  </script>
+</body>
+</html>
