@@ -172,9 +172,21 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
+Delivery evidence gate (for close-gate publishing):
+- `ARTIFACTS_DIR=/path/to/artifacts make delivery-evidence-gate`
+- Enforces mandatory artifacts and consistency:
+  - `changes.patch` and `git_status.txt` must exist and be non-empty.
+  - `changes.patch` must cover paths declared in `git_status.txt`.
+  - At least one JSON report file must exist.
+  - Visual evidence must include `desktop`, `tablet`, and `mobile` screenshots.
+  - `preview.html` must exist and look like valid HTML.
+  - Telegram traceability evidence must be present (files containing `telegram`).
+- Writes:
+  - `sre_evidence_gate_report.json` (machine-readable PASS/FAIL + reasons)
+  - `sre_evidence_gate.log` (human-readable per-check log)
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
 - Prefer user-level service with `Restart=always` and journal retention policies.
 - For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
-
