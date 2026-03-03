@@ -30,9 +30,13 @@ wormhole-contract-export:
 
 wormhole-contract-integrity-gate:
 	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
+	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
+	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
 	python3 tools/wormhole_scene_integrity_gate.py \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--contract-source docs/contracts/wormhole_scene_contract.v1.json
+		--contract-source docs/contracts/wormhole_scene_contract.v1.json \
+		--expected-branch "$(ORDER_BRANCH)" \
+		--expected-ticket-id "$(TICKET_ID)"
 
 visual-preview-audit:
 	@test -n "$(PREVIEW_HTML)" || (echo "PREVIEW_HTML is required"; exit 2)

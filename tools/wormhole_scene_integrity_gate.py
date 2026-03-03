@@ -24,7 +24,13 @@ def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def evaluate_integrity(artifacts_dir: Path, contract_source: Path | None = None) -> dict[str, Any]:
+def evaluate_integrity(
+    artifacts_dir: Path,
+    contract_source: Path | None = None,
+    *,
+    expected_branch: str = "",
+    expected_ticket_id: str = "",
+) -> dict[str, Any]:
     errors: list[str] = []
     checks: dict[str, bool] = {}
 
@@ -94,6 +100,9 @@ def evaluate_integrity(artifacts_dir: Path, contract_source: Path | None = None)
 
     trace = _load_json(trace_report)
     trace_scene_signature = trace.get("scene_signature_sha256", "")
+    reported_branch = str(trace.get("reported_branch", "") or "")
+    reported_ticket_id = str(trace.get("ticket_id", "") or "")
+    reported_artifacts_dir = str(trace.get("artifacts_dir", "") or "")
 
     checks["canonical_source_matches_report"] = canonical_source == hashes.get("canonical_json_sha256")
     if not checks["canonical_source_matches_report"]:
@@ -125,10 +134,32 @@ def evaluate_integrity(artifacts_dir: Path, contract_source: Path | None = None)
     if not checks["report_scene_signature_matches_canonical"]:
         errors.append("report scene_signature_sha256 does not match canonical_json_sha256")
 
+    checks["trace_artifacts_dir_matches_runtime"] = reported_artifacts_dir == str(artifacts_dir)
+    if not checks["trace_artifacts_dir_matches_runtime"]:
+        errors.append("trace artifacts_dir does not match evaluated artifacts_dir")
+
+    if expected_branch:
+        checks["expected_branch_matches_trace"] = reported_branch == expected_branch
+        if not checks["expected_branch_matches_trace"]:
+            errors.append(
+                f"reported_branch mismatch: expected '{expected_branch}' observed '{reported_branch}'"
+            )
+
+    if expected_ticket_id:
+        checks["expected_ticket_id_matches_trace"] = reported_ticket_id == expected_ticket_id
+        if not checks["expected_ticket_id_matches_trace"]:
+            errors.append(
+                f"ticket_id mismatch: expected '{expected_ticket_id}' observed '{reported_ticket_id}'"
+            )
+
     return {
         "status": "PASS" if not errors else "FAIL",
         "errors": errors,
         "artifacts_dir": str(artifacts_dir),
+        "expected_branch": expected_branch,
+        "reported_branch": reported_branch,
+        "expected_ticket_id": expected_ticket_id,
+        "reported_ticket_id": reported_ticket_id,
         "checks": checks,
         "canonical_json_sha256": hashes.get("canonical_json_sha256", ""),
         "contract_source_file_sha256": source_file_sha,
@@ -140,13 +171,20 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Integrity gate for wormhole scene contract export artifacts")
     ap.add_argument("--artifacts-dir", required=True)
     ap.add_argument("--contract-source", default="")
+    ap.add_argument("--expected-branch", default="")
+    ap.add_argument("--expected-ticket-id", default="")
     ap.add_argument("--report-out", default="")
     args = ap.parse_args()
 
     artifacts_dir = Path(args.artifacts_dir).resolve()
     contract_source = Path(args.contract_source).resolve() if args.contract_source else None
 
-    result = evaluate_integrity(artifacts_dir, contract_source=contract_source)
+    result = evaluate_integrity(
+        artifacts_dir,
+        contract_source=contract_source,
+        expected_branch=args.expected_branch,
+        expected_ticket_id=args.expected_ticket_id,
+    )
     out = json.dumps(result, ensure_ascii=False, indent=2)
     if args.report_out:
         report_out = Path(args.report_out).resolve()
