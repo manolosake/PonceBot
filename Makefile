@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export
+.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export visual-preview-audit visual-preview-smoke
 
 verify: lint security test coverage
 
@@ -27,3 +27,22 @@ wormhole-contract-export:
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)"
+
+visual-preview-audit:
+	@test -n "$(PREVIEW_HTML)" || (echo "PREVIEW_HTML is required"; exit 2)
+	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
+	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
+	python3 tools/visual_preview_audit.py \
+		--preview-html "$(PREVIEW_HTML)" \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--order-branch "$(ORDER_BRANCH)"
+
+visual-preview-smoke:
+	python3 tools/visual_preview_audit.py \
+		--preview-html tools/fixtures/preview_fixture.html \
+		--artifacts-dir .codexbot_tmp/visual-preview-smoke \
+		--ticket-id local-smoke \
+		--order-branch sre_visual_pipeline \
+		--capture-mode synthetic \
+		--force-capture

@@ -184,6 +184,13 @@ Commands:
 
 This export emits signed traceability artifacts for QA comparison between iterations.
 
+## Visual Preview Audit Pipeline
+
+For frontend `preview.html` evidence validation/capture with retry+backoff and audit packaging:
+- runbook: `docs/visual_pipeline_runbook.md`
+- smoke check: `make visual-preview-smoke`
+- real capture: `make visual-preview-audit PREVIEW_HTML=... ARTIFACTS_DIR=... TICKET_ID=... ORDER_BRANCH=...`
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
