@@ -44,6 +44,13 @@ def _snapshot(path: Path) -> dict[str, Any]:
     }
 
 
+def _to_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
@@ -69,7 +76,13 @@ def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
     return int(proc.returncode), out
 
 
-def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: Path, verify_cmd: str) -> dict[str, Any]:
+def _pre_execution_guard(
+    artifacts_dir: Path,
+    repo_root: Path,
+    qa_preview_dir: Path,
+    verify_cmd: str,
+    expected_branch: str,
+) -> dict[str, Any]:
     required_files = [
         repo_root / "tools" / "s02_bundle_atomic.py",
         repo_root / "tools" / "s02_trace_checker.py",
@@ -89,6 +102,7 @@ def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: P
         "artifacts_dir_writable": os.access(str(artifacts_dir), os.W_OK),
         "qa_preview_dir_absolute": qa_preview_dir.is_absolute(),
         "verify_cmd_non_empty": bool(verify_cmd.strip()),
+        "expected_branch_non_empty": bool(expected_branch.strip()),
         "python_executable_exists": Path(sys.executable).exists(),
         "required_files_present": all(file_checks.values()),
     }
@@ -100,6 +114,8 @@ def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: P
         errors.append("qa_preview_dir must be absolute")
     if not checks["verify_cmd_non_empty"]:
         errors.append("verify_cmd is empty")
+    if not checks["expected_branch_non_empty"]:
+        errors.append("expected_branch is empty (pass --expected-branch or ORDER_BRANCH)")
     if not checks["python_executable_exists"]:
         errors.append("python executable not found")
 
@@ -111,6 +127,7 @@ def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: P
         "artifacts_dir": str(artifacts_dir),
         "qa_preview_dir": str(qa_preview_dir),
         "verify_cmd": verify_cmd,
+        "expected_branch": expected_branch,
         "captured_at_utc": _utc_now(),
     }
     _atomic_write_json(artifacts_dir / "pre_execution_guard.json", report)
@@ -122,6 +139,7 @@ def _pre_execution_guard(artifacts_dir: Path, repo_root: Path, qa_preview_dir: P
             f"ARTIFACTS_DIR={artifacts_dir}\n"
             f"QA_PREVIEW_DIR={qa_preview_dir}\n"
             f"VERIFY_CMD={verify_cmd}\n"
+            f"EXPECTED_BRANCH={expected_branch}\n"
             f"ERRORS={json.dumps(errors, ensure_ascii=False)}\n"
             f"EXIT_CODE={0 if report['status'] == 'PASS' else 1}\n"
         ),
@@ -260,7 +278,12 @@ def _run_verify(artifacts_dir: Path, repo_root: Path, verify_cmd: str) -> dict[s
     return {"status": "PASS" if code == 0 else "FAIL", "exit_code": code}
 
 
-def _post_publish_check(artifacts_dir: Path, validation: dict[str, Any]) -> dict[str, Any]:
+def _post_publish_check(
+    artifacts_dir: Path,
+    validation: dict[str, Any],
+    trace_meta: dict[str, Any],
+    expected_branch: str,
+) -> dict[str, Any]:
     files = validation.get("files", {})
     expected_gs = files.get("git_status.txt", {})
     expected_patch = files.get("changes.patch", {})
@@ -272,14 +295,24 @@ def _post_publish_check(artifacts_dir: Path, validation: dict[str, Any]) -> dict
     checks = {
         "git_status_size_gt_zero": actual_gs["size_bytes"] > 0,
         "changes_patch_size_gt_zero": actual_patch["size_bytes"] > 0,
+        "git_status_path_matches_validation": actual_gs["path"] == expected_gs.get("path", ""),
+        "changes_patch_path_matches_validation": actual_patch["path"] == expected_patch.get("path", ""),
+        "git_status_size_matches_validation": actual_gs["size_bytes"] == _to_int(expected_gs.get("size_bytes", -1)),
+        "changes_patch_size_matches_validation": actual_patch["size_bytes"] == _to_int(expected_patch.get("size_bytes", -1)),
         "git_status_hash_matches_validation": actual_gs["sha256"] == expected_gs.get("sha256", ""),
         "changes_patch_hash_matches_validation": actual_patch["sha256"] == expected_patch.get("sha256", ""),
         "validation_artifact_dir_matches_bundle_dir": validation.get("artifacts_dir", "") == str(artifacts_dir),
+        "branch_matches_expected": trace_meta.get("branch", "") == expected_branch,
     }
     status = "PASS" if all(checks.values()) else "FAIL"
     report = {
         "status": status,
         "checks": checks,
+        "branch_provenance": {
+            "expected_branch": expected_branch,
+            "trace_branch": trace_meta.get("branch", ""),
+            "head_sha": trace_meta.get("head_sha", ""),
+        },
         "expected_from_validation": {
             "git_status.txt": expected_gs,
             "changes.patch": expected_patch,
@@ -299,6 +332,11 @@ def main() -> int:
     parser.add_argument("--artifacts-dir", required=True)
     parser.add_argument("--qa-preview-dir", default=str(QA_PREVIEW_DIR_DEFAULT))
     parser.add_argument("--verify-cmd", default="make verify")
+    parser.add_argument(
+        "--expected-branch",
+        default=(os.environ.get("ORDER_BRANCH", "") or "").strip(),
+        help="Expected branch provenance for this bundle (defaults to ORDER_BRANCH env var).",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -306,7 +344,8 @@ def main() -> int:
     qa_preview_dir = Path(args.qa_preview_dir).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    pre_exec_guard = _pre_execution_guard(artifacts_dir, repo_root, qa_preview_dir, args.verify_cmd)
+    expected_branch = args.expected_branch.strip()
+    pre_exec_guard = _pre_execution_guard(artifacts_dir, repo_root, qa_preview_dir, args.verify_cmd, expected_branch)
     if pre_exec_guard["status"] != "PASS":
         _atomic_write_json(
             artifacts_dir / "bundle_s02_summary.json",
@@ -336,7 +375,7 @@ def main() -> int:
         ),
     )
 
-    post_publish = _post_publish_check(artifacts_dir, validation)
+    post_publish = _post_publish_check(artifacts_dir, validation, meta, expected_branch)
 
     base_pass = (
         pre_exec_guard["status"] == "PASS"
@@ -356,6 +395,7 @@ def main() -> int:
     summary = {
         "status": status,
         "trace": meta,
+        "expected_branch": expected_branch,
         "preflight_report": str(artifacts_dir / "preflight_report.json"),
         "pre_execution_guard_report": str(artifacts_dir / "pre_execution_guard.json"),
         "pre_execution_guard_log": str(artifacts_dir / "pre_execution_guard.log"),
