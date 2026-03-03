@@ -30,6 +30,11 @@ def _parse_git_status_paths(git_status_path: Path) -> list[str]:
         line = raw.rstrip()
         if not line or line.startswith("#"):
             continue
+        if "\t" in line:
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                tracked.add(parts[-1].strip())
+                continue
         if line.startswith("?? "):
             tracked.add(line[3:].strip())
             continue

@@ -21,16 +21,12 @@ wormhole-contract-export:
 	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
 	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
 	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
-	python3 tools/wormhole_scene_contract.py export \
+	python3 tools/wormhole_atomic_packager.py \
 		--repo-root . \
 		--contract docs/contracts/wormhole_scene_contract.v1.json \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)"
-	git status --short --untracked-files=no > "$(ARTIFACTS_DIR)/git_status.txt"
-	git diff --binary HEAD > "$(ARTIFACTS_DIR)/changes.patch"
-	python3 tools/wormhole_patch_apply_check.py --artifacts-dir "$(ARTIFACTS_DIR)" --repo-root . --out "$(ARTIFACTS_DIR)/patch_apply_check.json"
-	$(MAKE) publish-atomic-guard ARTIFACTS_DIR="$(ARTIFACTS_DIR)"
 
 wormhole-contract-integrity-gate:
 	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
