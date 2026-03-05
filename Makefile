@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check close-time-postfinal-guard close-time-terminal-enforce
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -53,11 +53,24 @@ close-time-postfinal-guard:
 		--files "changes.patch,git_status.txt" \
 		--summary "$(ARTIFACTS_DIR)/sre_close_summary.json" \
 		--report "$(ARTIFACTS_DIR)/postfinal_close_guard_report.json" \
-		--sleep-seconds "$${SLEEP_SECONDS:-1.5}"
+		--sleep-seconds "$${SLEEP_SECONDS:-5.0}"
+
+atomic-root-publish-from-smoke:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ ! -d "$(ARTIFACTS_DIR)/smoke_stable" ]; then echo "smoke_stable bundle is required"; exit 2; fi
+	@$(PYTHON) tools/postfinal_root_smoke_guard.py \
+		--root-dir "$(ARTIFACTS_DIR)" \
+		--smoke-stable-dir "$(ARTIFACTS_DIR)/smoke_stable" \
+		--files "changes.patch,git_status.txt" \
+		--summary "$(ARTIFACTS_DIR)/sre_close_summary.json" \
+		--report "$(ARTIFACTS_DIR)/atomic_root_publish_report.json" \
+		--sleep-seconds "$${SLEEP_SECONDS:-0.0}" \
+		--sync-root-from-smoke \
+		--allow-missing-summary
 
 close-time-terminal-enforce:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	@$(MAKE) close-time-postfinal-guard ARTIFACTS_DIR="$(ARTIFACTS_DIR)" SLEEP_SECONDS="$${SLEEP_SECONDS:-1.5}"
+	@$(MAKE) close-time-postfinal-guard ARTIFACTS_DIR="$(ARTIFACTS_DIR)" SLEEP_SECONDS="$${SLEEP_SECONDS:-5.0}"
 	@$(PYTHON) tools/terminal_live_probe.py \
 		--root-dir "$(ARTIFACTS_DIR)" \
 		--files "changes.patch,git_status.txt" \
