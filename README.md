@@ -172,6 +172,7 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
+<<<<<<< HEAD
 Delivery evidence gate (for close-gate publishing):
 - `ARTIFACTS_DIR=/path/to/artifacts make delivery-evidence-gate`
 - Enforces mandatory artifacts and consistency:
@@ -189,6 +190,36 @@ Delivery evidence gate (for close-gate publishing):
 - Negative smoke expectation:
   - If `changes.patch` or `git_status.txt` are empty, guard must return exit code `2` and mark
     `required_changes_patch_non_empty` / `required_git_status_non_empty` as failed.
+=======
+## Wormhole Scene Contract (Backend Traceability)
+
+Backend includes a versioned scene contract for reproducible visual params (seed/version/presets):
+- canonical file: `docs/contracts/wormhole_scene_contract.v1.json`
+- validator/exporter: `tools/wormhole_scene_contract.py`
+
+Commands:
+- `make wormhole-contract-validate`
+- `make wormhole-contract-export ARTIFACTS_DIR=... ORDER_BRANCH=... TICKET_ID=...`
+
+This export emits signed traceability artifacts for QA comparison between iterations.
+
+## Visual Preview Audit Pipeline
+
+For frontend `preview.html` evidence validation/capture with retry+backoff and audit packaging:
+- runbook: `docs/visual_pipeline_runbook.md`
+- smoke check: `make visual-preview-smoke`
+- real capture: `make visual-preview-audit PREVIEW_HTML=... ARTIFACTS_DIR=... TICKET_ID=... ORDER_BRANCH=...`
+
+## Atomic Publish Guard
+
+To block non-atomic publication inconsistencies between `git_status.txt`, `patch_apply_check.json`, and `changes.patch`:
+- run: `make publish-atomic-guard ARTIFACTS_DIR=/path/to/artifacts`
+- output: `publish_atomic_guard_report.json` and `publish_atomic_guard.log`
+- enforced failures:
+  - `changes.patch` is empty while `patch_apply_check` declares files
+  - paths listed by status/apply-check are missing in patch
+  - patch introduces paths not declared in status/apply-check
+>>>>>>> origin/main
 
 ## Deployment Notes
 
