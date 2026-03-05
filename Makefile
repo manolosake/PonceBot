@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+.PHONY: verify test lint security coverage backend-provenance-export
+=======
+<<<<<<< HEAD
 .PHONY: verify test lint security coverage validate-s02-trace bundle-s02-atomic
 
 PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
@@ -13,6 +16,7 @@ PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>
 ifeq ($(PYTHON),)
 $(error No Python runtime found. Install python3 (preferred) or python)
 endif
+>>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
 
@@ -46,6 +50,17 @@ bundle-s02-atomic:
 <<<<<<< HEAD
 	python tools/coverage_gate.py --min 0.65
 
+<<<<<<< HEAD
+backend-provenance-export:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	python3 tools/backend_provenance_export.py \
+		--repo-root "." \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--expected-branch "$(ORDER_BRANCH)"
+=======
 wormhole-contract-validate:
 	python3 tools/wormhole_scene_contract.py validate --contract docs/contracts/wormhole_scene_contract.v1.json
 
@@ -178,5 +193,6 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
+>>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
