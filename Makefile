@@ -86,6 +86,7 @@ close-regression-harness:
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
 
 # Compatibility aliases for delivery/traceability lanes after post-merge reconciliation.
+# branchlock: d65b5f6f backend_fix_makefile_branchlock
 delivery-evidence-gate:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
 	@$(PYTHON) tools/delivery_evidence_gate.py --artifacts-dir "$(ARTIFACTS_DIR)" --workspace-dir "."
