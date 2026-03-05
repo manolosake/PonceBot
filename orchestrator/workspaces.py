@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import json
+import os
 import subprocess
 import time
 
@@ -140,14 +141,52 @@ def collect_git_artifacts(*, repo_dir: Path, artifacts_dir: Path) -> list[Path]:
     diff_p = artifacts_dir / "changes.patch"
 
     st = _run(["git", "-C", str(repo_dir), "status", "--porcelain"], check=False)
-    status_p.write_text(st.stdout or "", encoding="utf-8", errors="replace")
+    status_text = st.stdout or ""
+    _atomic_write_text(status_p, status_text)
     out.append(status_p)
 
-    df = _run(["git", "-C", str(repo_dir), "diff"], check=False)
-    diff_p.write_text(df.stdout or "", encoding="utf-8", errors="replace")
+    # Contractual patch: include tracked staged+unstaged deltas (against HEAD)
+    # and explicit diffs for untracked files listed as ?? in porcelain status.
+    tracked = _run(
+        ["git", "-C", str(repo_dir), "diff", "--binary", "--no-ext-diff", "HEAD", "--", "."],
+        check=False,
+    ).stdout or ""
+    patch_parts = [tracked]
+    for rel in _parse_untracked_from_status(status_text):
+        # `git diff --no-index /dev/null <file>` is the canonical way to emit a patch for untracked paths.
+        # It returns non-zero by design when differences are present.
+        untracked = _run(
+            ["git", "-C", str(repo_dir), "diff", "--binary", "--no-ext-diff", "--no-index", "--", "/dev/null", rel],
+            check=False,
+        ).stdout or ""
+        if untracked:
+            patch_parts.append(untracked)
+    patch_text = "".join(patch_parts)
+    _atomic_write_text(diff_p, patch_text)
     out.append(diff_p)
 
     return out
+
+
+def _parse_untracked_from_status(status_text: str) -> list[str]:
+    out: list[str] = []
+    for line in status_text.splitlines():
+        raw = line.rstrip("\n")
+        if not raw:
+            continue
+        # Porcelain format for untracked files is `?? <path>`.
+        if raw.startswith("?? "):
+            rel = raw[3:].strip()
+            if rel:
+                out.append(rel)
+    return sorted(set(out))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8", errors="replace")
+    tmp.replace(path)
 
 
 def _pick_base_ref(repo: Path) -> str:
