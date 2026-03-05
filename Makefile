@@ -18,8 +18,11 @@ backend-traceability-runtime-export:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
 	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
 	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	@if [ -z "$(FRONTEND_JOB_ID)" ]; then echo "FRONTEND_JOB_ID is required"; exit 2; fi
 	python3 tools/backend_traceability_runtime_export.py \
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
-		--expected-branch "$(ORDER_BRANCH)"
+		--expected-branch "$(ORDER_BRANCH)" \
+		--frontend-job-id "$(FRONTEND_JOB_ID)" \
+		--target-artifact-dir "$(TARGET_ARTIFACT_DIR)"
