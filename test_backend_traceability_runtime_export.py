@@ -1,5 +1,6 @@
 import base64
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -30,13 +31,19 @@ class TestBackendTraceabilityRuntimeExport(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _png_with_dimensions(self, width: int, height: int) -> bytes:
+        raw = bytearray(PNG_1X1)
+        raw[16:24] = struct.pack(">II", width, height)
+        return bytes(raw)
+
     def test_export_includes_visual_metadata_per_viewport(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             self._seed_bundle(root)
-            (root / "desktop_capture.png").write_bytes(PNG_1X1)
-            (root / "tablet_capture.png").write_bytes(PNG_1X1)
-            (root / "mobile_capture.png").write_bytes(PNG_1X1)
+            png_2x2 = self._png_with_dimensions(2, 2)
+            (root / "desktop_capture.png").write_bytes(png_2x2)
+            (root / "tablet_capture.png").write_bytes(png_2x2)
+            (root / "mobile_capture.png").write_bytes(png_2x2)
 
             rc = subprocess.call(
                 [
@@ -66,8 +73,8 @@ class TestBackendTraceabilityRuntimeExport(unittest.TestCase):
                 self.assertTrue(by_vp[vp]["present"])
                 self.assertGreater(by_vp[vp]["bytes"], 0)
                 self.assertEqual(len(by_vp[vp]["sha256"]), 64)
-                self.assertGreater(by_vp[vp]["width"], 0)
-                self.assertGreater(by_vp[vp]["height"], 0)
+                self.assertGreater(by_vp[vp]["width"], 1)
+                self.assertGreater(by_vp[vp]["height"], 1)
 
     def test_export_fails_when_viewport_metadata_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -100,6 +107,39 @@ class TestBackendTraceabilityRuntimeExport(unittest.TestCase):
 
             summary = json.loads((root / "backend_traceability_runtime_summary.json").read_text(encoding="utf-8"))
             self.assertIn("mobile", summary["visual_metadata"]["missing_viewports"])
+
+    def test_export_fails_for_1x1_placeholder_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            self._seed_bundle(root)
+            (root / "desktop_capture.png").write_bytes(PNG_1X1)
+            (root / "tablet_capture.png").write_bytes(PNG_1X1)
+            (root / "mobile_capture.png").write_bytes(PNG_1X1)
+
+            rc = subprocess.call(
+                [
+                    "python3",
+                    "tools/backend_traceability_runtime_export.py",
+                    "--repo-root",
+                    ".",
+                    "--artifacts-dir",
+                    str(root),
+                    "--ticket-id",
+                    "01b4d09a-665c-4d53-b1fb-8cea3509d4b5",
+                    "--expected-branch",
+                    self._current_branch(),
+                    "--frontend-job-id",
+                    "frontend_rc_bundle_republish_v2",
+                    "--target-artifact-dir",
+                    str(root),
+                    "--execution-id",
+                    "exec-visual-3",
+                ]
+            )
+            self.assertNotEqual(rc, 0)
+            summary = json.loads((root / "backend_traceability_runtime_summary.json").read_text(encoding="utf-8"))
+            self.assertIn("desktop", summary["visual_metadata"]["invalid_viewports"])
+            self.assertIn("width_le_1", summary["visual_metadata"]["by_viewport"]["desktop"]["invalid_reasons"])
 
 
 if __name__ == "__main__":

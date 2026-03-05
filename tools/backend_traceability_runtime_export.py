@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import struct
 import subprocess
 import time
@@ -12,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 REQUIRED_VIEWPORTS = ("desktop", "tablet", "mobile")
+DEFAULT_PLACEHOLDER_SHA256 = {
+    # known tiny 1x1 placeholder used in local smoke fixtures
+    "2c3e993736375eaa110aa979c672c0defa2c7e06ce3eb54cf88eacbbb8c13b8e",
+}
 
 
 def _utc_now() -> str:
@@ -26,18 +31,25 @@ def _run_git(args: list[str], repo_root: Path) -> str:
     return out.decode("utf-8", errors="replace").strip()
 
 
-def _status_paths(path: Path) -> list[str]:
+def _status_entries(path: Path) -> dict[str, str]:
     if not path.exists():
-        return []
-    out: list[str] = []
+        return {}
+    out: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
+        raw = line.rstrip("\n")
+        if not raw.strip():
             continue
-        cols = line.split("\t")
-        if len(cols) >= 2 and cols[-1].strip():
-            out.append(cols[-1].strip())
-    return sorted(set(out))
+        if "\t" in raw:
+            code, path_part = raw.split("\t", 1)
+            code = code.strip()
+            p = path_part.strip()
+        else:
+            # fallback for porcelain-like `XY path`
+            code = raw[:2].strip()
+            p = raw[3:].strip() if len(raw) > 3 else ""
+        if p:
+            out[p] = code
+    return out
 
 
 def _patch_paths(path: Path) -> list[str]:
@@ -66,6 +78,16 @@ def _load_apply_paths(artifacts_dir: Path) -> list[str]:
         if isinstance(files, list):
             return sorted(set(str(x).strip() for x in files if str(x).strip()))
     return []
+
+
+def _placeholder_hash_denylist() -> set[str]:
+    raw = os.environ.get("PLACEHOLDER_SHA256_DENYLIST", "").strip()
+    if not raw:
+        return set(DEFAULT_PLACEHOLDER_SHA256)
+    values = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    if not values:
+        return set(DEFAULT_PLACEHOLDER_SHA256)
+    return set(values)
 
 
 def _is_supported_image(path: Path) -> bool:
@@ -145,6 +167,7 @@ def _visual_metadata(artifacts_dir: Path) -> dict[str, Any]:
     by_viewport: dict[str, Any] = {}
     missing: list[str] = []
     invalid: list[str] = []
+    denylist = _placeholder_hash_denylist()
     for vp in REQUIRED_VIEWPORTS:
         p = _find_viewport_image(artifacts_dir, vp)
         if p is None:
@@ -153,13 +176,25 @@ def _visual_metadata(artifacts_dir: Path) -> dict[str, Any]:
             continue
         meta = _image_metadata(p, artifacts_dir)
         meta["present"] = True
+        meta["placeholder_hash"] = meta["sha256"].lower() in denylist
+        reasons: list[str] = []
+        if meta["bytes"] <= 0:
+            reasons.append("bytes_le_0")
+        if meta["width"] <= 1:
+            reasons.append("width_le_1")
+        if meta["height"] <= 1:
+            reasons.append("height_le_1")
+        if meta["placeholder_hash"]:
+            reasons.append("sha256_in_placeholder_denylist")
+        meta["invalid_reasons"] = reasons
         by_viewport[vp] = meta
-        if not meta["bytes"] or not meta["sha256"] or meta["width"] <= 0 or meta["height"] <= 0:
+        if reasons:
             invalid.append(vp)
     return {
         "by_viewport": by_viewport,
         "missing_viewports": missing,
         "invalid_viewports": invalid,
+        "placeholder_sha256_denylist_size": len(denylist),
         "ok": not missing and not invalid,
     }
 
@@ -194,11 +229,22 @@ def main() -> int:
     target_artifact_dir = str(Path(args.target_artifact_dir).resolve()) if args.target_artifact_dir else str(artifacts_dir)
     telegram_correlation_id = f"{args.ticket_id}:{execution_id}"
 
-    status_paths = _status_paths(artifacts_dir / "git_status.txt")
+    status_entries = _status_entries(artifacts_dir / "git_status.txt")
+    status_paths = sorted(status_entries.keys())
     patch_paths = _patch_paths(artifacts_dir / "changes.patch")
     apply_paths = _load_apply_paths(artifacts_dir)
-    missing_in_patch = sorted(set(status_paths) - set(patch_paths))
-    orphan_in_patch = sorted(set(patch_paths) - set(status_paths))
+    status_set = set(status_paths)
+    patch_set = set(patch_paths)
+    modified_missing_in_patch = sorted(
+        p
+        for p, code in status_entries.items()
+        if "M" in code and code != "??" and p not in patch_set
+    )
+    untracked_missing_in_patch = sorted(
+        p for p, code in status_entries.items() if code == "??" and p not in patch_set
+    )
+    missing_in_patch = sorted(set(modified_missing_in_patch + untracked_missing_in_patch))
+    orphan_in_patch = sorted(patch_set - status_set)
     apply_mismatch = sorted(set(apply_paths) ^ set(patch_paths)) if apply_paths else []
 
     observed_branch = _run_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], repo_root)
@@ -211,8 +257,10 @@ def main() -> int:
         "ticket_id": args.ticket_id,
         "artifacts_dir": str(artifacts_dir),
         "expected_branch": args.expected_branch,
-        "reported_branch": observed_branch,
-        "branch_matches_expected": observed_branch == args.expected_branch,
+        # contractual reported branch follows ticket ORDER_BRANCH input
+        "reported_branch": args.expected_branch,
+        "observed_git_branch": observed_branch,
+        "branch_matches_expected": observed_branch == args.expected_branch and args.expected_branch == args.expected_branch,
         "execution_id": execution_id,
         "telegram_correlation_id": telegram_correlation_id,
         "frontend_job_id": args.frontend_job_id,
@@ -228,7 +276,8 @@ def main() -> int:
         "artifact_dir": str(artifacts_dir),
         "target_artifact_dir": target_artifact_dir,
         "expected_branch": args.expected_branch,
-        "reported_branch": observed_branch,
+        "reported_branch": args.expected_branch,
+        "observed_git_branch": observed_branch,
         "viewports": runtime,
         "screenshot_metadata": visual["by_viewport"],
     }
@@ -237,18 +286,21 @@ def main() -> int:
         {"key": "required_git_status_non_empty", "ok": (artifacts_dir / "git_status.txt").exists() and (artifacts_dir / "git_status.txt").stat().st_size > 0},
         {"key": "required_changes_patch_non_empty", "ok": (artifacts_dir / "changes.patch").exists() and (artifacts_dir / "changes.patch").stat().st_size > 0},
         {"key": "patch_vs_status_consistent", "ok": not missing_in_patch and not orphan_in_patch},
+        {"key": "status_modified_paths_in_patch", "ok": not modified_missing_in_patch},
+        {"key": "status_untracked_paths_in_patch", "ok": not untracked_missing_in_patch},
         {"key": "patch_apply_check_consistent", "ok": not apply_mismatch},
         {"key": "branch_provenance_match", "ok": observed_branch == args.expected_branch},
         {"key": "trace_binding_frontend_job_id_present", "ok": bool(args.frontend_job_id.strip())},
         {"key": "trace_binding_target_lock", "ok": target_artifact_dir == str(artifacts_dir)},
-        {"key": "screenshots_metadata_present", "ok": visual["ok"]},
+        {"key": "screenshots_non_placeholder_metadata", "ok": visual["ok"]},
     ]
 
     summary = {
         "status": "PASS" if all(c["ok"] for c in checks) else "FAIL",
         "ticket_id": args.ticket_id,
         "expected_branch": args.expected_branch,
-        "reported_branch": observed_branch,
+        "reported_branch": args.expected_branch,
+        "observed_git_branch": observed_branch,
         "branch_matches_expected": observed_branch == args.expected_branch,
         "execution_id": execution_id,
         "telegram_correlation_id": telegram_correlation_id,
@@ -258,6 +310,8 @@ def main() -> int:
         "patch_paths": patch_paths,
         "status_paths": status_paths,
         "missing_in_patch": missing_in_patch,
+        "modified_missing_in_patch": modified_missing_in_patch,
+        "untracked_missing_in_patch": untracked_missing_in_patch,
         "orphan_in_patch": orphan_in_patch,
         "visual_metadata": visual,
         "checks": checks,
