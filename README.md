@@ -172,9 +172,37 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
+## Wormhole Scene Contract (Backend Traceability)
+
+Backend includes a versioned scene contract for reproducible visual params (seed/version/presets):
+- canonical file: `docs/contracts/wormhole_scene_contract.v1.json`
+- validator/exporter: `tools/wormhole_scene_contract.py`
+
+Commands:
+- `make wormhole-contract-validate`
+- `make wormhole-contract-export ARTIFACTS_DIR=... ORDER_BRANCH=... TICKET_ID=...`
+
+This export emits signed traceability artifacts for QA comparison between iterations.
+
+## Visual Preview Audit Pipeline
+
+For frontend `preview.html` evidence validation/capture with retry+backoff and audit packaging:
+- runbook: `docs/visual_pipeline_runbook.md`
+- smoke check: `make visual-preview-smoke`
+- real capture: `make visual-preview-audit PREVIEW_HTML=... ARTIFACTS_DIR=... TICKET_ID=... ORDER_BRANCH=...`
+
+## Atomic Publish Guard
+
+To block non-atomic publication inconsistencies between `git_status.txt`, `patch_apply_check.json`, and `changes.patch`:
+- run: `make publish-atomic-guard ARTIFACTS_DIR=/path/to/artifacts`
+- output: `publish_atomic_guard_report.json` and `publish_atomic_guard.log`
+- enforced failures:
+  - `changes.patch` is empty while `patch_apply_check` declares files
+  - paths listed by status/apply-check are missing in patch
+  - patch introduces paths not declared in status/apply-check
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
 - Prefer user-level service with `Restart=always` and journal retention policies.
 - For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
-
