@@ -1,4 +1,7 @@
 <<<<<<< HEAD
+.PHONY: verify test lint security coverage delivery-evidence-gate wormhole-trace-export patch-status-reconcile crosslane-validate
+=======
+<<<<<<< HEAD
 .PHONY: verify test lint security coverage backend-provenance-export
 =======
 <<<<<<< HEAD
@@ -16,6 +19,7 @@ PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>
 ifeq ($(PYTHON),)
 $(error No Python runtime found. Install python3 (preferred) or python)
 endif
+>>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
@@ -50,6 +54,17 @@ bundle-s02-atomic:
 <<<<<<< HEAD
 	python tools/coverage_gate.py --min 0.65
 
+<<<<<<< HEAD
+delivery-evidence-gate:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	python3 tools/delivery_evidence_gate.py --artifacts-dir "$(ARTIFACTS_DIR)" --workspace-dir "."
+
+wormhole-trace-export:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	python3 tools/wormhole_trace_export.py \
+=======
 <<<<<<< HEAD
 backend-provenance-export:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
@@ -135,10 +150,28 @@ backend-traceability-runtime-export:
 	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
 	@if [ -z "$(FRONTEND_JOB_ID)" ]; then echo "FRONTEND_JOB_ID is required"; exit 2; fi
 	@$(PYTHON) tools/backend_traceability_runtime_export.py \
+>>>>>>> origin/main
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)" \
+<<<<<<< HEAD
+		--reported-branch-mode "expected"
+
+patch-status-reconcile:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	python3 tools/patch_status_reconciler.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--out "$(ARTIFACTS_DIR)/patch_status_reconciler_report.json"
+
+crosslane-validate:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	python3 tools/crosslane_traceability_validator.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--expected-branch "$(ORDER_BRANCH)" \
+		--out "$(ARTIFACTS_DIR)/crosslane_validator_report.json"
+=======
 		--frontend-job-id "$(FRONTEND_JOB_ID)" \
 		--target-artifact-dir "$(TARGET_ARTIFACT_DIR)"
 
@@ -193,6 +226,7 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
+>>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
 >>>>>>> origin/main
