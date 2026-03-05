@@ -1,4 +1,9 @@
 <<<<<<< HEAD
+.PHONY: verify test lint security coverage validate-s02-trace bundle-s02-atomic
+
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
+=======
+<<<<<<< HEAD
 .PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export wormhole-contract-integrity-gate publish-atomic-guard publish-postwrite-verify wormhole-contract-publish visual-preview-audit visual-preview-smoke
 =======
 .PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness
@@ -9,10 +14,15 @@ ifeq ($(PYTHON),)
 $(error No Python runtime found. Install python3 (preferred) or python)
 endif
 >>>>>>> origin/main
+>>>>>>> origin/main
 
 verify: lint security test coverage
 
 lint:
+<<<<<<< HEAD
+	@if [ -z "$(PYTHON)" ]; then echo "ERROR: python3/python not found"; exit 127; fi
+=======
+>>>>>>> origin/main
 	$(PYTHON) -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
 
 security:
@@ -22,6 +32,17 @@ test:
 	$(PYTHON) -m unittest -q
 
 coverage:
+<<<<<<< HEAD
+	$(PYTHON) tools/coverage_gate.py --min 0.65
+
+validate-s02-trace:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	$(PYTHON) tools/s02_trace_checker.py --artifacts-dir "$$ART"
+
+bundle-s02-atomic:
+	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
+	$(PYTHON) tools/s02_bundle_atomic.py --artifacts-dir "$$ART"
+=======
 <<<<<<< HEAD
 	python tools/coverage_gate.py --min 0.65
 
@@ -157,4 +178,5 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
+>>>>>>> origin/main
 >>>>>>> origin/main
