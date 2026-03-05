@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness delivery-evidence-gate wormhole-trace-export backend-provenance-export crosslane-validate wormhole-contract-export validate-s02-trace bundle-s02-atomic patch-status-reconcile
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness delivery-evidence-gate wormhole-trace-export backend-provenance-export crosslane-validate wormhole-contract-validate wormhole-contract-export publish-atomic-guard visual-preview-audit visual-preview-smoke validate-s02-trace bundle-s02-atomic patch-status-reconcile
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -120,6 +120,35 @@ wormhole-contract-export:
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)"
+
+wormhole-contract-validate:
+	@$(PYTHON) tools/wormhole_scene_contract.py validate --contract docs/contracts/wormhole_scene_contract.v1.json
+
+publish-atomic-guard:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(PYTHON) tools/publish_atomic_guard.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--out "$(ARTIFACTS_DIR)/publish_atomic_guard_report.json" \
+		--log "$(ARTIFACTS_DIR)/publish_atomic_guard.log"
+
+visual-preview-audit:
+	@if [ -z "$(PREVIEW_HTML)" ]; then echo "PREVIEW_HTML is required"; exit 2; fi
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	@$(PYTHON) tools/visual_preview_audit.py \
+		--preview-html "$(PREVIEW_HTML)" \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--order-branch "$(ORDER_BRANCH)"
+
+visual-preview-smoke:
+	@$(PYTHON) tools/visual_preview_audit.py \
+		--preview-html tools/fixtures/preview_fixture.html \
+		--artifacts-dir .codexbot_tmp/visual-preview-smoke \
+		--ticket-id local-smoke \
+		--order-branch sre_visual_pipeline \
+		--capture-mode synthetic \
+		--force-capture
 
 validate-s02-trace:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
