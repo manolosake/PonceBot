@@ -87,6 +87,7 @@ close-regression-harness:
 
 # Compatibility aliases for delivery/traceability lanes after post-merge reconciliation.
 # branchlock: d65b5f6f backend_fix_makefile_branchlock
+# fix-pass: d65b5f6f backend_publish_makefile_fix_r1
 delivery-evidence-gate:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
 	@$(PYTHON) tools/delivery_evidence_gate.py --artifacts-dir "$(ARTIFACTS_DIR)" --workspace-dir "."
