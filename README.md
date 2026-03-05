@@ -172,7 +172,6 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
-<<<<<<< HEAD
 Delivery evidence gate (for close-gate publishing):
 - `ARTIFACTS_DIR=/path/to/artifacts make delivery-evidence-gate`
 - Enforces mandatory artifacts and consistency:
@@ -190,7 +189,7 @@ Delivery evidence gate (for close-gate publishing):
 - Negative smoke expectation:
   - If `changes.patch` or `git_status.txt` are empty, guard must return exit code `2` and mark
     `required_changes_patch_non_empty` / `required_git_status_non_empty` as failed.
-=======
+
 ## Wormhole Scene Contract (Backend Traceability)
 
 Backend includes a versioned scene contract for reproducible visual params (seed/version/presets):
@@ -219,7 +218,6 @@ To block non-atomic publication inconsistencies between `git_status.txt`, `patch
   - `changes.patch` is empty while `patch_apply_check` declares files
   - paths listed by status/apply-check are missing in patch
   - patch introduces paths not declared in status/apply-check
->>>>>>> origin/main
 
 ## Deployment Notes
 
