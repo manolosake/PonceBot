@@ -1,18 +1,24 @@
 .PHONY: verify test lint security coverage backend-traceability-runtime-export
 
+PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
+
+ifeq ($(PYTHON),)
+$(error No Python runtime found. Install python3 (preferred) or python)
+endif
+
 verify: lint security test coverage
 
 lint:
-	python -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
+	$(PYTHON) -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
 
 security:
-	python tools/security_check.py --strict
+	$(PYTHON) tools/security_check.py --strict
 
 test:
-	python -m unittest -q
+	$(PYTHON) -m unittest -q
 
 coverage:
-	python tools/coverage_gate.py --min 0.65
+	$(PYTHON) tools/coverage_gate.py --min 0.65
 
 backend-traceability-runtime-export:
 	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
