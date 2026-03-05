@@ -85,6 +85,25 @@ def main() -> int:
         errors.append({"type": "late_root_mutation_after_summary", "count": len(late_mut), "details": late_mut})
     if summary_mut:
         errors.append({"type": "summary_mutation_during_guard_window", "count": len(summary_mut), "details": summary_mut})
+    summary_mtime = float(summary_after.get("mtime_epoch", 0.0))
+    mtime_after_summary: list[dict[str, Any]] = []
+    for rel, meta in root_t1.items():
+        if float(meta.get("mtime_epoch", 0.0)) > summary_mtime:
+            mtime_after_summary.append(
+                {
+                    "file": rel,
+                    "file_mtime_epoch": float(meta.get("mtime_epoch", 0.0)),
+                    "summary_mtime_epoch": summary_mtime,
+                }
+            )
+    if mtime_after_summary:
+        errors.append(
+            {
+                "type": "contract_file_mtime_newer_than_final_summary",
+                "count": len(mtime_after_summary),
+                "details": mtime_after_summary,
+            }
+        )
 
     report = {
         "check": "postfinal_root_smoke_guard",
@@ -99,11 +118,14 @@ def main() -> int:
         "summary_path": str(summary_path),
         "summary_snapshot_t0": summary_stat,
         "summary_snapshot_t1": summary_after,
+        "summary_mtime_epoch": summary_mtime,
         "mismatch_count": len(mismatch),
         "late_mutation_count": len(late_mut),
         "summary_mutation_count": len(summary_mut),
+        "mtime_after_summary_count": len(mtime_after_summary),
         "errors": errors,
         "root_smoke_consistency": len(mismatch) == 0,
+        "root_mtime_not_newer_than_summary": len(mtime_after_summary) == 0,
         "status": "PASS" if not errors else "FAIL",
         "exit_code": 0 if not errors else 2,
     }

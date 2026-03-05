@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check close-time-postfinal-guard
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -43,3 +43,14 @@ manifest-drift-check:
 		--manifest-t0 "$(ARTIFACTS_DIR)/bundle_manifest_t0.json" \
 		--manifest-tn "$(ARTIFACTS_DIR)/bundle_manifest_t_plus_n.json" \
 		--report "$(ARTIFACTS_DIR)/manifest_drift_report.json"
+
+close-time-postfinal-guard:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ ! -d "$(ARTIFACTS_DIR)/smoke_stable" ]; then echo "smoke_stable bundle is required"; exit 2; fi
+	@$(PYTHON) tools/postfinal_root_smoke_guard.py \
+		--root-dir "$(ARTIFACTS_DIR)" \
+		--smoke-stable-dir "$(ARTIFACTS_DIR)/smoke_stable" \
+		--files "changes.patch,git_status.txt" \
+		--summary "$(ARTIFACTS_DIR)/sre_close_summary.json" \
+		--report "$(ARTIFACTS_DIR)/postfinal_close_guard_report.json" \
+		--sleep-seconds "$${SLEEP_SECONDS:-1.5}"
