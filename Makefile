@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness delivery-evidence-gate wormhole-trace-export backend-provenance-export crosslane-validate wormhole-contract-validate wormhole-contract-export publish-atomic-guard visual-preview-audit visual-preview-smoke validate-s02-trace bundle-s02-atomic patch-status-reconcile
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness backend-done-evidence-guard delivery-evidence-gate wormhole-trace-export backend-provenance-export crosslane-validate wormhole-contract-validate wormhole-contract-export publish-atomic-guard visual-preview-audit visual-preview-smoke validate-s02-trace bundle-s02-atomic patch-status-reconcile
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -84,6 +84,14 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
+
+backend-done-evidence-guard:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@$(PYTHON) tools/backend_done_evidence_guard.py \
+		--repo-root "." \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--expected-branch "$(ORDER_BRANCH)"
 
 # Compatibility aliases for delivery/traceability lanes after post-merge reconciliation.
 # branchlock: d65b5f6f backend_fix_makefile_branchlock
