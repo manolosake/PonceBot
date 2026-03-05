@@ -1,0 +1,57 @@
+{
+  "contract_name": "wormhole_scene_contract",
+  "contract_version": "1.0.0",
+  "scene_version": "wormhole-v3",
+  "seed": {
+    "strategy": "fixed",
+    "value": 241019,
+    "reproducible": true
+  },
+  "quality_presets": {
+    "cinematic": {
+      "particle_density": 1.0,
+      "ring_layers": 5,
+      "meridian_lines": 40,
+      "volumetric_intensity": 0.9,
+      "distortion_strength": 0.65,
+      "parallax_depth": 1.0
+    },
+    "balanced": {
+      "particle_density": 0.75,
+      "ring_layers": 4,
+      "meridian_lines": 28,
+      "volumetric_intensity": 0.7,
+      "distortion_strength": 0.5,
+      "parallax_depth": 0.8
+    },
+    "performance": {
+      "particle_density": 0.5,
+      "ring_layers": 3,
+      "meridian_lines": 20,
+      "volumetric_intensity": 0.55,
+      "distortion_strength": 0.35,
+      "parallax_depth": 0.6
+    }
+  },
+  "viewport_defaults": {
+    "desktop": "cinematic",
+    "tablet": "balanced",
+    "mobile": "performance"
+  },
+  "parameter_ranges": {
+    "volumetric_intensity": {"min": 0.0, "max": 1.0},
+    "distortion_strength": {"min": 0.0, "max": 1.0},
+    "parallax_depth": {"min": 0.0, "max": 1.5}
+  },
+  "traceability": {
+    "signature_fields": [
+      "contract_name",
+      "contract_version",
+      "scene_version",
+      "seed",
+      "quality_presets",
+      "viewport_defaults"
+    ],
+    "comparison_mode": "exact_json_sha256"
+  }
+}
