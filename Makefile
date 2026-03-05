@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness delivery-evidence-gate wormhole-trace-export backend-provenance-export crosslane-validate wormhole-contract-export validate-s02-trace bundle-s02-atomic patch-status-reconcile
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -84,3 +84,50 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
+
+# Compatibility aliases for delivery/traceability lanes after post-merge reconciliation.
+delivery-evidence-gate:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(PYTHON) tools/delivery_evidence_gate.py --artifacts-dir "$(ARTIFACTS_DIR)" --workspace-dir "."
+
+wormhole-trace-export:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	@$(PYTHON) tools/wormhole_trace_export.py \
+		--repo-root "." \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--expected-branch "$(ORDER_BRANCH)" \
+		--reported-branch-mode "expected"
+
+backend-provenance-export: wormhole-trace-export
+
+crosslane-validate:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@$(PYTHON) tools/crosslane_traceability_validator.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--expected-branch "$(ORDER_BRANCH)" \
+		--out "$(ARTIFACTS_DIR)/crosslane_validator_report.json"
+
+wormhole-contract-export:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
+	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
+	@$(PYTHON) tools/wormhole_atomic_packager.py \
+		--repo-root "." \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--ticket-id "$(TICKET_ID)" \
+		--expected-branch "$(ORDER_BRANCH)"
+
+validate-s02-trace:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(PYTHON) tools/s02_trace_checker.py --artifacts-dir "$(ARTIFACTS_DIR)"
+
+bundle-s02-atomic:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(PYTHON) tools/s02_bundle_atomic.py --artifacts-dir "$(ARTIFACTS_DIR)"
+
+patch-status-reconcile:
+	@echo "patch-status-reconcile replaced by crosslane-validate + manifest-drift-check (no-op alias)."
