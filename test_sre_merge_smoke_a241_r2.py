@@ -42,6 +42,12 @@ class TestSreMergeSmokeA241R2(unittest.TestCase):
                 self.assertTrue(p.exists(), name)
                 self.assertGreater(p.stat().st_size, 0, name)
 
+            guard_report = art / "bundle_integrity_guard_report.json"
+            self.assertTrue(guard_report.exists())
+            guard = json.loads(guard_report.read_text(encoding="utf-8"))
+            self.assertIn(guard.get("status"), ("PASS", "FAIL"))
+            self.assertIn("summary_json_parseable", {c.get("key") for c in guard.get("checks", [])})
+
 
 if __name__ == "__main__":
     unittest.main()

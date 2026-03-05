@@ -124,8 +124,6 @@ def main() -> int:
     )
     conflict_markers_count = len([ln for ln in marker_out.splitlines() if ln.strip()]) if marker_rc in (0, 1) else 0
 
-    commands_log.write_text(_sanitize_text("\n".join(cmd_lines)).strip() + "\n", encoding="utf-8")
-
     status = "PASS"
     if git_status_bytes <= 0 or changes_patch_bytes <= 0 or merge_tree_bytes <= 0:
         status = "FAIL"
@@ -162,6 +160,35 @@ def main() -> int:
 
     summary_path = artifacts_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+    # Local integrity guard: fail fast on non-parseable summary or empty contractual files.
+    guard_report_path = artifacts_dir / "bundle_integrity_guard_report.json"
+    guard_rc, guard_out = run_logged(
+        "bundle_integrity_guard",
+        [
+            "python3",
+            "tools/sre_bundle_integrity_guard.py",
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--summary",
+            str(summary_path),
+            "--required",
+            "merge_tree.log,changes.patch,git_status.txt,git_status",
+            "--out",
+            str(guard_report_path),
+        ],
+    )
+    summary["bundle_integrity_guard_exit_code"] = int(guard_rc)
+    summary["bundle_integrity_guard_report"] = str(guard_report_path)
+    summary["checks"]["bundle_integrity_guard_passed"] = guard_rc == 0
+    if guard_rc != 0:
+        status = "FAIL"
+    summary["status"] = status
+    if guard_out.strip():
+        summary["bundle_integrity_guard_output"] = guard_out.strip().splitlines()[-1]
+    summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+    commands_log.write_text(_sanitize_text("\n".join(cmd_lines)).strip() + "\n", encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=True, indent=2))
     return 0 if status == "PASS" else 1
 
