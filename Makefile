@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -77,3 +77,10 @@ close-time-terminal-enforce:
 		--samples "$${PROBE_SAMPLES:-2}" \
 		--interval-seconds "$${PROBE_INTERVAL_SECONDS:-0.8}" \
 		--report "$(ARTIFACTS_DIR)/terminal_live_probe_report.json"
+
+close-regression-harness:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(PYTHON) tools/r1_close_regression_harness.py \
+		--repo-root "." \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"

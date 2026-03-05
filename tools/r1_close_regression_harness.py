@@ -61,6 +61,26 @@ def compare_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def invariant_diff(previous: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
+    diffs: list[dict[str, Any]] = []
+    prev_root = previous.get("root", {})
+    curr_root = current.get("root", {})
+    for name in CRITICAL_FILES:
+        a = prev_root.get(name, {})
+        b = curr_root.get(name, {})
+        for field in ("exists", "size_bytes", "sha256", "mtime_epoch"):
+            if a.get(field) != b.get(field):
+                diffs.append(
+                    {
+                        "file": name,
+                        "field": field,
+                        "previous": a.get(field),
+                        "current": b.get(field),
+                    }
+                )
+    return diffs
+
+
 def ensure_smoke_bundle(repo_root: Path, smoke_dir: Path) -> None:
     smoke_dir.mkdir(parents=True, exist_ok=True)
     st = subprocess.run(
@@ -134,6 +154,7 @@ def main() -> int:
     ap.add_argument("--artifacts-dir", required=True)
     ap.add_argument("--probe-interval-seconds", type=float, default=5.0)
     ap.add_argument("--simulate-late-mutation", action="store_true")
+    ap.add_argument("--simulate-post-guard-mutation", action="store_true")
     ap.add_argument("--output", default="r1_close_regression_harness_report.json")
     args = ap.parse_args()
 
@@ -159,37 +180,70 @@ def main() -> int:
     if args.simulate_late_mutation:
         maybe_mutate_late(artifacts_dir)
 
-    post1 = snapshot(artifacts_dir, smoke_dir, "post_probe_1")
-    time.sleep(max(args.probe_interval_seconds, 0.0))
-    post2 = snapshot(artifacts_dir, smoke_dir, "post_probe_2")
-    live = snapshot(artifacts_dir, smoke_dir, "live_now")
-
     guard_rc, guard_report = run_guard(artifacts_dir, args.probe_interval_seconds)
+    post_guard = snapshot(artifacts_dir, smoke_dir, "post_guard")
+
+    if args.simulate_post_guard_mutation:
+        maybe_mutate_late(artifacts_dir)
+
+    time.sleep(max(args.probe_interval_seconds, 0.0))
+    live_final = snapshot(artifacts_dir, smoke_dir, "live_final")
+
+    post_summary = snapshot(artifacts_dir, smoke_dir, "post_summary")
 
     phase_checks = {
         "pre_summary": compare_snapshot(pre),
-        "post_probe_1": compare_snapshot(post1),
-        "post_probe_2": compare_snapshot(post2),
-        "live_now": compare_snapshot(live),
+        "post_summary": compare_snapshot(post_summary),
+        "post_guard": compare_snapshot(post_guard),
+        "live_final": compare_snapshot(live_final),
     }
+    late_drift_post_summary = invariant_diff(post_summary, live_final)
+    late_drift_post_guard = invariant_diff(post_guard, live_final)
+    summary_mtime = float((artifacts_dir / "sre_close_summary.json").stat().st_mtime)
+    late_mtime_files = [
+        {
+            "file": name,
+            "file_mtime_epoch": float(live_final["root"][name]["mtime_epoch"]),
+            "summary_mtime_epoch": summary_mtime,
+        }
+        for name in CRITICAL_FILES
+        if float(live_final["root"][name]["mtime_epoch"]) > summary_mtime
+    ]
     pass_all_phases = all(v["ok"] for v in phase_checks.values())
     pass_guard = guard_rc == 0 and str(guard_report.get("status", "")).upper() == "PASS"
+    no_late_drift = len(late_drift_post_summary) == 0 and len(late_drift_post_guard) == 0 and len(late_mtime_files) == 0
 
-    status = "PASS" if (pass_all_phases and pass_guard) else "FAIL"
+    status = "PASS" if (pass_all_phases and pass_guard and no_late_drift) else "FAIL"
     report = {
-        "schema": "r1_close_regression_harness_v1",
+        "schema": "r1_close_regression_harness_v2",
         "generated_at_utc": utc_now(),
         "artifacts_dir": str(artifacts_dir),
         "simulate_late_mutation": bool(args.simulate_late_mutation),
+        "simulate_post_guard_mutation": bool(args.simulate_post_guard_mutation),
         "pre_summary": pre,
-        "post_probe_1": post1,
-        "post_probe_2": post2,
-        "live_now": live,
+        "post_summary": post_summary,
+        "post_guard": post_guard,
+        "live_final": live_final,
+        "snapshots": {
+            "pre_summary": pre,
+            "post_guard": post_guard,
+            "live_final": live_final,
+        },
         "phase_checks": phase_checks,
+        "invariant_diffs": {
+            "post_summary_to_live_final": late_drift_post_summary,
+            "post_guard_to_live_final": late_drift_post_guard,
+            "mtime_late_write_after_summary": late_mtime_files,
+        },
         "guard": {
             "exit_code": guard_rc,
             "status": guard_report.get("status", "UNKNOWN"),
             "report_path": str(artifacts_dir / "postfinal_close_guard_report.json"),
+        },
+        "reviewer_contract": {
+            "unique_report": True,
+            "manual_inspection_required": False,
+            "keys_required": ["pre_summary", "post_guard", "live_final", "invariant_diffs"],
         },
         "status": status,
         "exit_code": 0 if status == "PASS" else 2,
