@@ -142,46 +142,39 @@ In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
 
 ## Safety Notes
 
-- Keep secrets out of git and out of `CODEX_WORKDIR` when possible.
-- Default sandbox mode is read-only; `rw` allows writing inside worktrees; `full` is dangerous.
-- You can enable "minimal limitations" by setting:
-  - `CODEX_DANGEROUS_BYPASS_SANDBOX=1` (EXTREMELY DANGEROUS; prefer external sandboxing like a VM).
+- Keep secrets out of git and out of `CODEX_WORKDIR` whenever possible.
+- Default execution should stay sandboxed (`CODEX_DEFAULT_MODE=ro` or `rw`).
+- `CODEX_DANGEROUS_BYPASS_SANDBOX=1` is breakglass-only and requires:
+  - `BOT_BREAKGLASS_REASON` at startup
+  - short `BOT_BREAKGLASS_TTL_SECONDS`
+  - admin-controlled activation/deactivation from Telegram (`/breakglass ...`)
+- Status HTTP API requires token auth (`Authorization: Bearer ...`) and strict CORS allowlist.
 
-## OpenClaw Gap Notes (todo)
+## Deliverability Checklist (Safe Defaults)
 
-This repo is optimized for Telegram-first CEO UX and a minimal control plane (ticket cards + `/watch`).
-Grounded source for the notes below: `openclaw/openclaw` at `1f607be` (README + repo structure).
+1. `TELEGRAM_ALLOWED_*` is configured (no open bot).
+2. `BOT_ADMIN_USER_IDS` and/or `BOT_ADMIN_CHAT_IDS` is configured.
+3. `BOT_STATUS_HTTP_ENABLED=1` implies:
+   - `BOT_STATUS_HTTP_TOKEN` is set
+   - `BOT_STATUS_HTTP_ALLOWED_ORIGINS` is explicit (no `*`)
+4. `CODEX_DANGEROUS_BYPASS_SANDBOX=0` for normal operation.
+5. Run verification before deploy:
 
-### What OpenClaw Has That PonceBot Does Not (Yet)
+```bash
+make verify
+```
 
-- Multi-channel inbox: WhatsApp, Slack, Discord, Google Chat, Signal, iMessage, Teams, WebChat, etc.
-- A Gateway WebSocket control plane + a first-class web UI, plus multiple clients (CLI, web, macOS app, mobile nodes).
-- Wizard-driven onboarding (`openclaw onboard`) and a diagnostic tool (`openclaw doctor`).
-- "Nodes" on macOS/iOS/Android for always-on voice ("Voice Wake" / Talk Mode), camera/screen recording, and local device actions.
-- A live visual "Canvas" / A2UI surface (agent-driven UI updates).
-- Strong default DM security via pairing codes and allowlists per channel.
-- Model auth + failover + rotation, plus richer usage/cost tracking.
+## Verification Targets
 
-### What PonceBot Already Has (Today)
+`make verify` runs:
+- syntax/lint-style checks (`py_compile`)
+- security guardrail checks (`tools/security_check.py --strict`)
+- unit tests (`python -m unittest -q`)
+- coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
 
-- Telegram-first CEO experience:
-  - Single editable ticket cards (no spam)
-  - `/watch` live company status (single message, auto-updated)
-- Simple, inspectable runtime (Python stdlib + SQLite).
-- Multi-agent engineering org model:
-  - roles (`jarvis/frontend/backend/qa/sre/...`)
-  - per-role worktrees + per-role Codex sessions
-  - runbooks + 24/7 autopilot constrained to CEO orders
+## Deployment Notes
 
-### Highest-ROI Next Steps for PonceBot (CEO Experience)
+- Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
+- Prefer user-level service with `Restart=always` and journal retention policies.
+- For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
 
-1. Multi-repo "Project Registry" + per-project worktrees
-   - Grounded gap: today, worktrees are based on a single `CODEX_WORKDIR` git repo.
-   - Outcome: Jarvis can work on `ExecutiveDashboard` (and future repos) without asking for a local path.
-2. Minimal local web control plane (read-only)
-   - Serve a small dashboard from the bot (localhost only) backed by SQLite, refreshed every 1-5 seconds.
-   - Keep Telegram as the main UI; the web UI is for deep inspection.
-3. Pairing-based access for unknown users (instead of hard Unauthorized)
-   - Grounded gap: today, allowlists are manual (`TELEGRAM_ALLOWED_*`).
-4. Optional voice replies (TTS local)
-   - Voice-in already exists; voice-out would complete the "Jarvis" feel.

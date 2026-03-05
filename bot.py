@@ -38,11 +38,13 @@ import dataclasses
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from state_store import StateStore
 
 from orchestrator.agents import load_agent_profiles
-from orchestrator.dispatcher import detect_request_type, to_task
-from orchestrator.delegation import parse_orchestrator_subtasks
+from orchestrator.dispatcher import detect_ceo_intent, detect_request_type, to_task
+from orchestrator.delegation import TaskSpec, parse_orchestrator_subtasks
 from orchestrator.prompting import build_agent_prompt
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.runbooks import Runbook, due as runbook_due, load_runbooks, to_task as runbook_to_task
@@ -69,6 +71,9 @@ except ModuleNotFoundError:  # pragma: no cover
 
 LOG = logging.getLogger("codexbot")
 
+_STATE_STORES_LOCK = threading.Lock()
+_STATE_STORES_BY_PATH: dict[str, StateStore] = {}
+
 
 TELEGRAM_MSG_LIMIT = 4096
 
@@ -80,6 +85,17 @@ _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 _TICKET_CARD_LOCK = threading.Lock()
 _TICKET_CARD_LAST_EDIT: dict[tuple[int, str], float] = {}
 _TICKET_CARD_MIN_EDIT_INTERVAL_S = 2.0
+
+_APK_BUILD_LOCK = threading.Lock()
+_APK_BUILD_ACTIVE = False
+
+_MODEL_CEO_QUERY = "gpt-5.3-codex-spark"
+_MODEL_JARVIS_PLAN = "gpt-5.3-codex"
+_MODEL_AGENT_EXEC = "gpt-5.3-codex"
+
+_EFFORT_CEO_QUERY = "high"
+_EFFORT_JARVIS_PLAN = "xhigh"
+_EFFORT_AGENT_EXEC = "medium"
 
 
 def _codex_home_dir() -> Path:
@@ -468,17 +484,177 @@ def _state_access_mode(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     return v if v in ("default", "full") else ""
 
 
+def _get_breakglass_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    raw = st.get("breakglass")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _append_security_audit_event(cfg: "BotConfig", *, event: str, details: dict[str, Any]) -> None:
+    row = {
+        "at": float(time.time()),
+        "event": str(event or "").strip() or "unknown",
+        "details": details if isinstance(details, dict) else {},
+    }
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("security_audit")
+        items = list(raw) if isinstance(raw, list) else []
+        items.append(row)
+        if len(items) > 80:
+            items = items[-80:]
+        st["security_audit"] = items
+
+    _update_state(cfg, _m)
+
+
+def _breakglass_is_active(cfg: "BotConfig", *, now_ts: float | None = None) -> tuple[bool, dict[str, Any]]:
+    raw = _get_breakglass_state(cfg)
+    now = float(now_ts if now_ts is not None else time.time())
+    exp_raw = raw.get("expires_at")
+    try:
+        exp = float(exp_raw)
+    except Exception:
+        exp = 0.0
+    reason = str(raw.get("reason") or "").strip()
+    active = bool(reason) and exp > now
+    return active, raw
+
+
+def _activate_breakglass(
+    cfg: "BotConfig",
+    *,
+    reason: str,
+    ttl_seconds: int,
+    chat_id: int,
+    user_id: int | None,
+    source: str,
+) -> float:
+    now = float(time.time())
+    ttl = int(ttl_seconds)
+    if ttl < 60:
+        ttl = 60
+    if ttl > 4 * 60 * 60:
+        ttl = 4 * 60 * 60
+    exp = now + float(ttl)
+    safe_reason = str(reason or "").strip()
+
+    def _m(st: dict[str, Any]) -> None:
+        st["breakglass"] = {
+            "enabled": True,
+            "enabled_at": now,
+            "expires_at": exp,
+            "reason": safe_reason,
+            "source": str(source or "telegram").strip() or "telegram",
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+        }
+
+    _update_state(cfg, _m)
+    _append_security_audit_event(
+        cfg,
+        event="breakglass.enabled",
+        details={
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "source": str(source or "telegram").strip() or "telegram",
+            "ttl_seconds": int(ttl),
+            "reason": safe_reason,
+        },
+    )
+    LOG.warning(
+        "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
+        str(source or "telegram").strip() or "telegram",
+        int(chat_id),
+        int(user_id) if user_id is not None else "",
+        int(ttl),
+        safe_reason,
+    )
+    return exp
+
+
+def _deactivate_breakglass(
+    cfg: "BotConfig",
+    *,
+    reason: str,
+    chat_id: int,
+    user_id: int | None,
+    source: str,
+) -> None:
+    old = _get_breakglass_state(cfg)
+
+    def _m(st: dict[str, Any]) -> None:
+        st.pop("breakglass", None)
+
+    _update_state(cfg, _m)
+    _append_security_audit_event(
+        cfg,
+        event="breakglass.disabled",
+        details={
+            "chat_id": int(chat_id),
+            "user_id": int(user_id) if user_id is not None else None,
+            "source": str(source or "telegram").strip() or "telegram",
+            "reason": str(reason or "manual_off").strip() or "manual_off",
+            "previous": old,
+        },
+    )
+    LOG.warning(
+        "BREAKGLASS DISABLED source=%s chat_id=%s user_id=%s reason=%s",
+        str(source or "telegram").strip() or "telegram",
+        int(chat_id),
+        int(user_id) if user_id is not None else "",
+        str(reason or "manual_off").strip() or "manual_off",
+    )
+
+
 def _effective_bypass_sandbox(cfg: "BotConfig", *, chat_id: int | None = None) -> bool:
     """
     True means we pass `--dangerously-bypass-approvals-and-sandbox`.
-    State override (if set) wins over env config.
+    Breakglass must be active for this mode.
     """
     mode = _state_access_mode(cfg, chat_id=chat_id)
     if mode == "default":
         return False
-    if mode == "full":
-        return True
-    return bool(cfg.codex_dangerous_bypass_sandbox)
+    wants_dangerous = (mode == "full") or bool(cfg.codex_dangerous_bypass_sandbox)
+    if not wants_dangerous:
+        return False
+    active, _ = _breakglass_is_active(cfg)
+    return bool(active)
+
+
+def _parse_allowed_origins_env(raw: str) -> list[str]:
+    out: list[str] = []
+    for item in (raw or "").split(","):
+        v = item.strip()
+        if not v:
+            continue
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _security_startup_findings(cfg: "BotConfig") -> list[str]:
+    issues: list[str] = []
+    http_enabled = os.environ.get("BOT_STATUS_HTTP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    http_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
+    allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
+
+    if http_enabled and not http_token:
+        issues.append("BOT_STATUS_HTTP_ENABLED=1 but BOT_STATUS_HTTP_TOKEN is empty (API will be blocked).")
+    if http_enabled and "*" in allowed_origins:
+        issues.append("BOT_STATUS_HTTP_ALLOWED_ORIGINS contains '*' (insecure CORS).")
+
+    if cfg.codex_dangerous_bypass_sandbox:
+        active, bg = _breakglass_is_active(cfg)
+        if not active:
+            issues.append("Dangerous bypass requested but breakglass is inactive; bypass remains OFF.")
+        elif not str((bg or {}).get("reason") or "").strip():
+            issues.append("Breakglass is active without reason metadata.")
+
+    if not (cfg.admin_chat_ids or cfg.admin_user_ids):
+        issues.append("BOT_ADMIN_* allowlists are empty; breakglass command stays disabled until admin ids are configured.")
+
+    return issues
 
 
 def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None = None) -> None:
@@ -486,13 +662,15 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
     Persist access mode override to cfg.state_file.
     mode=None clears the override.
     """
-    st = _get_state(cfg)
-    if chat_id is None:
-        if mode is None:
-            st.pop("access_mode", None)
-        else:
-            st["access_mode"] = mode
-    else:
+
+    def _m(st: dict[str, Any]) -> None:
+        if chat_id is None:
+            if mode is None:
+                st.pop("access_mode", None)
+            else:
+                st["access_mode"] = mode
+            return
+
         by_chat = st.get("access_mode_by_chat")
         if not isinstance(by_chat, dict):
             by_chat = {}
@@ -502,24 +680,39 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
         else:
             by_chat[key] = mode
         st["access_mode_by_chat"] = by_chat
-    _atomic_write_json(cfg.state_file, st)
+
+    _update_state(cfg, _m)
 
 
 def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
     bypass = _effective_bypass_sandbox(cfg, chat_id=chat_id)
+    bg_active, bg = _breakglass_is_active(cfg)
     default_line = "- Default (current)" if not bypass else "- Default"
     full_line = "- Full access (current)" if bypass else "- Full access"
+    bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
+    bg_exp = (bg or {}).get("expires_at")
+    try:
+        rem_s = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
+    except Exception:
+        rem_s = 0
+    bg_status = f"active ({rem_s}s left)" if bg_active else "inactive"
     return "\n".join(
         [
             "Dos opciones:",
             default_line,
             full_line,
             "",
+            "Breakglass (dangerous bypass):",
+            f"- status: {bg_status}",
+            f"- reason: {bg_reason}",
+            "",
             "Uso:",
             "- /permissions default",
             "- /permissions full",
             "- /permissions clear",
+            "- /breakglass on <minutes> <reason>   (admin only)",
+            "- /breakglass off                     (admin only)",
         ]
     )
 
@@ -664,6 +857,8 @@ class IncomingMessage:
     message_id: int
     username: str | None
     text: str
+    reply_to_message_id: int | None = None
+    reply_to_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -785,6 +980,10 @@ class BotConfig:
     # If empty, the bot falls back to profile-based permissions (when BOT_AUTH_ENABLED=1).
     admin_user_ids: frozenset[int] = frozenset()
     admin_chat_ids: frozenset[int] = frozenset()
+    # Breakglass guardrails for dangerous bypass mode.
+    # Startup env requires a reason when CODEX_DANGEROUS_BYPASS_SANDBOX=1.
+    breakglass_ttl_seconds: int = 900
+    breakglass_start_reason: str = ""
     # Voice-out (reply as Telegram voice note).
     voice_out_enabled: bool = False
     # TTS backend: "none" | "piper" | "edge" | "openai" | "tone"
@@ -816,6 +1015,14 @@ class BotConfig:
     tts_piper_length_scale: float = 0.0
     tts_piper_noise_w: float = 0.0
     tts_piper_sentence_silence: float = 0.0
+    # Mobile app (native Android) build + delivery config.
+    mobile_app_project_dir: Path = Path("/home/aponce/OmniCrewApp.android")
+    mobile_app_artifacts_dir: Path = Path(__file__).with_name("data") / "artifacts" / "mobile"
+    mobile_app_build_script: Path = Path(__file__).with_name("scripts") / "build_release_apk.sh"
+    mobile_app_keystore_path: Path = Path.home() / ".config" / "omnicrew-app" / "keystore.jks"
+    mobile_app_key_alias: str = "omnicrew_release"
+    mobile_app_keystore_pass: str = ""
+    mobile_app_key_pass: str = ""
 
 
 class TelegramAPI:
@@ -1647,41 +1854,34 @@ class WhisperCppTranscriber:
                 pass
 
 
+def _state_store_for_path(path: Path) -> StateStore:
+    key = str(Path(path).expanduser().resolve())
+    with _STATE_STORES_LOCK:
+        store = _STATE_STORES_BY_PATH.get(key)
+        if store is None:
+            store = StateStore(Path(key))
+            _STATE_STORES_BY_PATH[key] = store
+        return store
+
+
+def _state_store(cfg: "BotConfig") -> StateStore:
+    return _state_store_for_path(cfg.state_file)
+
+
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Use a unique temp file in the same directory to keep replace() atomic and
-    # to avoid collisions if multiple processes write state concurrently.
-    tmp_f = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(path.parent),
-        delete=False,
-    )
-    try:
-        tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
-        tmp_f.flush()
-    finally:
-        tmp_f.close()
-    Path(tmp_f.name).replace(path)
+    _state_store_for_path(path).replace(data)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        LOG.exception("Failed to read json: %s", path)
-    return {}
+    return _state_store_for_path(path).read()
+
+
+def _update_state(cfg: "BotConfig", mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    return _state_store(cfg).update(mutator)
 
 
 def _get_state(cfg: "BotConfig") -> dict[str, Any]:
-    return _read_json(cfg.state_file)
+    return _state_store(cfg).read()
 
 
 def _get_voice_state(cfg: "BotConfig") -> dict[str, Any]:
@@ -1691,15 +1891,19 @@ def _get_voice_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_voice_state(cfg: "BotConfig", voice_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["voice"] = voice_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = voice_state if isinstance(voice_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["voice"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _clear_voice_state(cfg: "BotConfig") -> None:
-    st = _get_state(cfg)
-    st.pop("voice", None)
-    _atomic_write_json(cfg.state_file, st)
+    def _m(st: dict[str, Any]) -> None:
+        st.pop("voice", None)
+
+    _update_state(cfg, _m)
 
 
 def _get_qa_state(cfg: "BotConfig") -> dict[str, Any]:
@@ -1709,9 +1913,12 @@ def _get_qa_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_qa_state(cfg: "BotConfig", qa_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["qa"] = qa_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = qa_state if isinstance(qa_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["qa"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _qa_chat_key(chat_id: int) -> str:
@@ -1859,9 +2066,12 @@ def _get_auth_state(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_auth_state(cfg: "BotConfig", auth_state: dict[str, Any]) -> None:
-    st = _get_state(cfg)
-    st["auth"] = auth_state
-    _atomic_write_json(cfg.state_file, st)
+    safe = auth_state if isinstance(auth_state, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        st["auth"] = safe
+
+    _update_state(cfg, _m)
 
 
 def _get_auth_sessions(cfg: "BotConfig") -> dict[str, Any]:
@@ -1871,9 +2081,16 @@ def _get_auth_sessions(cfg: "BotConfig") -> dict[str, Any]:
 
 
 def _set_auth_sessions(cfg: "BotConfig", sessions: dict[str, Any]) -> None:
-    auth = _get_auth_state(cfg)
-    auth["sessions"] = sessions
-    _set_auth_state(cfg, auth)
+    safe = sessions if isinstance(sessions, dict) else {}
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        auth["sessions"] = safe
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _auth_now() -> float:
@@ -1904,34 +2121,62 @@ def _auth_is_session_active(cfg: "BotConfig", *, chat_id: int) -> tuple[bool, di
 
 
 def _auth_touch_session(cfg: "BotConfig", *, chat_id: int) -> None:
-    sessions = _get_auth_sessions(cfg)
     key = _session_key(chat_id)
-    s = sessions.get(key)
-    if not isinstance(s, dict):
-        return
     now = _auth_now()
     ttl = int(cfg.auth_session_ttl_seconds) if int(cfg.auth_session_ttl_seconds) > 0 else 0
     if ttl <= 0:
         return
-    s["last_active_at"] = now
-    s["expires_at"] = now + ttl
-    sessions[key] = s
-    _set_auth_sessions(cfg, sessions)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            return
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            return
+        cur = sessions.get(key)
+        if not isinstance(cur, dict):
+            return
+        cur["last_active_at"] = now
+        cur["expires_at"] = now + ttl
+        sessions[key] = cur
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _auth_logout(cfg: "BotConfig", *, chat_id: int) -> None:
-    sessions = _get_auth_sessions(cfg)
-    sessions.pop(_session_key(chat_id), None)
-    _set_auth_sessions(cfg, sessions)
+    key = _session_key(chat_id)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            return
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            return
+        sessions.pop(key, None)
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
+
 
 def _auth_clear_all_sessions(cfg: "BotConfig") -> None:
     """
     Clears all auth sessions from state.
     Use this if you want every bot restart to require /login again.
     """
-    auth = _get_auth_state(cfg)
-    auth["sessions"] = {}
-    _set_auth_state(cfg, auth)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        auth["sessions"] = {}
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:
@@ -2003,15 +2248,26 @@ def _auth_login(cfg: "BotConfig", *, chat_id: int, username: str, password: str)
 
     ttl = int(cfg.auth_session_ttl_seconds) if int(cfg.auth_session_ttl_seconds) > 0 else 0
     now = _auth_now()
-    sessions = _get_auth_sessions(cfg)
-    sessions[_session_key(chat_id)] = {
-        "username": u,
-        "profile": profile_s,
-        "logged_in_at": now,
-        "last_active_at": now,
-        "expires_at": (now + ttl) if ttl else 0.0,
-    }
-    _set_auth_sessions(cfg, sessions)
+    key = _session_key(chat_id)
+
+    def _m(st: dict[str, Any]) -> None:
+        auth = st.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        sessions = auth.get("sessions")
+        if not isinstance(sessions, dict):
+            sessions = {}
+        sessions[key] = {
+            "username": u,
+            "profile": profile_s,
+            "logged_in_at": now,
+            "last_active_at": now,
+            "expires_at": (now + ttl) if ttl else 0.0,
+        }
+        auth["sessions"] = sessions
+        st["auth"] = auth
+
+    _update_state(cfg, _m)
     return True, f"OK. Login: {u} (perfil={profile_s or 'default'})"
 
 
@@ -2137,25 +2393,29 @@ def _persist_thread_id(cfg: "BotConfig", *, chat_id: int, thread_id: str) -> Non
     tid = (thread_id or "").strip()
     if not tid:
         return
-    st = _get_state(cfg)
-    raw = st.get("threads")
-    threads: dict[str, Any] = raw if isinstance(raw, dict) else {}
-    threads[str(int(chat_id))] = tid
-    st["threads"] = threads
-    _atomic_write_json(cfg.state_file, st)
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("threads")
+        threads: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        threads[str(int(chat_id))] = tid
+        st["threads"] = threads
+
+    _update_state(cfg, _m)
 
 
 def _clear_persisted_thread_id(cfg: "BotConfig", *, chat_id: int) -> None:
-    st = _get_state(cfg)
-    raw = st.get("threads")
-    if not isinstance(raw, dict):
-        return
     key = str(int(chat_id))
-    if key not in raw:
-        return
-    raw.pop(key, None)
-    st["threads"] = raw
-    _atomic_write_json(cfg.state_file, st)
+
+    def _m(st: dict[str, Any]) -> None:
+        raw = st.get("threads")
+        if not isinstance(raw, dict):
+            return
+        if key not in raw:
+            return
+        raw.pop(key, None)
+        st["threads"] = raw
+
+    _update_state(cfg, _m)
 
 
 def _get_model_overrides(cfg: "BotConfig", *, chat_id: int | None = None) -> tuple[str, str]:
@@ -2702,7 +2962,8 @@ class CodexRunner:
     ) -> "CodexRunner.Running":
         """
         Resumes an existing Codex thread (session) using `codex exec resume <thread_id>`.
-        This does not use `--output-last-message` (not supported by resume); the final response is read from stdout.
+        This does not use `--output-last-message` (not supported by resume).
+        We run with `--json` and reconstruct the final assistant message from JSONL stdout.
         """
         tid = (thread_id or "").strip()
         prompt = (prompt or "").strip()
@@ -2742,6 +3003,7 @@ class CodexRunner:
             for p in image_paths:
                 cmd += ["--image", str(p)]
 
+        cmd.append("--json")
         cmd.append(prompt)
         return self._start_with_cmd(cmd=cmd, last_msg_path=None)
 
@@ -2993,19 +3255,24 @@ def _help_text(cfg: BotConfig) -> str:
         "- /status             Show legacy/system status and orchestrator queue",
         "- /agents             Show orchestrator role status and queue per role",
         "- /dashboard          Visual dashboard snapshot (PNG)",
+        "- /apk_build          Build/sign native Android APK and send to this chat",
+        "- /apk_latest         Re-send latest successful Android APK",
         "- /watch              Live company status (single message, auto-updated)",
         "- /unwatch            Disable /watch",
         "- /orders             List CEO orders (autopilot scope)",
-        "- /order show|pause|done <id>   Manage an order",
+        "- /order show|pause|done|merge|rollback <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
         "- /brief              Executive brief (short digest)",
         "- /approve <id>       Approve a blocked task",
+        "- /approve_merge <id> Approve and execute merge to main for an order",
+        "- /rollback <id>      Revert latest merged commit associated to an order",
         "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
         "- /cancel <id>        Cancel orchestrator task by id",
-        "- /purge [chat|global]  Purge queued+blocked orchestrator jobs (keeps running)",
+        "- /purge [chat|global]  Purge queued+waiting_deps+blocked_approval jobs (keeps running)",
+        "- /hardreset confirm  One-shot hard reset (cancel queue + close active orders)",
         "- /emergency_resume   Resume orchestrator after emergency stop",
         "- /cancel             Cancel the running job (and drop queued jobs) for this chat",
         "- /new                Start a new Codex conversation thread for this chat",
@@ -3075,12 +3342,15 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("help", "Show help"),
         ("agents", "Orchestrator status"),
         ("dashboard", "Visual dashboard (PNG)"),
+        ("apk_build", "Build + send Android APK"),
+        ("apk_latest", "Send latest Android APK"),
         ("watch", "Live company status"),
         ("orders", "List CEO orders"),
         ("status", "Bot/model status"),
         ("s", "Alias for /status"),
         ("whoami", "Show your IDs"),
-        ("purge", "Clear queue (queued+blocked)"),
+        ("purge", "Clear queue (queued+waiting_deps+blocked_approval)"),
+        ("hardreset", "One-shot hard reset"),
     ]
     if cfg.auth_enabled:
         cmds += [
@@ -3088,7 +3358,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
             ("logout", "Logout"),
         ]
     cmds += [
-        ("order", "Show/pause/done order"),
+        ("order", "Show/pause/done/merge/rollback order"),
         ("job", "Show job status"),
         ("ticket", "Show ticket tree"),
         ("inbox", "Inbox by role"),
@@ -3100,6 +3370,8 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("brief", "Executive brief"),
         ("snapshot", "Request UI snapshot"),
         ("approve", "Approve blocked job"),
+        ("approve_merge", "Approve order merge to main"),
+        ("rollback", "Rollback latest merged order commit"),
         ("pause", "Pause role"),
         ("resume", "Resume role"),
         ("new", "New Codex thread"),
@@ -3109,6 +3381,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("m", "Alias for /model"),
         ("voice", "Voice transcription"),
         ("v", "Alias for /voice"),
+        ("breakglass", "Temporary dangerous bypass (admin)"),
         ("permissions", "Codex permissions"),
         ("p", "Alias for /permissions"),
         ("skills", "Manage skills"),
@@ -3196,80 +3469,10 @@ def _maybe_handle_ceo_query(
     else:
         display_user = "(no username)"
 
-    # Status requests: answer from the orchestrator directly (no Codex, no ticket).
+    # Let Jarvis handle natural-language status requests (query lane), so it can
+    # reason with project/order context instead of a fixed local summary.
     if req_type == "status":
-        if orchestrator_queue is None:
-            return False
-        try:
-            health = orchestrator_queue.get_role_health()
-            queued = int(orchestrator_queue.get_queued_count())
-            running_n = int(orchestrator_queue.get_running_count())
-            blocked = 0
-            for rec in (health or {}).values():
-                try:
-                    blocked += int((rec or {}).get("blocked", 0))
-                except Exception:
-                    pass
-            running = orchestrator_queue.jobs_by_state(state="running", limit=5)
-            queued_samples = orchestrator_queue.peek(state="queued", limit=30)
-            blocked_samples = orchestrator_queue.peek(state="blocked", limit=30)
-        except Exception:
-            health = {}
-            queued = 0
-            running_n = 0
-            blocked = 0
-            running = []
-            queued_samples = []
-            blocked_samples = []
-
-        lines: list[str] = []
-        lines.append("Jarvis: team status")
-        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
-        if running:
-            parts: list[str] = []
-            for r in running[:5]:
-                role_h = _humanize_orchestrator_role(r.role)
-                snippet = (r.input_text or "").strip().replace("\n", " ")
-                if len(snippet) > 70:
-                    snippet = snippet[:70] + "..."
-                parts.append(f"{role_h}: {snippet}")
-            lines.append("- running: " + " | ".join(parts))
-
-        def _sample_line(label: str, items: list[Task]) -> str | None:
-            by_role: dict[str, Task] = {}
-            for it in items:
-                r = str(it.role or "").strip().lower()
-                if not r or r in by_role:
-                    continue
-                by_role[r] = it
-                if len(by_role) >= 5:
-                    break
-            if not by_role:
-                return None
-            parts: list[str] = []
-            for r in sorted(by_role.keys()):
-                it = by_role[r]
-                role_h = _humanize_orchestrator_role(it.role)
-                snippet = (it.input_text or "").strip().replace("\n", " ")
-                if len(snippet) > 70:
-                    snippet = snippet[:70] + "..."
-                parts.append(f"{role_h}: {snippet}")
-            return f"- {label}: " + " | ".join(parts)
-
-        q_line = _sample_line("queued (examples)", queued_samples)
-        if q_line:
-            lines.append(q_line)
-        b_line = _sample_line("blocked (examples)", blocked_samples)
-        if b_line:
-            lines.append(b_line)
-
-        lines.append("Links: /agents  /dashboard")
-        api.send_message(
-            msg.chat_id,
-            "\n".join(lines),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
-        )
-        return True
+        return False
 
     if any(k in t for k in ("who am i", "quien soy", "quién soy")):
         api.send_message(
@@ -3298,50 +3501,9 @@ def _maybe_handle_ceo_query(
             "whats next",
         )
     ):
-        if orchestrator_queue is None:
-            api.send_message(
-                msg.chat_id,
-                "Jarvis: I can't read the orchestrator queue right now.",
-                reply_to_message_id=msg.message_id if msg.message_id else None,
-            )
-            return True
-        try:
-            active = orchestrator_queue.list_orders(chat_id=int(msg.chat_id), status="active", limit=6)
-            queued = int(orchestrator_queue.get_queued_count())
-            running_n = int(orchestrator_queue.get_running_count())
-            health = orchestrator_queue.get_role_health()
-            blocked = 0
-            for rec in (health or {}).values():
-                try:
-                    blocked += int((rec or {}).get("blocked", 0))
-                except Exception:
-                    pass
-        except Exception:
-            active = []
-            queued = 0
-            running_n = 0
-            blocked = 0
-
-        lines: list[str] = []
-        lines.append("Jarvis: pending")
-        if active:
-            parts: list[str] = []
-            for o in active[:6]:
-                oid = str(o.get("order_id") or "")[:8]
-                title = str(o.get("title") or "").strip()
-                if len(title) > 60:
-                    title = title[:60] + "..."
-                parts.append(f"{oid} {title}".strip())
-            lines.append("- active_orders: " + " | ".join(parts))
-        else:
-            lines.append("- active_orders: (none)")
-        lines.append(f"- queue: queued={queued} running={running_n} blocked={blocked}")
-        api.send_message(
-            msg.chat_id,
-            "\n".join(lines),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
-        )
-        return True
+        # Let Jarvis answer backlog/pending questions with full conversational context
+        # (instead of a fixed local summary) so this interaction is reflected in orchestration.
+        return False
 
     if any(k in t for k in ("cuantos empleados", "cuántos empleados", "cuantos trabajadores", "how many employees", "how many agents")):
         profs = orchestrator_profiles or {}
@@ -3482,6 +3644,7 @@ def _move_skill_dir(*, src: Path, dst: Path) -> None:
 
 _PUNCT_TRIM = "`\"'()[]{}<>.,;:"
 _PNG_TOKEN_RE = re.compile(r"(?i)(?:^|\\s)([^\\s\"'<>]+\\.png)")
+_VISUAL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def _path_is_within_dir(path: Path, base_dir: Path) -> bool:
@@ -3490,6 +3653,10 @@ def _path_is_within_dir(path: Path, base_dir: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _is_visual_artifact(path: Path) -> bool:
+    return str(path.suffix or "").strip().lower() in _VISUAL_IMAGE_EXTS
 
 
 def _collect_png_artifacts(cfg: BotConfig, *, start_time: float, text: str) -> list[Path]:
@@ -3859,6 +4026,346 @@ def _orchestrator_profile(
     return out
 
 
+def _projects_root_dir() -> Path:
+    raw = os.environ.get("BOT_PROJECTS_ROOT", "").strip()
+    base = Path(raw) if raw else Path("/home/aponce/projects")
+    try:
+        return base.expanduser().resolve()
+    except Exception:
+        return base.expanduser()
+
+
+def _slug_token(value: str, *, max_len: int = 56) -> str:
+    slug = _SAFE_FILENAME_RE.sub("-", (value or "").strip().lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-._")
+    if not slug:
+        slug = "project"
+    return slug[:max_len]
+
+
+def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> str:
+    line = (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+    if not line:
+        line = fallback
+    if len(line) > 120:
+        line = line[:120] + "..."
+    return line
+
+
+def _order_branch_name(order_id: str, title: str) -> str:
+    oid = str(order_id or "").strip()[:8] or "order"
+    slug = _slug_token(title or f"order-{oid}", max_len=38)
+    return f"feature/order-{oid}-{slug}"
+
+
+def _run_git(
+    repo: Path,
+    args: list[str],
+    *,
+    check: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+        env=env,
+    )
+
+
+def _git_ref_exists(repo: Path, ref: str) -> bool:
+    p = _run_git(repo, ["rev-parse", "--verify", ref], check=False)
+    return int(p.returncode or 1) == 0
+
+
+def _git_pick_main_ref(repo: Path) -> str:
+    if _git_ref_exists(repo, "refs/remotes/origin/main"):
+        return "origin/main"
+    if _git_ref_exists(repo, "origin/main"):
+        return "origin/main"
+    if _git_ref_exists(repo, "refs/heads/main"):
+        return "main"
+    if _git_ref_exists(repo, "main"):
+        return "main"
+    return "HEAD"
+
+
+def _git_remote_branch_exists(repo: Path, branch: str) -> bool:
+    b = str(branch or "").strip()
+    if not b:
+        return False
+    p = _run_git(repo, ["ls-remote", "--heads", "origin", f"refs/heads/{b}"], check=False)
+    if p.returncode != 0:
+        return False
+    return bool(str(p.stdout or "").strip())
+
+
+def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
+    b = str(branch or "").strip()
+    if not b:
+        return False, "branch_missing"
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    if (
+        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+        or _git_ref_exists(repo, f"origin/{b}")
+        or _git_remote_branch_exists(repo, b)
+    ):
+        return True, "already_exists"
+    base = _git_pick_main_ref(repo)
+    src_ref = f"refs/heads/{b}"
+    p = _run_git(repo, ["push", "origin", f"{base}:{src_ref}"], check=False)
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout or "").strip()
+        return False, msg or "push_failed"
+    return True, "created_from_main"
+
+
+def _resolve_order_branch_from_task(task: Task, orch_q: OrchestratorQueue | None) -> str:
+    tr = dict(task.trace or {})
+    direct = str(tr.get("order_branch") or "").strip()
+    if direct:
+        return direct
+    if orch_q is None:
+        return ""
+    root_ticket = (task.parent_job_id or task.job_id or "").strip()
+    if not root_ticket:
+        return ""
+    try:
+        root = orch_q.get_job(root_ticket)
+    except Exception:
+        root = None
+    if root is None:
+        return ""
+    return str((root.trace or {}).get("order_branch") or "").strip()
+
+
+def _sync_worktree_to_order_branch(
+    *,
+    base_repo: Path,
+    worktree_dir: Path,
+    order_branch: str,
+) -> tuple[bool, str]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return True, "no_branch"
+    ok, msg = _git_ensure_branch_from_main(base_repo, b)
+    if not ok:
+        return False, f"ensure_branch_failed:{msg}"
+
+    # Some repos use narrow fetch refspecs; fetch branch explicitly to guarantee local visibility.
+    f = _run_git(
+        worktree_dir,
+        ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"],
+        check=False,
+    )
+    if f.returncode != 0:
+        f2 = _run_git(worktree_dir, ["fetch", "origin", b], check=False)
+        if f2.returncode != 0:
+            ferr = (f2.stderr or f2.stdout or f.stderr or f.stdout or "").strip()
+            return False, f"fetch_failed:{ferr or 'unknown'}"
+
+    p = _run_git(worktree_dir, ["reset", "--hard", f"origin/{b}"], check=False)
+    if p.returncode != 0:
+        # Fallback for detached/narrow cases where FETCH_HEAD is available but origin/<branch> is not.
+        p2 = _run_git(worktree_dir, ["reset", "--hard", "FETCH_HEAD"], check=False)
+        if p2.returncode != 0:
+            err = (p2.stderr or p2.stdout or p.stderr or p.stdout or "").strip()
+            return False, f"reset_failed:{err or 'unknown'}"
+    return True, "synced"
+
+
+def _autocommit_push_order_branch(
+    *,
+    worktree_dir: Path,
+    order_branch: str,
+    task: Task,
+) -> dict[str, Any]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return {"status": "skipped", "reason": "no_branch"}
+    st = _run_git(worktree_dir, ["status", "--porcelain"], check=False)
+    status_out = str(st.stdout or "").strip()
+    if not status_out:
+        return {"status": "skipped", "reason": "no_changes"}
+
+    # Ensure deterministic identity for autonomous commits.
+    env = dict(os.environ)
+    env.setdefault("GIT_AUTHOR_NAME", "PonceBot")
+    env.setdefault("GIT_AUTHOR_EMAIL", "poncebot@local")
+    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+
+    add = _run_git(worktree_dir, ["add", "-A"], check=False, env=env)
+    if add.returncode != 0:
+        return {"status": "error", "reason": "git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+
+    key = str((task.labels or {}).get("key") or "").strip() or "work"
+    msg = f"order:{(task.parent_job_id or task.job_id)[:8]} job:{task.job_id[:8]} role:{task.role} key:{key}"
+    commit = _run_git(worktree_dir, ["commit", "-m", msg], check=False, env=env)
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        if "nothing to commit" in detail.lower():
+            return {"status": "skipped", "reason": "nothing_to_commit"}
+        return {"status": "error", "reason": "git_commit_failed", "detail": detail}
+
+    # Rebase onto latest canonical branch tip before push.
+    _run_git(worktree_dir, ["fetch", "origin", "--prune"], check=False, env=env)
+    if _git_ref_exists(worktree_dir, f"refs/remotes/origin/{b}") or _git_ref_exists(worktree_dir, f"origin/{b}"):
+        rb = _run_git(worktree_dir, ["rebase", f"origin/{b}"], check=False, env=env)
+        if rb.returncode != 0:
+            _run_git(worktree_dir, ["rebase", "--abort"], check=False, env=env)
+            return {
+                "status": "error",
+                "reason": "git_rebase_failed",
+                "detail": (rb.stderr or rb.stdout or "").strip(),
+            }
+
+    push = _run_git(worktree_dir, ["push", "origin", f"HEAD:refs/heads/{b}"], check=False, env=env)
+    if push.returncode != 0:
+        return {"status": "error", "reason": "git_push_failed", "detail": (push.stderr or push.stdout or "").strip()}
+
+    rev = _run_git(worktree_dir, ["rev-parse", "--short", "HEAD"], check=False, env=env)
+    sha = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+    return {
+        "status": "ok",
+        "branch": b,
+        "commit": sha,
+        "message": msg,
+    }
+
+
+def _merge_order_branch_to_main(
+    *,
+    repo: Path,
+    order_branch: str,
+    order_id: str,
+) -> tuple[bool, str, str | None]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return True, "no_branch", None
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+        # If branch no longer exists remotely, treat as already integrated/closed.
+        return True, "branch_missing_remote", None
+
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    merge_root.mkdir(parents=True, exist_ok=True)
+    merge_dir = (merge_root / f"{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
+    tmp_branch = f"poncebot/merge/{str(order_id or 'order')[:8]}-{int(time.time())}"
+
+    try:
+        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
+        if add.returncode != 0:
+            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+
+        mg = _run_git(merge_dir, ["merge", "--no-ff", "--no-edit", f"origin/{b}"], check=False)
+        if mg.returncode != 0:
+            _run_git(merge_dir, ["merge", "--abort"], check=False)
+            return False, (mg.stderr or mg.stdout or "").strip() or "merge_failed", None
+
+        rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+        merge_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+
+        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
+        if ps.returncode != 0:
+            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
+
+        # Hygiene: one branch per project/order, remove after successful merge.
+        _run_git(repo, ["push", "origin", "--delete", b], check=False)
+        _run_git(repo, ["branch", "-D", b], check=False)
+        return True, "merged_to_main", (merge_commit or None)
+    finally:
+        try:
+            _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+            _run_git(repo, ["worktree", "prune"], check=False)
+            _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+        except Exception:
+            pass
+
+
+def _rollback_order_merge_on_main(
+    *,
+    repo: Path,
+    order_id: str,
+    merge_commit: str,
+) -> tuple[bool, str, str | None]:
+    mc = str(merge_commit or "").strip()
+    if not mc:
+        return False, "missing_merge_commit", None
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    merge_root.mkdir(parents=True, exist_ok=True)
+    merge_dir = (merge_root / f"rollback-{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
+    tmp_branch = f"poncebot/rollback/{str(order_id or 'order')[:8]}-{int(time.time())}"
+
+    try:
+        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
+        if add.returncode != 0:
+            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+
+        rv = _run_git(merge_dir, ["revert", "--no-edit", mc], check=False)
+        if rv.returncode != 0:
+            _run_git(merge_dir, ["revert", "--abort"], check=False)
+            return False, (rv.stderr or rv.stdout or "").strip() or "revert_failed", None
+
+        rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+        rollback_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+
+        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
+        if ps.returncode != 0:
+            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
+        return True, "rollback_pushed", (rollback_commit or None)
+    finally:
+        try:
+            _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+            _run_git(repo, ["worktree", "prune"], check=False)
+            _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+        except Exception:
+            pass
+
+
+def _ensure_project_workspace(
+    *,
+    project_id: str,
+    title: str,
+    created_by: str,
+    runtime_mode: str = "venv",
+) -> dict[str, str]:
+    root = _projects_root_dir()
+    root.mkdir(parents=True, exist_ok=True)
+
+    pid = (project_id or "").strip() or str(uuid.uuid4())
+    slug = _slug_token(title or pid)
+    dirname = f"{time.strftime('%Y%m%d')}-{slug}-{pid[:8]}"
+    path = (root / dirname).resolve()
+    path.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "project_id": pid,
+        "name": title or pid,
+        "path": str(path),
+        "runtime_mode": runtime_mode,
+        "ports": [],
+        "created_by": created_by or "jarvis",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "notes": "Isolated workspace scaffold created by PonceBot orchestration.",
+    }
+    try:
+        (path / "PROJECT_MANIFEST.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return {"project_id": pid, "path": str(path), "name": str(manifest["name"])}
+
+
 def _orchestrator_model_for_profile(cfg: BotConfig, profile: dict[str, Any]) -> str:
     model = str(profile.get("model") or "").strip()
     model = _sanitize_model_id(model)
@@ -3882,6 +4389,10 @@ def _orchestrator_task_from_job(
     *,
     profiles: dict[str, dict[str, Any]] | None,
     user_id: int | None = None,
+    intent_type: str | None = None,
+    source_message_id: int | None = None,
+    quoted_message_id: int | None = None,
+    quoted_message_text: str = "",
 ) -> Task:
     employee_name, user_text = _parse_employee_forward(job.user_text)
 
@@ -3905,10 +4416,24 @@ def _orchestrator_task_from_job(
     effort = _orchestrator_effort_for_profile(profile, cfg)
 
     req_type = str(pre.request_type or "task")
-    if req_type == "query":
-        # CEO UX policy: queries should be fast/cheap and never request writes.
+    normalized_intent = str(intent_type or "").strip().lower()
+    # Intent classifier is the source of truth for conversational asks. This prevents
+    # imperative-but-non-execution prompts (e.g. ideation) from entering delegation lanes.
+    if role == "jarvis" and normalized_intent == "query" and req_type not in ("query", "status"):
+        req_type = "query"
+    if req_type in ("query", "status"):
+        # CEO/Jarvis conversational lane: fast model, no write mode, no ticket card spam.
+        model = _MODEL_CEO_QUERY
+        effort = _EFFORT_CEO_QUERY
         mode_hint = "ro"
-        effort = "low"
+    elif role == "jarvis":
+        # Jarvis planning lane.
+        model = _MODEL_JARVIS_PLAN
+        effort = _EFFORT_JARVIS_PLAN
+    else:
+        # Worker execution lane.
+        model = _MODEL_AGENT_EXEC
+        effort = _EFFORT_AGENT_EXEC
 
     requires_approval = bool(profile.get("approval_required", False))
     if mode_hint == "full":
@@ -3921,10 +4446,25 @@ def _orchestrator_task_from_job(
         "profile_role": role,
         "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
     }
-    if req_type == "query":
+    if req_type in ("query", "status"):
         trace["max_runtime_seconds"] = 120
         trace["suppress_ticket_card"] = True
         requires_approval = False
+    if normalized_intent:
+        trace["intent_type"] = normalized_intent
+    if source_message_id is not None:
+        try:
+            trace["source_message_id"] = int(source_message_id)
+        except Exception:
+            pass
+    if quoted_message_id is not None:
+        try:
+            trace["quoted_message_id"] = int(quoted_message_id)
+        except Exception:
+            pass
+    qtxt = (quoted_message_text or "").strip()
+    if qtxt:
+        trace["quoted_message_text"] = qtxt[:800]
     trace["prefer_voice_reply"] = bool(getattr(job, "prefer_voice_reply", False))
     if employee_name:
         trace["employee_name"] = employee_name
@@ -3938,9 +4478,9 @@ def _orchestrator_task_from_job(
         priority = 2
     if priority < 1:
         priority = 1
-    # CEO preemption: for manual top-level work requests, default to priority=1 so it
-    # doesn't sit behind an old backlog.
-    if not (user_text or "").lstrip().startswith("/") and str(pre.request_type or "task") == "task":
+    # CEO preemption: top-level manual requests should not queue behind autonomous work.
+    # Applies to task + query/status lanes so direct CEO asks stay responsive.
+    if not (user_text or "").lstrip().startswith("/") and str(pre.request_type or "task") in ("task", "query", "status"):
         priority = 1
 
     context = {
@@ -3956,7 +4496,8 @@ def _orchestrator_task_from_job(
         "due_at": None,
         "mode_hint": mode_hint,
         # Let dispatcher detect request_type (query/status/task), but keep our role fixed unless @role was explicit.
-        "request_type": pre.request_type,
+        "request_type": req_type,
+        "intent_type": (normalized_intent or None),
         "requires_approval": requires_approval,
         "max_cost_window_usd": float(cfg.orchestrator_default_max_cost_window_usd),
         "trace": trace,
@@ -4023,6 +4564,18 @@ def _can_manage_orchestrator(cfg: BotConfig, *, chat_id: int) -> bool:
         return True
     return _profile_can_manage_bot(cfg, profile_name=profile)
 
+def _is_admin_actor(cfg: BotConfig, *, chat_id: int, user_id: int | None) -> bool:
+    if cfg.admin_chat_ids or cfg.admin_user_ids:
+        if cfg.admin_chat_ids and int(chat_id) in cfg.admin_chat_ids:
+            return True
+        if cfg.admin_user_ids and user_id is not None and int(user_id) in cfg.admin_user_ids:
+            return True
+        return False
+    if cfg.auth_enabled:
+        return _can_manage_orchestrator(cfg, chat_id=chat_id)
+    return False
+
+
 def _can_delete_jobs(cfg: BotConfig, *, chat_id: int, user_id: int | None) -> bool:
     """
     Destructive actions (delete) should be stricter than "manage orchestrator".
@@ -4057,6 +4610,122 @@ def _send_chunked_text(
             api.send_message(chat_id, payload, reply_to_message_id=reply_to_message_id)
         except Exception:
             LOG.exception("Failed to send chunked message. chat_id=%s", chat_id)
+
+
+def _mobile_latest_apk(artifacts_dir: Path) -> Path | None:
+    try:
+        root = Path(artifacts_dir).expanduser().resolve()
+    except Exception:
+        return None
+    if not root.exists() or not root.is_dir():
+        return None
+    items = sorted(root.glob("omnicrewapp-*-universal-release.apk"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return items[0] if items else None
+
+
+def _mobile_read_build_report(artifacts_dir: Path) -> dict[str, Any]:
+    report_path = Path(artifacts_dir).expanduser().resolve() / "build_report.json"
+    if not report_path.exists():
+        return {}
+    try:
+        raw = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _mobile_apk_caption(report: dict[str, Any], apk_name: str) -> str:
+    version = str(report.get("version") or "-")
+    commit = str(report.get("git_sha") or "-")
+    built_at = str(report.get("built_at") or "-")
+    sha = str(report.get("sha256") or "-")
+    lines = [
+        "OmniCrew Android APK",
+        f"version: {version}",
+        f"commit: {commit}",
+        f"built_at: {built_at}",
+        f"sha256: {sha}",
+        f"file: {apk_name}",
+    ]
+    return "\n".join(lines)
+
+
+def _start_apk_build_worker(
+    *,
+    cfg: BotConfig,
+    api: "TelegramAPI",
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    global _APK_BUILD_ACTIVE
+
+    def _run() -> None:
+        global _APK_BUILD_ACTIVE
+        try:
+            api.send_message(chat_id, "apk_build: building", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "apk_build: testing", reply_to_message_id=reply_to_message_id)
+            api.send_message(chat_id, "apk_build: signing", reply_to_message_id=reply_to_message_id)
+
+            env = os.environ.copy()
+            env["MOBILE_APP_PROJECT_DIR"] = str(cfg.mobile_app_project_dir)
+            env["MOBILE_APP_ARTIFACTS_DIR"] = str(cfg.mobile_app_artifacts_dir)
+            env["MOBILE_APP_BUILD_SCRIPT"] = str(cfg.mobile_app_build_script)
+            env["MOBILE_APP_KEYSTORE_PATH"] = str(cfg.mobile_app_keystore_path)
+            env["MOBILE_APP_KEY_ALIAS"] = str(cfg.mobile_app_key_alias)
+            env["MOBILE_APP_KEYSTORE_PASS"] = str(cfg.mobile_app_keystore_pass or "")
+            env["MOBILE_APP_KEY_PASS"] = str(cfg.mobile_app_key_pass or "")
+
+            proc = subprocess.run(
+                [str(cfg.mobile_app_build_script)],
+                cwd=str(cfg.mobile_app_project_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60 * 60,
+            )
+            if proc.returncode != 0:
+                tail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                if len(tail) > 1600:
+                    tail = tail[-1600:]
+                api.send_message(
+                    chat_id,
+                    f"apk_build: failed (code={proc.returncode})\n{tail or 'No output captured.'}",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+
+            report = _mobile_read_build_report(cfg.mobile_app_artifacts_dir)
+            apk_path_raw = str(report.get("artifact_path") or "").strip()
+            apk_path = Path(apk_path_raw).expanduser().resolve() if apk_path_raw else None
+            if apk_path is None or not apk_path.exists():
+                apk_path = _mobile_latest_apk(cfg.mobile_app_artifacts_dir)
+
+            if apk_path is None or not apk_path.exists():
+                api.send_message(
+                    chat_id,
+                    "apk_build: failed (artifact not found after successful build)",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return
+
+            api.send_message(chat_id, "apk_build: sending", reply_to_message_id=reply_to_message_id)
+            caption = _mobile_apk_caption(report, apk_path.name)
+            api.send_document(
+                chat_id,
+                apk_path,
+                filename=apk_path.name,
+                caption=caption,
+                reply_to_message_id=reply_to_message_id,
+            )
+            api.send_message(chat_id, "apk_build: done", reply_to_message_id=reply_to_message_id)
+        except Exception as e:
+            api.send_message(chat_id, f"apk_build: failed ({e})", reply_to_message_id=reply_to_message_id)
+        finally:
+            with _APK_BUILD_LOCK:
+                _APK_BUILD_ACTIVE = False
+
+    t = threading.Thread(target=_run, daemon=True, name="apk-build-worker")
+    t.start()
 
 
 def _send_orchestrator_marker_response(
@@ -4131,6 +4800,8 @@ def _send_orchestrator_marker_response(
                 return default
 
         queued_total = _as_int(snap.get("queued_total"), 0)
+        waiting_deps_total = _as_int(snap.get("waiting_deps_total"), 0)
+        blocked_approval_total = _as_int(snap.get("blocked_approval_total"), 0)
         running_total = _as_int(snap.get("running_total"), 0)
         blocked_total = _as_int(snap.get("blocked_total"), 0)
 
@@ -4164,7 +4835,9 @@ def _send_orchestrator_marker_response(
         if not cfg.screenshot_enabled:
             lines: list[str] = []
             lines.append(f"Jarvis: dashboard ({scope_label})")
-            lines.append(f"Hecho (DB): queued={queued_total} running={running_total} blocked={blocked_total}")
+            lines.append(
+                f"Hecho (DB): queued={queued_total} waiting_deps={waiting_deps_total} blocked_approval={blocked_approval_total} running={running_total} blocked={blocked_total}"
+            )
             if staleness_s is not None:
                 lines.append(f"Hecho (DB): staleness={_fmt_age(staleness_s)}")
             lines.append(f"Hecho (DB): generated_at={ts}")
@@ -4412,6 +5085,8 @@ def _send_orchestrator_marker_response(
             + "</div></div>"
             "<div class='stats'>"
             + _pill("Hecho (DB)", f"queued={queued_total}")
+            + _pill("Hecho (DB)", f"waiting_deps={waiting_deps_total}")
+            + _pill("Hecho (DB)", f"blocked_approval={blocked_approval_total}")
             + _pill("Hecho (DB)", f"running={running_total}")
             + _pill("Hecho (DB)", f"blocked={blocked_total}")
             + ("" if staleness_s is None else _pill("Hecho (DB)", f"staleness={_fmt_age(staleness_s)}"))
@@ -4443,6 +5118,41 @@ def _send_orchestrator_marker_response(
         return True
 
 
+    if kind == "apk_latest":
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor para APK delivery.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        apk_path = _mobile_latest_apk(cfg.mobile_app_artifacts_dir)
+        if apk_path is None or not apk_path.exists():
+            api.send_message(chat_id, "No APK artifact found yet. Run /apk_build first.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        report = _mobile_read_build_report(cfg.mobile_app_artifacts_dir)
+        caption = _mobile_apk_caption(report, apk_path.name)
+        try:
+            api.send_document(chat_id, apk_path, filename=apk_path.name, caption=caption, reply_to_message_id=reply_to_message_id)
+        except Exception as e:
+            api.send_message(chat_id, f"/apk_latest failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
+    if kind == "apk_build":
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(chat_id, "No permitido: necesitas permisos de gestor para APK build.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        with _APK_BUILD_LOCK:
+            global _APK_BUILD_ACTIVE
+            if _APK_BUILD_ACTIVE:
+                api.send_message(chat_id, "apk_build: already running", reply_to_message_id=reply_to_message_id)
+                return True
+            _APK_BUILD_ACTIVE = True
+
+        api.send_message(chat_id, "apk_build: queued", reply_to_message_id=reply_to_message_id)
+        _start_apk_build_worker(cfg=cfg, api=api, chat_id=chat_id, reply_to_message_id=reply_to_message_id)
+        return True
+
+
     if kind == "watch":
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -4455,9 +5165,14 @@ def _send_orchestrator_marker_response(
         key = str(int(chat_id))
 
         if mode in ("off", "0", "false", "stop", "disable", "disabled"):
-            watch_by_chat.pop(key, None)
-            st["watch_by_chat"] = watch_by_chat
-            _atomic_write_json(cfg.state_file, st)
+            def _m_disable(s: dict[str, Any]) -> None:
+                wb = s.get("watch_by_chat")
+                if not isinstance(wb, dict):
+                    wb = {}
+                wb.pop(key, None)
+                s["watch_by_chat"] = wb
+
+            _update_state(cfg, _m_disable)
             api.send_message(chat_id, "OK. Watch disabled.", reply_to_message_id=reply_to_message_id)
             return True
 
@@ -4465,9 +5180,14 @@ def _send_orchestrator_marker_response(
         msg_txt = _watch_status_text(orch_q)
         mid = api.send_message(chat_id, msg_txt, reply_to_message_id=reply_to_message_id)
         if mid is not None:
-            watch_by_chat[key] = int(mid)
-            st["watch_by_chat"] = watch_by_chat
-            _atomic_write_json(cfg.state_file, st)
+            def _m_enable(s: dict[str, Any]) -> None:
+                wb = s.get("watch_by_chat")
+                if not isinstance(wb, dict):
+                    wb = {}
+                wb[key] = int(mid)
+                s["watch_by_chat"] = wb
+
+            _update_state(cfg, _m_enable)
         return True
 
     if kind == "orders":
@@ -4481,10 +5201,64 @@ def _send_orchestrator_marker_response(
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
+        cmd = ((payload or "").strip().split()[:1] or [""])[0].strip().lower()
+        if cmd in ("merge", "rollback", "revert") and (not _can_manage_orchestrator(cfg, chat_id=chat_id)):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para merge/rollback.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
         _send_chunked_text(
             api,
             chat_id=chat_id,
-            text=_order_command_text(orch_q, chat_id=chat_id, payload=payload),
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=payload, user_id=user_id),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
+    if kind == "approve_merge":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para merge.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        oid = str(payload or "").strip()
+        if not oid:
+            api.send_message(chat_id, "Uso: /approve_merge <order_id>", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=f"merge {oid}", user_id=user_id),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
+    if kind == "rollback_merge":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para rollback.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        oid = str(payload or "").strip()
+        if not oid:
+            api.send_message(chat_id, "Uso: /rollback <order_id>", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_order_command_text(cfg, orch_q, chat_id=chat_id, payload=f"rollback {oid}", user_id=user_id),
             reply_to_message_id=reply_to_message_id,
         )
         return True
@@ -4704,6 +5478,42 @@ def _send_orchestrator_marker_response(
             api.send_message(chat_id, "Emergency stop liberado. Roles reanudados.", reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind == "hard_reset":
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para hard reset.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if (payload or "").strip().lower() != "confirm":
+            api.send_message(chat_id, "Uso: /hardreset confirm", reply_to_message_id=reply_to_message_id)
+            return True
+        try:
+            out = orch_q.hard_reset_bootstrap(reason="hard_reset_bootstrap")
+            queued = int(orch_q.get_queued_count())
+            waiting_deps = int(orch_q.get_waiting_deps_count())
+            blocked_approval = int(orch_q.get_blocked_approval_count())
+            running_n = int(orch_q.get_running_count())
+            api.send_message(
+                chat_id,
+                "\n".join(
+                    [
+                        "Hard reset executed.",
+                        f"- jobs_cancelled: {int(out.get('jobs_cancelled', 0))}",
+                        f"- orders_done: {int(out.get('orders_done', 0))}",
+                        f"- now: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n}",
+                    ]
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+        except Exception as e:
+            api.send_message(chat_id, f"Hard reset failed: {e}", reply_to_message_id=reply_to_message_id)
+        return True
+
     if kind == "approve":
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -4763,24 +5573,28 @@ def _send_orchestrator_marker_response(
         if scope in ("chat", "here", "aqui", "aquí", "this"):
             target_chat_id = int(chat_id)
         cancelled = orch_q.cancel_by_states(
-            states=("queued", "blocked"),
+            states=("queued", "waiting_deps", "blocked_approval", "blocked"),
             reason="purge_queue",
             chat_id=target_chat_id,
         )
         try:
-            health = orch_q.get_role_health()
-            queued = int(orch_q.get_queued_count())
-            running_n = int(orch_q.get_running_count())
+            health = orch_q.get_role_health(chat_id=target_chat_id)
+            queued = int(orch_q.get_queued_count(chat_id=target_chat_id))
+            running_n = int(orch_q.get_running_count(chat_id=target_chat_id))
+            waiting_deps = int(orch_q.get_waiting_deps_count(chat_id=target_chat_id))
+            blocked_approval = int(orch_q.get_blocked_approval_count(chat_id=target_chat_id))
             blocked = 0
             for rec in (health or {}).values():
                 try:
                     blocked += int((rec or {}).get("blocked", 0))
                 except Exception:
                     pass
-            running = orch_q.jobs_by_state(state="running", limit=5)
+            running = orch_q.jobs_by_state(state="running", limit=5, chat_id=target_chat_id)
         except Exception:
             queued = 0
             running_n = 0
+            waiting_deps = 0
+            blocked_approval = 0
             blocked = 0
             running = []
 
@@ -4790,8 +5604,10 @@ def _send_orchestrator_marker_response(
             lines.append(f"- scope: global")
         else:
             lines.append(f"- scope: chat_id={target_chat_id}")
-        lines.append(f"- cancelled: {int(cancelled)} (queued+blocked)")
-        lines.append(f"- now: queued={queued} running={running_n} blocked={blocked}")
+        lines.append(f"- cancelled: {int(cancelled)} (queued+waiting_deps+blocked_approval+blocked)")
+        lines.append(
+            f"- now: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running_n} blocked={blocked}"
+        )
         if running:
             parts: list[str] = []
             for r in running[:5]:
@@ -4813,7 +5629,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
     if not health:
         return "No orchestrator jobs yet."
 
-    states = ("queued", "running", "blocked", "done", "failed", "cancelled")
+    states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked", "done", "failed", "cancelled")
     system_state = "paused" if orch_q.is_paused_globally() else "active"
     lines = ["Jarvis role health:", f"system: {system_state}", ""]
     for role in sorted(health.keys()):
@@ -4883,10 +5699,14 @@ def _watch_status_text(orch_q: OrchestratorQueue) -> str:
         for role in sorted(health.keys()):
             vals = health.get(role, {}) or {}
             queued = int(vals.get("queued", 0) or 0)
+            waiting_deps = int(vals.get("waiting_deps", 0) or 0)
+            blocked_approval = int(vals.get("blocked_approval", 0) or 0)
             running = int(vals.get("running", 0) or 0)
             blocked = int(vals.get("blocked", 0) or 0)
             failed = int(vals.get("failed", 0) or 0)
-            lines.append(f"- {role}: queued={queued} running={running} blocked={blocked} failed={failed}")
+            lines.append(
+                f"- {role}: queued={queued} waiting_deps={waiting_deps} blocked_approval={blocked_approval} running={running} blocked={blocked} failed={failed}"
+            )
     else:
         lines.append("roles: (no data yet)")
 
@@ -4941,8 +5761,10 @@ def _tick_watch_messages(*, cfg: BotConfig, api: TelegramAPI, orch_q: Orchestrat
             changed = True
 
     if changed:
-        st["watch_by_chat"] = watch_by_chat
-        _atomic_write_json(cfg.state_file, st)
+        def _m(st2: dict[str, Any]) -> None:
+            st2["watch_by_chat"] = watch_by_chat
+
+        _update_state(cfg, _m)
 
 
 def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
@@ -4953,6 +5775,9 @@ def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
     for it in items[:50]:
         oid = str(it.get("order_id") or "").strip()
         status = str(it.get("status") or "").strip() or "active"
+        phase = str(it.get("phase") or "").strip() or "planning"
+        intent = str(it.get("intent_type") or "").strip() or "order_project_new"
+        project_id = str(it.get("project_id") or "").strip()
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -4961,28 +5786,65 @@ def _orders_text(orch_q: OrchestratorQueue, *, chat_id: int) -> str:
         title = str(it.get("title") or "").strip().replace("\n", " ")
         if len(title) > 80:
             title = title[:80] + "..."
-        lines.append(f"- {oid[:8]} status={status} priority={pr_s} title={title}")
+        branch_short = ""
+        merge_flag = ""
+        try:
+            root = orch_q.get_job(oid)
+            tr = dict((root.trace or {}) if root else {})
+            br = str(tr.get("order_branch") or "").strip()
+            if br:
+                branch_short = br
+            if bool(tr.get("merge_ready", False)):
+                merge_flag = " merge=ready"
+            elif bool(tr.get("merged_to_main", False)):
+                merge_flag = " merge=done"
+        except Exception:
+            pass
+        project_part = f" project={project_id[:8]}" if project_id else ""
+        branch_part = f" branch={branch_short}" if branch_short else ""
+        lines.append(
+            f"- {oid[:8]} status={status} phase={phase} intent={intent} priority={pr_s}{project_part}{branch_part}{merge_flag} title={title}"
+        )
     lines.append("")
     lines.append("Usage:")
     lines.append("- /order show <id>")
     lines.append("- /order pause <id>")
     lines.append("- /order done <id>")
+    lines.append("- /order merge <id>  (or /approve_merge <id>)")
+    lines.append("- /order rollback <id>  (or /rollback <id>)")
     return "\n".join(lines)
 
 
-def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str) -> str:
+def _order_command_text(
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    *,
+    chat_id: int,
+    payload: str,
+    user_id: int | None = None,
+) -> str:
     parts = (payload or "").strip().split()
     if len(parts) < 2:
-        return "Usage: /order show|pause|done <id>"
+        return "Usage: /order show|pause|done|merge|rollback <id>"
     cmd = parts[0].strip().lower()
     oid = parts[1].strip()
     if cmd == "show":
         it = orch_q.get_order(oid, chat_id=int(chat_id))
         if not it:
             return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        root = orch_q.get_job(root_id) if root_id else None
+        trace = dict((root.trace or {}) if root else {})
         title = str(it.get("title") or "").strip()
         body = str(it.get("body") or "").strip()
         status = str(it.get("status") or "").strip()
+        phase = str(it.get("phase") or "").strip() or "planning"
+        intent = str(it.get("intent_type") or "").strip() or "order_project_new"
+        project_id = str(it.get("project_id") or "").strip() or "n/a"
+        order_branch = str(trace.get("order_branch") or "").strip() or "n/a"
+        merge_ready = bool(trace.get("merge_ready", False))
+        merged_to_main = bool(trace.get("merged_to_main", False))
+        merge_commit = str(trace.get("merge_commit") or "").strip() or "n/a"
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -4994,7 +5856,14 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
                 "=" * 5,
                 f"id: {str(it.get('order_id') or '')}",
                 f"status: {status}",
+                f"phase: {phase}",
+                f"intent_type: {intent}",
                 f"priority: {pr_s}",
+                f"project_id: {project_id}",
+                f"order_branch: {order_branch}",
+                f"merge_ready: {'yes' if merge_ready else 'no'}",
+                f"merged_to_main: {'yes' if merged_to_main else 'no'}",
+                f"merge_commit: {merge_commit}",
                 "",
                 "title:",
                 title,
@@ -5005,11 +5874,141 @@ def _order_command_text(orch_q: OrchestratorQueue, *, chat_id: int, payload: str
         )
     if cmd in ("pause", "paused"):
         ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="paused")
+        if ok:
+            try:
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="paused")
+            except Exception:
+                pass
         return "OK." if ok else f"No such order: {oid}"
     if cmd in ("done", "complete", "completed"):
         ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+        if ok:
+            try:
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+            except Exception:
+                pass
         return "OK." if ok else f"No such order: {oid}"
-    return "Usage: /order show|pause|done <id>"
+    if cmd in ("merge", "approve_merge"):
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        if not root_id:
+            return f"Invalid order id: {oid}"
+        root = orch_q.get_job(root_id)
+        trace = dict((root.trace or {}) if root else {})
+        order_branch = str(trace.get("order_branch") or "").strip()
+        if not order_branch:
+            return f"Order {root_id[:8]} has no branch metadata yet."
+        merged_ok, merged_msg, merge_commit = _merge_order_branch_to_main(
+            repo=cfg.codex_workdir,
+            order_branch=order_branch,
+            order_id=root_id,
+        )
+        if merged_ok:
+            try:
+                orch_q.update_trace(
+                    root_id,
+                    merge_ready=False,
+                    merge_approved=True,
+                    merge_approved_by=(int(user_id) if user_id is not None else None),
+                    merge_approved_at=time.time(),
+                    merged_to_main=True,
+                    merge_result=str(merged_msg),
+                    merge_commit=(merge_commit or None),
+                    merged_at=time.time(),
+                )
+            except Exception:
+                pass
+            try:
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="order.merged",
+                    actor="ceo",
+                    details={
+                        "order_id": root_id,
+                        "order_branch": order_branch,
+                        "merge_commit": (merge_commit or None),
+                        "result": str(merged_msg),
+                    },
+                )
+            except Exception:
+                pass
+            commit_part = f" commit={merge_commit}" if merge_commit else ""
+            return f"Order {root_id[:8]} merged to main.{commit_part}"
+        try:
+            orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(root_id, merge_ready=True, merge_error=str(merged_msg), merge_failed_at=time.time())
+        except Exception:
+            pass
+        try:
+            orch_q.append_audit_event(
+                event_type="order.merge_failed",
+                actor="ceo",
+                details={
+                    "order_id": root_id,
+                    "order_branch": order_branch,
+                    "error": str(merged_msg),
+                },
+            )
+        except Exception:
+            pass
+        return f"Merge failed for order {root_id[:8]}: {merged_msg}"
+
+    if cmd in ("rollback", "revert"):
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        if not root_id:
+            return f"Invalid order id: {oid}"
+        root = orch_q.get_job(root_id)
+        trace = dict((root.trace or {}) if root else {})
+        merge_commit = str(trace.get("merge_commit") or "").strip()
+        if not merge_commit:
+            return f"Order {root_id[:8]} has no merge commit to rollback."
+        ok_rb, rb_msg, rb_commit = _rollback_order_merge_on_main(
+            repo=cfg.codex_workdir,
+            order_id=root_id,
+            merge_commit=merge_commit,
+        )
+        if ok_rb:
+            try:
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    root_id,
+                    rollback_commit=(rb_commit or None),
+                    rollback_of_merge_commit=merge_commit,
+                    rollback_at=time.time(),
+                    merged_to_main=False,
+                    merge_ready=False,
+                )
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="order.rollback",
+                    actor="ceo",
+                    details={
+                        "order_id": root_id,
+                        "merge_commit": merge_commit,
+                        "rollback_commit": (rb_commit or None),
+                        "result": str(rb_msg),
+                    },
+                )
+            except Exception:
+                pass
+            rb_part = f" rollback_commit={rb_commit}" if rb_commit else ""
+            return f"Rollback pushed for order {root_id[:8]}.{rb_part}"
+        return f"Rollback failed for order {root_id[:8]}: {rb_msg}"
+
+    return "Usage: /order show|pause|done|merge|rollback <id>"
 
 
 def _autopilot_tick(
@@ -5050,14 +6049,14 @@ def _autopilot_tick(
         children = orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
         if any(
             str((c.labels or {}).get("kind") or "").strip().lower() == "autopilot"
-            and c.state in ("queued", "running")
+            and c.state in ("queued", "waiting_deps", "blocked_approval", "running")
             for c in children
         ):
             continue
 
         # If there is any real work already queued/running for this order, do nothing.
         has_active_work = any(
-            c.state in ("queued", "running")
+            c.state in ("queued", "waiting_deps", "blocked_approval", "running")
             and str((c.labels or {}).get("kind") or "").strip().lower() not in ("autopilot", "wrapup", "evidence")
             for c in children
         )
@@ -5135,9 +6134,579 @@ def _autopilot_tick(
             pass
 
         orch_q.submit_task(t)
+        try:
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
+        except Exception:
+            pass
         created += 1
         # Cap per tick to avoid spam / runaway job creation.
         if created >= 1:
+            break
+
+    return created
+
+
+def _normalize_contract_lines(value: list[str] | None, *, fallback: list[str]) -> list[str]:
+    lines: list[str] = []
+    for raw in (value or []):
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        if len(s) > 240:
+            s = s[:240].rstrip() + "..."
+        lines.append(s)
+        if len(lines) >= 8:
+            break
+    if lines:
+        return lines
+    out: list[str] = []
+    for raw in fallback:
+        s = str(raw or "").strip()
+        if s:
+            out.append(s)
+    return out[:4]
+
+
+def _normalize_sla_tier(value: str | None, *, priority: int) -> str:
+    v = str(value or "").strip().lower()
+    if v in ("normal", "high", "urgent"):
+        return v
+    if int(priority or 2) <= 1:
+        return "high"
+    return "normal"
+
+
+def _default_eta_minutes_for_spec(spec: TaskSpec) -> int:
+    role = str(spec.role or "").strip().lower()
+    base_by_role: dict[str, int] = {
+        "jarvis": 45,
+        "qa": 60,
+        "sre": 75,
+        "research": 90,
+        "product_ops": 90,
+        "security": 105,
+        "release_mgr": 120,
+        "frontend": 150,
+        "backend": 150,
+    }
+    base = int(base_by_role.get(role, 120))
+    pr = max(1, min(3, int(spec.priority or 2)))
+    if pr == 1:
+        return max(20, int(base * 0.6))
+    if pr == 3:
+        return int(base * 1.25)
+    return base
+
+
+def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSpec:
+    base_text = str(spec.text or "").strip()
+    acceptance = _normalize_contract_lines(
+        list(spec.acceptance_criteria or []),
+        fallback=[
+            f"Deliver the requested outcome for key `{spec.key}` without breaking existing behavior.",
+            "Include verifiable output/evidence in summary and artifacts.",
+        ],
+    )
+    dod = _normalize_contract_lines(
+        list(spec.definition_of_done or []),
+        fallback=[
+            "Implementation completed and validated in assigned workspace.",
+            "Residual risks and next action explicitly documented.",
+        ],
+    )
+    eta = int(spec.eta_minutes) if spec.eta_minutes is not None else _default_eta_minutes_for_spec(spec)
+    eta = max(5, min(7 * 24 * 60, eta))
+    sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
+
+    # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
+    return TaskSpec(
+        key=spec.key,
+        role=spec.role,
+        text=base_text,
+        mode_hint=spec.mode_hint,
+        priority=int(spec.priority or 2),
+        depends_on=list(spec.depends_on or []),
+        requires_approval=bool(spec.requires_approval),
+        acceptance_criteria=acceptance,
+        definition_of_done=dod,
+        eta_minutes=int(eta),
+        sla_tier=sla,
+    )
+
+
+def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
+    acceptance = [f"- {x}" for x in (spec.acceptance_criteria or []) if str(x).strip()]
+    dod = [f"- {x}" for x in (spec.definition_of_done or []) if str(x).strip()]
+    deps = [str(x).strip() for x in (spec.depends_on or []) if str(x).strip()]
+    contract_lines: list[str] = [
+        "",
+        "Execution contract:",
+        f"- Ticket: {root_ticket}",
+        f"- Key: {spec.key}",
+        f"- ETA (minutes): {int(spec.eta_minutes or 0)}",
+        f"- SLA tier: {spec.sla_tier or 'normal'}",
+    ]
+    if deps:
+        contract_lines.append("- Depends on keys: " + ", ".join(deps))
+    if acceptance:
+        contract_lines.append("- Acceptance criteria:")
+        contract_lines.extend(acceptance[:8])
+    if dod:
+        contract_lines.append("- Definition of done:")
+        contract_lines.extend(dod[:8])
+    return (str(spec.text or "").strip() + "\n" + "\n".join(contract_lines)).strip()
+
+
+def _ttl_seconds_from_spec(spec: TaskSpec) -> int:
+    eta_m = max(5, int(spec.eta_minutes or _default_eta_minutes_for_spec(spec)))
+    sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
+    mult = 2.0
+    if sla == "high":
+        mult = 1.6
+    elif sla == "urgent":
+        mult = 1.25
+    ttl = int(max(300, eta_m * 60 * mult))
+    return min(ttl, 7 * 24 * 60 * 60)
+
+
+def _sync_order_phase_from_runtime(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    chat_id: int,
+) -> None:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return
+    order = orch_q.get_order(rid, chat_id=int(chat_id))
+    if not order:
+        return
+    status = str(order.get("status") or "").strip().lower()
+    if status == "done":
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+        return
+    if status == "paused":
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="paused")
+        return
+
+    root_job = orch_q.get_job(rid)
+    root_trace = dict((root_job.trace or {}) if root_job else {})
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+
+    children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
+    if not children:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
+        return
+
+    states = [str(c.state or "").strip().lower() for c in children]
+    wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
+    wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
+    wrapup_active = any(str(w.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for w in wrapups)
+
+    if any(s in ("blocked", "blocked_approval", "failed") for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+        return
+    if any(s == "running" for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="executing")
+        return
+    if any(s in ("queued", "waiting_deps") for s in states):
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="delegated")
+        return
+    if wrapup_active:
+        orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+        return
+    if wrapup_done:
+        if merged_to_main:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        else:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            try:
+                orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
+            except Exception:
+                pass
+        return
+
+    # If there are no active/blocked jobs, close only when all children reached terminal states.
+    terminal_ok = all(s in ("done", "cancelled") for s in states)
+    if terminal_ok:
+        if merged_to_main:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+        else:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            try:
+                orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
+            except Exception:
+                pass
+        return
+    orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+
+
+def _orchestrator_min_evidence_gate(
+    *,
+    task: Task,
+    summary: str,
+    artifacts: list[str],
+    logs: str,
+    structured: dict[str, Any],
+) -> tuple[bool, str | None, dict[str, Any]]:
+    role = _coerce_orchestrator_role(task.role)
+    req = str(task.request_type or "").strip().lower()
+    kind = str((task.labels or {}).get("kind") or "").strip().lower()
+    if req in ("query", "status"):
+        return True, None, {"skipped": "conversational_lane"}
+    if role == "jarvis":
+        return True, None, {"skipped": f"jarvis_{kind or 'controller'}"}
+
+    summary_clean = str(summary or "").strip()
+    logs_clean = str(logs or "").strip()
+    artifacts_clean = [str(a).strip() for a in (artifacts or []) if str(a).strip()]
+    lower = summary_clean.lower()
+    weak_summary = lower in ("", "(no output)", "(no summary)", "ok", "done", "hecho")
+    summary_substantial = (len(summary_clean) >= 48) and (not weak_summary)
+    has_artifacts = len(artifacts_clean) > 0
+    has_logs = len(logs_clean) >= 100
+
+    evidence_meta: dict[str, Any] = {
+        "summary_chars": int(len(summary_clean)),
+        "artifacts_count": int(len(artifacts_clean)),
+        "logs_chars": int(len(logs_clean)),
+        "summary_substantial": bool(summary_substantial),
+    }
+
+    if role == "qa":
+        qa_tokens = ("pass", "fail", "blocked", "regression", "test", "coverage")
+        if not any(tok in lower for tok in qa_tokens):
+            return (
+                False,
+                "QA evidence gate not met. Include PASS/FAIL style validation with concrete findings.",
+                evidence_meta,
+            )
+
+    if role == "release_mgr":
+        by_name = any(
+            ("release_checklist" in p.lower()) or ("pr_url" in p.lower())
+            for p in artifacts_clean
+        )
+        by_summary = ("pull request" in lower) or ("pr " in lower) or ("checklist" in lower)
+        if not (by_name or by_summary):
+            return (
+                False,
+                "Release evidence gate not met. Include release checklist / PR evidence before closing.",
+                evidence_meta,
+            )
+
+    if not (summary_substantial or has_artifacts or has_logs):
+        return (
+            False,
+            "Evidence gate not met. Provide meaningful summary and/or artifacts/log evidence before closing.",
+            evidence_meta,
+        )
+    return True, None, evidence_meta
+
+
+def _stalled_replan_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Escalate stalled dependency/approval chains to Jarvis for automatic replanning.
+    """
+    try:
+        stale_after_s = max(300.0, float(os.environ.get("BOT_STALLED_TTL_SECONDS", "1800").strip() or "1800"))
+    except Exception:
+        stale_after_s = 1800.0
+
+    stalled = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=80)
+    if not stalled:
+        return 0
+
+    dedup_roots: set[str] = set()
+    created = 0
+    for item in stalled:
+        root_ticket = (item.parent_job_id or item.job_id or "").strip() or item.job_id
+        if not root_ticket or root_ticket in dedup_roots:
+            continue
+        dedup_roots.add(root_ticket)
+
+        root_job = orch_q.get_job(root_ticket)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            escalated_at = float(root_trace.get("stalled_escalated_at", 0.0) or 0.0)
+        except Exception:
+            escalated_at = 0.0
+        if escalated_at > 0 and (now - escalated_at) < 600.0:
+            continue
+
+        profile = _orchestrator_profile(profiles, "jarvis")
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+
+        reason = str(item.blocked_reason or item.state or "stalled").strip()
+        task_id = str(uuid.uuid4())
+        escalation = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=(
+                "STALL ESCALATION\n"
+                f"Order/Ticket: {root_ticket}\n"
+                f"Stalled job: {item.job_id}\n"
+                f"Stalled state: {item.state}\n"
+                f"Reason: {reason}\n"
+                "Action required:\n"
+                "- Re-plan remaining work to unblock delivery.\n"
+                "- If approvals are required, prepare explicit approval request.\n"
+                "- Reassign dependencies so runnable work remains in queued.\n"
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(item.chat_id),
+            user_id=item.user_id,
+            reply_to_message_id=item.reply_to_message_id,
+            parent_job_id=root_ticket,
+            labels={"ticket": root_ticket, "kind": "stalled_replan"},
+            artifacts_dir=str((cfg.artifacts_root / task_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": root_ticket,
+                "stalled_job_id": item.job_id,
+                "stalled_state": item.state,
+                "stalled_reason": reason,
+            },
+            job_id=task_id,
+        )
+        orch_q.submit_task(escalation)
+        created += 1
+        try:
+            orch_q.update_trace(root_ticket, stalled_escalated_at=float(now), stalled_job_id=item.job_id, live_at=now)
+            orch_q.set_order_phase(root_ticket, chat_id=int(item.chat_id), phase="planning")
+            orch_q.append_audit_event(
+                event_type="task.stalled",
+                actor="jarvis",
+                details={
+                    "order_id": root_ticket,
+                    "job_id": item.job_id,
+                    "state": item.state,
+                    "reason": reason,
+                },
+            )
+        except Exception:
+            pass
+
+        if created >= 8:
+            break
+
+    return created
+
+
+def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Periodic hygiene: close very old blocked/waiting jobs so queues don't accumulate dead entries forever.
+    """
+    try:
+        stale_after_s = max(1800.0, float(os.environ.get("BOT_HYGIENE_STALE_BLOCKED_SECONDS", "86400").strip() or "86400"))
+    except Exception:
+        stale_after_s = 86400.0
+    try:
+        max_jobs = max(1, int(os.environ.get("BOT_HYGIENE_MAX_CLEANUP_PER_TICK", "12").strip() or "12"))
+    except Exception:
+        max_jobs = 12
+
+    candidates = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=max_jobs * 4)
+    if not candidates:
+        return 0
+
+    cleaned = 0
+    for task in candidates:
+        st = str(task.state or "").strip().lower()
+        if st not in ("waiting_deps", "blocked_approval", "blocked"):
+            continue
+        if cleaned >= max_jobs:
+            break
+        try:
+            orch_q.update_state(
+                task.job_id,
+                "failed",
+                blocked_reason="stale_cleanup",
+                result_summary="Auto-closed by hygiene: stale blocked job.",
+                result_next_action="manual_requeue_if_needed",
+            )
+            orch_q.append_audit_event(
+                event_type="task.hygiene_closed",
+                actor="scheduler",
+                details={
+                    "job_id": task.job_id,
+                    "state": st,
+                    "stale_after_seconds": float(stale_after_s),
+                },
+            )
+            cleaned += 1
+        except Exception:
+            continue
+    return cleaned
+
+
+def _sla_overdue_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Escalate jobs that exceeded their delegated ETA/SLA (ttl_seconds) so Jarvis replans.
+    """
+    try:
+        cooldown_s = max(180.0, float(os.environ.get("BOT_SLA_ESCALATION_COOLDOWN_SECONDS", "900").strip() or "900"))
+    except Exception:
+        cooldown_s = 900.0
+    try:
+        grace_s = max(0.0, float(os.environ.get("BOT_SLA_OVERDUE_GRACE_SECONDS", "120").strip() or "120"))
+    except Exception:
+        grace_s = 120.0
+
+    active_states = ("running", "queued", "waiting_deps", "blocked_approval")
+    seen: set[str] = set()
+    overdue_items: list[tuple[float, Task]] = []
+    for st in active_states:
+        try:
+            rows = orch_q.peek(state=st, limit=800)
+        except Exception:
+            rows = []
+        for item in rows:
+            jid = str(item.job_id or "").strip()
+            if not jid or jid in seen:
+                continue
+            seen.add(jid)
+            try:
+                ttl_s = int(item.ttl_seconds or 0)
+            except Exception:
+                ttl_s = 0
+            if ttl_s <= 0:
+                continue
+            age_s = max(0.0, float(now - float(item.created_at or now)))
+            overdue_by = age_s - float(ttl_s)
+            if overdue_by <= grace_s:
+                continue
+            kind = str((item.labels or {}).get("kind") or "").strip().lower()
+            if kind in ("autopilot", "stalled_replan", "sla_replan", "wrapup", "evidence"):
+                continue
+            if str(item.request_type or "").strip().lower() in ("query", "status"):
+                continue
+            overdue_items.append((float(overdue_by), item))
+
+    if not overdue_items:
+        return 0
+    overdue_items.sort(key=lambda it: it[0], reverse=True)
+
+    created = 0
+    dedup_roots: set[str] = set()
+    for overdue_by, item in overdue_items:
+        root_ticket = (item.parent_job_id or item.job_id or "").strip() or item.job_id
+        if not root_ticket or root_ticket in dedup_roots:
+            continue
+        dedup_roots.add(root_ticket)
+
+        root_job = orch_q.get_job(root_ticket)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            escalated_at = float(root_trace.get("sla_escalated_at", 0.0) or 0.0)
+        except Exception:
+            escalated_at = 0.0
+        if escalated_at > 0 and (now - escalated_at) < cooldown_s:
+            continue
+
+        # Avoid duplicate active SLA replans.
+        children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=300)
+        if any(
+            str((c.labels or {}).get("kind") or "").strip().lower() == "sla_replan"
+            and str(c.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running")
+            for c in children
+        ):
+            continue
+
+        profile = _orchestrator_profile(profiles, "jarvis")
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+
+        task_id = str(uuid.uuid4())
+        escalation = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=(
+                "SLA OVERDUE ESCALATION\n"
+                f"Order/Ticket: {root_ticket}\n"
+                f"Overdue job: {item.job_id}\n"
+                f"Role: {item.role}\n"
+                f"State: {item.state}\n"
+                f"ETA budget (s): {int(item.ttl_seconds or 0)}\n"
+                f"Overdue by (s): {int(max(0.0, overdue_by))}\n"
+                "Action required:\n"
+                "- Re-plan remaining work and priorities.\n"
+                "- Keep runnable tasks in queued and isolate blockers.\n"
+                "- Update delegation contract with realistic ETA/SLA.\n"
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(item.chat_id),
+            user_id=item.user_id,
+            reply_to_message_id=item.reply_to_message_id,
+            parent_job_id=root_ticket,
+            labels={"ticket": root_ticket, "kind": "sla_replan"},
+            artifacts_dir=str((cfg.artifacts_root / task_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": root_ticket,
+                "overdue_job_id": item.job_id,
+                "overdue_role": item.role,
+                "overdue_state": item.state,
+                "overdue_by_s": float(overdue_by),
+                "sla_ttl_s": int(item.ttl_seconds or 0),
+            },
+            job_id=task_id,
+        )
+        orch_q.submit_task(escalation)
+        created += 1
+        try:
+            orch_q.update_trace(
+                root_ticket,
+                sla_escalated_at=float(now),
+                sla_overdue_job_id=item.job_id,
+                sla_overdue_by_s=float(overdue_by),
+                live_at=now,
+            )
+            _sync_order_phase_from_runtime(orch_q=orch_q, root_ticket=root_ticket, chat_id=int(item.chat_id))
+            orch_q.append_audit_event(
+                event_type="task.overdue",
+                actor="jarvis",
+                details={
+                    "order_id": root_ticket,
+                    "job_id": item.job_id,
+                    "role": item.role,
+                    "state": item.state,
+                    "ttl_seconds": int(item.ttl_seconds or 0),
+                    "overdue_by_s": float(overdue_by),
+                },
+            )
+        except Exception:
+            pass
+        if created >= 8:
             break
 
     return created
@@ -5351,6 +6920,10 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
     ]
     if order:
         lines.append(f"Order status: {str(order.get('status') or 'active')}")
+        order_phase = str(order.get("phase") or "").strip().lower() or "planning"
+        lines.append(f"Order phase: {order_phase}")
+        if order_phase == "ready_for_merge":
+            lines.append(f"Action: /approve_merge {root_id[:8]}")
     lines.append(f"Goal: {goal or '(empty)'}")
     lines.append(f"Progress: {progress}")
 
@@ -5362,7 +6935,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
             first = (head_res.splitlines()[0] if head_res else "").strip()
             if len(first) > 220:
                 first = first[:220] + "..."
-            label = "Result" if head.state in ("done", "failed", "cancelled", "blocked") else "Latest"
+            label = "Result" if head.state in ("done", "failed", "cancelled", "blocked", "blocked_approval") else "Latest"
             lines.append(f"{label}: {first}")
         head_next = str(head_trace.get("result_next_action") or "").strip()
         if head_next:
@@ -5384,7 +6957,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
             lines.append(f"- {role_h} ({phase}): {snippet}")
     # Latest outcome signals across subtasks so the CEO can track progress without opening /job.
     try:
-        recent = [c for c in children if c.state in ("done", "failed", "blocked")]
+        recent = [c for c in children if c.state in ("done", "failed", "blocked", "blocked_approval")]
         recent_sorted = sorted(recent, key=lambda c: float(c.updated_at), reverse=True)
         if recent_sorted:
             lines.append("Latest updates:")
@@ -5396,7 +6969,7 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
                 if len(first) > 160:
                     first = first[:160] + "..."
                 line = f"- {c.job_id[:8]} {role_h} {st}" + (f": {first}" if first else "")
-                if st == "blocked":
+                if st in ("blocked", "blocked_approval"):
                     line += f"  Approve: /approve {c.job_id[:8]}"
                 lines.append(line)
     except Exception:
@@ -5489,18 +7062,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if not text:
         return "", None
 
-    # Friendly local handling for greetings: avoid creating a ticket card for
-    # tiny social messages.
-    if not text.startswith("/") and _is_greeting(text):
-        return "Jarvis: ¡Hola! Soy tu mano derecha ejecutiva. ¿En qué puedo ayudar?", None
-
-    # Ignore acks (ok/gracias/jaja) to avoid ticket/cost spam.
-    if not text.startswith("/") and _is_ack(text):
-        return "", None
-
-    # CEO control-plane: clear queue/backlog should be immediate and deterministic.
-    if not text.startswith("/") and _is_purge_queue_request(text):
-        return _orch_marker("purge_queue", "global"), None
+    # CEO-first policy: all non-slash conversation goes through Jarvis/Codex.
 
     if text in ("/start", "/help"):
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
@@ -5540,6 +7102,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             return _orch_marker("purge_queue", "global"), None
         return "Usage: /purge [chat|global]", None
 
+    if text in ("/hardreset", "/hard_reset"):
+        return "Usage: /hardreset confirm", None
+
+    if text in ("/hardreset confirm", "/hard_reset confirm"):
+        return _orch_marker("hard_reset", "confirm"), None
+
     if text == "/synccommands":
         return "__synccommands__", None
 
@@ -5574,6 +7142,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             f"heartbeat_seconds: {eff_cfg.heartbeat_seconds}",
             f"send_as_file_threshold_chars: {eff_cfg.send_as_file_threshold_chars}",
         ]
+        issues = _security_startup_findings(eff_cfg)
+        if issues:
+            lines.append("")
+            lines.append("security:")
+            for it in issues[:8]:
+                lines.append(f"- {it}")
         return "\n".join(lines), None
 
     if text == "/agents":
@@ -5587,6 +7161,12 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             return _orch_marker("dashboard", "all"), None
         return "Usage: /dashboard [all]", None
 
+    if text == "/apk_build":
+        return _orch_marker("apk_build"), None
+
+    if text == "/apk_latest":
+        return _orch_marker("apk_latest"), None
+
     if text == "/watch":
         return _orch_marker("watch", "on"), None
 
@@ -5599,8 +7179,26 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text.startswith("/order "):
         payload = text[len("/order ") :].strip()
         if not payload:
-            return "Usage: /order show|pause|done <id>", None
+            return "Usage: /order show|pause|done|merge|rollback <id>", None
         return _orch_marker("order", payload), None
+
+    if text == "/approve_merge":
+        return "Uso: /approve_merge <order_id>", None
+
+    if text.startswith("/approve_merge "):
+        oid = _orch_job_id(text[len("/approve_merge ") :])
+        if not oid:
+            return "Uso: /approve_merge <order_id>", None
+        return _orch_marker("approve_merge", oid), None
+
+    if text == "/rollback":
+        return "Uso: /rollback <order_id>", None
+
+    if text.startswith("/rollback "):
+        oid = _orch_job_id(text[len("/rollback ") :])
+        if not oid:
+            return "Uso: /rollback <order_id>", None
+        return _orch_marker("rollback_merge", oid), None
 
     if text.startswith("/job "):
         raw = text[len("/job ") :].strip()
@@ -5758,8 +7356,18 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
         eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
         bypass = _effective_bypass_sandbox(eff_cfg, chat_id=msg.chat_id)
+        bg_active, bg = _breakglass_is_active(eff_cfg)
+        bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
+        bg_exp = (bg or {}).get("expires_at")
+        try:
+            bg_left = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
+        except Exception:
+            bg_left = 0
         lines = [
             f"permissions: {'full' if bypass else 'default'}",
+            f"breakglass: {'ACTIVE' if bg_active else 'inactive'}",
+            f"breakglass_left_seconds: {bg_left}",
+            f"breakglass_reason: {bg_reason}",
             f"profile: {profile or '(none)'}",
             f"strict_proxy: {'ON' if eff_cfg.strict_proxy else 'off'}",
             f"unsafe_direct_codex: {'ON' if eff_cfg.unsafe_direct_codex else 'off'}",
@@ -5774,6 +7382,78 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             lines.append("codex: -a never (no approval prompts)")
             lines.append(f"codex sandbox default: {_threaded_sandbox_mode_label(eff_cfg)}")
         return "\n".join(lines), None
+
+    if text == "/breakglass":
+        active, raw = _breakglass_is_active(cfg)
+        reason = str(raw.get("reason") or "").strip() or "(none)"
+        source = str(raw.get("source") or "").strip() or "(none)"
+        exp = raw.get("expires_at")
+        try:
+            left_s = max(0, int(float(exp) - time.time())) if exp is not None else 0
+        except Exception:
+            left_s = 0
+        lines = [
+            f"status: {'ACTIVE' if active else 'inactive'}",
+            f"seconds_left: {left_s}",
+            f"reason: {reason}",
+            f"source: {source}",
+            "",
+            "Usage:",
+            "- /breakglass on <minutes> <reason>",
+            "- /breakglass off",
+        ]
+        if not _is_admin_actor(cfg, chat_id=msg.chat_id, user_id=msg.user_id):
+            lines.append("(read-only: admin required for changes)")
+        return "\n".join(lines), None
+
+    if text.startswith("/breakglass "):
+        if not _is_admin_actor(cfg, chat_id=msg.chat_id, user_id=msg.user_id):
+            return "No permitido: /breakglass requiere admin allowlist o perfil con manage bot.", None
+        arg = text[len("/breakglass ") :].strip()
+        if not arg:
+            return _parse_job(cfg, IncomingMessage(**{**msg.__dict__, "text": "/breakglass"}))
+
+        parts = arg.split()
+        sub = parts[0].strip().lower()
+        if sub in ("off", "disable", "0"):
+            _deactivate_breakglass(
+                cfg,
+                reason="manual_off",
+                chat_id=msg.chat_id,
+                user_id=msg.user_id,
+                source="telegram",
+            )
+            return "OK. breakglass disabled.", None
+
+        if sub in ("status", "show"):
+            return _parse_job(cfg, IncomingMessage(**{**msg.__dict__, "text": "/breakglass"}))
+
+        if sub == "on":
+            ttl_minutes = max(1, int(cfg.breakglass_ttl_seconds // 60) if int(cfg.breakglass_ttl_seconds) > 0 else 15)
+            reason = ""
+            if len(parts) >= 2 and parts[1].isdigit():
+                ttl_minutes = int(parts[1])
+                reason = " ".join(parts[2:]).strip()
+            else:
+                reason = " ".join(parts[1:]).strip()
+            if ttl_minutes < 1:
+                ttl_minutes = 1
+            if ttl_minutes > 240:
+                ttl_minutes = 240
+            if not reason:
+                return "Usage: /breakglass on <minutes> <reason>", None
+            exp = _activate_breakglass(
+                cfg,
+                reason=reason,
+                ttl_seconds=int(ttl_minutes * 60),
+                chat_id=msg.chat_id,
+                user_id=msg.user_id,
+                source="telegram",
+            )
+            left = max(0, int(exp - time.time()))
+            return f"OK. breakglass enabled for {left}s. reason={reason}", None
+
+        return "Usage: /breakglass on <minutes> <reason> | /breakglass off | /breakglass status", None
 
     if text == "/format":
         return _format_preview_text(), None
@@ -5958,33 +7638,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
         # /model clear
         if len(args) == 2 and args[1].lower() == "clear":
-            st = _get_state(cfg)
-            by_chat_models = st.get("model_overrides_by_chat")
-            if not isinstance(by_chat_models, dict):
-                by_chat_models = {}
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if cfg.codex_use_oss:
-                rec_m.pop("oss_model", None)
-                rec_e.pop("oss_effort", None)
-            else:
-                rec_m.pop("openai_model", None)
-                rec_e.pop("openai_effort", None)
-            if rec_m:
-                by_chat_models[key] = rec_m
-            else:
-                by_chat_models.pop(key, None)
-            if rec_e:
-                by_chat_efforts[key] = rec_e
-            else:
-                by_chat_efforts.pop(key, None)
-            st["model_overrides_by_chat"] = by_chat_models
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_models = st.get("model_overrides_by_chat")
+                if not isinstance(by_chat_models, dict):
+                    by_chat_models = {}
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if cfg.codex_use_oss:
+                    rec_m.pop("oss_model", None)
+                    rec_e.pop("oss_effort", None)
+                else:
+                    rec_m.pop("openai_model", None)
+                    rec_e.pop("openai_effort", None)
+                if rec_m:
+                    by_chat_models[key] = rec_m
+                else:
+                    by_chat_models.pop(key, None)
+                if rec_e:
+                    by_chat_efforts[key] = rec_e
+                else:
+                    by_chat_efforts.pop(key, None)
+                st["model_overrides_by_chat"] = by_chat_models
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             return "OK. Cleared model/effort override for current mode.", None
 
         # /model openai <name> OR /model oss <name>
@@ -5995,33 +7677,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             name, default_eff = _resolve_model_token(name_raw)
             if not name:
                 return "Usage: /model openai <name> [effort] OR /model oss <name> [effort]", None
-            st = _get_state(cfg)
-            by_chat_models = st.get("model_overrides_by_chat")
-            if not isinstance(by_chat_models, dict):
-                by_chat_models = {}
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if scope == "openai":
-                rec_m["openai_model"] = name
-                if eff:
-                    rec_e["openai_effort"] = eff
-                elif default_eff:
-                    rec_e["openai_effort"] = default_eff
-            else:
-                rec_m["oss_model"] = name
-                if eff:
-                    rec_e["oss_effort"] = eff
-                elif default_eff:
-                    rec_e["oss_effort"] = default_eff
-            by_chat_models[key] = rec_m
-            by_chat_efforts[key] = rec_e
-            st["model_overrides_by_chat"] = by_chat_models
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_models = st.get("model_overrides_by_chat")
+                if not isinstance(by_chat_models, dict):
+                    by_chat_models = {}
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if scope == "openai":
+                    rec_m["openai_model"] = name
+                    if eff:
+                        rec_e["openai_effort"] = eff
+                    elif default_eff:
+                        rec_e["openai_effort"] = default_eff
+                else:
+                    rec_m["oss_model"] = name
+                    if eff:
+                        rec_e["oss_effort"] = eff
+                    elif default_eff:
+                        rec_e["oss_effort"] = default_eff
+                by_chat_models[key] = rec_m
+                by_chat_efforts[key] = rec_e
+                st["model_overrides_by_chat"] = by_chat_models
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             eff_set = eff or default_eff
             if eff_set:
                 return f"OK. Set {scope} model to: {name} (effort={eff_set})", None
@@ -6033,33 +7717,35 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         name, default_eff = _resolve_model_token(name_raw)
         if not name:
             return "Usage: /model <name> [effort]", None
-        st = _get_state(cfg)
-        by_chat_models = st.get("model_overrides_by_chat")
-        if not isinstance(by_chat_models, dict):
-            by_chat_models = {}
-        by_chat_efforts = st.get("effort_overrides_by_chat")
-        if not isinstance(by_chat_efforts, dict):
-            by_chat_efforts = {}
         key = str(int(msg.chat_id))
-        rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
-        rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-        if cfg.codex_use_oss:
-            rec_m["oss_model"] = name
-            if eff:
-                rec_e["oss_effort"] = eff
-            elif default_eff:
-                rec_e["oss_effort"] = default_eff
-        else:
-            rec_m["openai_model"] = name
-            if eff:
-                rec_e["openai_effort"] = eff
-            elif default_eff:
-                rec_e["openai_effort"] = default_eff
-        by_chat_models[key] = rec_m
-        by_chat_efforts[key] = rec_e
-        st["model_overrides_by_chat"] = by_chat_models
-        st["effort_overrides_by_chat"] = by_chat_efforts
-        _atomic_write_json(cfg.state_file, st)
+
+        def _m(st: dict[str, Any]) -> None:
+            by_chat_models = st.get("model_overrides_by_chat")
+            if not isinstance(by_chat_models, dict):
+                by_chat_models = {}
+            by_chat_efforts = st.get("effort_overrides_by_chat")
+            if not isinstance(by_chat_efforts, dict):
+                by_chat_efforts = {}
+            rec_m = by_chat_models.get(key) if isinstance(by_chat_models.get(key), dict) else {}
+            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+            if cfg.codex_use_oss:
+                rec_m["oss_model"] = name
+                if eff:
+                    rec_e["oss_effort"] = eff
+                elif default_eff:
+                    rec_e["oss_effort"] = default_eff
+            else:
+                rec_m["openai_model"] = name
+                if eff:
+                    rec_e["openai_effort"] = eff
+                elif default_eff:
+                    rec_e["openai_effort"] = default_eff
+            by_chat_models[key] = rec_m
+            by_chat_efforts[key] = rec_e
+            st["model_overrides_by_chat"] = by_chat_models
+            st["effort_overrides_by_chat"] = by_chat_efforts
+
+        _update_state(cfg, _m)
         eff_set = eff or default_eff
         if eff_set:
             return f"OK. Set model for current mode to: {name} (effort={eff_set})", None
@@ -6212,45 +7898,49 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         if not val:
             return "Usage: /effort low|medium|high|xhigh OR /effort clear", None
         if val == "clear":
-            st = _get_state(cfg)
-            by_chat_efforts = st.get("effort_overrides_by_chat")
-            if not isinstance(by_chat_efforts, dict):
-                by_chat_efforts = {}
             key = str(int(msg.chat_id))
-            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-            if cfg.codex_use_oss:
-                rec_e.pop("oss_effort", None)
-            else:
-                rec_e.pop("openai_effort", None)
-            if rec_e:
-                by_chat_efforts[key] = rec_e
-            else:
-                by_chat_efforts.pop(key, None)
-            st["effort_overrides_by_chat"] = by_chat_efforts
-            _atomic_write_json(cfg.state_file, st)
+
+            def _m(st: dict[str, Any]) -> None:
+                by_chat_efforts = st.get("effort_overrides_by_chat")
+                if not isinstance(by_chat_efforts, dict):
+                    by_chat_efforts = {}
+                rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+                if cfg.codex_use_oss:
+                    rec_e.pop("oss_effort", None)
+                else:
+                    rec_e.pop("openai_effort", None)
+                if rec_e:
+                    by_chat_efforts[key] = rec_e
+                else:
+                    by_chat_efforts.pop(key, None)
+                st["effort_overrides_by_chat"] = by_chat_efforts
+
+            _update_state(cfg, _m)
             return "OK. Cleared effort override for current mode.", None
         if val not in ("low", "medium", "high", "xhigh"):
             return "Invalid effort. Use: low, medium, high, xhigh.", None
-        st = _get_state(cfg)
-        by_chat_efforts = st.get("effort_overrides_by_chat")
-        if not isinstance(by_chat_efforts, dict):
-            by_chat_efforts = {}
         key = str(int(msg.chat_id))
-        rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
-        if cfg.codex_use_oss:
-            rec_e["oss_effort"] = val
-        else:
-            rec_e["openai_effort"] = val
-        by_chat_efforts[key] = rec_e
-        st["effort_overrides_by_chat"] = by_chat_efforts
-        _atomic_write_json(cfg.state_file, st)
+
+        def _m(st: dict[str, Any]) -> None:
+            by_chat_efforts = st.get("effort_overrides_by_chat")
+            if not isinstance(by_chat_efforts, dict):
+                by_chat_efforts = {}
+            rec_e = by_chat_efforts.get(key) if isinstance(by_chat_efforts.get(key), dict) else {}
+            if cfg.codex_use_oss:
+                rec_e["oss_effort"] = val
+            else:
+                rec_e["openai_effort"] = val
+            by_chat_efforts[key] = rec_e
+            st["effort_overrides_by_chat"] = by_chat_efforts
+
+        _update_state(cfg, _m)
         return f"OK. Set effort for current mode to: {val}", None
 
     if text == "/setnotify":
         # Preserve any existing state (e.g. model overrides).
-        st = _get_state(cfg)
-        st["notify_chat_id"] = msg.chat_id
-        _atomic_write_json(cfg.state_file, st)
+        def _m(st: dict[str, Any]) -> None:
+            st["notify_chat_id"] = int(msg.chat_id)
+        _update_state(cfg, _m)
         return f"OK. notify_chat_id={msg.chat_id}", None
 
     if text.startswith("/notify "):
@@ -6607,6 +8297,38 @@ def _extract_thread_id_from_jsonl_file(path: Path, *, max_bytes: int = 1_000_000
     return ""
 
 
+def _extract_last_agent_message_from_jsonl(text: str) -> str:
+    """
+    Best-effort extraction of the final assistant message from `codex exec --json` JSONL output.
+    """
+    last = ""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        t = str(obj.get("type") or "").strip().lower()
+        if t == "item.completed":
+            item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+            it = str(item.get("type") or "").strip().lower()
+            if it == "agent_message":
+                msg = str(item.get("text") or "").strip()
+                if msg:
+                    last = msg
+        elif t in ("response.completed", "assistant.completed"):
+            msg = str(obj.get("text") or "").strip()
+            if msg:
+                last = msg
+
+    return last
+
+
 def _skill_installer_scripts_dir() -> Path:
     # skill-installer is a system skill that ships with this deployment.
     return _skills_root_dir() / ".system" / "skill-installer" / "scripts"
@@ -6847,36 +8569,151 @@ def _submit_orchestrator_task(
     job: Job,
     *,
     user_id: int | None = None,
+    source_message_id: int | None = None,
+    quoted_message_id: int | None = None,
+    quoted_message_text: str = "",
 ) -> tuple[bool, str]:
     if not cfg.orchestrator_enabled or orch_q is None:
         return False, ""
     if not _should_route_to_orchestrator(cfg, job):
         return False, ""
     try:
-        task = _orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=user_id)
+        intent_type = detect_ceo_intent(
+            job.user_text,
+            reply_context={
+                "reply_to_message_id": quoted_message_id,
+                "reply_to_text": (quoted_message_text or "").strip()[:400],
+            },
+        )
+
+        task = _orchestrator_task_from_job(
+            cfg,
+            job,
+            profiles=profiles,
+            user_id=user_id,
+            intent_type=intent_type,
+            source_message_id=source_message_id,
+            quoted_message_id=quoted_message_id,
+            quoted_message_text=quoted_message_text,
+        )
+
+        # Safety guard: conversational lanes must not create persistent orders/projects.
+        task_req = str(task.request_type or "").strip().lower()
+        if task_req in ("query", "status"):
+            intent_type = "query"
+
+        is_top_level_jarvis = (
+            _coerce_orchestrator_role(task.role) == "jarvis"
+            and not task.is_autonomous
+            and not (task.parent_job_id or "").strip()
+        )
+        order_id = ""
+        project_id: str | None = None
+        order_branch: str | None = None
+        order_phase = "planning"
+
+        if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
+            if intent_type == "order_project_change":
+                active = orch_q.latest_active_order(chat_id=int(task.chat_id))
+                if active and str(active.get("order_id") or "").strip():
+                    order_id = str(active.get("order_id") or "").strip()
+                    project_id = str(active.get("project_id") or "").strip() or None
+                    try:
+                        root_job = orch_q.get_job(order_id)
+                        if root_job is not None:
+                            order_branch = str((root_job.trace or {}).get("order_branch") or "").strip() or None
+                    except Exception:
+                        order_branch = None
+                    ttrace = dict(task.trace or {})
+                    ttrace["order_id"] = order_id
+                    ttrace["intent_type"] = "order_project_change"
+                    if order_branch:
+                        ttrace["order_branch"] = str(order_branch)
+                    if quoted_message_id is not None:
+                        ttrace["reply_to_message_id"] = int(quoted_message_id)
+                    task = task.with_updates(parent_job_id=order_id, trace=ttrace, priority=1)
+                else:
+                    intent_type = "order_project_new"
+
+            if intent_type == "order_project_new":
+                order_id = task.job_id
+                title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+                workspace = _ensure_project_workspace(
+                    project_id=str(uuid.uuid4()),
+                    title=title_guess,
+                    created_by="ceo",
+                    runtime_mode="venv",
+                )
+                project_id = str(workspace.get("project_id") or "").strip() or None
+                if project_id:
+                    orch_q.upsert_project(
+                        project_id=project_id,
+                        name=str(workspace.get("name") or title_guess),
+                        path=str(workspace.get("path") or ""),
+                        runtime_mode="venv",
+                        ports=[],
+                        status="active",
+                        created_by="ceo",
+                    )
+                    orch_q.append_audit_event(
+                        event_type="project.created",
+                        actor="jarvis",
+                        details={
+                            "project_id": project_id,
+                            "order_id": order_id,
+                            "path": str(workspace.get("path") or ""),
+                            "runtime_mode": "venv",
+                        },
+                    )
+                ttrace = dict(task.trace or {})
+                ttrace["order_id"] = order_id
+                if project_id:
+                    ttrace["project_id"] = project_id
+                task = task.with_updates(trace=ttrace)
+
+            if order_id:
+                title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+                if not order_branch:
+                    order_branch = _order_branch_name(order_id, title_guess)
+                ok_branch, branch_msg = _git_ensure_branch_from_main(cfg.codex_workdir, str(order_branch))
+                if not ok_branch:
+                    raise RuntimeError(f"Cannot prepare order branch {order_branch}: {branch_msg}")
+                ttrace = dict(task.trace or {})
+                ttrace["order_branch"] = str(order_branch)
+                task = task.with_updates(trace=ttrace)
+
         job_id = orch_q.submit_task(task)
 
-        # Autopilot scope: any top-level Jarvis ticket (except pure queries) becomes an "active order".
-        try:
-            if (
-                _coerce_orchestrator_role(task.role) == "jarvis"
-                and not task.is_autonomous
-                and not (task.parent_job_id or "").strip()
-                and (task.request_type or "task") != "query"
-            ):
-                title = (task.input_text or "").strip().splitlines()[0].strip()
-                if len(title) > 120:
-                    title = title[:120] + "..."
-                orch_q.upsert_order(
-                    order_id=task.job_id,
-                    chat_id=int(task.chat_id),
-                    title=title or f"Order {task.job_id[:8]}",
-                    body=(task.input_text or "").strip(),
-                    status="active",
-                    priority=int(task.priority or cfg.orchestrator_default_priority),
-                )
-        except Exception:
-            pass
+        # Only actionable project orders become CEO orders; conversational queries never create orders.
+        if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
+            if not order_id:
+                order_id = task.job_id
+            title = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
+            orch_q.upsert_order(
+                order_id=order_id,
+                chat_id=int(task.chat_id),
+                title=title,
+                body=(task.input_text or "").strip(),
+                status="active",
+                priority=int(task.priority or cfg.orchestrator_default_priority),
+                intent_type=intent_type,
+                source_message_id=source_message_id,
+                reply_to_message_id=quoted_message_id,
+                phase=order_phase,
+                project_id=project_id,
+            )
+            orch_q.append_audit_event(
+                event_type="order.created",
+                actor="jarvis",
+                details={
+                    "order_id": order_id,
+                    "intent_type": intent_type,
+                    "project_id": project_id,
+                    "order_branch": (str(order_branch or "").strip() or None),
+                    "source_message_id": source_message_id,
+                    "reply_to_message_id": quoted_message_id,
+                },
+            )
 
         return True, job_id
     except Exception as e:
@@ -7037,6 +8874,7 @@ def _orchestrator_run_codex(
         }
 
     # Worktree isolation (best-effort). If configured incorrectly, fail safe (no writes) by falling back.
+    order_branch = _resolve_order_branch_from_task(task, orch_q)
     eff_cfg = cfg
     worktree_dir: Path | None = None
     leased_slot: int | None = None
@@ -7061,6 +8899,14 @@ def _orchestrator_run_codex(
             ensure_worktree_pool(base_repo=cfg.codex_workdir, root=cfg.worktree_root, role=role, slots=slots)
             worktree_dir = (cfg.worktree_root / role / f"slot{leased_slot}").resolve()
             prepare_clean_workspace(worktree_dir)
+            if order_branch:
+                ok_sync, sync_msg = _sync_worktree_to_order_branch(
+                    base_repo=cfg.codex_workdir,
+                    worktree_dir=worktree_dir,
+                    order_branch=order_branch,
+                )
+                if not ok_sync:
+                    raise RuntimeError(f"order branch sync failed: {sync_msg}")
             eff_cfg = dataclasses.replace(cfg, codex_workdir=worktree_dir)
             try:
                 if orch_q is not None:
@@ -7069,6 +8915,7 @@ def _orchestrator_run_codex(
                         live_phase="workspace_ready",
                         live_workdir=str(worktree_dir),
                         live_workspace_slot=int(leased_slot),
+                        live_branch=(order_branch or None),
                         live_at=time.time(),
                     )
             except Exception:
@@ -7214,7 +9061,7 @@ def _orchestrator_run_codex(
                     counts[c.state] = counts.get(c.state, 0) + 1
                 ctx_lines.append("order_children_counts=" + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
                 # Show a few most recent failures/blocked items as unblock targets.
-                blockers = [c for c in children if c.state in ("blocked", "failed")][:8]
+                blockers = [c for c in children if c.state in ("blocked", "blocked_approval", "failed")][:8]
                 if blockers:
                     ctx_lines.append("blockers:")
                     for c in blockers[:8]:
@@ -7227,7 +9074,7 @@ def _orchestrator_run_codex(
                 for r in sorted(health.keys()):
                     vals = health.get(r, {}) or {}
                     ctx_lines.append(
-                        f"- {r}: queued={int(vals.get('queued',0) or 0)} running={int(vals.get('running',0) or 0)} blocked={int(vals.get('blocked',0) or 0)}"
+                        f"- {r}: queued={int(vals.get('queued',0) or 0)} waiting_deps={int(vals.get('waiting_deps',0) or 0)} blocked_approval={int(vals.get('blocked_approval',0) or 0)} running={int(vals.get('running',0) or 0)} blocked={int(vals.get('blocked',0) or 0)}"
                     )
             if running:
                 ctx_lines.append("running_jobs:")
@@ -7315,6 +9162,9 @@ def _orchestrator_run_codex(
                     live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
                     live_workdir=str(eff_cfg.codex_workdir),
                     live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                    live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                    live_stdout_path=str(proc.stdout_path),
+                    live_stderr_path=str(proc.stderr_path),
                     live_at=time.time(),
                 )
         except Exception:
@@ -7338,11 +9188,11 @@ def _orchestrator_run_codex(
                 now = time.time()
                 if now - last_live_update >= float(cfg.orchestrator_live_update_seconds):
                     try:
-                        stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=1200)).strip()
+                        stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=10000)).strip()
                     except Exception:
                         stdout_tail = ""
                     try:
-                        stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=1200)).strip()
+                        stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=10000)).strip()
                     except Exception:
                         stderr_tail = ""
                     try:
@@ -7352,6 +9202,9 @@ def _orchestrator_run_codex(
                             live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
                             live_workdir=str(eff_cfg.codex_workdir),
                             live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                            live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                            live_stdout_path=str(proc.stdout_path),
+                            live_stderr_path=str(proc.stderr_path),
                             live_stdout_tail=stdout_tail,
                             live_stderr_tail=stderr_tail,
                             live_at=now,
@@ -7363,6 +9216,33 @@ def _orchestrator_run_codex(
 
         try:
             proc.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+        # Final live snapshot so dashboard can render the full terminal tail even for short-lived jobs.
+        try:
+            if orch_q is not None:
+                try:
+                    final_stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=30000)).strip()
+                except Exception:
+                    final_stdout_tail = ""
+                try:
+                    final_stderr_tail = _strip_ansi(_tail_file_text(proc.stderr_path, max_chars=30000)).strip()
+                except Exception:
+                    final_stderr_tail = ""
+                orch_q.update_trace(
+                    task.job_id,
+                    live_phase="final",
+                    live_pid=int(getattr(proc.proc, "pid", 0) or 0) or None,
+                    live_workdir=str(eff_cfg.codex_workdir),
+                    live_workspace_slot=int(leased_slot) if leased_slot is not None else None,
+                    live_cmd=" ".join(_redact_codex_cmd_for_log(list(proc.cmd or []))),
+                    live_stdout_path=str(proc.stdout_path),
+                    live_stderr_path=str(proc.stderr_path),
+                    live_stdout_tail=final_stdout_tail,
+                    live_stderr_tail=final_stderr_tail,
+                    live_at=time.time(),
+                )
         except Exception:
             pass
 
@@ -7395,9 +9275,13 @@ def _orchestrator_run_codex(
             except OSError:
                 sz = 0
             if sz <= 256_000:
-                body = _strip_ansi(_read_text_file(proc.stdout_path)).strip()
+                stdout_text = _strip_ansi(_read_text_file(proc.stdout_path)).strip()
             else:
-                body = _tail_file_text(proc.stdout_path, max_chars=6000).strip()
+                stdout_text = _tail_file_text(proc.stdout_path, max_chars=6000).strip()
+
+            # When resume runs with --json, keep the user-facing body as the last assistant message.
+            json_last_msg = _extract_last_agent_message_from_jsonl(stdout_text)
+            body = (json_last_msg or stdout_text).strip()
         if not body:
             body = "(no output)"
 
@@ -7428,24 +9312,39 @@ def _orchestrator_run_codex(
                 LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
 
         # Frontend evidence: allow the agent to drop a self-contained preview HTML inside the workspace.
-        # The bot screenshots it (headless) and sends `preview.png` to Telegram as an artifact.
+        # The bot screenshots it (headless) and sends visual artifacts to Telegram/dashboard.
         if role == "frontend" and cfg.screenshot_enabled:
             try:
                 preview_html = Path(eff_cfg.codex_workdir) / ".codexbot_preview" / "preview.html"
                 if preview_html.exists() and preview_html.is_file():
                     dest_html = artifacts_dir / "preview.html"
                     shutil.copyfile(preview_html, dest_html)
-                    out_png = artifacts_dir / "preview.png"
-                    capture_screenshot_html_file(
-                        dest_html,
-                        out_png,
-                        viewport=Viewport(width=1280, height=720),
-                        allowed_hosts=cfg.screenshot_allowed_hosts,
-                        allow_private=False,
-                        block_network=True,
-                    )
+                    preview_root = (Path(eff_cfg.codex_workdir) / ".codexbot_preview").resolve()
+                    preview_root.mkdir(parents=True, exist_ok=True)
+
+                    # Multi-device captures for feedback before completion.
+                    capture_specs = [
+                        ("preview.png", Viewport(width=1366, height=768)),
+                        ("preview-tablet.png", Viewport(width=1024, height=1366)),
+                        ("preview-mobile.png", Viewport(width=412, height=915)),
+                    ]
                     artifacts.append(dest_html)
-                    artifacts.append(out_png)
+                    for filename, viewport in capture_specs:
+                        out_png = artifacts_dir / filename
+                        capture_screenshot_html_file(
+                            dest_html,
+                            out_png,
+                            viewport=viewport,
+                            allowed_hosts=cfg.screenshot_allowed_hosts,
+                            allow_private=False,
+                            block_network=True,
+                        )
+                        artifacts.append(out_png)
+                        # Keep latest visual proof directly in workspace so telemetry/dashboard can watch it live.
+                        try:
+                            shutil.copyfile(out_png, preview_root / filename)
+                        except Exception:
+                            pass
             except Exception as e:
                 LOG.exception("Failed to generate frontend preview screenshot. job=%s", task.job_id)
                 try:
@@ -7456,15 +9355,75 @@ def _orchestrator_run_codex(
                     pass
 
         artifacts_text = [str(p) for p in artifacts]
+        visual_artifacts = [str(p) for p in artifacts if _is_visual_artifact(Path(p))]
         structured: dict[str, Any] = {
             "role": role,
             "workdir": str(eff_cfg.codex_workdir),
             "artifacts_dir": str(artifacts_dir),
+            "visual_evidence_count": int(len(visual_artifacts)),
+            "visual_evidence": visual_artifacts[:8],
         }
+        if order_branch:
+            structured["order_branch"] = str(order_branch)
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
         if used_thread_id:
             structured["thread_id"] = used_thread_id
+
+        # Quality gate: frontend work cannot complete without visual evidence.
+        if code == 0 and role == "frontend" and len(visual_artifacts) < 2:
+            return {
+                "status": "blocked",
+                "summary": (
+                    "Visual evidence gate not met. "
+                    "Provide live preview or at least 2 screenshots (mobile/tablet/desktop) before marking done."
+                ),
+                "artifacts": artifacts_text,
+                "logs": logs or body,
+                "next_action": "add_visual_evidence",
+                "structured_digest": structured,
+            }
+
+        evidence_ok, evidence_reason, evidence_meta = _orchestrator_min_evidence_gate(
+            task=task,
+            summary=body,
+            artifacts=artifacts_text,
+            logs=logs,
+            structured=structured,
+        )
+        structured["evidence"] = evidence_meta
+        if code == 0 and (not evidence_ok):
+            return {
+                "status": "blocked",
+                "summary": str(evidence_reason or "Evidence gate not met."),
+                "artifacts": artifacts_text,
+                "logs": logs or body,
+                "next_action": "add_evidence",
+                "structured_digest": structured,
+            }
+
+        if code == 0 and worktree_dir is not None and order_branch and str(task.request_type or "").strip().lower() in (
+            "task",
+            "maintenance",
+            "review",
+        ):
+            branch_sync = _autocommit_push_order_branch(
+                worktree_dir=worktree_dir,
+                order_branch=order_branch,
+                task=task,
+            )
+            structured["branch_sync"] = branch_sync
+            if str(branch_sync.get("status") or "") == "error":
+                detail = str(branch_sync.get("detail") or "").strip()
+                reason = str(branch_sync.get("reason") or "branch_sync_failed")
+                return {
+                    "status": "blocked",
+                    "summary": f"Branch sync failed: {reason}.",
+                    "artifacts": artifacts_text,
+                    "logs": detail or (logs or body),
+                    "next_action": "resolve_branch_sync",
+                    "structured_digest": structured,
+                }
 
         if code == 0:
             return {
@@ -7507,6 +9466,37 @@ def _send_orchestrator_result(
     *,
     cfg: BotConfig,
 ) -> None:
+    def _normalize_jarvis_reply(text: str) -> str:
+        """
+        CEO UX rule: avoid "No puedo / I can't" phrasing.
+        Keep responses actionable and operation-focused.
+        """
+        s = str(text or "").strip()
+        if not s:
+            return s
+        # Spanish variants
+        s = re.sub(r"\bno puedo\b", "Para avanzar necesito", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno puedo ejecutar\b", "Para ejecutar necesito", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno tengo acceso\b", "Para continuar con precisión necesito validar acceso", s, flags=re.IGNORECASE)
+        # English variants
+        s = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bcannot\b", "can proceed when we confirm", s, flags=re.IGNORECASE)
+        return s
+
+    def _first_line(text: str, *, max_chars: int = 420) -> str:
+        line = (str(text or "").splitlines() or ["(no summary)"])[0].strip() or "(no summary)"
+        if len(line) > max_chars:
+            return line[:max_chars] + "..."
+        return line
+
+    def _is_visual_artifact(raw: str) -> bool:
+        p = Path(str(raw or "")).name.lower()
+        if not p:
+            return False
+        if p.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            return True
+        return any(k in p for k in ("snapshot", "screenshot", "preview"))
+
     try:
         if isinstance(result, dict):
             status = str(result.get("status", "error"))
@@ -7524,96 +9514,124 @@ def _send_orchestrator_result(
         labels = task.labels or {}
         kind = str(labels.get("kind") or "").strip().lower()
         mode = (cfg.orchestrator_notify_mode or "minimal").strip().lower()
+        runbook_id = str((task.trace or {}).get("runbook_id") or labels.get("runbook") or "").strip().lower()
+
+        if _coerce_orchestrator_role(task.role) == "jarvis":
+            summary = _normalize_jarvis_reply(summary)
+
+        ticket_hint = (
+            (task.parent_job_id or "").strip()
+            or str(labels.get("ticket") or "").strip()
+            or str((task.trace or {}).get("order_id") or "").strip()
+        )
+        child_or_autonomous = bool((task.parent_job_id or "").strip()) or bool(task.is_autonomous)
+        visual_artifacts = [str(a) for a in artifacts if _is_visual_artifact(str(a))]
 
         def _should_notify() -> bool:
             if mode == "verbose":
                 return True
+            # Keep periodic runbook chatter internal. Jarvis can escalate to CEO when relevant.
+            if runbook_id:
+                return False
+            if status != "ok":
+                return True
             if kind == "wrapup":
                 return True
-            # Ticket-card UX: if a top-level ticket has an editable card message, do not send a separate
-            # "job=... status=ok" message on success. The card is updated in-place by the worker loop.
+            # CTO relay: when worker/autonomous work tied to an order/ticket completes, notify CEO.
+            if child_or_autonomous and ticket_hint:
+                return True
+            # Ticket-card UX: top-level ok updates are already reflected by editable card.
             try:
                 if (
-                    status == "ok"
-                    and not (task.parent_job_id or "").strip()
+                    not (task.parent_job_id or "").strip()
                     and str((task.trace or {}).get("ticket_card_message_id") or "").strip()
                 ):
                     return False
             except Exception:
                 pass
-            # Autonomous runbooks: only notify on non-ok outcomes.
-            if bool(task.is_autonomous):
-                return status != "ok"
-            # Subtasks: only notify on non-ok outcomes (details are visible via /ticket and /job).
-            if (task.parent_job_id or "").strip():
-                return status != "ok"
             return True
 
-        # Evidence jobs: on success, send only the artifact(s) and skip the text message.
-        artifacts_only = (kind == "evidence") and status == "ok" and mode != "verbose"
+        # For ticket-linked evidence jobs we want both text + attachments (not attachments-only).
+        artifacts_only = (
+            (kind == "evidence")
+            and status == "ok"
+            and mode != "verbose"
+            and not (child_or_autonomous and ticket_hint)
+        )
 
         prefer_voice = bool((task.trace or {}).get("prefer_voice_reply", False))
         force_notify = prefer_voice and bool(cfg.voice_out_enabled)
         notify = _should_notify() or force_notify
 
         if notify:
-            # Keep chat updates short; details are always available via /job and /ticket.
-            max_summary = 900
-            if len(summary) > max_summary:
-                summary = summary[:max_summary] + "...\n(details: /job %s)" % task.job_id[:8]
-
             role_name = _humanize_orchestrator_role(task.role)
-            summary_lines = (summary or "").splitlines() or ["(no summary)"]
-            summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
-            payload = list(summary_lines)
-            if next_action:
-                payload.append(f"Next: {next_action}")
+            # Compact CTO status format for child/autonomous completion events.
+            if mode != "verbose" and status == "ok" and child_or_autonomous and ticket_hint:
+                payload = [
+                    f"Jarvis: worker completed for ticket {ticket_hint[:8]}",
+                    f"Role: {role_name}",
+                    f"Result: {_first_line(summary)}",
+                ]
+                if visual_artifacts:
+                    payload.append(f"Visual evidence: {len(visual_artifacts)} screenshot(s) attached.")
+                if next_action:
+                    payload.append(f"Next: {next_action}")
+                payload.append(f"Links: /ticket {ticket_hint[:8]}  /job {task.job_id[:8]}  /agents  /dashboard")
+                msg = "\n".join(payload)
+                sent_voice = False
+            else:
+                summary_lines = (summary or "").splitlines() or ["(no summary)"]
+                summary_lines[0] = f"{role_name}: {summary_lines[0]}".strip()
+                payload = list(summary_lines)
+                if next_action:
+                    payload.append(f"Next: {next_action}")
 
-            # If there's no ticket card to click, provide /job for errors only.
-            try:
-                has_ticket_card = (
-                    (not (task.parent_job_id or "").strip())
-                    and bool(str((task.trace or {}).get("ticket_card_message_id") or "").strip())
-                )
-            except Exception:
-                has_ticket_card = False
-            if status != "ok" and (not has_ticket_card):
-                payload.append(f"Details: /job {task.job_id[:8]}")
-
-            # Wrap-ups: include a short pointer back to the ticket tree.
-            if kind == "wrapup":
-                root = (task.parent_job_id or "").strip()
-                if root:
-                    payload.append(f"Ticket: /ticket {root[:8]}")
-
-            msg = "\n".join(payload)
-            sent_voice = False
-            if prefer_voice and cfg.voice_out_enabled:
+                # If there's no ticket card to click, provide /job for errors only.
                 try:
-                    tts_client: OpenAITTS | None = None
-                    if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
-                        tts_client = OpenAITTS(
-                            api_key=cfg.openai_api_key,
-                            api_base_url=cfg.openai_api_base_url,
-                            timeout_seconds=cfg.http_timeout_seconds,
-                            max_retries=cfg.http_max_retries,
-                            retry_initial_seconds=cfg.http_retry_initial_seconds,
-                            retry_max_seconds=cfg.http_retry_max_seconds,
-                        )
-                    speak_text = (summary_lines[0] if summary_lines else summary) or "(no summary)"
-                    _send_voice_note(
-                        api=api,
-                        cfg=cfg,
-                        chat_id=int(task.chat_id),
-                        reply_to_message_id=int(task.reply_to_message_id or 0),
-                        tts=tts_client,
-                        speak_text=str(speak_text),
-                        caption_text=msg,
+                    has_ticket_card = (
+                        (not (task.parent_job_id or "").strip())
+                        and bool(str((task.trace or {}).get("ticket_card_message_id") or "").strip())
                     )
-                    sent_voice = True
                 except Exception:
-                    sent_voice = False
-                    LOG.exception("Failed to send orchestrator voice reply. job=%s", task.job_id)
+                    has_ticket_card = False
+                if status != "ok" and (not has_ticket_card):
+                    payload.append(f"Details: /job {task.job_id[:8]}")
+
+                # Wrap-ups: include a short pointer back to the ticket tree.
+                if kind == "wrapup":
+                    root = (task.parent_job_id or "").strip()
+                    if root:
+                        payload.append(f"Ticket: /ticket {root[:8]}")
+
+                msg = "\n".join(payload)
+                sent_voice = False
+                if prefer_voice and cfg.voice_out_enabled:
+                    try:
+                        tts_client: OpenAITTS | None = None
+                        if cfg.openai_api_key and (cfg.tts_backend or "").strip().lower() == "openai":
+                            tts_client = OpenAITTS(
+                                api_key=cfg.openai_api_key,
+                                api_base_url=cfg.openai_api_base_url,
+                                timeout_seconds=cfg.http_timeout_seconds,
+                                max_retries=cfg.http_max_retries,
+                                retry_initial_seconds=cfg.http_retry_initial_seconds,
+                                retry_max_seconds=cfg.http_retry_max_seconds,
+                            )
+                        raw_speak_line = ((summary or "").splitlines() or [""])[0].strip()
+                        speak_text = raw_speak_line or (summary_lines[0] if summary_lines else summary) or "(no summary)"
+                        _send_voice_note(
+                            api=api,
+                            cfg=cfg,
+                            chat_id=int(task.chat_id),
+                            reply_to_message_id=int(task.reply_to_message_id or 0),
+                            tts=tts_client,
+                            speak_text=str(speak_text),
+                            caption_text=msg,
+                        )
+                        sent_voice = True
+                    except Exception:
+                        sent_voice = False
+                        LOG.exception("Failed to send orchestrator voice reply. job=%s", task.job_id)
 
             if (not sent_voice) and (not artifacts_only):
                 _send_chunked_text(api, chat_id=task.chat_id, text=msg, reply_to_message_id=task.reply_to_message_id)
@@ -7631,7 +9649,7 @@ def _send_orchestrator_result(
         if (not notify) and (not artifacts_only):
             return
 
-        for raw in artifacts[:3]:
+        for raw in artifacts[:4]:
             p = Path(str(raw))
             try:
                 if not p.exists() or p.is_dir():
@@ -7642,7 +9660,7 @@ def _send_orchestrator_result(
                 continue
 
             ext = p.suffix.lower()
-            is_img = ext in (".png", ".jpg", ".jpeg", ".webp")
+            is_img = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
             if is_img:
                 try:
                     api.send_photo(task.chat_id, p, caption=p.name, reply_to_message_id=task.reply_to_message_id)
@@ -7727,7 +9745,7 @@ def orchestrator_worker_loop(
 
             raw_status = str(getattr(result, "status", "") or "")
             orch_state = raw_status or "failed"
-            if orch_state not in {"ok", "blocked", "done", "failed", "cancelled"}:
+            if orch_state not in {"ok", "blocked", "blocked_approval", "done", "failed", "cancelled"}:
                 orch_state = "failed"
             if orch_state == "ok":
                 orch_state = "done"
@@ -7736,11 +9754,22 @@ def orchestrator_worker_loop(
             summary = str(getattr(result, "summary", "") or "").strip()
             if len(summary) > 4000:
                 summary = summary[:4000] + "..."
+            if _coerce_orchestrator_role(task.role) == "jarvis":
+                summary = re.sub(r"\bno puedo\b", "Para avanzar necesito", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bcannot\b", "can proceed when we confirm", summary, flags=re.IGNORECASE)
             artifacts = list(getattr(result, "artifacts", []) or [])
             artifacts = [str(a) for a in artifacts if str(a).strip()][:20]
             next_action = getattr(result, "next_action", None)
             if next_action is not None:
                 next_action = str(next_action).strip() or None
+
+            if orch_state == "blocked":
+                na = str(next_action or "").strip().lower()
+                if na in ("approve", "approve_screenshot", "approval", "await_approval"):
+                    orch_state = "blocked_approval"
+                elif bool(task.requires_approval):
+                    orch_state = "blocked_approval"
 
             structured_digest: Any = getattr(result, "structured_digest", None)
             if structured_digest is None and isinstance(result, dict):
@@ -7764,40 +9793,93 @@ def orchestrator_worker_loop(
                         result_meta["result_workspace_slot"] = int(slot)
                 except Exception:
                     pass
+            if orch_state == "blocked_approval":
+                result_meta["blocked_reason"] = "requires_approval"
 
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
-                if orch_state == "failed" and int(task.retry_count or 0) < int(task.max_retries or 0):
-                    retry_n = int(task.retry_count or 0) + 1
-                    base = 30.0
-                    delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
-                    due_at = time.time() + delay
-                    err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
-                    scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
-                    if scheduled:
-                        try:
-                            orch_q.update_trace(
-                                task.job_id,
-                                retry_scheduled_at=time.time(),
-                                retry_due_at=float(due_at),
-                                retry_delay_s=float(delay),
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
-                            _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
-                        except Exception:
-                            pass
-                        # In minimal mode, avoid extra spam; the ticket card reflects the state.
-                        if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
-                            api.send_message(
-                                task.chat_id,
-                                f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
-                                reply_to_message_id=task.reply_to_message_id,
-                            )
-                        continue
+            retry_policy = str(next_action or "").strip().lower()
+            retry_allowed = retry_policy in ("retry", "retry_transient", "retry_controlled", "")
+            if orch_state == "failed" and retry_allowed and int(task.retry_count or 0) < int(task.max_retries or 0):
+                retry_n = int(task.retry_count or 0) + 1
+                base = 30.0
+                delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
+                due_at = time.time() + delay
+                err_for_trace = summary or str(getattr(result, "logs", "") or "").strip()
+                scheduled = orch_q.bump_retry(task.job_id, due_at=due_at, error=err_for_trace)
+                if scheduled:
+                    try:
+                        orch_q.update_trace(
+                            task.job_id,
+                            retry_scheduled_at=time.time(),
+                            retry_due_at=float(due_at),
+                            retry_delay_s=float(delay),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                        _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
+                    except Exception:
+                        pass
+                    # In minimal mode, avoid extra spam; the ticket card reflects the state.
+                    if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
+                        api.send_message(
+                            task.chat_id,
+                            f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
+                            reply_to_message_id=task.reply_to_message_id,
+                        )
+                    continue
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            # Keep CEO order phase aligned with real execution state.
+            try:
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                _sync_order_phase_from_runtime(
+                    orch_q=orch_q,
+                    root_ticket=root_ticket,
+                    chat_id=int(task.chat_id),
+                )
+            except Exception:
+                pass
+            # Git policy: one order/project branch from main.
+            # Merge to main requires explicit CEO approval via Telegram command (/approve_merge or /order merge).
+            try:
+                labels_now = task.labels or {}
+                task_kind = str(labels_now.get("kind") or "").strip().lower()
+                if orch_state == "done" and task_kind == "wrapup":
+                    root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                    live_order_branch = _resolve_order_branch_from_task(task, orch_q)
+                    root_job = orch_q.get_job(root_ticket)
+                    root_trace = dict((root_job.trace or {}) if root_job else {})
+                    announced = bool(root_trace.get("merge_ready_announced", False))
+                    try:
+                        orch_q.set_order_status(root_ticket, chat_id=int(task.chat_id), status="active")
+                        orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="ready_for_merge")
+                        orch_q.update_trace(
+                            root_ticket,
+                            merge_ready=True,
+                            merge_ready_at=time.time(),
+                            merge_ready_announced=True,
+                            order_branch=(live_order_branch or None),
+                            merged_to_main=False,
+                        )
+                    except Exception:
+                        pass
+                    if not announced:
+                        try:
+                            orch_q.append_audit_event(
+                                event_type="order.ready_for_merge",
+                                actor="jarvis",
+                                details={
+                                    "order_id": root_ticket,
+                                    "order_branch": (live_order_branch or None),
+                                    "next_action": f"/approve_merge {root_ticket[:8]}",
+                                },
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                LOG.exception("Failed to prepare merge-ready state after wrap-up. job=%s", task.job_id)
             # Update ticket card after the state transition so it reflects latest progress/result.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -7843,6 +9925,7 @@ def orchestrator_worker_loop(
                                 "screenshot_url": snap_url,
                                 "screenshot_only": True,
                                 "delegated_by": task.job_id,
+                                "order_branch": str(_resolve_order_branch_from_task(task, orch_q) or ""),
                             },
                             job_id=shot_id,
                         )
@@ -7877,6 +9960,7 @@ def orchestrator_worker_loop(
 
                 if orch_state == "done" and is_jarvis and (not is_query) and (is_top_level_manual or allow_delegation):
                     root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                    order_branch_for_root = _resolve_order_branch_from_task(task, orch_q)
                     existing = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=400)
                     existing_wrapup = any(str((c.labels or {}).get("kind") or "") == "wrapup" for c in existing)
                     existing_subtasks = [c for c in existing if str((c.labels or {}).get("kind") or "") != "wrapup"]
@@ -7887,11 +9971,66 @@ def orchestrator_worker_loop(
                     }
 
                     specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
+                    current_plan_revision = 0
+                    try:
+                        current_plan_revision = int((task.trace or {}).get("plan_revision", 0) or 0)
+                    except Exception:
+                        current_plan_revision = 0
+                    next_plan_revision = current_plan_revision
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
                         # Key-based dedupe: allows multiple waves (autopilot) without duplicating keys.
                         specs = [s for s in specs if s.key not in existing_keys]
+                        if specs:
+                            next_plan_revision = max(1, current_plan_revision + 1)
+                            # CEO orders should always pass through a QA gate before wrap-up.
+                            # If Jarvis did not include QA explicitly, inject one depending on all delegated keys.
+                            if is_top_level_manual:
+                                has_qa = any(str(s.role).strip().lower() == "qa" for s in specs)
+                                needs_qa = any(
+                                    str(s.role).strip().lower()
+                                    in ("frontend", "backend", "security", "research", "release_mgr", "product_ops", "sre")
+                                    for s in specs
+                                )
+                                if needs_qa and (not has_qa):
+                                    dep_keys = [str(s.key).strip() for s in specs if str(s.key).strip()]
+                                    qa_key_base = f"qa_gate_r{int(next_plan_revision)}"
+                                    qa_key = qa_key_base
+                                    suffix = 1
+                                    while qa_key in existing_keys or any(str(s.key).strip() == qa_key for s in specs):
+                                        qa_key = f"{qa_key_base}_{suffix}"
+                                        suffix += 1
+                                    qa_text = (
+                                        f"QA gate for ticket {root_ticket}: validate delegated deliverables, run targeted tests, "
+                                        "and report PASS/FAIL with evidence and residual risks."
+                                    )
+                                    if len(specs) >= 12:
+                                        specs = specs[:11]
+                                    specs.append(
+                                        TaskSpec(
+                                            key=qa_key,
+                                            role="qa",
+                                            text=qa_text,
+                                            mode_hint="rw",
+                                            priority=1,
+                                            depends_on=dep_keys,
+                                            requires_approval=False,
+                                            acceptance_criteria=[
+                                                "Validate delegated deliverables against acceptance criteria.",
+                                                "Run targeted tests and report PASS/FAIL with evidence.",
+                                            ],
+                                            definition_of_done=[
+                                                "QA verdict published with residual risks and next action.",
+                                            ],
+                                            eta_minutes=60,
+                                            sla_tier="high",
+                                        )
+                                    )
+                            specs = [
+                                _normalize_task_spec_contract(s, root_ticket=root_ticket)
+                                for s in specs
+                            ]
 
                     if specs:
                         key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
@@ -7908,6 +10047,8 @@ def orchestrator_worker_loop(
                                 or mode_hint == "full"
                             )
                             deps = [key_to_job[k] for k in spec.depends_on if k in key_to_job]
+                            contract_text = _compose_subtask_instruction(spec, root_ticket=root_ticket)
+                            ttl_seconds = _ttl_seconds_from_spec(spec)
                             trace: dict[str, str | int | float | bool | list[str]] = {
                                 "source": "telegram",
                                 "delegated_by": task.job_id,
@@ -7915,11 +10056,17 @@ def orchestrator_worker_loop(
                                 "profile_name": str(child_profile.get("name") or child_role),
                                 "profile_role": child_role,
                                 "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
+                                "acceptance_criteria": list(spec.acceptance_criteria or []),
+                                "definition_of_done": list(spec.definition_of_done or []),
+                                "eta_minutes": int(spec.eta_minutes or 0),
+                                "sla_tier": str(spec.sla_tier or "normal"),
                             }
+                            if order_branch_for_root:
+                                trace["order_branch"] = str(order_branch_for_root)
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
-                                input_text=spec.text,
+                                input_text=contract_text,
                                 request_type="task",
                                 priority=int(spec.priority),
                                 model=model,
@@ -7932,9 +10079,11 @@ def orchestrator_worker_loop(
                                 reply_to_message_id=task.reply_to_message_id,
                                 parent_job_id=root_ticket,
                                 depends_on=deps,
+                                ttl_seconds=int(ttl_seconds),
                                 labels={"ticket": root_ticket, "kind": "subtask", "key": spec.key},
                                 artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
                                 trace=trace,
+                                plan_revision=int(next_plan_revision),
                                 job_id=key_to_job[spec.key],
                             )
                             children.append(child)
@@ -7951,7 +10100,12 @@ def orchestrator_worker_loop(
                                         edge_type="delegated",
                                         to_role=c.role,
                                         to_key=ckey,
-                                        details={"priority": int(c.priority or 2), "text": (c.input_text or "")[:400]},
+                                        details={
+                                            "priority": int(c.priority or 2),
+                                            "text": (c.input_text or "")[:400],
+                                            "eta_minutes": int((c.trace or {}).get("eta_minutes") or 0),
+                                            "sla_tier": str((c.trace or {}).get("sla_tier") or "normal"),
+                                        },
                                     )
                                     for dep in (c.depends_on or []):
                                         if dep:
@@ -7968,7 +10122,28 @@ def orchestrator_worker_loop(
                                 pass
                             orch_q.submit_batch(children)
                             try:
-                                orch_q.update_trace(root_ticket, delegated_count=int(len(children)), live_at=time.time())
+                                orch_q.update_trace(
+                                    root_ticket,
+                                    delegated_count=int(len(children)),
+                                    plan_revision=int(next_plan_revision),
+                                    live_at=time.time(),
+                                )
+                                _sync_order_phase_from_runtime(
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    chat_id=int(task.chat_id),
+                                )
+                                if next_plan_revision > current_plan_revision:
+                                    orch_q.append_audit_event(
+                                        event_type="plan.revised",
+                                        actor="jarvis",
+                                        details={
+                                            "order_id": root_ticket,
+                                            "from_revision": int(current_plan_revision),
+                                            "to_revision": int(next_plan_revision),
+                                            "delegated_jobs": int(len(children)),
+                                        },
+                                    )
                             except Exception:
                                 pass
 
@@ -7992,6 +10167,8 @@ def orchestrator_worker_loop(
                                 "profile_role": "jarvis",
                                 "max_runtime_seconds": int(orch_profile.get("max_runtime_seconds") or 0),
                             }
+                            if order_branch_for_root:
+                                wrap_trace["order_branch"] = str(order_branch_for_root)
                             wrap = Task.new(
                                 source="telegram",
                                 role="jarvis",
@@ -8011,13 +10188,27 @@ def orchestrator_worker_loop(
                                 labels={"ticket": root_ticket, "kind": "wrapup"},
                                 artifacts_dir=str((cfg.artifacts_root / wrap_id).resolve()),
                                 trace=wrap_trace,
+                                plan_revision=int(next_plan_revision),
                                 job_id=wrap_id,
                             )
                             orch_q.submit_task(wrap)
                             try:
                                 orch_q.update_trace(root_ticket, wrapup_job_id=wrap.job_id, live_at=time.time())
+                                _sync_order_phase_from_runtime(
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    chat_id=int(task.chat_id),
+                                )
                             except Exception:
                                 pass
+                    try:
+                        _sync_order_phase_from_runtime(
+                            orch_q=orch_q,
+                            root_ticket=root_ticket,
+                            chat_id=int(task.chat_id),
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
         except Exception as e:
@@ -8202,17 +10393,15 @@ def _transcribe_worker_loop(
                     profiles=orchestrator_profiles,
                     job=job,
                     user_id=req.user_id,
+                    source_message_id=message_id,
+                    quoted_message_id=None,
+                    quoted_message_text="",
                 )
             except Exception:
                 did_submit = False
                 orch_job_id = ""
                 LOG.exception("Failed to submit transcribed task to orchestrator")
             if did_submit:
-                api.send_message(
-                    chat_id,
-                    f"Transcrito y encolado: task={orch_job_id[:8]}",
-                    reply_to_message_id=message_id if message_id else None,
-                )
                 continue
 
         ok, reason, epoch, q_after = tracker.try_mark_enqueued(chat_id, max_queued_per_chat=cfg.max_queued_per_chat)
@@ -8254,14 +10443,28 @@ def _is_exec_available(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
+def _normalize_tts_speak_text(text: str, *, backend: str, voice: str = "") -> str:
     """
-    Light normalization to improve pronunciation for local TTS.
+    Light normalization to improve pronunciation while preserving mixed ES/EN readability.
     Keep it conservative: the caption is still sent as text, this only affects spoken audio.
     """
     t = (text or "").strip()
     if not t:
         return ""
+
+    # Do not read sender label aloud (e.g. "Jarvis: ...").
+    t = re.sub(
+        r"^\s*(jarvis|sre|backend|frontend|qa|product[ _]ops|security|research|release[ _]manager|autopilot|subtask|wrapup)\s*:\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
+
+    b = (backend or "").strip().lower()
+    v = (voice or "").strip().lower()
+    spanish_voice = v.startswith("es-")
+    # Spanish TTS engines benefit from a few pronunciation hints for English technical words.
+    use_spanish_pronunciation_hints = (b == "piper") or spanish_voice
 
     # Remove very long hex-like tokens (job ids, commit hashes) that sound bad.
     t = re.sub(r"\b[0-9a-f]{8,}\b", "", t, flags=re.IGNORECASE)
@@ -8279,8 +10482,7 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Bullets/headings/quotes at line start
     t = re.sub(r"(?m)^\s*([>#-]+|\*+)\s*", "", t)
 
-    # Common acronyms and terms. Keep this short to avoid "spelled out" / staccato speech.
-    # CEO preference: E2E is read in English ("end to end").
+    # Common acronyms and terms. Keep this short to avoid staccato speech.
     repl: list[tuple[str, str]] = [
         (r"\bE2E\b", "end to end"),
         (r"\bPR\b", "pull request"),
@@ -8297,29 +10499,27 @@ def _normalize_tts_speak_text(text: str, *, backend: str) -> str:
     # Remove stray symbols (keep it conservative; avoid changing normal words)
     t = re.sub(r"[{}\[\]()<>\u2022]+", " ", t)
 
-    # Common English product/engineering terms: make them easier for Spanish TTS
-    # without fully translating (keeps CEO preference of mixing ES + EN).
-    eng_terms: list[tuple[str, str]] = [
-        (r"\bbackend\b", "back end"),
-        (r"\bfrontend\b", "front end"),
-        # "dashboard" tends to get mangled by Spanish TTS ("dasvoard"). This spelling usually lands closer to "dashbord".
-        (r"\bdashboard\b", "dashbord"),
-        (r"\bdeploy\b", "de ploy"),
-        (r"\brelease\b", "re lease"),
-        (r"\brollback\b", "roll back"),
-        (r"\bhotfix\b", "hot fix"),
-    ]
-    for pat, rep in eng_terms:
-        t = re.sub(pat, rep, t, flags=re.IGNORECASE)
-
-    # Piper (Spanish) tends to sound better without excessive punctuation.
-    if (backend or "").strip().lower() == "piper":
-        t = t.replace("_", " ").replace("|", " ")
+    if use_spanish_pronunciation_hints:
+        # Keep ES + EN mix understandable for Spanish voices.
+        eng_terms: list[tuple[str, str]] = [
+            (r"\bbackend\b", "back end"),
+            (r"\bfrontend\b", "front end"),
+            (r"\bdashboard\b", "dashbord"),
+            (r"\bdeploy\b", "de ploy"),
+            (r"\brelease\b", "re lease"),
+            (r"\brollback\b", "roll back"),
+            (r"\bhotfix\b", "hot fix"),
+            (r"\brebase\b", "rei beis"),
+            (r"\bmerge\b", "merch"),
+            (r"\bbranch\b", "branch"),
+            (r"\bcommit\b", "comit"),
+        ]
+        for pat, rep in eng_terms:
+            t = re.sub(pat, rep, t, flags=re.IGNORECASE)
 
     # Collapse whitespace
     t = re.sub(r"\s+", " ", t).strip()
     return t
-
 
 def _piper_to_wav(
     *,
@@ -8532,7 +10732,8 @@ def _synthesize_voice_note_ogg(
         speak = speak[: cfg.tts_max_chars].rstrip() + "..."
 
     # Normalize for clearer pronunciation (especially acronyms like E2E, CI/CD, etc).
-    speak = _normalize_tts_speak_text(speak, backend=backend)
+    voice_hint = cfg.tts_edge_voice if backend == "edge" else (cfg.tts_openai_voice if backend == "openai" else "")
+    speak = _normalize_tts_speak_text(speak, backend=backend, voice=voice_hint)
     semis = float(getattr(cfg, "tts_voice_pitch_semitones", 0.0) or 0.0)
     if semis > 12.0:
         semis = 12.0
@@ -9147,7 +11348,7 @@ def poll_loop(
 
                             api.send_message(
                                 chat_id,
-                                "Recibido, transcribiendo y encolando...",
+                                "Recibido, escuchando",
                                 reply_to_message_id=message_id if message_id else None,
                             )
                             try:
@@ -9264,6 +11465,21 @@ def poll_loop(
                                 pass
 
                 incoming_text = _normalize_slash_aliases(incoming_text)
+                reply_to = msg.get("reply_to_message") if isinstance(msg, dict) else None
+                reply_to_message_id = None
+                reply_to_text = ""
+                if isinstance(reply_to, dict):
+                    try:
+                        rid = reply_to.get("message_id")
+                        if rid is not None:
+                            reply_to_message_id = int(rid)
+                    except Exception:
+                        reply_to_message_id = None
+                    rtxt = reply_to.get("text")
+                    if not isinstance(rtxt, str) or not rtxt.strip():
+                        rtxt = reply_to.get("caption")
+                    if isinstance(rtxt, str):
+                        reply_to_text = rtxt.strip()
                 incoming = IncomingMessage(
                     update_id=update_id,
                     chat_id=chat_id,
@@ -9271,6 +11487,8 @@ def poll_loop(
                     message_id=message_id,
                     username=username,
                     text=incoming_text,
+                    reply_to_message_id=reply_to_message_id,
+                    reply_to_text=reply_to_text,
                 )
                 LOG.debug(
                     "Incoming update_id=%s chat_id=%s user_id=%s message_id=%s kind=%s text_chars=%s text_lines=%s",
@@ -9406,20 +11624,8 @@ def poll_loop(
                     )
                     continue
 
-                # Deterministic CEO queries (no Codex, no delegation).
-                # This runs after authorization/auth checks, so we don't leak info to unauthorized chats.
-                try:
-                    if _maybe_handle_ceo_query(
-                        api=api,
-                        cfg=cfg,
-                        msg=incoming,
-                        orchestrator_profiles=orchestrator_profiles,
-                        orchestrator_queue=orchestrator_queue,
-                    ):
-                        continue
-                except Exception:
-                    # Best-effort only; fall back to normal routing.
-                    pass
+                # CEO-first policy: route all non-slash conversation through Jarvis/Codex.
+                # Keep deterministic shortcuts disabled so Telegram is the single operating surface.
 
                 if incoming_text.strip().startswith("/say "):
                     to_say = incoming_text.strip()[5:].strip()
@@ -9659,10 +11865,13 @@ def poll_loop(
                         "/skills",
                         "/model",
                         "/voice",
+                        "/breakglass",
                         "/effort",
                         "/setnotify",
                         "/agents",
                         "/dashboard",
+                        "/apk_build",
+                        "/apk_latest",
                         "/orders",
                         "/watch",
                         "/unwatch",
@@ -9670,6 +11879,8 @@ def poll_loop(
                         "/brief",
                         "/snapshot",
                         "/approve",
+                        "/approve_merge",
+                        "/rollback",
                         "/emergency_stop",
                         "/emergency_resume",
                         "/pause",
@@ -9708,6 +11919,8 @@ def poll_loop(
                         "/snapshot ",
                         "/daily",
                         "/approve ",
+                        "/approve_merge ",
+                        "/rollback ",
                         "/pause ",
                         "/resume ",
                         "/cancel ",
@@ -9865,6 +12078,9 @@ def poll_loop(
                                 profiles=orchestrator_profiles,
                                 job=job,
                                 user_id=user_id,
+                                source_message_id=message_id,
+                                quoted_message_id=incoming.reply_to_message_id,
+                                quoted_message_text=incoming.reply_to_text,
                             )
                         except Exception:
                             did_submit = False
@@ -9878,7 +12094,7 @@ def poll_loop(
                                 task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
                                 tr = (task.trace or {}) if task is not None else {}
                                 suppress_ticket_card = bool(tr.get("suppress_ticket_card", False)) or (
-                                    task is not None and str(task.request_type or "") == "query"
+                                    task is not None and str(task.request_type or "") in ("query", "status")
                                 )
                             except Exception:
                                 suppress_ticket_card = False
@@ -9896,9 +12112,15 @@ def poll_loop(
                                     pass
                             else:
                                 try:
-                                    card = _ticket_card_text(orchestrator_queue, ticket_id=orch_job_id)
+                                    card_task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
+                                    ticket_target_id = (
+                                        str((card_task.parent_job_id if card_task is not None else "") or "").strip()
+                                        or orch_job_id
+                                    )
+                                    card = _ticket_card_text(orchestrator_queue, ticket_id=ticket_target_id)
                                 except Exception:
                                     card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
+                                    ticket_target_id = orch_job_id
                                 mid = api.send_message(
                                     chat_id,
                                     card,
@@ -9907,7 +12129,7 @@ def poll_loop(
                                 try:
                                     if mid is not None and orchestrator_queue is not None:
                                         orchestrator_queue.update_trace(
-                                            orch_job_id,
+                                            ticket_target_id,
                                             ticket_card_message_id=int(mid),
                                             ticket_card_created_at=time.time(),
                                         )
@@ -10093,9 +12315,12 @@ def _load_config() -> BotConfig:
     if orchestrator_worker_count < 1:
         orchestrator_worker_count = max(1, int(worker_count))
     orchestrator_sessions_enabled = os.environ.get("BOT_ORCH_SESSIONS_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
-    orchestrator_live_update_seconds = int(os.environ.get("BOT_ORCHESTRATOR_LIVE_UPDATE_SECONDS", "8"))
-    if orchestrator_live_update_seconds < 2:
-        orchestrator_live_update_seconds = 2
+    try:
+        orchestrator_live_update_seconds = float(os.environ.get("BOT_ORCHESTRATOR_LIVE_UPDATE_SECONDS", "0.35"))
+    except ValueError:
+        orchestrator_live_update_seconds = 0.35
+    if orchestrator_live_update_seconds < 0.2:
+        orchestrator_live_update_seconds = 0.2
     if orchestrator_live_update_seconds > 60:
         orchestrator_live_update_seconds = 60
     orchestrator_notify_mode = os.environ.get("BOT_ORCHESTRATOR_NOTIFY_MODE", "minimal").strip().lower() or "minimal"
@@ -10186,6 +12411,14 @@ def _load_config() -> BotConfig:
     except Exception:
         tts_piper_sentence_silence = 0.0
 
+    mobile_app_project_dir = Path(os.environ.get("MOBILE_APP_PROJECT_DIR", "/home/aponce/OmniCrewApp.android")).expanduser().resolve()
+    mobile_app_artifacts_dir = Path(os.environ.get("MOBILE_APP_ARTIFACTS_DIR", str(Path(__file__).with_name("data") / "artifacts" / "mobile"))).expanduser().resolve()
+    mobile_app_build_script = Path(os.environ.get("MOBILE_APP_BUILD_SCRIPT", str(Path(__file__).with_name("scripts") / "build_release_apk.sh"))).expanduser().resolve()
+    mobile_app_keystore_path = Path(os.environ.get("MOBILE_APP_KEYSTORE_PATH", str(Path.home() / ".config" / "omnicrew-app" / "keystore.jks"))).expanduser().resolve()
+    mobile_app_key_alias = os.environ.get("MOBILE_APP_KEY_ALIAS", "omnicrew_release").strip() or "omnicrew_release"
+    mobile_app_keystore_pass = os.environ.get("MOBILE_APP_KEYSTORE_PASS", "").strip()
+    mobile_app_key_pass = os.environ.get("MOBILE_APP_KEY_PASS", "").strip()
+
     codex_workdir = Path(os.environ.get("CODEX_WORKDIR", os.getcwd())).expanduser().resolve()
     if not codex_workdir.exists() or not codex_workdir.is_dir():
         raise SystemExit(f"CODEX_WORKDIR must be an existing directory: {codex_workdir}")
@@ -10208,6 +12441,14 @@ def _load_config() -> BotConfig:
 
     codex_force_full_access = os.environ.get("CODEX_FORCE_FULL_ACCESS", "0").strip().lower() in ("1", "true", "yes", "on")
     codex_dangerous_bypass_sandbox = os.environ.get("CODEX_DANGEROUS_BYPASS_SANDBOX", "0").strip().lower() in ("1", "true", "yes", "on")
+    breakglass_start_reason = os.environ.get("BOT_BREAKGLASS_REASON", "").strip()
+    breakglass_ttl_seconds = int(os.environ.get("BOT_BREAKGLASS_TTL_SECONDS", "900"))
+    if breakglass_ttl_seconds < 60:
+        breakglass_ttl_seconds = 60
+    if breakglass_ttl_seconds > 4 * 60 * 60:
+        breakglass_ttl_seconds = 4 * 60 * 60
+    if codex_dangerous_bypass_sandbox and not breakglass_start_reason:
+        raise SystemExit("CODEX_DANGEROUS_BYPASS_SANDBOX=1 requires BOT_BREAKGLASS_REASON and short TTL.")
 
     return BotConfig(
         telegram_token=token,
@@ -10294,9 +12535,18 @@ def _load_config() -> BotConfig:
         tts_piper_length_scale=tts_piper_length_scale,
         tts_piper_noise_w=tts_piper_noise_w,
         tts_piper_sentence_silence=tts_piper_sentence_silence,
+        mobile_app_project_dir=mobile_app_project_dir,
+        mobile_app_artifacts_dir=mobile_app_artifacts_dir,
+        mobile_app_build_script=mobile_app_build_script,
+        mobile_app_keystore_path=mobile_app_keystore_path,
+        mobile_app_key_alias=mobile_app_key_alias,
+        mobile_app_keystore_pass=mobile_app_keystore_pass,
+        mobile_app_key_pass=mobile_app_key_pass,
         ceo_name=ceo_name,
         admin_user_ids=admin_user_ids,
         admin_chat_ids=admin_chat_ids,
+        breakglass_ttl_seconds=breakglass_ttl_seconds,
+        breakglass_start_reason=breakglass_start_reason,
     )
 
 
@@ -10340,6 +12590,28 @@ def _configured_notify_chat_id(cfg: BotConfig) -> int | None:
         return None
 
 
+def _migrate_state_schema(cfg: BotConfig) -> None:
+    """Best-effort backward-compatible migration for mutable bot state."""
+    def _m(st: dict[str, Any]) -> None:
+        cur = st.get("schema_version")
+        try:
+            version = int(cur) if cur is not None else 1
+        except Exception:
+            version = 1
+        if version < 2:
+            # Ensure expected container types exist or are cleaned up safely.
+            for key in ("threads", "watch_by_chat", "access_mode_by_chat", "model_overrides_by_chat", "effort_overrides_by_chat"):
+                if key in st and not isinstance(st.get(key), dict):
+                    st.pop(key, None)
+            if "auth" in st and not isinstance(st.get("auth"), dict):
+                st["auth"] = {}
+            if "voice" in st and not isinstance(st.get("voice"), dict):
+                st["voice"] = {}
+            st["schema_version"] = 2
+
+    _update_state(cfg, _m)
+
+
 def main() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -10347,6 +12619,27 @@ def main() -> None:
     )
 
     cfg = _load_config()
+    try:
+        _migrate_state_schema(cfg)
+    except Exception:
+        LOG.exception("State migration failed; continuing with existing state")
+
+    if cfg.codex_dangerous_bypass_sandbox and cfg.breakglass_start_reason:
+        try:
+            _activate_breakglass(
+                cfg,
+                reason=cfg.breakglass_start_reason,
+                ttl_seconds=int(cfg.breakglass_ttl_seconds),
+                chat_id=0,
+                user_id=None,
+                source="startup_env",
+            )
+        except Exception:
+            LOG.exception("Failed to initialize startup breakglass")
+
+    for issue in _security_startup_findings(cfg):
+        LOG.warning("SECURITY CHECK: %s", issue)
+
     api = TelegramAPI(
         cfg.telegram_token,
         http_timeout_seconds=cfg.http_timeout_seconds,
@@ -10412,6 +12705,9 @@ def main() -> None:
             try:
                 svc = StatusService(orch_q=orchestrator_queue, role_profiles=orchestrator_profiles, cache_ttl_seconds=ttl_s)
                 auth_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
+                allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
+                if not auth_token:
+                    raise RuntimeError("BOT_STATUS_HTTP_TOKEN is required when BOT_STATUS_HTTP_ENABLED=1")
                 try:
                     snap_rps = float(os.environ.get("BOT_STATUS_HTTP_SNAPSHOT_RPS", "2.0"))
                 except Exception:
@@ -10430,6 +12726,7 @@ def main() -> None:
                     status_service=svc,
                     stream_interval_s=interval_s,
                     auth_token=auth_token,
+                    allowed_origins=allowed_origins,
                     snapshot_rate_per_s=snap_rps,
                     snapshot_burst=snap_burst,
                     max_sse_per_ip=max_sse,
@@ -10471,7 +12768,7 @@ def main() -> None:
             orchestrator_scheduler.start()
 
         # Runbooks scheduler: enqueues autonomous tasks periodically to the notify chat.
-        if cfg.runbooks_enabled and _configured_notify_chat_id(cfg):
+        if cfg.runbooks_enabled:
             notify_chat_id = _configured_notify_chat_id(cfg)
 
             def _tick_runbooks() -> None:
@@ -10483,6 +12780,29 @@ def main() -> None:
                     _tick_watch_messages(cfg=cfg, api=api, orch_q=orchestrator_queue)
                 except Exception:
                     pass
+
+                try:
+                    _stalled_replan_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Stalled replan tick failed")
+                try:
+                    _sla_overdue_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("SLA overdue tick failed")
+                try:
+                    _cleanup_stale_blocked_jobs(orch_q=orchestrator_queue, now=time.time())
+                except Exception:
+                    LOG.exception("Hygiene stale cleanup tick failed")
 
                 if notify_chat_id is None:
                     return

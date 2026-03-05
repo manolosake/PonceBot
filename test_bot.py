@@ -2,8 +2,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 # Allow running tests from either repo root (e.g. `python3 -m unittest codexbot/test_bot.py`)
@@ -126,22 +128,26 @@ class TestParseJob(unittest.TestCase):
             self.assertEqual(resp, "__cancel__")
             self.assertIsNone(job)
 
-    def test_plain_greeting_is_direct_response(self) -> None:
+    def test_plain_greeting_routes_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Hola")
             resp, job = bot._parse_job(cfg, msg)
-            self.assertIn("Jarvis:", resp)
-            self.assertIsNone(job)
+            self.assertEqual(resp, "")
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job.argv, ["exec", "Hola"])
 
 
-    def test_ack_is_silent(self) -> None:
+    def test_ack_routes_to_codex(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="Ok")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "")
-            self.assertIsNone(job)
+            self.assertIsNotNone(job)
+            assert job is not None
+            self.assertEqual(job.argv, ["exec", "Ok"])
 
     def test_dashboard_all_returns_marker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -149,6 +155,22 @@ class TestParseJob(unittest.TestCase):
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/dashboard all")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "__orch_dashboard:all")
+            self.assertIsNone(job)
+
+    def test_approve_merge_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/approve_merge abc12345")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_approve_merge:abc12345")
+            self.assertIsNone(job)
+
+    def test_rollback_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/rollback abc12345")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_rollback_merge:abc12345")
             self.assertIsNone(job)
 
     def test_orch_marker_no_payload_is_parsed(self) -> None:
@@ -380,6 +402,51 @@ class TestCeoQueryFastPath(unittest.TestCase):
             self.assertIn("Jarvis: employees (agents) = 3", text)
             self.assertIn("jarvis", text)
 
+    def test_natural_language_status_falls_through_to_jarvis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username=None,
+                text="Que proyectos tienes ahorita en progreso?",
+            )
+
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles={"jarvis": {"model": "gpt-5.3-codex-spark"}},
+                orchestrator_queue=None,
+            )
+            self.assertFalse(handled)
+            self.assertFalse(api.sent)
+
+    def test_pending_query_falls_through_to_jarvis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            api = _FakeTelegramAPI()
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=10,
+                user_id=20,
+                message_id=30,
+                username=None,
+                text="que tareas tenemos pendientes?",
+            )
+            handled = bot._maybe_handle_ceo_query(
+                api=api,
+                cfg=cfg,
+                msg=msg,
+                orchestrator_profiles={"jarvis": {"model": "gpt-5.3-codex-spark"}},
+                orchestrator_queue=None,
+            )
+            self.assertFalse(handled)
+            self.assertFalse(api.sent)
+
     def test_queries_do_not_trigger_when_slash_command(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
@@ -447,7 +514,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             task = bot._orchestrator_task_from_job(cfg, job, profiles=profiles, user_id=123)
             self.assertEqual(task.role, "frontend")
 
-    def test_query_tasks_are_ro_low_effort_and_suppress_ticket_card(self) -> None:
+    def test_query_tasks_use_spark_high_and_suppress_ticket_card(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
@@ -467,10 +534,42 @@ class TestJarvisFirstRouting(unittest.TestCase):
             task = bot._orchestrator_task_from_job(cfg, job, profiles=None, user_id=123)
             self.assertEqual(task.request_type, "query")
             self.assertEqual(task.mode_hint, "ro")
-            self.assertEqual(task.effort, "low")
+            self.assertEqual(task.effort, "high")
+            self.assertEqual(task.model, "gpt-5.3-codex-spark")
             self.assertFalse(task.requires_approval)
+            self.assertEqual(int(task.priority), 1)
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
             self.assertEqual(int((task.trace or {}).get("max_runtime_seconds") or 0), 120)
+
+    def test_intent_query_forces_query_lane_even_if_request_type_looked_like_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_default_role": "jarvis"})
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=0,
+                user_text="ok, dame 15 proyectos interesantes que podemos hacer",
+                argv=["exec", "ok, dame 15 proyectos interesantes que podemos hacer"],
+                mode_hint="rw",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+
+            task = bot._orchestrator_task_from_job(
+                cfg,
+                job,
+                profiles=None,
+                user_id=123,
+                intent_type="query",
+            )
+            self.assertEqual(task.request_type, "query")
+            self.assertEqual(task.mode_hint, "ro")
+            self.assertEqual(task.effort, "high")
+            self.assertEqual(task.model, "gpt-5.3-codex-spark")
+            self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
 
 
     def test_alias_p_maps_to_permissions(self) -> None:
@@ -639,7 +738,8 @@ class TestJarvisFirstRouting(unittest.TestCase):
             msg2 = bot.IncomingMessage(update_id=2, chat_id=1, user_id=2, message_id=11, username="u", text="/permissions")
             resp2, job2 = bot._parse_job(cfg, msg2)
             self.assertIsNone(job2)
-            self.assertIn("Full access (current)", resp2)
+            self.assertIn("Breakglass", resp2)
+            self.assertIn("status: inactive", resp2)
 
 
 class TestTelegramUploads(unittest.TestCase):
@@ -787,7 +887,7 @@ class TestDangerousBypassThreaded(unittest.TestCase):
     def test_threaded_new_injects_dangerous_bypass_and_omits_sandbox(self) -> None:
         cfg = self._cfg()
         runner = bot.CodexRunner(cfg)
-        with patch.object(bot.subprocess, "Popen") as popen:
+        with patch.object(bot.subprocess, "Popen") as popen, patch("bot._breakglass_is_active", return_value=(True, {"reason": "test"})):
             popen.side_effect = FileNotFoundError("no codex in test")
             with self.assertRaises(FileNotFoundError):
                 runner.start_threaded_new(prompt="hi", mode_hint="ro")
@@ -798,7 +898,7 @@ class TestDangerousBypassThreaded(unittest.TestCase):
     def test_threaded_resume_injects_dangerous_bypass_and_omits_sandbox(self) -> None:
         cfg = self._cfg()
         runner = bot.CodexRunner(cfg)
-        with patch.object(bot.subprocess, "Popen") as popen:
+        with patch.object(bot.subprocess, "Popen") as popen, patch("bot._breakglass_is_active", return_value=(True, {"reason": "test"})):
             popen.side_effect = FileNotFoundError("no codex in test")
             with self.assertRaises(FileNotFoundError):
                 runner.start_threaded_resume(thread_id="t_123", prompt="hi", mode_hint="rw")
@@ -917,3 +1017,135 @@ class TestAuthCommandVisibility(unittest.TestCase):
             resp4, job4 = bot._parse_job(cfg_on, msg_logout)
             self.assertIsNone(job4)
             self.assertEqual(resp4, "__logout__")
+
+
+class _FakeAPI:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def send_message(self, chat_id: int, text: str, reply_to_message_id: int | None = None):
+        self.messages.append(str(text))
+        return 1
+
+    def send_photo(self, *args, **kwargs):
+        return None
+
+    def send_document(self, *args, **kwargs):
+        return None
+
+    def send_voice(self, *args, **kwargs):
+        return None
+
+
+class TestHardeningControls(unittest.TestCase):
+    def _cfg(self, state_file: Path) -> bot.BotConfig:
+        return TestStateHandling()._cfg(state_file)
+
+    def test_breakglass_requires_admin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/breakglass on 5 emergency",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("No permitido", resp)
+
+    def test_breakglass_enables_dangerous_bypass_temporarily(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(
+                **{
+                    **cfg.__dict__,
+                    "admin_chat_ids": frozenset({1}),
+                    "codex_dangerous_bypass_sandbox": True,
+                    "breakglass_ttl_seconds": 60,
+                }
+            )
+
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/breakglass on 1 emergency fix",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("breakglass enabled", resp)
+
+            bot._set_access_mode(cfg, "full", chat_id=1)
+            self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
+
+            active, raw = bot._breakglass_is_active(cfg)
+            self.assertTrue(active)
+            exp = float(raw.get("expires_at") or 0.0)
+            with patch("bot.time.time", return_value=exp + 1.0):
+                self.assertFalse(bot._effective_bypass_sandbox(cfg, chat_id=1))
+
+    def test_auth_touch_session_extends_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "auth_enabled": True, "auth_session_ttl_seconds": 30})
+            bot._set_auth_sessions(
+                cfg,
+                {
+                    "1": {
+                        "username": "u",
+                        "profile": "",
+                        "logged_in_at": 100.0,
+                        "last_active_at": 100.0,
+                        "expires_at": 130.0,
+                    }
+                },
+            )
+            with patch("bot._auth_now", return_value=200.0):
+                bot._auth_touch_session(cfg, chat_id=1)
+            with patch("bot._auth_now", return_value=220.0):
+                active, sess = bot._auth_is_session_active(cfg, chat_id=1)
+            self.assertTrue(active)
+            self.assertEqual(int(float(sess.get("expires_at") or 0)), 230)
+
+    def test_runbook_ok_is_suppressed_in_minimal_notify_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "orchestrator_notify_mode": "minimal"})
+            api = _FakeAPI()
+            task = SimpleNamespace(
+                labels={"runbook": "sre_health"},
+                trace={"runbook_id": "sre_health"},
+                role="sre",
+                parent_job_id="",
+                is_autonomous=True,
+                job_id="12345678-1234-1234-1234-123456789012",
+                chat_id=1,
+                reply_to_message_id=None,
+            )
+            result = {
+                "status": "ok",
+                "summary": "Host healthy",
+                "logs": "",
+                "next_action": None,
+                "artifacts": [],
+            }
+            bot._send_orchestrator_result(api, task, result, cfg=cfg)
+            self.assertEqual(api.messages, [])
+
+
+class TestVoiceNormalization(unittest.TestCase):
+    def test_normalize_tts_strips_sender_prefix(self) -> None:
+        out = bot._normalize_tts_speak_text("Jarvis: merge completed", backend="piper")
+        self.assertFalse(out.lower().startswith("jarvis:"))
+        self.assertIn("merch", out.lower())
+
+    def test_normalize_tts_keeps_mixed_terms_readable(self) -> None:
+        out = bot._normalize_tts_speak_text("rebase y merge en branch main", backend="piper")
+        self.assertIn("rei beis", out.lower())
+        self.assertIn("merch", out.lower())
+

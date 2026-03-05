@@ -80,6 +80,11 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(w2["next"]["job_id_short"], "bbbbbbbb"[:8])
 
             self.assertIsNotNone(snap["snapshot_hash"])
+            self.assertIn("alerts", snap)
+            self.assertIn("risks", snap)
+            self.assertIn("decisions_pending", snap)
+            self.assertIn("live_view", snap)
+            self.assertEqual(str((snap.get("live_view") or {}).get("transport")), "sse")
 
     def test_snapshot_filters_by_chat_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -144,3 +149,25 @@ class TestStatusService(unittest.TestCase):
             self.assertIsNotNone(workers2[0]["next"])
             self.assertEqual(workers2[0]["next"]["job_id"], t2.job_id)
 
+    def test_snapshot_includes_pending_decisions_from_decision_log(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+
+            order_id = "33333333-3333-3333-3333-333333333333"
+            q.upsert_order(order_id=order_id, chat_id=11, title="Order3", body="Body", status="active", priority=2)
+            q.append_decision_log(
+                order_id=order_id,
+                job_id="eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+                kind="qa_verdict",
+                state="blocked",
+                summary="Falta evidencia QA",
+                next_action="Aprobar evidencia o pedir corrección",
+                details={"gate": "qa"},
+            )
+
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+            snap = svc.snapshot(chat_id=11)
+            pending = list(snap.get("decisions_pending") or [])
+            self.assertTrue(len(pending) >= 1)
+            self.assertTrue(any(str(x.get("next_action") or "").startswith("Aprobar evidencia") for x in pending))

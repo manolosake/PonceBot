@@ -46,16 +46,14 @@ def _parse_since_ts(qs: dict[str, list[str]]) -> float | None:
         return None
 
 
-def _extract_bearer_token(handler: BaseHTTPRequestHandler, qs: dict[str, list[str]]) -> str:
-    # Prefer Authorization header: "Bearer <token>"
+def _extract_bearer_token(handler: BaseHTTPRequestHandler) -> str:
+    # Authorization header only: "Bearer <token>"
     auth = handler.headers.get("Authorization") or ""
     if isinstance(auth, str):
         a = auth.strip()
         if a.lower().startswith("bearer "):
             return a.split(None, 1)[1].strip()
-    # Fallback: query param for constrained clients.
-    raw = (qs.get("token") or [""])[0]
-    return str(raw or "").strip()
+    return ""
 
 
 class _TokenBucket:
@@ -88,6 +86,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         svc: StatusService,
         stream_interval_s: float,
         auth_token: str,
+        allowed_origins: list[str] | None,
         snapshot_rate_per_s: float,
         snapshot_burst: float,
         max_sse_per_ip: int,
@@ -96,6 +95,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.status_service = svc
         self.stream_interval_s = max(0.25, float(stream_interval_s))
         self.auth_token = (auth_token or "").strip()
+        self.allowed_origins = tuple(sorted({str(o).strip() for o in (allowed_origins or []) if str(o).strip()}))
 
         self._rl_lock = threading.Lock()
         self._snap_buckets: dict[str, _TokenBucket] = {}
@@ -143,13 +143,34 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         # Keep server quiet by default; integrate with app logging if needed.
         return
 
-    def _send_json(self, code: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None) -> None:
+    def _resolve_cors(self) -> tuple[bool, dict[str, str]]:
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True, {}
+        allowed = tuple(self.server.allowed_origins or ())
+        if origin in allowed:
+            return True, {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+        return False, {}
+
+    def _send_json(
+        self,
+        code: int,
+        payload: dict[str, Any],
+        *,
+        extra_headers: dict[str, str] | None = None,
+        cors_headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-ED-API-Version", _API_VERSION)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        use_cors = cors_headers
+        if use_cors is None:
+            use_cors = getattr(self, "_cors_headers", {})
+        if use_cors:
+            for k, v in use_cors.items():
+                self.send_header(str(k), str(v))
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(str(k), str(v))
@@ -158,8 +179,13 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self) -> None:  # pragma: no cover
+        ok, cors_headers = self._resolve_cors()
+        if not ok:
+            self._send_json(403, {"error": "cors_origin_denied"}, cors_headers={})
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        for k, v in cors_headers.items():
+            self.send_header(str(k), str(v))
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("X-ED-API-Version", _API_VERSION)
@@ -171,10 +197,16 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query or "")
         chat_id = _parse_chat_id(qs)
         ip = str(getattr(self, "client_address", ("unknown", 0))[0] or "unknown")
+        self._cors_headers = {}
+        cors_ok, cors_headers = self._resolve_cors()
+        self._cors_headers = cors_headers
+        if not cors_ok:
+            self._send_json(403, {"error": "cors_origin_denied"}, cors_headers={})
+            return
 
-        # Lightweight token auth (optional, but recommended for Tailscale/mobile).
+        # Token auth is mandatory when configured (Bearer header only).
         if self.server.auth_token:
-            tok = _extract_bearer_token(self, qs)
+            tok = _extract_bearer_token(self)
             if not tok or tok != self.server.auth_token:
                 self._send_json(401, {"error": "unauthorized"})
                 return
@@ -221,12 +253,144 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"api_version": _API_VERSION, "role": role, "since_ts": since_ts, "items": items})
             return
 
+        if path in ("/api/v1/orchestration/overview", "/api/orchestration/overview"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "queue": {
+                        "queued_runnable": int(snap.get("queued_total") or 0),
+                        "waiting_deps": int(snap.get("waiting_deps_total") or 0),
+                        "blocked_approval": int(snap.get("blocked_approval_total") or 0),
+                        "running": int(snap.get("running_total") or 0),
+                        "blocked_legacy": int(snap.get("blocked_total") or 0),
+                        "by_role": snap.get("queue_by_role") or [],
+                    },
+                    "orders_active_count": len(list(snap.get("orders_active") or [])),
+                    "projects_count": len(list(snap.get("projects") or [])),
+                    "stalled_count": len(list(snap.get("stalled_tasks") or [])),
+                    "staleness_seconds": snap.get("staleness_seconds"),
+                },
+            )
+            return
+
+        if path in ("/api/v1/orchestration/orders", "/api/orchestration/orders"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            status = (qs.get("status") or [""])[0].strip().lower() or None
+            limit = _parse_limit(qs, 100, hi=2000)
+            if chat_id is None:
+                items = self.server.status_service.orch_q.list_orders_global(status=status, limit=limit)
+            else:
+                items = self.server.status_service.orch_q.list_orders(chat_id=int(chat_id), status=status, limit=limit)
+            self._send_json(200, {"api_version": _API_VERSION, "chat_id": chat_id, "status": status, "items": items})
+            return
+
+        if path in ("/api/v1/orchestration/projects", "/api/orchestration/projects"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            status = (qs.get("status") or [""])[0].strip().lower() or None
+            limit = _parse_limit(qs, 200, hi=5000)
+            items = self.server.status_service.orch_q.list_projects(status=status, limit=limit)
+            self._send_json(200, {"api_version": _API_VERSION, "status": status, "items": items})
+            return
+
+        if path in ("/api/v1/orchestration/agents-live", "/api/orchestration/agents-live"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            workers = list(snap.get("workers") or [])
+            running = 0
+            queued_next = 0
+            for w in workers:
+                if not isinstance(w, dict):
+                    continue
+                if isinstance(w.get("current"), dict):
+                    running += 1
+                if isinstance(w.get("next"), dict):
+                    queued_next += 1
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "summary": {
+                        "workers_total": len(workers),
+                        "running_workers": int(running),
+                        "workers_with_next": int(queued_next),
+                    },
+                    "workers": workers,
+                },
+            )
+            return
+
         if path in ("/api/status/snapshot", f"/api/{_API_VERSION}/status/snapshot"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
                 return
             snap = self.server.status_service.snapshot(chat_id=chat_id)
             self._send_json(200, snap)
+            return
+
+        if path in ("/api/status/alerts", f"/api/{_API_VERSION}/status/alerts"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("alerts") or []),
+                },
+            )
+            return
+
+        if path in ("/api/status/risks", f"/api/{_API_VERSION}/status/risks"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("risks") or []),
+                },
+            )
+            return
+
+        if path in ("/api/status/decisions", f"/api/{_API_VERSION}/status/decisions"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            snap = self.server.status_service.snapshot(chat_id=chat_id)
+            self._send_json(
+                200,
+                {
+                    "api_version": _API_VERSION,
+                    "schema_version": int(snap.get("schema_version") or 1),
+                    "generated_at": snap.get("generated_at"),
+                    "chat_id": snap.get("chat_id"),
+                    "items": list(snap.get("decisions_pending") or []),
+                },
+            )
             return
 
         if path in ("/api/status/stream", f"/api/{_API_VERSION}/status/stream"):
@@ -238,7 +402,8 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
             self.send_header("X-ED-API-Version", _API_VERSION)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            for k, v in cors_headers.items():
+                self.send_header(str(k), str(v))
             self.end_headers()
 
             last_hash = ""
@@ -305,6 +470,7 @@ def start_status_http_server(
     status_service: StatusService,
     stream_interval_s: float = 1.0,
     auth_token: str = "",
+    allowed_origins: list[str] | None = None,
     snapshot_rate_per_s: float = 2.0,
     snapshot_burst: float = 4.0,
     max_sse_per_ip: int = 2,
@@ -315,6 +481,7 @@ def start_status_http_server(
         svc=status_service,
         stream_interval_s=stream_interval_s,
         auth_token=auth_token,
+        allowed_origins=allowed_origins,
         snapshot_rate_per_s=snapshot_rate_per_s,
         snapshot_burst=snapshot_burst,
         max_sse_per_ip=max_sse_per_ip,

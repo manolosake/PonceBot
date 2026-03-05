@@ -40,3 +40,15 @@
     - Status (green/yellow/red) + 1 risk if applicable
     - What was achieved / what's next (1 sentence)
     - Decision needed (or N/A)
+
+- id: hygiene_maintenance
+  role: sre
+  interval_seconds: 3600
+  mode_hint: ro
+  priority: 3
+  enabled: true
+  prompt: |
+    Perform repository/runtime hygiene checks:
+    - identify stale blocked jobs and recommend cleanup
+    - verify retention/backup health
+    - summarize only actionable risks (severity + next action + ETA)

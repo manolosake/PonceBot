@@ -14,7 +14,7 @@ from orchestrator.screenshot import validate_screenshot_url
 from orchestrator.schemas.result import TaskResult
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
-from orchestrator.dispatcher import detect_request_type
+from orchestrator.dispatcher import detect_ceo_intent, detect_request_type
 import threading
 import time as _time
 
@@ -99,8 +99,11 @@ class TestOrchestratorCommands(unittest.TestCase):
             self.assertEqual(resp_purge, "__orch_purge_queue:global")
 
             msg_purge_nl = bot.IncomingMessage(6, 1, 2, 15, "u", "Vamos a limpiar la cola, que no haya tareas.")
-            resp_purge_nl, _ = bot._parse_job(cfg, msg_purge_nl)
-            self.assertEqual(resp_purge_nl, "__orch_purge_queue:global")
+            resp_purge_nl, job_purge_nl = bot._parse_job(cfg, msg_purge_nl)
+            self.assertEqual(resp_purge_nl, "")
+            self.assertIsNotNone(job_purge_nl)
+            assert job_purge_nl is not None
+            self.assertEqual(job_purge_nl.argv, ["exec", "Vamos a limpiar la cola, que no haya tareas."])
 
             msg_job_list = bot.IncomingMessage(7, 1, 2, 16, "u", "/job")
             resp_job_list, _ = bot._parse_job(cfg, msg_job_list)
@@ -147,6 +150,36 @@ class TestRequestTypeDetection(unittest.TestCase):
         self.assertEqual(detect_request_type("que tienes pendiente jarvis?"), "query")
 
 
+    def test_projects_in_progress_question_is_query(self) -> None:
+        self.assertEqual(detect_request_type("Que proyectos tienes ahorita en progreso?"), "query")
+
+    def test_spanish_update_question_is_task(self) -> None:
+        self.assertEqual(detect_request_type("podrias actualizar el dashboard?"), "task")
+
+    def test_conversational_creo_que_is_query(self) -> None:
+        self.assertEqual(detect_request_type("creo que el servidor esta bien"), "query")
+
+
+class TestCeoIntentDetection(unittest.TestCase):
+    def test_ideation_prompt_is_query(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("ok, dame 15 proyectos interesantes que podemos hacer"),
+            "query",
+        )
+
+    def test_explicit_execution_project_is_new_order(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("quiero que crees un proyecto backend nuevo y lo despliegues"),
+            "order_project_new",
+        )
+
+    def test_reply_defaults_to_change(self) -> None:
+        self.assertEqual(
+            detect_ceo_intent("ajusta eso por favor", reply_context={"reply_to_message_id": 123}),
+            "order_project_change",
+        )
+
+
 class TestDelegationParsing(unittest.TestCase):
     def test_orchestrator_subtasks_mode_hint_is_optional(self) -> None:
         specs = parse_orchestrator_subtasks({"subtasks": [{"key": "a", "role": "backend", "text": "do the thing"}]})
@@ -164,6 +197,80 @@ class TestDelegationParsing(unittest.TestCase):
         )
         # Invalid but explicit => fall back to a safe value.
         self.assertEqual(specs3[0].mode_hint, "ro")
+
+    def test_orchestrator_subtasks_contract_fields_are_parsed(self) -> None:
+        specs = parse_orchestrator_subtasks(
+            {
+                "subtasks": [
+                    {
+                        "key": "ship_api",
+                        "role": "backend",
+                        "text": "Implement endpoint",
+                        "acceptance_criteria": ["returns 200", "includes schema validation"],
+                        "definition_of_done": ["tests pass", "docs updated"],
+                        "eta_minutes": 95,
+                        "sla_tier": "high",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(specs), 1)
+        s = specs[0]
+        self.assertEqual(s.acceptance_criteria, ["returns 200", "includes schema validation"])
+        self.assertEqual(s.definition_of_done, ["tests pass", "docs updated"])
+        self.assertEqual(int(s.eta_minutes or 0), 95)
+        self.assertEqual(s.sla_tier, "high")
+
+
+class TestOrchestratorEvidenceGate(unittest.TestCase):
+    def test_backend_requires_meaningful_evidence(self) -> None:
+        t = Task.new(
+            source="telegram",
+            role="backend",
+            input_text="Do backend work",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=5.0,
+            chat_id=1,
+        )
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=t,
+            summary="ok",
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+        self.assertFalse(ok)
+        self.assertIn("Evidence gate", str(reason))
+        self.assertEqual(int(meta.get("artifacts_count") or 0), 0)
+
+    def test_qa_requires_pass_fail_style_language(self) -> None:
+        t = Task.new(
+            source="telegram",
+            role="qa",
+            input_text="Run tests",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=5.0,
+            chat_id=1,
+        )
+        ok, reason, _meta = bot._orchestrator_min_evidence_gate(
+            task=t,
+            summary="Checked things quickly.",
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+        self.assertFalse(ok)
+        self.assertIn("QA evidence gate", str(reason))
 
 
 class TestOrchestratorMarkerResponse(unittest.TestCase):
@@ -510,6 +617,201 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertEqual(recovered, 0)
             self.assertIsNone(q.get_workspace_lease(job_id="deadbeef"))
 
+    def test_sync_order_phase_marks_ready_for_merge_when_wrapup_done(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-12345678"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Test order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="subtask",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "subtask", "key": "impl"},
+                    state="done",
+                    job_id="job-subtask",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="wrap",
+                    request_type="review",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "wrapup"},
+                    state="done",
+                    job_id="job-wrapup",
+                )
+            )
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "ready_for_merge")
+            self.assertEqual(str(got.get("status")), "active")
+
+    def test_sync_order_phase_marks_done_when_wrapup_done_and_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-merged-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Merged order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"merged_to_main": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="wrap",
+                    request_type="review",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "wrapup"},
+                    state="done",
+                    job_id="job-wrapup",
+                )
+            )
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "done")
+            self.assertEqual(str(got.get("status")), "done")
+
+    def test_set_order_phase_accepts_ready_for_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-rfm-001"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="planning",
+                project_id="proj-1",
+            )
+            ok = q.set_order_phase(order_id, chat_id=1, phase="ready_for_merge")
+            self.assertTrue(ok)
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "ready_for_merge")
+
+
+class TestOrderBranchPolicy(unittest.TestCase):
+    def test_order_branch_name_uses_feature_prefix(self) -> None:
+        b = bot._order_branch_name("abcd1234-ffff", "Nuevo proyecto server core")
+        self.assertTrue(b.startswith("feature/order-abcd1234-"))
+
+    def test_resolve_order_branch_from_parent_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            root_id = "ord-branch-001"
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"order_branch": "feature/order-ord-bran-root"},
+                    job_id=root_id,
+                )
+            )
+            child_id = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="child",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=root_id,
+                    state="queued",
+                )
+            )
+            child = q.get_job(child_id)
+            self.assertIsNotNone(child)
+            assert child is not None
+            self.assertEqual(
+                bot._resolve_order_branch_from_task(child, q),
+                "feature/order-ord-bran-root",
+            )
+
 
 class TestYamlLikeParsing(unittest.TestCase):
     def test_agents_yaml_parses_lists(self) -> None:
@@ -628,7 +930,7 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             assert taken is not None
             self.assertEqual(taken.job_id, wrap_id)
 
-    def test_non_wrapup_requires_done_dependencies_and_defers_due_at(self) -> None:
+    def test_non_wrapup_requires_done_dependencies_and_moves_to_waiting_deps(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
             q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -670,9 +972,10 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             refreshed = q.get_job(jid)
             self.assertIsNotNone(refreshed)
             assert refreshed is not None
-            self.assertIsNotNone(refreshed.due_at)
-            assert refreshed.due_at is not None
-            self.assertGreater(refreshed.due_at, now)
+            self.assertEqual(refreshed.state, "waiting_deps")
+            self.assertIsNone(refreshed.due_at)
+            self.assertTrue(str(refreshed.blocked_reason or "").startswith("dependencies_pending"))
+            self.assertGreater(float(refreshed.updated_at), now)
 
 
 class TestRetryScheduling(unittest.TestCase):
@@ -827,6 +1130,56 @@ class TestCeoOrders(unittest.TestCase):
 
             bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
             self.assertFalse(bad)
+
+
+    def test_set_order_done_closes_linked_project_when_no_active_orders_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            pid = "proj-aaaaaaaa"
+            oid = "aaaaaaaa-1111-1111-1111-111111111111"
+
+            st.upsert_project(project_id=pid, name="Ideas project", path="/tmp/ideas", status="active", created_by="ceo")
+            st.upsert_order(
+                order_id=oid,
+                chat_id=1,
+                title="Ideation order",
+                body="dame ideas",
+                status="active",
+                priority=2,
+                intent_type="order_project_new",
+                project_id=pid,
+            )
+
+            ok = st.set_order_status(oid[:8], chat_id=1, status="done")
+            self.assertTrue(ok)
+
+            done_ids = {str(p["project_id"]) for p in st.list_projects(status="done", limit=20)}
+            self.assertIn(pid, done_ids)
+
+    def test_project_stays_active_while_another_order_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+
+            pid = "proj-bbbbbbbb"
+            oid1 = "bbbbbbbb-1111-1111-1111-111111111111"
+            oid2 = "bbbbbbbb-2222-2222-2222-222222222222"
+
+            st.upsert_project(project_id=pid, name="Shared project", path="/tmp/shared", status="active", created_by="ceo")
+            st.upsert_order(order_id=oid1, chat_id=1, title="order 1", body="work 1", status="active", priority=2, intent_type="order_project_new", project_id=pid)
+            st.upsert_order(order_id=oid2, chat_id=1, title="order 2", body="work 2", status="active", priority=2, intent_type="order_project_change", project_id=pid)
+
+            ok1 = st.set_order_status(oid1, chat_id=1, status="done")
+            self.assertTrue(ok1)
+            active_ids = {str(p["project_id"]) for p in st.list_projects(status="active", limit=20)}
+            self.assertIn(pid, active_ids)
+
+            ok2 = st.set_order_status(oid2, chat_id=1, status="done")
+            self.assertTrue(ok2)
+            done_ids = {str(p["project_id"]) for p in st.list_projects(status="done", limit=20)}
+            self.assertIn(pid, done_ids)
 
 
 class TestBulkCancel(unittest.TestCase):

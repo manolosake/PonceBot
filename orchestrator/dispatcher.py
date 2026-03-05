@@ -117,6 +117,7 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 _REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
+_INTENT_TYPES = {"query", "order_project_new", "order_project_change"}
 
 _TOKEN_RE = re.compile(r"[\w]+", flags=re.UNICODE)
 _TASK_VERB_RE = re.compile(
@@ -124,8 +125,8 @@ _TASK_VERB_RE = re.compile(
     # words like "status"/"estado" (which otherwise cause false positives).
     r"\b("
     r"arregl\w*|corrig\w*|cambi\w*|modific\w*|ajust\w*|"
-    r"agreg\w*|anad\w*|añad\w*|quit\w*|elimin\w*|"
-    r"implement\w*|cre\w*|haz|hagan|"
+    r"agreg\w*|anad\w*|añad\w*|quit\w*|elimin\w*|actualiz\w*|mejor\w*|"
+    r"implement\w*|crea\w*|crear\w*|haz|hagan|"
     r"fix\w*|remove\w*|add\w*|update\w*|format\w*|refactor\w*|improv\w*"
     r")\b",
     flags=re.IGNORECASE,
@@ -141,7 +142,7 @@ def _score_role(text_l: str, role: str) -> int:
     """
     score = 0
     tokens: set[str] | None = None
-    for k in _ROLE_KEYWORDS.get(role, ()):
+    for k in _ROLE_KEYWORDS.get(role, ()):  # pragma: no branch
         kk = (k or "").strip().lower()
         if not kk:
             continue
@@ -214,8 +215,6 @@ def detect_request_type(text_l: str) -> str:
                 "ya terminó",
                 "en que van",
                 "en qué van",
-                "progreso",
-                "avance",
                 "que estan haciendo",
                 "qué están haciendo",
                 "que están haciendo",
@@ -254,6 +253,9 @@ def detect_request_type(text_l: str) -> str:
 
     if _looks_like_status():
         return "status"
+    # Conversational statements (non-imperative) should stay in Jarvis query lane.
+    if any(t.startswith(k) for k in ("creo que ", "pienso que ", "me parece ", "considero que ", "i think ")):
+        return "query"
     # Queries (CEO questions) that should not auto-delegate.
     if any(
         k in t
@@ -288,6 +290,151 @@ def detect_request_type(text_l: str) -> str:
     if "mantenimiento" in t or "cron" in t or "monitor" in t:
         return "maintenance"
     return "task"
+
+
+def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None) -> str:
+    """
+    Classify a top-level CEO message into:
+    - query
+    - order_project_new
+    - order_project_change
+
+    Grounded rule set:
+    - Queries never create/advance CEO orders.
+    - Replies/corrections default to `order_project_change`.
+    - New orders/projects require explicit project scope signals.
+    - Plain one-shot asks (without project scope) stay in conversational lane.
+    """
+    req_type = detect_request_type(text)
+    if req_type in ("query", "status"):
+        return "query"
+
+    raw = (text or "").strip().lower()
+
+    project_scope_terms = (
+        "project",
+        "proyecto",
+        "repo",
+        "repository",
+        "dashboard",
+        "feature",
+        "branch",
+        "pull request",
+        "merge",
+        "release",
+        "app",
+        "application",
+        "backend",
+        "frontend",
+        "api",
+        "database",
+        "db ",
+        "schema",
+        "migration",
+        "migracion",
+        "migración",
+        "deploy",
+        "infra",
+        "infrastructure",
+    )
+    has_project_scope = any(k in raw for k in project_scope_terms)
+
+    has_reply = bool(reply_context and isinstance(reply_context, dict) and any(reply_context.values()))
+    if has_reply:
+        return "order_project_change"
+
+    has_change_signal = any(
+        k in raw
+        for k in (
+            "change ",
+            "update ",
+            "modify ",
+            "adjust ",
+            "fix this",
+            "sobre eso",
+            "de eso",
+            "ajusta",
+            "corrige",
+            "modifica",
+            "actualiza",
+            "cambia",
+            "iterate",
+            "iteration",
+            "follow up",
+        )
+    )
+    if has_change_signal and has_project_scope:
+        return "order_project_change"
+
+    if any(
+        k in raw
+        for k in (
+            "new project",
+            "nuevo proyecto",
+            "start project",
+            "inicia proyecto",
+            "create project",
+            "crear proyecto",
+            "new order",
+            "nueva orden",
+            "build from scratch",
+            "desde cero",
+        )
+    ):
+        return "order_project_new"
+
+    ideation_signal = any(
+        k in raw
+        for k in (
+            "ideas",
+            "idea ",
+            "propuestas",
+            "suggest",
+            "suggestion",
+            "brainstorm",
+            "que proyectos",
+            "qué proyectos",
+            "proyectos interesantes",
+            "podemos hacer",
+        )
+    )
+    execution_signal = any(
+        k in raw
+        for k in (
+            "implement",
+            "build",
+            "develop",
+            "create",
+            "ship",
+            "deploy",
+            "setup",
+            "set up",
+            "execute",
+            "run",
+            "haz ",
+            "quiero que",
+            "agrega",
+            "añade",
+            "anade",
+            "pon ",
+            "ejecuta",
+            "implementa",
+            "desarrolla",
+            "construye",
+            "crea",
+            "inicia",
+            "asigna",
+            "deleg",
+        )
+    )
+    if ideation_signal and not execution_signal:
+        return "query"
+
+    # Safety: only create a persistent project/order when there is explicit execution intent.
+    if has_project_scope and req_type in ("task", "maintenance", "review") and execution_signal:
+        return "order_project_new"
+
+    return "query"
 
 
 def choose_model_by_role(role: str, model_override: str | None = None, default_model: str = "gpt-4.1") -> str:
@@ -335,7 +482,8 @@ def to_task(
     if role not in ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
         role = "backend"
 
-    request_type = detect_request_type(text)
+    override_request_type = str(normalized_context.get("request_type") or "").strip().lower()
+    request_type = override_request_type or detect_request_type(text)
     if request_type not in _REQUEST_TYPES:
         request_type = "task"
 
@@ -349,6 +497,11 @@ def to_task(
     requires_approval = bool(normalized_context.get("requires_approval", False))
     if mode_hint == "full":
         requires_approval = True
+
+    trace = dict(normalized_context.get("trace") or {})
+    intent_type = str(trace.get("intent_type") or normalized_context.get("intent_type") or "").strip().lower()
+    if intent_type in _INTENT_TYPES:
+        trace["intent_type"] = intent_type
 
     return Task.new(
         source=str(source),
@@ -365,5 +518,5 @@ def to_task(
         user_id=user_id,
         reply_to_message_id=reply_to_message_id,
         due_at=due_at,
-        trace=dict(normalized_context.get("trace") or {}),
+        trace=trace,
     )

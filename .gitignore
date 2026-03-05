@@ -20,3 +20,7 @@ models/
 vendor/
 bin/
 codexbot.env.bak.*
+.DS_Store
+bot.py.bak_*
+*.bak_*
+omnicrewapp.android/
