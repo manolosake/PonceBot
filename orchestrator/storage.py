@@ -945,6 +945,107 @@ class SQLiteTaskStorage:
             {"reason": "dependencies_pending", "missing_deps": missing_deps[:20]},
         )
 
+    def _dependency_blocked_reason(self, *, cause: str, dep_job_id: str) -> str:
+        return f"dependency_guard:cause={cause};dep_job_id={dep_job_id}"
+
+    def _mark_blocked_dependency(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        dep_job_id: str,
+        cause: str,
+        now: float,
+    ) -> None:
+        row = conn.execute("SELECT stalled_since FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        stalled_since = None
+        if row is not None:
+            stalled_since = _coerce_float(row["stalled_since"], None)
+        if stalled_since is None or stalled_since <= 0:
+            stalled_since = float(now)
+        reason = self._dependency_blocked_reason(cause=cause, dep_job_id=dep_job_id)
+        conn.execute(
+            "UPDATE jobs SET state = ?, updated_at = ?, blocked_reason = ?, stalled_since = ?, due_at = NULL "
+            "WHERE job_id = ? AND state IN ('queued', 'waiting_deps')",
+            ("blocked", float(now), reason, float(stalled_since), job_id),
+        )
+        details = {
+            "reason": "dependency_guard",
+            "cause": cause,
+            "dep_job_id": dep_job_id,
+            "blocked_reason": reason,
+        }
+        self._append_event(conn, job_id, "state:blocked", details)
+        conn.execute(
+            "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+            (
+                float(now),
+                "task.blocked_dependency",
+                "scheduler",
+                json.dumps({"job_id": job_id, **details}, ensure_ascii=False),
+            ),
+        )
+
+    def _dependency_cycle_detected(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        current_job_id: str,
+        dep_job_id: str,
+        seen: set[str] | None = None,
+    ) -> bool:
+        dep = str(dep_job_id).strip()
+        cur = str(current_job_id).strip()
+        if not dep or not cur:
+            return False
+        if dep == cur:
+            return True
+        visited = seen or set()
+        if dep in visited:
+            return False
+        visited.add(dep)
+        row = conn.execute("SELECT state, depends_on FROM jobs WHERE job_id = ?", (dep,)).fetchone()
+        if row is None:
+            return False
+        dep_state = str(row["state"] or "")
+        if dep_state not in ("queued", "waiting_deps"):
+            return False
+        nested = _coerce_json_list(row["depends_on"])
+        if cur in nested:
+            return True
+        for nxt in nested:
+            if self._dependency_cycle_detected(conn, current_job_id=cur, dep_job_id=str(nxt), seen=visited):
+                return True
+        return False
+
+    def _evaluate_dependency_guard(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        deps: list[str],
+        allow_terminal: bool,
+    ) -> tuple[list[str], str | None, str | None]:
+        missing: list[str] = []
+        for dep in [str(d).strip() for d in (deps or []) if str(d).strip()]:
+            dep_row = conn.execute("SELECT state FROM jobs WHERE job_id = ?", (dep,)).fetchone()
+            if dep_row is None:
+                missing.append(dep)
+                continue
+            dep_state = str(dep_row["state"] or "")
+            if dep_state == "done":
+                continue
+            if allow_terminal and dep_state in ("failed", "cancelled"):
+                continue
+            if dep_state == "failed":
+                return ([], "dependency_terminal_failed", dep)
+            if dep_state == "cancelled":
+                return ([], "dependency_terminal_cancelled", dep)
+            if self._dependency_cycle_detected(conn, current_job_id=job_id, dep_job_id=dep):
+                return ([], "dependency_recursive_waiting_deps", dep)
+            missing.append(dep)
+        return (missing, None, None)
+
     def _mark_blocked_approval(self, conn: sqlite3.Connection, *, job_id: str, now: float) -> None:
         row = conn.execute("SELECT stalled_since FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         stalled_since = None
@@ -971,7 +1072,22 @@ class SQLiteTaskStorage:
                 allow_terminal = bool(trace.get("wrapup_for"))
             except Exception:
                 allow_terminal = False
-            if deps and not self._deps_satisfied(conn, deps, allow_terminal=allow_terminal):
+            missing, block_cause, block_dep = self._evaluate_dependency_guard(
+                conn,
+                job_id=jid,
+                deps=deps,
+                allow_terminal=allow_terminal,
+            )
+            if block_cause and block_dep:
+                self._mark_blocked_dependency(
+                    conn,
+                    job_id=jid,
+                    dep_job_id=block_dep,
+                    cause=block_cause,
+                    now=now,
+                )
+                continue
+            if missing:
                 continue
             conn.execute(
                 "UPDATE jobs SET state = ?, updated_at = ?, blocked_reason = NULL, stalled_since = NULL WHERE job_id = ? AND state = 'waiting_deps'",
@@ -1053,6 +1169,10 @@ class SQLiteTaskStorage:
 
                 out: list[Task] = []
                 for row in rows:
+                    latest = conn.execute("SELECT state FROM jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+                    latest_state = str(latest["state"] or "") if latest is not None else ""
+                    if latest_state != "queued":
+                        continue
                     role_name = str(row["role"])
                     if self._is_role_paused(conn, role_name):
                         continue
@@ -1068,15 +1188,25 @@ class SQLiteTaskStorage:
                         allow_terminal = bool(trace.get("wrapup_for"))
                     except Exception:
                         allow_terminal = False
-                    if deps and not self._deps_satisfied(conn, deps, allow_terminal=allow_terminal):
-                        missing: list[str] = []
-                        for dep in deps:
-                            dep_row = conn.execute("SELECT state FROM jobs WHERE job_id = ?", (dep,)).fetchone()
-                            dep_state = str(dep_row["state"] or "") if dep_row is not None else ""
-                            if dep_state != "done" and not (allow_terminal and dep_state in ("failed", "cancelled")):
-                                missing.append(dep)
-                        self._mark_waiting_deps(conn, job_id=str(row["job_id"]), missing_deps=missing, now=now)
-                        continue
+                    if deps:
+                        missing, block_cause, block_dep = self._evaluate_dependency_guard(
+                            conn,
+                            job_id=str(row["job_id"]),
+                            deps=deps,
+                            allow_terminal=allow_terminal,
+                        )
+                        if block_cause and block_dep:
+                            self._mark_blocked_dependency(
+                                conn,
+                                job_id=str(row["job_id"]),
+                                dep_job_id=block_dep,
+                                cause=block_cause,
+                                now=now,
+                            )
+                            continue
+                        if missing:
+                            self._mark_waiting_deps(conn, job_id=str(row["job_id"]), missing_deps=missing, now=now)
+                            continue
 
                     running = self._count_jobs(conn, role=role_name, state="running")
                     max_parallel = max(1, int(max_parallel_by_role.get(role_name, 1)))

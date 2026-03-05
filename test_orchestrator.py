@@ -977,6 +977,141 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             self.assertTrue(str(refreshed.blocked_reason or "").startswith("dependencies_pending"))
             self.assertGreater(float(refreshed.updated_at), now)
 
+    def test_non_wrapup_terminal_dependency_is_blocked_with_structured_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep failed",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="failed",
+                )
+            )
+            blocked = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="blocked by terminal dep",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep],
+            )
+            jid = q.submit_task(blocked)
+            taken = q.take_next()
+            self.assertIsNone(taken)
+            refreshed = q.get_job(jid)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "blocked")
+            reason = str(refreshed.blocked_reason or "")
+            self.assertIn("dependency_guard:cause=dependency_terminal_failed", reason)
+            self.assertIn(f"dep_job_id={dep}", reason)
+
+    def test_recursive_waiting_dependency_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            cyc_id = "cycle-job-1"
+            cyc = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="cycle",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                job_id=cyc_id,
+                depends_on=[cyc_id],
+            )
+            q.submit_task(cyc)
+            taken = q.take_next()
+            self.assertIsNone(taken)
+            refreshed = q.get_job(cyc_id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "blocked")
+            reason = str(refreshed.blocked_reason or "")
+            self.assertIn("dependency_guard:cause=dependency_recursive_waiting_deps", reason)
+            self.assertIn(f"dep_job_id={cyc_id}", reason)
+
+    def test_waiting_deps_reconcile_blocks_when_dependency_becomes_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep running then cancelled",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                )
+            )
+            blocked = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="blocked waiting",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep],
+            )
+            jid = q.submit_task(blocked)
+            first = q.take_next()
+            self.assertIsNone(first)
+            waiting = q.get_job(jid)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting.state, "waiting_deps")
+            self.assertTrue(str(waiting.blocked_reason or "").startswith("dependencies_pending"))
+
+            ok = q.update_state(dep, "cancelled", reason="manual_cancel")
+            self.assertTrue(ok)
+            with storage._conn() as conn:
+                storage._reconcile_waiting_jobs_in_conn(conn, now=_time.time())
+                conn.commit()
+            refreshed = q.get_job(jid)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "blocked")
+            reason = str(refreshed.blocked_reason or "")
+            self.assertIn("dependency_guard:cause=dependency_terminal_cancelled", reason)
+            self.assertIn(f"dep_job_id={dep}", reason)
+
 
 class TestRetryScheduling(unittest.TestCase):
     def test_bump_retry_moves_job_to_queued_and_increments_counter(self) -> None:
