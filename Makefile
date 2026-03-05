@@ -1,17 +1,3 @@
-<<<<<<< HEAD
-.PHONY: verify test lint security coverage delivery-evidence-gate wormhole-trace-export patch-status-reconcile crosslane-validate
-=======
-<<<<<<< HEAD
-.PHONY: verify test lint security coverage backend-provenance-export
-=======
-<<<<<<< HEAD
-.PHONY: verify test lint security coverage validate-s02-trace bundle-s02-atomic
-
-PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null)
-=======
-<<<<<<< HEAD
-.PHONY: verify test lint security coverage wormhole-contract-validate wormhole-contract-export wormhole-contract-integrity-gate publish-atomic-guard publish-postwrite-verify wormhole-contract-publish visual-preview-audit visual-preview-smoke
-=======
 .PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check atomic-root-publish-from-smoke close-time-postfinal-guard close-time-terminal-enforce close-regression-harness
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
@@ -19,18 +5,10 @@ PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>
 ifeq ($(PYTHON),)
 $(error No Python runtime found. Install python3 (preferred) or python)
 endif
->>>>>>> origin/main
->>>>>>> origin/main
->>>>>>> origin/main
->>>>>>> origin/main
 
 verify: lint security test coverage
 
 lint:
-<<<<<<< HEAD
-	@if [ -z "$(PYTHON)" ]; then echo "ERROR: python3/python not found"; exit 127; fi
-=======
->>>>>>> origin/main
 	$(PYTHON) -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
 
 security:
@@ -40,108 +18,6 @@ test:
 	$(PYTHON) -m unittest -q
 
 coverage:
-<<<<<<< HEAD
-	$(PYTHON) tools/coverage_gate.py --min 0.65
-
-validate-s02-trace:
-	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
-	$(PYTHON) tools/s02_trace_checker.py --artifacts-dir "$$ART"
-
-bundle-s02-atomic:
-	@ART=$${ARTIFACTS_DIR:?set ARTIFACTS_DIR}; \
-	$(PYTHON) tools/s02_bundle_atomic.py --artifacts-dir "$$ART"
-=======
-<<<<<<< HEAD
-	python tools/coverage_gate.py --min 0.65
-
-<<<<<<< HEAD
-delivery-evidence-gate:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	python3 tools/delivery_evidence_gate.py --artifacts-dir "$(ARTIFACTS_DIR)" --workspace-dir "."
-
-wormhole-trace-export:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
-	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
-	python3 tools/wormhole_trace_export.py \
-=======
-<<<<<<< HEAD
-backend-provenance-export:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
-	@if [ -z "$(TICKET_ID)" ]; then echo "TICKET_ID is required"; exit 2; fi
-	python3 tools/backend_provenance_export.py \
-		--repo-root "." \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--ticket-id "$(TICKET_ID)" \
-		--expected-branch "$(ORDER_BRANCH)"
-=======
-wormhole-contract-validate:
-	python3 tools/wormhole_scene_contract.py validate --contract docs/contracts/wormhole_scene_contract.v1.json
-
-wormhole-contract-export:
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
-	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
-	python3 tools/wormhole_atomic_packager.py \
-		--repo-root . \
-		--contract docs/contracts/wormhole_scene_contract.v1.json \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--ticket-id "$(TICKET_ID)" \
-		--expected-branch "$(ORDER_BRANCH)"
-
-wormhole-contract-integrity-gate:
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
-	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
-	python3 tools/wormhole_scene_integrity_gate.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--contract-source docs/contracts/wormhole_scene_contract.v1.json \
-		--expected-branch "$(ORDER_BRANCH)" \
-		--expected-ticket-id "$(TICKET_ID)"
-
-publish-atomic-guard:
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	python3 tools/publish_atomic_guard.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--out "$(ARTIFACTS_DIR)/publish_atomic_guard_report.json" \
-		--log "$(ARTIFACTS_DIR)/publish_atomic_guard.log"
-
-publish-postwrite-verify:
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	python3 tools/bundle_postwrite_verify.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--manifest "$(ARTIFACTS_DIR)/bundle_immutability_manifest.json" \
-		--out "$(ARTIFACTS_DIR)/bundle_postwrite_verify_report.json"
-
-wormhole-contract-publish:
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	@test -n "$(ORDER_BRANCH)" || (echo "ORDER_BRANCH is required"; exit 2)
-	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
-	$(MAKE) wormhole-contract-validate
-	$(MAKE) wormhole-contract-export ARTIFACTS_DIR="$(ARTIFACTS_DIR)" ORDER_BRANCH="$(ORDER_BRANCH)" TICKET_ID="$(TICKET_ID)"
-	$(MAKE) wormhole-contract-integrity-gate ARTIFACTS_DIR="$(ARTIFACTS_DIR)" ORDER_BRANCH="$(ORDER_BRANCH)" TICKET_ID="$(TICKET_ID)"
-	$(MAKE) publish-postwrite-verify ARTIFACTS_DIR="$(ARTIFACTS_DIR)"
-
-visual-preview-audit:
-	@test -n "$(PREVIEW_HTML)" || (echo "PREVIEW_HTML is required"; exit 2)
-	@test -n "$(ARTIFACTS_DIR)" || (echo "ARTIFACTS_DIR is required"; exit 2)
-	@test -n "$(TICKET_ID)" || (echo "TICKET_ID is required"; exit 2)
-	python3 tools/visual_preview_audit.py \
-		--preview-html "$(PREVIEW_HTML)" \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--ticket-id "$(TICKET_ID)" \
-		--order-branch "$(ORDER_BRANCH)"
-
-visual-preview-smoke:
-	python3 tools/visual_preview_audit.py \
-		--preview-html tools/fixtures/preview_fixture.html \
-		--artifacts-dir .codexbot_tmp/visual-preview-smoke \
-		--ticket-id local-smoke \
-		--order-branch sre_visual_pipeline \
-		--capture-mode synthetic \
-		--force-capture
-=======
 	$(PYTHON) tools/coverage_gate.py --min 0.65
 
 backend-traceability-runtime-export:
@@ -150,28 +26,10 @@ backend-traceability-runtime-export:
 	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
 	@if [ -z "$(FRONTEND_JOB_ID)" ]; then echo "FRONTEND_JOB_ID is required"; exit 2; fi
 	@$(PYTHON) tools/backend_traceability_runtime_export.py \
->>>>>>> origin/main
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--ticket-id "$(TICKET_ID)" \
 		--expected-branch "$(ORDER_BRANCH)" \
-<<<<<<< HEAD
-		--reported-branch-mode "expected"
-
-patch-status-reconcile:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	python3 tools/patch_status_reconciler.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--out "$(ARTIFACTS_DIR)/patch_status_reconciler_report.json"
-
-crosslane-validate:
-	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
-	@if [ -z "$(ORDER_BRANCH)" ]; then echo "ORDER_BRANCH is required"; exit 2; fi
-	python3 tools/crosslane_traceability_validator.py \
-		--artifacts-dir "$(ARTIFACTS_DIR)" \
-		--expected-branch "$(ORDER_BRANCH)" \
-		--out "$(ARTIFACTS_DIR)/crosslane_validator_report.json"
-=======
 		--frontend-job-id "$(FRONTEND_JOB_ID)" \
 		--target-artifact-dir "$(TARGET_ARTIFACT_DIR)"
 
@@ -226,7 +84,3 @@ close-regression-harness:
 		--repo-root "." \
 		--artifacts-dir "$(ARTIFACTS_DIR)" \
 		--probe-interval-seconds "$${SLEEP_SECONDS:-0.2}"
->>>>>>> origin/main
->>>>>>> origin/main
->>>>>>> origin/main
->>>>>>> origin/main
