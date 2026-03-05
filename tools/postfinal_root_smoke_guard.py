@@ -36,7 +36,19 @@ def compare(root_dir: Path, smoke_dir: Path, files: list[str]) -> tuple[list[dic
         s = stat_meta(smoke_dir / rel)
         root_snap[rel] = r
         smoke_snap[rel] = s
-        if r != s:
+        # Contractual equivalence between root and smoke_stable is based on content/existence,
+        # not mtime parity (copy operations naturally produce different mtimes).
+        root_contract = {
+            "exists": r.get("exists", False),
+            "size_bytes": int(r.get("size_bytes", 0)),
+            "sha256": r.get("sha256", ""),
+        }
+        smoke_contract = {
+            "exists": s.get("exists", False),
+            "size_bytes": int(s.get("size_bytes", 0)),
+            "sha256": s.get("sha256", ""),
+        }
+        if root_contract != smoke_contract:
             mismatches.append({"file": rel, "root": r, "smoke_stable": s})
     return mismatches, root_snap, smoke_snap
 
