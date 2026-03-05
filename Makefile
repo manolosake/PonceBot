@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check close-time-postfinal-guard
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check close-time-postfinal-guard close-time-terminal-enforce
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -54,3 +54,13 @@ close-time-postfinal-guard:
 		--summary "$(ARTIFACTS_DIR)/sre_close_summary.json" \
 		--report "$(ARTIFACTS_DIR)/postfinal_close_guard_report.json" \
 		--sleep-seconds "$${SLEEP_SECONDS:-1.5}"
+
+close-time-terminal-enforce:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@$(MAKE) close-time-postfinal-guard ARTIFACTS_DIR="$(ARTIFACTS_DIR)" SLEEP_SECONDS="$${SLEEP_SECONDS:-1.5}"
+	@$(PYTHON) tools/terminal_live_probe.py \
+		--root-dir "$(ARTIFACTS_DIR)" \
+		--files "changes.patch,git_status.txt" \
+		--samples "$${PROBE_SAMPLES:-2}" \
+		--interval-seconds "$${PROBE_INTERVAL_SECONDS:-0.8}" \
+		--report "$(ARTIFACTS_DIR)/terminal_live_probe_report.json"
