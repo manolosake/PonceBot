@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage backend-traceability-runtime-export
+.PHONY: verify test lint security coverage backend-traceability-runtime-export manifest-drift-check
 
 PYTHON := $(strip $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null))
 
@@ -32,3 +32,14 @@ backend-traceability-runtime-export:
 		--expected-branch "$(ORDER_BRANCH)" \
 		--frontend-job-id "$(FRONTEND_JOB_ID)" \
 		--target-artifact-dir "$(TARGET_ARTIFACT_DIR)"
+
+manifest-drift-check:
+	@if [ -z "$(ARTIFACTS_DIR)" ]; then echo "ARTIFACTS_DIR is required"; exit 2; fi
+	@if [ -z "$(CRITICAL_FILES)" ]; then echo "CRITICAL_FILES is required (comma-separated)"; exit 2; fi
+	@$(PYTHON) tools/manifest_drift_checker.py \
+		--artifacts-dir "$(ARTIFACTS_DIR)" \
+		--critical-files "$(CRITICAL_FILES)" \
+		--sleep-seconds "$${SLEEP_SECONDS:-2}" \
+		--manifest-t0 "$(ARTIFACTS_DIR)/bundle_manifest_t0.json" \
+		--manifest-tn "$(ARTIFACTS_DIR)/bundle_manifest_t_plus_n.json" \
+		--report "$(ARTIFACTS_DIR)/manifest_drift_report.json"
