@@ -60,6 +60,37 @@ class TestStatusHTTP(unittest.TestCase):
 
             http_srv.shutdown()
 
+    def test_snapshot_supports_legacy_query_token_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend"}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend"}}, cache_ttl_seconds=0)
+
+            http_srv = start_status_http_server(
+                host="127.0.0.1",
+                port=0,
+                status_service=svc,
+                stream_interval_s=0.5,
+                auth_token="secret",
+                allow_query_token=True,
+                snapshot_rate_per_s=0.0,
+                snapshot_burst=1.0,
+                max_sse_per_ip=2,
+            )
+            t = threading.Thread(target=http_srv.serve_forever, daemon=True)
+            t.start()
+            time.sleep(0.05)
+
+            base = f"http://{http_srv.host}:{http_srv.port}"
+            url = base + "/api/v1/status/snapshot?token=secret"
+
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload.get("api_version"), "v1")
+
+            http_srv.shutdown()
+
     def test_cors_allowlist_enforced(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

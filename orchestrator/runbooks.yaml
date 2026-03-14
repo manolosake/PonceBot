@@ -12,7 +12,7 @@
   interval_seconds: 900
   mode_hint: ro
   priority: 2
-  enabled: true
+  enabled: false
   prompt: |
     Check host + bot service health.
     Report only actionable findings (impact, next action, ETA).
@@ -23,7 +23,7 @@
   interval_seconds: 21600
   mode_hint: rw
   priority: 3
-  enabled: true
+  enabled: false
   prompt: |
     Run smoke tests for this repo:
     - python3 -m unittest -q
@@ -46,7 +46,7 @@
   interval_seconds: 3600
   mode_hint: ro
   priority: 3
-  enabled: true
+  enabled: false
   prompt: |
     Perform repository/runtime hygiene checks:
     - identify stale blocked jobs and recommend cleanup

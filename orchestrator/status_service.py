@@ -24,6 +24,9 @@ def _max_parallel_by_role(role_profiles: dict[str, dict[str, Any]] | None) -> di
         "security": 1,
         "research": 1,
         "release_mgr": 1,
+        "architect_local": 1,
+        "implementer_local": 1,
+        "reviewer_local": 1,
     }
     for key, cfg in (role_profiles or {}).items():
         if not isinstance(cfg, dict):

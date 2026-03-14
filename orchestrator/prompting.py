@@ -56,7 +56,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
             '  "subtasks": [\n'
             "    {\n"
             '      "key": "short_unique_id",\n'
-            '      "role": "frontend|backend|qa|sre|product_ops|security|research|release_mgr|jarvis",\n'
+            '      "role": "frontend|backend|qa|sre|product_ops|security|research|release_mgr|architect_local|implementer_local|reviewer_local|jarvis",\n'
             '      "text": "task instruction",\n'
             '      "mode_hint": "ro|rw|full (optional; omit to use role defaults)",\n'
             '      "priority": 1,\n'
@@ -112,6 +112,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
         + "- Keep the JSON valid (double quotes, no trailing commas).\n"
         + "- If you cannot do something safely, explain and set next_action.\n"
         + "- If you delegate subtasks, include acceptance_criteria + definition_of_done + eta_minutes + sla_tier for each subtask.\n"
+        + "- For non-trivial project work, include local specialist subtasks (architect_local + implementer_local + reviewer_local) unless it is a tiny one-shot fix.\n"
         + android_guardrails
         + "- FRONTEND ONLY: visual evidence is mandatory before completion.\n"
         + "  Create `.codexbot_preview/preview.html` in the workspace so the bot can capture it.\n"

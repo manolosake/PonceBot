@@ -1,8 +1,11 @@
 from __future__ import annotations
+import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import bot
 from orchestrator.agents import load_agent_profiles
@@ -86,9 +89,17 @@ class TestOrchestratorCommands(unittest.TestCase):
             resp_pause, _ = bot._parse_job(cfg, msg_pause)
             self.assertEqual(resp_pause, "__orch_pause:backend")
 
+            msg_pause_autonomy = bot.IncomingMessage(21, 1, 2, 31, "u", "/pause_autonomy")
+            resp_pause_autonomy, _ = bot._parse_job(cfg, msg_pause_autonomy)
+            self.assertEqual(resp_pause_autonomy, "__orch_pause_autonomy__")
+
             msg_resume = bot.IncomingMessage(3, 1, 2, 12, "u", "/resume backend")
             resp_resume, _ = bot._parse_job(cfg, msg_resume)
             self.assertEqual(resp_resume, "__orch_resume:backend")
+
+            msg_resume_autonomy = bot.IncomingMessage(22, 1, 2, 32, "u", "/resume_autonomy")
+            resp_resume_autonomy, _ = bot._parse_job(cfg, msg_resume_autonomy)
+            self.assertEqual(resp_resume_autonomy, "__orch_resume_autonomy__")
 
             msg_cancel = bot.IncomingMessage(4, 1, 2, 13, "u", "/cancel 8f9c")
             resp_cancel, _ = bot._parse_job(cfg, msg_cancel)
@@ -178,6 +189,9 @@ class TestCeoIntentDetection(unittest.TestCase):
             detect_ceo_intent("ajusta eso por favor", reply_context={"reply_to_message_id": 123}),
             "order_project_change",
         )
+
+    def test_stop_all_prompt_maps_to_control_stop_all(self) -> None:
+        self.assertEqual(detect_ceo_intent("paren todo ahora mismo"), "control_stop_all")
 
 
 class TestDelegationParsing(unittest.TestCase):
@@ -304,6 +318,92 @@ class TestOrchestratorMarkerResponse(unittest.TestCase):
             self.assertTrue(handled)
             self.assertEqual(len(api.messages), 1)
             self.assertIn("Rol invalido", api.messages[0][1])
+
+    def test_pause_autonomy_cancels_autonomous_lane_and_sets_manual_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _cfg(Path(td) / "state.json")
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"implementer_local": {"role": "implementer_local"}})  # type: ignore[arg-type]
+
+            root_auto = Task.new(
+                source="telegram",
+                role="skynet",
+                input_text="auto lane",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                is_autonomous=True,
+            ).with_updates(job_id="1" * 36)
+            child_auto = Task.new(
+                source="telegram",
+                role="implementer_local",
+                input_text="local child",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                parent_job_id="1" * 36,
+            ).with_updates(job_id="2" * 36)
+            manual_root = Task.new(
+                source="telegram",
+                role="jarvis",
+                input_text="manual lane",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                is_autonomous=False,
+            ).with_updates(job_id="3" * 36)
+
+            storage.submit_task(root_auto)
+            storage.submit_task(child_auto)
+            storage.submit_task(manual_root)
+
+            class API:
+                def __init__(self) -> None:
+                    self.messages: list[tuple[int, str]] = []
+
+                def send_message(
+                    self, chat_id: int, text: str, *, reply_to_message_id: int | None = None
+                ) -> None:
+                    self.messages.append((chat_id, text))
+
+            api = API()
+            handled = bot._send_orchestrator_marker_response(
+                kind="pause_autonomy",
+                payload="",
+                cfg=cfg,
+                api=api,  # type: ignore[arg-type]
+                chat_id=1,
+                user_id=2,
+                reply_to_message_id=None,
+                orch_q=q,
+                profiles={"implementer_local": {"role": "implementer_local"}},
+            )
+            self.assertTrue(handled)
+            self.assertEqual(storage.get_job("1" * 36).state, "cancelled")
+            self.assertEqual(storage.get_job("2" * 36).state, "cancelled")
+            self.assertEqual(storage.get_job("3" * 36).state, "queued")
+            state = bot._proactive_lane_state(cfg)
+            self.assertTrue(bool(state.get("paused", False)))
+            self.assertTrue(bool(state.get("manual_pause", False)))
+            self.assertIn("Autonomia pausada", api.messages[0][1])
 
 
 class DummyExecutor:
@@ -736,6 +836,95 @@ class TestOrchestratorStorage(unittest.TestCase):
             self.assertEqual(str(got.get("phase")), "done")
             self.assertEqual(str(got.get("status")), "done")
 
+    def test_sync_order_phase_closes_proactive_order_on_blocked_with_root_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-proactive-blocked-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="impl",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="failed",
+                    job_id="job-impl-failed",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="final sweep",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    trace={
+                        "result_summary": (
+                            "NO-GO to remain active. "
+                            "Close this order as BLOCKED_WITH_ROOT_CAUSE because repeated local retries produced no validated improvement."
+                        )
+                    },
+                    labels={"ticket": order_id, "kind": "final_sweep"},
+                    job_id="job-skynet-final",
+                )
+            )
+
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "done")
+            self.assertEqual(str(got.get("status")), "done")
+
+            root = q.get_job(order_id)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("proactive_blocked_with_root_cause", False)))
+
     def test_set_order_phase_accepts_ready_for_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -811,6 +1000,124 @@ class TestOrderBranchPolicy(unittest.TestCase):
                 bot._resolve_order_branch_from_task(child, q),
                 "feature/order-ord-bran-root",
             )
+
+
+class TestRunningWatchdog(unittest.TestCase):
+    def test_requeues_silent_local_ollama_before_full_runtime_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+
+            job_id = "job-local-silent"
+            artifacts_dir = td_path / "artifacts" / job_id
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            live_md = artifacts_dir / "local_ollama_live.md"
+            live_stream = artifacts_dir / "local_ollama_stream.jsonl"
+            live_md.write_text("", encoding="utf-8")
+            live_stream.write_text("", encoding="utf-8")
+
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="silent local run",
+                    request_type="task",
+                    priority=1,
+                    model="qwen3.5:27b",
+                    effort="high",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                    artifacts_dir=str(artifacts_dir),
+                    trace={
+                        "live_phase": "local_ollama",
+                        "live_stdout_path": str(live_md),
+                        "live_stderr_path": str(live_stream),
+                        "max_runtime_seconds": 1800,
+                    },
+                    job_id=job_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 250.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), job_id),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS": "180"}, clear=False):
+                recovered = bot._running_watchdog_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(recovered, 1)
+            job = q.get_job(job_id)
+            assert job is not None
+            self.assertEqual(job.state, "queued")
+            self.assertIn("no local Ollama output", str((job.trace or {}).get("result_summary") or ""))
+            self.assertTrue(bool((job.trace or {}).get("running_watchdog_silent_local", False)))
+
+    def test_does_not_requeue_local_ollama_when_output_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+
+            job_id = "job-local-active"
+            artifacts_dir = td_path / "artifacts" / job_id
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            live_md = artifacts_dir / "local_ollama_live.md"
+            live_stream = artifacts_dir / "local_ollama_stream.jsonl"
+            live_md.write_text("partial output", encoding="utf-8")
+            live_stream.write_text("", encoding="utf-8")
+
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="active local run",
+                    request_type="task",
+                    priority=1,
+                    model="qwen3.5:27b",
+                    effort="high",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                    artifacts_dir=str(artifacts_dir),
+                    trace={
+                        "live_phase": "local_ollama",
+                        "live_stdout_path": str(live_md),
+                        "live_stderr_path": str(live_stream),
+                        "max_runtime_seconds": 1800,
+                    },
+                    job_id=job_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 250.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), job_id),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS": "180"}, clear=False):
+                recovered = bot._running_watchdog_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(recovered, 0)
+            job = q.get_job(job_id)
+            assert job is not None
+            self.assertEqual(job.state, "running")
 
 
 class TestYamlLikeParsing(unittest.TestCase):
@@ -1182,6 +1489,102 @@ class TestCeoOrders(unittest.TestCase):
             self.assertIn(pid, done_ids)
 
 
+class TestStopAllGlobal(unittest.TestCase):
+    def test_stop_all_global_cancels_jobs_closes_orders_projects_and_clears_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            st = SQLiteTaskStorage(db)
+            q = OrchestratorQueue(storage=st, role_profiles=None)
+
+            base = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="work item",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+            )
+            tasks = [
+                base.with_updates(job_id="a" * 36, state="queued", input_text="queued work"),
+                base.with_updates(job_id="b" * 36, state="running", input_text="running work"),
+                base.with_updates(job_id="c" * 36, state="blocked", input_text="blocked work"),
+                base.with_updates(job_id="d" * 36, state="waiting_deps", input_text="waiting work"),
+                base.with_updates(job_id="e" * 36, state="blocked_approval", input_text="approval work"),
+                base.with_updates(job_id="f" * 36, state="done", input_text="done work"),
+            ]
+            for task in tasks:
+                st.submit_task(task)
+
+            st.upsert_project(project_id="proj-stop", name="Stop project", path="/tmp/stop", status="active", created_by="ceo")
+            st.upsert_order(
+                order_id="11111111-1111-1111-1111-111111111111",
+                chat_id=1,
+                title="Stop order",
+                body="cancel everything",
+                status="active",
+                priority=1,
+                project_id="proj-stop",
+            )
+
+            slot = q.lease_workspace(role="backend", job_id="b" * 36, slots=1)
+            self.assertIsNotNone(slot)
+            self.assertIsNotNone(q.get_workspace_lease(job_id="b" * 36))
+
+            out = q.stop_all_global(
+                reason="ceo_stop_all",
+                actor="jarvis",
+                chat_id=None,
+                close_orders=True,
+                close_projects=True,
+                clear_workspace_leases=True,
+            )
+
+            self.assertEqual(out["jobs_cancelled"], 5)
+            self.assertEqual(out["orders_done"], 1)
+            self.assertEqual(out["projects_done"], 1)
+            self.assertEqual(out["workspace_leases_cleared"], 1)
+
+            for job_id in ("a" * 36, "b" * 36, "c" * 36, "d" * 36, "e" * 36):
+                job = st.get_job(job_id)
+                self.assertIsNotNone(job)
+                assert job is not None
+                self.assertEqual(job.state, "cancelled")
+            done_job = st.get_job("f" * 36)
+            self.assertIsNotNone(done_job)
+            assert done_job is not None
+            self.assertEqual(done_job.state, "done")
+
+            order = st.get_order("11111111", chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order["status"]), "done")
+            self.assertEqual(str(order["phase"]), "done")
+
+            done_projects = {str(p["project_id"]) for p in st.list_projects(status="done", limit=20)}
+            self.assertIn("proj-stop", done_projects)
+            self.assertIsNone(q.get_workspace_lease(job_id="b" * 36))
+
+            with st._conn() as conn:
+                row = conn.execute(
+                    "SELECT event_type, actor, details FROM audit_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(str(row["event_type"]), "stop_all_global")
+            self.assertEqual(str(row["actor"]), "jarvis")
+            details = json.loads(str(row["details"] or "{}"))
+            self.assertEqual(int(details.get("jobs_cancelled") or 0), 5)
+            self.assertEqual(int(details.get("orders_done") or 0), 1)
+            self.assertEqual(int(details.get("projects_done") or 0), 1)
+            self.assertEqual(int(details.get("workspace_leases_cleared") or 0), 1)
+
+
 class TestBulkCancel(unittest.TestCase):
     def test_cancel_by_states_keeps_running(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1223,3 +1626,34 @@ class TestBulkCancel(unittest.TestCase):
             self.assertEqual(got_b.state, "cancelled")
             self.assertEqual(got_r.state, "running")
             self.assertEqual(got_d.state, "done")
+
+
+
+class TestTraceEvents(unittest.TestCase):
+    def test_append_and_list_trace_events(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage)
+            eid = q.append_trace_event(
+                order_id="ord-1",
+                job_id="job-1",
+                agent_role="backend",
+                event_type="job.running",
+                severity="info",
+                message="job running",
+                payload={"phase": "exec"},
+            )
+            rows = q.list_trace_events(order_id="ord-1", limit=20)
+            self.assertTrue(rows)
+            self.assertEqual(rows[0]["id"], eid)
+            self.assertEqual(rows[0]["event_type"], "job.running")
+
+    def test_trace_noise_summary_counts_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage)
+            q.append_trace_event(order_id="ord-1", job_id="job-1", agent_role="backend", event_type="job.state", severity="info", message="same")
+            q.append_trace_event(order_id="ord-1", job_id="job-1", agent_role="backend", event_type="job.state", severity="info", message="same")
+            summary = q.trace_noise_summary(window_seconds=3600)
+            self.assertGreaterEqual(int(summary.get("total_events") or 0), 2)
+            self.assertGreaterEqual(int(summary.get("duplicate_events") or 0), 1)

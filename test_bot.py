@@ -96,6 +96,37 @@ class TestStateHandling(unittest.TestCase):
             self.assertEqual(saved["openai_model"], "gpt-4.1")
             self.assertEqual(saved["oss_model"], "qwen2.5-coder:7b")
 
+    def test_manual_proactive_pause_does_not_auto_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._set_proactive_lane_pause(
+                cfg,
+                paused=True,
+                reason="manual_pause_command",
+                manual=True,
+            )
+            resumed = bot._maybe_resume_proactive_lane_for_manual_ceo_request(cfg)
+            self.assertFalse(resumed)
+            state = bot._proactive_lane_state(cfg)
+            self.assertTrue(bool(state.get("paused", False)))
+            self.assertTrue(bool(state.get("manual_pause", False)))
+            self.assertEqual(str(state.get("reason") or ""), "manual_pause_command")
+
+    def test_stop_all_proactive_pause_can_auto_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._set_proactive_lane_pause(
+                cfg,
+                paused=True,
+                reason="ceo_stop_all",
+                manual=False,
+            )
+            resumed = bot._maybe_resume_proactive_lane_for_manual_ceo_request(cfg)
+            self.assertTrue(resumed)
+            state = bot._proactive_lane_state(cfg)
+            self.assertFalse(bool(state.get("paused", False)))
+            self.assertFalse(bool(state.get("manual_pause", False)))
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
@@ -722,7 +753,8 @@ class TestJarvisFirstRouting(unittest.TestCase):
             resp, job = bot._parse_job(cfg, msg)
             self.assertIsNone(job)
             self.assertIn("Dos opciones:", resp)
-            self.assertIn("Default (current)", resp)
+            self.assertIn("Default (selected)", resp)
+            self.assertIn("selected_access_mode: default", resp)
 
     def test_permissions_set_full_persists(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -730,7 +762,8 @@ class TestJarvisFirstRouting(unittest.TestCase):
             cfg = self._cfg(state_file)
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/permissions full")
             resp, job = bot._parse_job(cfg, msg)
-            self.assertEqual(resp, "OK. permissions=full")
+            self.assertIn("access_mode_selected=full", resp)
+            self.assertIn("dangerous_bypass=inactive", resp)
             self.assertIsNone(job)
             saved = json.loads(state_file.read_text())
             self.assertEqual(saved["access_mode_by_chat"]["1"], "full")
@@ -740,6 +773,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             self.assertIsNone(job2)
             self.assertIn("Breakglass", resp2)
             self.assertIn("status: inactive", resp2)
+            self.assertIn("selected_access_mode: full", resp2)
 
 
 class TestTelegramUploads(unittest.TestCase):
@@ -1056,7 +1090,7 @@ class TestHardeningControls(unittest.TestCase):
             self.assertIsNone(job)
             self.assertIn("No permitido", resp)
 
-    def test_breakglass_enables_dangerous_bypass_temporarily(self) -> None:
+    def test_breakglass_enables_dangerous_bypass_only_while_active(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
             cfg = bot.BotConfig(
@@ -1088,6 +1122,59 @@ class TestHardeningControls(unittest.TestCase):
             exp = float(raw.get("expires_at") or 0.0)
             with patch("bot.time.time", return_value=exp + 1.0):
                 self.assertFalse(bot._effective_bypass_sandbox(cfg, chat_id=1))
+
+    def test_permissions_full_ack_reports_selected_mode_and_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/permissions full",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("access_mode_selected=full", resp)
+            self.assertIn("dangerous_bypass=inactive", resp)
+            self.assertIn("breakglass=inactive", resp)
+
+    def test_botpermissions_shows_selected_mode_separately_from_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._set_access_mode(cfg, "full", chat_id=1)
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/botpermissions",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("access_mode_selected: full", resp)
+            self.assertIn("dangerous_bypass: inactive", resp)
+            self.assertIn("breakglass: inactive", resp)
+            self.assertIn("note: full selected, but dangerous bypass is OFF until breakglass is active", resp)
+
+    def test_breakglass_status_shows_selected_mode_and_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._set_access_mode(cfg, "full", chat_id=1)
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/breakglass",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("access_mode_selected: full", resp)
+            self.assertIn("dangerous_bypass: inactive", resp)
 
     def test_auth_touch_session_extends_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1138,6 +1225,283 @@ class TestHardeningControls(unittest.TestCase):
             self.assertEqual(api.messages, [])
 
 
+    def test_notify_policy_command_sets_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=1,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/notify policy critical",
+            )
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertIsNone(job)
+            self.assertIn("notify policy", resp.lower())
+            self.assertEqual(bot._effective_notify_scope(cfg, chat_id=1), "critical")
+
+    def test_notify_dedupe_suppresses_duplicate_worker_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(
+                **{
+                    **cfg.__dict__,
+                    "orchestrator_notify_mode": "minimal",
+                    "notify_scope": "state_change",
+                    "notify_dedupe_cooldown_seconds": 3600,
+                    "notify_child_worker_completions": True,
+                }
+            )
+            api = _FakeAPI()
+            task = SimpleNamespace(
+                labels={"ticket": "abcd1234"},
+                trace={},
+                role="backend",
+                parent_job_id="abcd1234",
+                is_autonomous=False,
+                job_id="12345678-1234-1234-1234-123456789012",
+                chat_id=1,
+                reply_to_message_id=None,
+            )
+            result = {
+                "status": "ok",
+                "summary": "Service deployed",
+                "logs": "",
+                "next_action": None,
+                "artifacts": [],
+            }
+            bot._send_orchestrator_result(api, task, result, cfg=cfg)
+            bot._send_orchestrator_result(api, task, result, cfg=cfg)
+            self.assertEqual(len(api.messages), 1)
+
+
+class TestLocalSpecialistDelegation(unittest.TestCase):
+    def test_inject_local_specialists_skips_manual_ceo_work_by_default(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        out = bot._inject_local_specialist_specs(
+            specs=specs,
+            root_ticket="ticket-123",
+            existing_keys=set(),
+            request_type="task",
+            is_top_level_manual=True,
+            proactive_lane=False,
+            allow_delegation=False,
+        )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_respects_disable_flag(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            )
+        ]
+        with patch.dict(os.environ, {"BOT_LOCAL_SPECIALISTS_ENFORCE": "0"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-123",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=True,
+                proactive_lane=False,
+                allow_delegation=False,
+            )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        out = bot._inject_local_specialist_specs(
+            specs=specs,
+            root_ticket="ticket-123",
+            existing_keys=set(),
+            request_type="task",
+            is_top_level_manual=False,
+            proactive_lane=True,
+            allow_delegation=False,
+        )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertIn("architect_local", roles)
+        self.assertIn("implementer_local", roles)
+        self.assertIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_manual_override_enables_all_three_roles(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        with patch.dict(os.environ, {"BOT_CEO_INJECT_LOCAL_SPECIALISTS": "1"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-123",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=True,
+                proactive_lane=False,
+                allow_delegation=False,
+            )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertIn("architect_local", roles)
+        self.assertIn("implementer_local", roles)
+        self.assertIn("reviewer_local", roles)
+
+    def test_normalize_contract_forces_local_roles_read_only(self) -> None:
+        spec = bot.TaskSpec(
+            key="local_impl",
+            role="implementer_local",
+            text="Draft implementation strategy.",
+            mode_hint="rw",
+            priority=2,
+            requires_approval=True,
+            acceptance_criteria=["Produce ordered steps"],
+            definition_of_done=["Plan published"],
+            eta_minutes=30,
+            sla_tier="high",
+        )
+        normalized = bot._normalize_task_spec_contract(spec, root_ticket="ticket-123")
+        self.assertEqual(normalized.mode_hint, "ro")
+        self.assertFalse(normalized.requires_approval)
+
+
+class TestImplementerFailureSelection(unittest.TestCase):
+    def test_implementer_failure_actionable_signal_detects_py_compile_syntax_error(self) -> None:
+        summary = (
+            "FAILED_VALIDATION_OUTPUT:\n"
+            "$ python3 -m py_compile tools/visual_preview_audit.py\n"
+            'File "tools/visual_preview_audit.py", line 281\n'
+            "    {\n"
+            "    ^^\n"
+            "SyntaxError: did you forget parentheses around the comprehension target?\n"
+        )
+        self.assertTrue(bot._implementer_failure_summary_has_actionable_signal(summary))
+
+    def test_implementer_failure_actionable_signal_rejects_generic_blocker_wrapped_as_validation(self) -> None:
+        summary = (
+            "FAILED_VALIDATION_OUTPUT:\n"
+            "Local Ollama execution failed for role=implementer_local model=qwen3.5:27b: "
+            "implementer_local blocker: The request mandates editing `tools/visual_preview_audit.py` "
+            "but provides no specific failing test output or description of broken behavior.\n"
+        )
+        self.assertFalse(bot._implementer_failure_summary_has_actionable_signal(summary))
+
+    def test_implementer_failure_actionable_signal_rejects_missing_failure_scenario_blocker(self) -> None:
+        summary = (
+            "BLOCKER: The request mandates editing `tools/visual_preview_audit.py` but provides no concrete "
+            "failing test output, error message, or description of the missing/broken functionality. "
+            "Without a concrete failure scenario, I cannot safely generate a targeted fix.\n\n"
+            "FAILED_VALIDATION_OUTPUT:\n"
+            "Local Ollama execution failed for role=implementer_local model=qwen3.5:27b: "
+            "implementer_local blocker: same generic request for more context.\n\n"
+            "To proceed, please provide:\n"
+            "1. The specific test name or path that is failing.\n"
+            "2. The exact error message or traceback from the failure.\n"
+            "3. A description of the expected vs. actual behavior.\n"
+        )
+        self.assertFalse(bot._implementer_failure_summary_has_actionable_signal(summary))
+
+    def test_select_preferred_implementer_failure_prefers_actionable_terminal(self) -> None:
+        generic_blocker = (
+            "BLOCKER: please provide failing test output for tools/visual_preview_audit.py",
+            "job-newer",
+            "slice-newer",
+            2,
+            "blocked",
+            200.0,
+        )
+        actionable_terminal = (
+            "FAILED_VALIDATION_OUTPUT:\n"
+            "$ python3 -m py_compile tools/visual_preview_audit.py\n"
+            'File "tools/visual_preview_audit.py", line 281\n'
+            "SyntaxError: did you forget parentheses around the comprehension target?\n",
+            "job-older",
+            "slice-older",
+            1,
+            "terminal",
+            100.0,
+        )
+        chosen = bot._select_preferred_implementer_failure([generic_blocker, actionable_terminal])
+        self.assertIsNotNone(chosen)
+        assert chosen is not None
+        self.assertEqual(chosen[1], "job-older")
+
+    def test_ignore_cancelled_local_failure_when_summary_is_benign(self) -> None:
+        self.assertTrue(
+            bot._should_ignore_cancelled_local_failure(
+                state_norm="cancelled",
+                failure_class="retriable",
+                attempt_n=7,
+                summary="cancelled",
+            )
+        )
+        self.assertTrue(
+            bot._should_ignore_cancelled_local_failure(
+                state_norm="cancelled",
+                failure_class="retriable",
+                attempt_n=3,
+                summary="",
+            )
+        )
+        self.assertFalse(
+            bot._should_ignore_cancelled_local_failure(
+                state_norm="cancelled",
+                failure_class="terminal",
+                attempt_n=3,
+                summary="FAILED_VALIDATION_OUTPUT: SyntaxError in tools/visual_preview_audit.py",
+            )
+        )
+
+
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
         out = bot._normalize_tts_speak_text("Jarvis: merge completed", backend="piper")
@@ -1148,4 +1512,3 @@ class TestVoiceNormalization(unittest.TestCase):
         out = bot._normalize_tts_speak_text("rebase y merge en branch main", backend="piper")
         self.assertIn("rei beis", out.lower())
         self.assertIn("merch", out.lower())
-

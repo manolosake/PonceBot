@@ -35,6 +35,8 @@ def main() -> int:
     status_http_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
     if status_http_enabled and not status_http_token:
         findings.append("BOT_STATUS_HTTP_ENABLED=1 requires BOT_STATUS_HTTP_TOKEN")
+    if _is_true("BOT_STATUS_HTTP_LEGACY_AUTH"):
+        warnings.append("BOT_STATUS_HTTP_LEGACY_AUTH=1 enables deprecated query token auth")
 
     origins = _split_csv("BOT_STATUS_HTTP_ALLOWED_ORIGINS")
     if "*" in origins:

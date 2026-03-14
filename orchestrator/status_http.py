@@ -56,6 +56,13 @@ def _extract_bearer_token(handler: BaseHTTPRequestHandler) -> str:
     return ""
 
 
+def _extract_query_token(qs: dict[str, list[str]]) -> str:
+    vals = qs.get("token") or []
+    if not vals:
+        return ""
+    return str(vals[0] or "").strip()
+
+
 class _TokenBucket:
     def __init__(self, *, rate_per_s: float, burst: float) -> None:
         self.rate_per_s = max(0.0, float(rate_per_s))
@@ -87,6 +94,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         stream_interval_s: float,
         auth_token: str,
         allowed_origins: list[str] | None,
+        allow_query_token: bool,
         snapshot_rate_per_s: float,
         snapshot_burst: float,
         max_sse_per_ip: int,
@@ -96,6 +104,7 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         self.stream_interval_s = max(0.25, float(stream_interval_s))
         self.auth_token = (auth_token or "").strip()
         self.allowed_origins = tuple(sorted({str(o).strip() for o in (allowed_origins or []) if str(o).strip()}))
+        self.allow_query_token = bool(allow_query_token)
 
         self._rl_lock = threading.Lock()
         self._snap_buckets: dict[str, _TokenBucket] = {}
@@ -207,6 +216,8 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         # Token auth is mandatory when configured (Bearer header only).
         if self.server.auth_token:
             tok = _extract_bearer_token(self)
+            if (not tok) and bool(getattr(self.server, "allow_query_token", False)):
+                tok = _extract_query_token(qs)
             if not tok or tok != self.server.auth_token:
                 self._send_json(401, {"error": "unauthorized"})
                 return
@@ -471,6 +482,7 @@ def start_status_http_server(
     stream_interval_s: float = 1.0,
     auth_token: str = "",
     allowed_origins: list[str] | None = None,
+    allow_query_token: bool = False,
     snapshot_rate_per_s: float = 2.0,
     snapshot_burst: float = 4.0,
     max_sse_per_ip: int = 2,
@@ -482,6 +494,7 @@ def start_status_http_server(
         stream_interval_s=stream_interval_s,
         auth_token=auth_token,
         allowed_origins=allowed_origins,
+        allow_query_token=allow_query_token,
         snapshot_rate_per_s=snapshot_rate_per_s,
         snapshot_burst=snapshot_burst,
         max_sse_per_ip=max_sse_per_ip,

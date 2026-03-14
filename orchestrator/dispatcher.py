@@ -114,10 +114,37 @@ _ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
         "changelog",
         "version",
     ),
+    "architect_local": (
+        "architect",
+        "arquitect",
+        "design review",
+        "tradeoff",
+        "decision",
+        "sistema",
+        "arquitectura",
+    ),
+    "implementer_local": (
+        "implement",
+        "resolver",
+        "fix",
+        "patch",
+        "code",
+        "codificar",
+        "write",
+    ),
+    "reviewer_local": (
+        "reviewer",
+        "peer review",
+        "auditor",
+        "critique",
+        "validate",
+        "verifica",
+        "quality",
+    ),
 }
 
 _REQUEST_TYPES = {"status", "query", "review", "maintenance", "task"}
-_INTENT_TYPES = {"query", "order_project_new", "order_project_change"}
+_INTENT_TYPES = {"query", "order_project_new", "order_project_change", "control_stop_all"}
 
 _TOKEN_RE = re.compile(r"[\w]+", flags=re.UNICODE)
 _TASK_VERB_RE = re.compile(
@@ -168,7 +195,7 @@ def _explicit_role(text_l: str) -> str | None:
     if "@jarvis" in tl or "@orchestrator" in tl or "@ceo" in tl:
         return "jarvis"
 
-    for role in ("frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
+    for role in ("frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local"):
         marker = f"@{role}"
         if marker in tl:
             return role
@@ -305,11 +332,31 @@ def detect_ceo_intent(text: str, *, reply_context: dict[str, Any] | None = None)
     - New orders/projects require explicit project scope signals.
     - Plain one-shot asks (without project scope) stay in conversational lane.
     """
+    raw = (text or "").strip().lower()
+
+    # Explicit global control intent: stop/cancel everything now.
+    if any(
+        k in raw
+        for k in (
+            "paren todo",
+            "paren tofo",
+            "parar todo",
+            "deten todo",
+            "detén todo",
+            "detengan todo",
+            "stop all",
+            "cancelen todo",
+            "cancelen tofo",
+            "cancela todo",
+            "limpia todo",
+            "hard reset",
+        )
+    ):
+        return "control_stop_all"
+
     req_type = detect_request_type(text)
     if req_type in ("query", "status"):
         return "query"
-
-    raw = (text or "").strip().lower()
 
     project_scope_terms = (
         "project",
@@ -444,7 +491,7 @@ def choose_model_by_role(role: str, model_override: str | None = None, default_m
 
 
 def choose_effort_by_role(role: str) -> str:
-    return {"jarvis": "high", "qa": "high", "sre": "high"}.get(role, "medium")
+    return {"jarvis": "high", "qa": "high", "sre": "high", "architect_local": "high", "reviewer_local": "high"}.get(role, "medium")
 
 
 def choose_priority(text: str) -> int:
@@ -479,7 +526,7 @@ def to_task(
     if role in ("ceo", "orchestrator"):
         role = "jarvis"
 
-    if role not in ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"):
+    if role not in ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local"):
         role = "backend"
 
     override_request_type = str(normalized_context.get("request_type") or "").strip().lower()
@@ -495,7 +542,7 @@ def to_task(
 
     max_cost_window_usd = float(normalized_context.get("max_cost_window_usd", 8.0))
     requires_approval = bool(normalized_context.get("requires_approval", False))
-    if mode_hint == "full":
+    if mode_hint == "full" and str(role) != "jarvis":
         requires_approval = True
 
     trace = dict(normalized_context.get("trace") or {})

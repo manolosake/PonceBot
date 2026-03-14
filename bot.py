@@ -203,6 +203,13 @@ _GREETING_PREFIXES = (
 )
 
 
+_CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
+
+
+def _is_controller_role(role: str) -> bool:
+    return (role or "").strip().lower() in _CONTROLLER_ROLE_NAMES
+
+
 def _is_greeting(text: str) -> bool:
     """
     Identify short pleasantries that should be answered immediately.
@@ -324,10 +331,18 @@ def _humanize_orchestrator_role(role: str) -> str:
     r = (role or "").strip().lower()
     if r == "jarvis":
         return "Jarvis"
+    if r == "skynet":
+        return "Skynet"
     if r == "product_ops":
         return "Product Ops"
     if r == "release_mgr":
         return "Release Manager"
+    if r == "architect_local":
+        return "Architect Local"
+    if r == "implementer_local":
+        return "Implementer Local"
+    if r == "reviewer_local":
+        return "Reviewer Local"
     return " ".join(part.capitalize() for part in re.split(r"[_-]", r) if part) or "Jarvis"
 
 
@@ -636,6 +651,7 @@ def _parse_allowed_origins_env(raw: str) -> list[str]:
 def _security_startup_findings(cfg: "BotConfig") -> list[str]:
     issues: list[str] = []
     http_enabled = os.environ.get("BOT_STATUS_HTTP_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+    legacy_http_auth = os.environ.get("BOT_STATUS_HTTP_LEGACY_AUTH", "0").strip().lower() in ("1", "true", "yes", "on")
     http_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
     allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
 
@@ -643,6 +659,8 @@ def _security_startup_findings(cfg: "BotConfig") -> list[str]:
         issues.append("BOT_STATUS_HTTP_ENABLED=1 but BOT_STATUS_HTTP_TOKEN is empty (API will be blocked).")
     if http_enabled and "*" in allowed_origins:
         issues.append("BOT_STATUS_HTTP_ALLOWED_ORIGINS contains '*' (insecure CORS).")
+    if http_enabled and legacy_http_auth:
+        issues.append("BOT_STATUS_HTTP_LEGACY_AUTH=1 enabled (temporary compatibility mode; query token accepted).")
 
     if cfg.codex_dangerous_bypass_sandbox:
         active, bg = _breakglass_is_active(cfg)
@@ -684,28 +702,54 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
     _update_state(cfg, _m)
 
 
-def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
-    # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
+def _dangerous_bypass_status(cfg: "BotConfig", *, chat_id: int | None = None) -> dict[str, Any]:
+    selected_mode = _state_access_mode(cfg, chat_id=chat_id) or "default"
     bypass = _effective_bypass_sandbox(cfg, chat_id=chat_id)
     bg_active, bg = _breakglass_is_active(cfg)
-    default_line = "- Default (current)" if not bypass else "- Default"
-    full_line = "- Full access (current)" if bypass else "- Full access"
     bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
     bg_exp = (bg or {}).get("expires_at")
     try:
         rem_s = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
     except Exception:
         rem_s = 0
-    bg_status = f"active ({rem_s}s left)" if bg_active else "inactive"
-    return "\n".join(
+    note = ""
+    if selected_mode == "full" and not bypass:
+        note = "full selected, but dangerous bypass is OFF until breakglass is active"
+    return {
+        "selected_mode": selected_mode,
+        "bypass": bool(bypass),
+        "breakglass_active": bool(bg_active),
+        "breakglass_reason": bg_reason,
+        "breakglass_seconds_left": rem_s,
+        "note": note,
+    }
+
+
+def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
+    # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
+    status = _dangerous_bypass_status(cfg, chat_id=chat_id)
+    default_line = "- Default (selected)" if status["selected_mode"] == "default" else "- Default"
+    full_line = "- Full access (selected)" if status["selected_mode"] == "full" else "- Full access"
+    bg_status = (
+        f"active ({int(status['breakglass_seconds_left'])}s left)"
+        if status["breakglass_active"]
+        else "inactive"
+    )
+    lines = [
+        "Dos opciones:",
+        default_line,
+        full_line,
+        "",
+        f"selected_access_mode: {status['selected_mode']}",
+        f"dangerous_bypass: {'ACTIVE' if status['bypass'] else 'inactive'}",
+        "Breakglass (dangerous bypass):",
+        f"- status: {bg_status}",
+        f"- reason: {status['breakglass_reason']}",
+    ]
+    if status["note"]:
+        lines.append(f"- note: {status['note']}")
+    lines.extend(
         [
-            "Dos opciones:",
-            default_line,
-            full_line,
-            "",
-            "Breakglass (dangerous bypass):",
-            f"- status: {bg_status}",
-            f"- reason: {bg_reason}",
             "",
             "Uso:",
             "- /permissions default",
@@ -715,6 +759,7 @@ def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
             "- /breakglass off                     (admin only)",
         ]
     )
+    return "\n".join(lines)
 
 
 def _format_preview_text() -> str:
@@ -782,6 +827,7 @@ def _status_text_for_chat(
         orch_r = 0
         orch_paused = "disabled"
         qmax = "unbounded" if cfg.queue_maxsize == 0 else str(cfg.queue_maxsize)
+    proactive_lane = _proactive_lane_status_label(cfg) if orchestrator_queue is not None else "disabled"
 
     lines = [
         f"permissions: {permissions}",
@@ -791,6 +837,7 @@ def _status_text_for_chat(
         f"thread: {tid or '(none; send a message or use /reset)'}",
         f"queue: inflight={inflight} queued={queued} legacy_global={global_q} orch_queued={orch_q} orch_running={orch_r}",
         f"orchestrator: {orch_paused}",
+        f"proactive_lane: {proactive_lane}",
         f"queue policy: max={qmax}",
         "",
         "Common commands:",
@@ -801,6 +848,8 @@ def _status_text_for_chat(
         "- /job <id> (job status)",
         "- /daily (daily digest)",
         "- /approve <id> (approve blocked job)",
+        "- /pause_autonomy (pause Skynet/local autonomy)",
+        "- /resume_autonomy (resume Skynet/local autonomy)",
         "- /pause <role> (pause role)",
         "- /resume <role> (resume role)",
         "- /cancel <id> (cancel orchestrator job)",
@@ -967,6 +1016,21 @@ class BotConfig:
     orchestrator_live_update_seconds: int = 8
     # Notification policy for Telegram chat: "verbose" | "minimal".
     orchestrator_notify_mode: str = "minimal"
+    # CEO notification scope: "critical" | "state_change" | "digest_only".
+    notify_scope: str = "state_change"
+    # Suppress repeated notifications with identical fingerprint within this window.
+    notify_dedupe_cooldown_seconds: int = 600
+    # If false, suppress routine child worker "completed" notifications in Telegram.
+    notify_child_worker_completions: bool = False
+    # Proactive lane: autonomous improvements with bounded capacity.
+    proactive_lane_enabled: bool = True
+    proactive_lane_interval_seconds: int = 24 * 60 * 60
+    proactive_lane_max_active_orders: int = 3
+    proactive_lane_max_global_queued: int = 14
+    proactive_lane_max_per_tick: int = 1
+    # Post-delivery iterative review loop (bounded rounds).
+    proactive_iteration_enabled: bool = True
+    proactive_iteration_max_rounds: int = 2
     worktree_root: Path = Path(__file__).with_name("data") / "worktrees"
     artifacts_root: Path = Path(__file__).with_name("data") / "artifacts"
     runbooks_enabled: bool = True
@@ -1706,7 +1770,7 @@ class OpenAITTS:
                 conn.endheaders()
                 conn.send(body)
 
-                resp = conn.getresponse()
+                resp = conn.getresponse()
                 raw = resp.read()
                 if resp.status >= 400:
                     msg = raw.decode("utf-8", errors="replace")
@@ -1882,6 +1946,124 @@ def _update_state(cfg: "BotConfig", mutator: Callable[[dict[str, Any]], None]) -
 
 def _get_state(cfg: "BotConfig") -> dict[str, Any]:
     return _state_store(cfg).read()
+
+
+def _proactive_lane_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    paused = bool(st.get("proactive_lane_paused", False))
+    manual_pause = bool(st.get("proactive_lane_manual_pause", False))
+    reason = str(st.get("proactive_lane_paused_reason") or "").strip()
+    paused_at = st.get("proactive_lane_paused_at")
+    try:
+        paused_at_val = float(paused_at) if paused_at is not None else None
+    except Exception:
+        paused_at_val = None
+    return {
+        "paused": paused,
+        "manual_pause": manual_pause,
+        "reason": reason,
+        "paused_at": paused_at_val,
+    }
+
+
+def _set_proactive_lane_pause(
+    cfg: "BotConfig",
+    *,
+    paused: bool,
+    reason: str | None = None,
+    manual: bool | None = None,
+) -> dict[str, Any]:
+    now = float(time.time())
+
+    def _m(st: dict[str, Any]) -> None:
+        current_manual = bool(st.get("proactive_lane_manual_pause", False))
+        current_reason = str(st.get("proactive_lane_paused_reason") or "").strip()
+        if paused:
+            st["proactive_lane_paused"] = True
+            st["proactive_lane_paused_at"] = now
+            next_manual = current_manual if manual is None else bool(manual)
+            if next_manual:
+                st["proactive_lane_manual_pause"] = True
+            else:
+                st.pop("proactive_lane_manual_pause", None)
+            if reason:
+                st["proactive_lane_paused_reason"] = str(reason)
+            elif current_reason:
+                st["proactive_lane_paused_reason"] = current_reason
+        else:
+            st["proactive_lane_paused"] = False
+            st.pop("proactive_lane_paused_reason", None)
+            st.pop("proactive_lane_paused_at", None)
+            st.pop("proactive_lane_manual_pause", None)
+
+    return _update_state(cfg, _m)
+
+
+def _maybe_resume_proactive_lane_for_manual_ceo_request(cfg: "BotConfig") -> bool:
+    state = _proactive_lane_state(cfg)
+    if not bool(state.get("paused", False)):
+        return False
+    if bool(state.get("manual_pause", False)):
+        return False
+    _set_proactive_lane_pause(cfg, paused=False)
+    return True
+
+
+def _task_belongs_to_proactive_lane(orch_q: "OrchestratorQueue", task: "Task") -> bool:
+    try:
+        if bool(getattr(task, "is_autonomous", False)):
+            return True
+    except Exception:
+        pass
+    parent_job_id = str(getattr(task, "parent_job_id", "") or "").strip()
+    if not parent_job_id:
+        return False
+    try:
+        parent = orch_q.get_job(parent_job_id)
+    except Exception:
+        parent = None
+    if parent is None:
+        return False
+    try:
+        return bool(getattr(parent, "is_autonomous", False))
+    except Exception:
+        return False
+
+
+def _pause_proactive_lane_now(
+    *,
+    cfg: "BotConfig",
+    orch_q: "OrchestratorQueue",
+    reason: str,
+    manual: bool,
+) -> dict[str, Any]:
+    before = _proactive_lane_state(cfg)
+    cancelled = 0
+    seen: set[str] = set()
+    active_states = ("running", "queued", "waiting_deps", "blocked_approval", "blocked")
+    for state in active_states:
+        try:
+            tasks = orch_q.jobs_by_state(state=state, limit=600)
+        except Exception:
+            tasks = []
+        for task in tasks:
+            job_id = str(getattr(task, "job_id", "") or "").strip()
+            if (not job_id) or (job_id in seen):
+                continue
+            if not _task_belongs_to_proactive_lane(orch_q, task):
+                continue
+            seen.add(job_id)
+            try:
+                if orch_q.cancel(job_id):
+                    cancelled += 1
+            except Exception:
+                continue
+    after = _set_proactive_lane_pause(cfg, paused=True, reason=reason, manual=manual)
+    return {
+        "autonomous_jobs_cancelled": int(cancelled),
+        "was_paused": bool(before.get("paused", False)),
+        "manual_pause": bool(after.get("proactive_lane_manual_pause", False)),
+    }
 
 
 def _get_voice_state(cfg: "BotConfig") -> dict[str, Any]:
@@ -2099,7 +2281,7 @@ def _auth_now() -> float:
 
 def _session_key(chat_id: int) -> str:
     return str(int(chat_id))
-
+
 
 def _auth_is_session_active(cfg: "BotConfig", *, chat_id: int) -> tuple[bool, dict[str, Any]]:
     """
@@ -2544,7 +2726,7 @@ def _model_choices_for_display() -> list[tuple[str, str, str, list[str]]]:
                         effs.append(eff)
         # De-dupe while preserving order.
         seen: set[str] = set()
-        effs2: list[str] = []
+        effs2: list[str] = []
         for e in effs:
             if e not in seen:
                 seen.add(e)
@@ -3212,6 +3394,1707 @@ def _ollama_status() -> tuple[bool, str]:
         return True, "ollama: reachable (unexpected response)"
 
 
+_LOCAL_OLLAMA_ROLE_NAMES = frozenset({"architect_local", "implementer_local", "reviewer_local"})
+
+
+def _ollama_base_url() -> str:
+    raw = str(os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434") or "").strip()
+    if not raw:
+        raw = "http://127.0.0.1:11434"
+    if "://" not in raw:
+        raw = "http://" + raw
+    return raw.rstrip("/")
+
+
+def _orchestrator_role_prefers_local_ollama(role: str, profile: dict[str, Any] | None) -> bool:
+    backend = str((profile or {}).get("execution_backend") or "").strip().lower()
+    if backend:
+        return backend in ("local_ollama", "ollama_local", "ollama")
+    return (role or "").strip().lower() in _LOCAL_OLLAMA_ROLE_NAMES
+
+
+def _orchestrator_codex_backend_overrides(
+    profile: dict[str, Any] | None,
+    *,
+    model_override: str = "",
+) -> dict[str, Any]:
+    role_profile = profile if isinstance(profile, dict) else {}
+    backend = str(role_profile.get("execution_backend") or "").strip().lower()
+    requested_model = _sanitize_model_id(str(model_override or "").strip())
+    if not requested_model:
+        requested_model = _sanitize_model_id(str(role_profile.get("model") or "").strip())
+
+    if backend in ("codex_oss", "oss_codex", "codex_local_ollama", "codex_local"):
+        provider = str(role_profile.get("codex_local_provider") or "ollama").strip() or "ollama"
+        overrides: dict[str, Any] = {
+            "codex_use_oss": True,
+            "codex_local_provider": provider,
+        }
+        if requested_model:
+            overrides["codex_oss_model"] = requested_model
+        return overrides
+
+    if backend in ("codex", "codex_openai", "openai_codex"):
+        overrides = {"codex_use_oss": False}
+        if requested_model:
+            overrides["codex_openai_model"] = requested_model
+        return overrides
+
+    return {}
+
+
+def _ollama_installed_model_names() -> set[str]:
+    base = _ollama_base_url()
+    url = f"{base}/api/tags"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw)
+        models = parsed.get("models") if isinstance(parsed, dict) else []
+        out: set[str] = set()
+        if isinstance(models, list):
+            for m in models:
+                if isinstance(m, dict):
+                    name = str(m.get("name") or "").strip()
+                    if name:
+                        out.add(name)
+        return out
+    except Exception:
+        return set()
+
+
+def _ollama_chat(
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout_seconds: float,
+    temperature: float = 0.15,
+    num_ctx: int = 32768,
+    max_tokens: int = 900,
+    keep_alive_s: int = 420,
+    think: bool | None = None,
+    stream: bool = False,
+    on_chunk: Any | None = None,
+    on_request: Any | None = None,
+) -> dict[str, Any]:
+    base = _ollama_base_url()
+    url = f"{base}/api/chat"
+    _keep_alive_s = int(max(30, min(3600, int(keep_alive_s or 420))))
+    body: dict[str, Any] = {
+        "model": str(model or "").strip(),
+        "stream": bool(stream),
+        "keep_alive": f"{_keep_alive_s}s",
+        "messages": [
+            {"role": "system", "content": str(system_prompt or "")},
+            {"role": "user", "content": str(user_prompt or "")},
+        ],
+        "options": {
+            "temperature": float(max(0.0, min(1.0, temperature))),
+            "num_ctx": int(max(4096, min(131072, int(num_ctx or 32768)))),
+            "num_predict": int(max(128, min(4096, int(max_tokens or 900)))),
+        },
+    }
+    if think is not None:
+        body["think"] = bool(think)
+    if on_request is not None:
+        try:
+            on_request(dict(body))
+        except Exception:
+            pass
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    timeout_s = max(10.0, float(timeout_seconds or 120.0))
+
+    if not stream:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        parsed = json.loads(raw)
+        msg = parsed.get("message") if isinstance(parsed, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else ""
+        if not isinstance(content, str):
+            content = str(content or "")
+        return {"content": content.strip(), "response": parsed}
+
+    content_parts: list[str] = []
+    last_event: dict[str, Any] = {}
+    event_count = 0
+
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            event_count += 1
+            last_event = parsed
+            msg = parsed.get("message") if isinstance(parsed.get("message"), dict) else {}
+            piece = msg.get("content") if isinstance(msg, dict) else ""
+            if not isinstance(piece, str):
+                piece = str(piece or "")
+            if piece:
+                content_parts.append(piece)
+            if on_chunk is not None:
+                try:
+                    on_chunk(piece, parsed)
+                except Exception:
+                    pass
+
+    content = "".join(content_parts).strip()
+    if not content and isinstance(last_event, dict):
+        msg = last_event.get("message") if isinstance(last_event.get("message"), dict) else {}
+        piece = msg.get("content") if isinstance(msg, dict) else ""
+        if not isinstance(piece, str):
+            piece = str(piece or "")
+        content = piece.strip()
+
+    return {"content": content, "response": last_event, "events": int(event_count)}
+
+
+def _extract_first_diff_block(text: str) -> str:
+    raw = str(text or "")
+    fenced_blocks = re.findall(r"```diff\s*\n(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    normalized_blocks = [str(block or "").strip() for block in fenced_blocks if str(block or "").strip()]
+    if normalized_blocks:
+        return "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
+    plain = re.search(r"(^diff --git .*?$.*)", raw, flags=re.MULTILINE | re.DOTALL)
+    if plain:
+        patch = str(plain.group(1) or "").strip()
+        return (patch + "\n") if patch else ""
+    return ""
+
+
+def _extract_changed_files_from_patch_text(text: str) -> list[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in raw.splitlines():
+        candidate = ""
+        if line.startswith("+++ "):
+            candidate = line[4:].strip()
+            if candidate.startswith("b/"):
+                candidate = candidate[2:]
+        elif line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                candidate = str(parts[3] or "").strip()
+                if candidate.startswith("b/"):
+                    candidate = candidate[2:]
+        candidate = str(candidate or "").strip()
+        if not candidate or candidate == "/dev/null" or candidate in seen:
+            continue
+        seen.add(candidate)
+        found.append(candidate)
+    return found
+
+
+def _summarize_validation_failure(*, changed_files: list[str], validation_text: str, max_chars: int = 1200) -> str:
+    files = [str(path or "").strip() for path in (changed_files or []) if str(path or "").strip()]
+    header = "py_compile failed"
+    if files:
+        header += " for " + ", ".join(files[:8])
+    body = str(validation_text or "").strip()
+    if body:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        # Drop the command echo if we also have stderr/stdout detail.
+        if len(lines) > 1 and lines[0].startswith("$ "):
+            lines = lines[1:]
+        body = "\n".join(lines).strip()
+    if body:
+        summary = f"{header}\n{body}"
+    else:
+        summary = header
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rstrip() + "..."
+    return summary
+
+
+def _local_artifact_candidate_paths(*, job_id: str, artifacts_dir: str, names: tuple[str, ...]) -> list[Path]:
+    candidates: list[Path] = []
+    base_artifacts_dir = str(artifacts_dir or "").strip()
+    if base_artifacts_dir:
+        base = Path(base_artifacts_dir)
+        for name in names:
+            candidates.append(base / str(name))
+    clean_job_id = str(job_id or "").strip()
+    if clean_job_id:
+        fallback_base = Path(__file__).resolve().parent / "data" / "artifacts" / clean_job_id
+        for name in names:
+            candidate = fallback_base / str(name)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _read_local_artifact_excerpt(
+    *,
+    job_id: str,
+    artifacts_dir: str,
+    names: tuple[str, ...],
+    max_chars: int = 2000,
+) -> str:
+    for candidate in _local_artifact_candidate_paths(job_id=job_id, artifacts_dir=artifacts_dir, names=names):
+        try:
+            if candidate.exists():
+                text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                if len(text) > max_chars:
+                    text = text[:max_chars].rstrip() + "..."
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _augment_implementer_failure_summary(*, summary: str, job_id: str, artifacts_dir: str, max_chars: int = 2400) -> str:
+    base = str(summary or "").strip()
+    validation_excerpt = _read_local_artifact_excerpt(
+        job_id=job_id,
+        artifacts_dir=artifacts_dir,
+        names=("local_ollama_validation.txt", "local_ollama_patch_error.txt", "local_ollama_error.txt"),
+        max_chars=1400,
+    )
+    status_excerpt = _read_local_artifact_excerpt(
+        job_id=job_id,
+        artifacts_dir=artifacts_dir,
+        names=("local_ollama_git_status.txt",),
+        max_chars=900,
+    )
+    chunks: list[str] = []
+    if base:
+        chunks.append(base)
+    if validation_excerpt and validation_excerpt not in base:
+        chunks.append("FAILED_VALIDATION_OUTPUT:\n" + validation_excerpt)
+    if status_excerpt and status_excerpt not in base:
+        chunks.append("FAILED_CHANGED_FILES:\n" + status_excerpt)
+    combined = "\n\n".join(chunk for chunk in chunks if chunk).strip()
+    if len(combined) > max_chars:
+        combined = combined[:max_chars].rstrip() + "..."
+    return combined
+
+
+def _implementer_failure_summary_has_actionable_signal(summary: str) -> bool:
+    blob = str(summary or "").strip()
+    if not blob:
+        return False
+    lower = blob.lower()
+    non_actionable_markers = (
+        "provides no concrete failing test output",
+        "provides no specific failing test output",
+        "without a concrete failure scenario",
+        "without a specific failure scenario",
+        "please provide:\n1. the specific test name or path that is failing.",
+        "to proceed, please provide:",
+        "what test is failing",
+        "what error message or exception occurs",
+        "what behavior is expected vs actual",
+    )
+    if any(marker in lower for marker in non_actionable_markers):
+        return False
+    has_validation_output = "failed_validation_output:" in lower
+    technical_markers = (
+        "syntaxerror",
+        "traceback (most recent call last):",
+        "pycompileerror",
+        "assertionerror",
+        "nameerror:",
+        "typeerror:",
+        "valueerror:",
+        "importerror:",
+        "modulenotfounderror:",
+        "patch rejected by git apply --check",
+        "patch apply failed",
+        "did you forget parentheses around the comprehension target?",
+    )
+    if any(marker in lower for marker in technical_markers):
+        return True
+    if has_validation_output and (
+        ("file \"" in lower and "line " in lower and ("error" in lower or "failed" in lower))
+        or ("traceback" in lower)
+    ):
+        return True
+    return bool(("file \"" in lower) and ("line " in lower) and (("error" in lower) or ("failed" in lower)))
+
+
+def _select_preferred_implementer_failure(
+    candidates: list[tuple[str, str, str, int, str, float]],
+) -> tuple[str, str, str, int, str, float] | None:
+    if not candidates:
+        return None
+    fallback = candidates[0]
+    actionable_candidate: tuple[str, str, str, int, str, float] | None = None
+    terminal_or_blocked_candidate: tuple[str, str, str, int, str, float] | None = None
+    for candidate in candidates:
+        summary, _job_id, _slice_id, attempt_n, failure_class, _ts = candidate
+        actionable = _implementer_failure_summary_has_actionable_signal(summary)
+        if actionable and actionable_candidate is None:
+            actionable_candidate = candidate
+        if terminal_or_blocked_candidate is None and (
+            str(failure_class or "").strip().lower() in ("terminal", "blocked")
+            or int(attempt_n) >= 2
+        ):
+            terminal_or_blocked_candidate = candidate
+        if actionable and str(failure_class or "").strip().lower() == "terminal":
+            return candidate
+    return actionable_candidate or terminal_or_blocked_candidate or fallback
+
+
+def _should_ignore_cancelled_local_failure(
+    *,
+    state_norm: str,
+    failure_class: str,
+    attempt_n: int,
+    summary: str,
+) -> bool:
+    if str(state_norm or "").strip().lower() != "cancelled":
+        return False
+    failure_norm = str(failure_class or "").strip().lower()
+    text = str(summary or "").strip()
+    if failure_norm not in ("", "retriable"):
+        return False
+    if not text:
+        return True
+    lower = text.lower()
+    benign_markers = (
+        "cancelled",
+        "user_requested",
+        "stale",
+        "superseded",
+        "queue hygiene",
+        "running_watchdog_requeue",
+        "proactive_local_stale",
+    )
+    if any(marker in lower for marker in benign_markers):
+        return True
+    return int(attempt_n) < 2
+
+
+def _repair_unified_diff_text(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False
+    lines = raw.splitlines()
+    changed = False
+    repaired_lines: list[str] = []
+    i = 0
+    hunk_header_re = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<tail>.*)$")
+
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("@@"):
+            repaired_lines.append(line)
+            i += 1
+            continue
+
+        header_match = hunk_header_re.match(line)
+        if not header_match:
+            repaired_lines.append(line)
+            i += 1
+            continue
+
+        old_start = int(header_match.group("old_start"))
+        new_start = int(header_match.group("new_start"))
+        tail = header_match.group("tail") or ""
+        i += 1
+        hunk_lines: list[str] = []
+
+        while i < len(lines):
+            hunk_line = lines[i]
+            if hunk_line.startswith(("diff --git ", "index ", "--- ", "+++ ", "@@")):
+                break
+            if hunk_line.startswith((" ", "+", "-", "\\")):
+                repaired_line = hunk_line
+            else:
+                # Local models sometimes emit raw context lines without the required
+                # unified-diff prefix. Repair those lines conservatively so a coherent
+                # patch is still usable by git apply.
+                repaired_line = " " + hunk_line
+                changed = True
+            hunk_lines.append(repaired_line)
+            i += 1
+
+        old_count = 0
+        new_count = 0
+        for hunk_line in hunk_lines:
+            if not hunk_line:
+                continue
+            prefix = hunk_line[0]
+            if prefix in (" ", "-"):
+                old_count += 1
+            if prefix in (" ", "+"):
+                new_count += 1
+
+        repaired_header = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{tail}"
+        if repaired_header != line:
+            changed = True
+        repaired_lines.append(repaired_header)
+        repaired_lines.extend(hunk_lines)
+
+    repaired = "\n".join(repaired_lines)
+    if raw.endswith("\n"):
+        repaired += "\n"
+    return repaired, changed
+
+
+def _extract_blocker_response(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = re.search(r"BLOCKER:\s*(.+)", raw, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    blocker = str(match.group(1) or "").strip()
+    if "```" in blocker:
+        blocker = blocker.split("```", 1)[0].strip()
+    return blocker[:2000].strip()
+
+
+def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"```(?P<info>[^\n`]*)\n(?P<body>.*?)```", raw, flags=re.DOTALL):
+        info = str(match.group("info") or "").strip()
+        body = str(match.group("body") or "")
+        rel_path = ""
+        info_match = re.search(r"(?:^|\s)(?:path|file)=([^\s`]+)", info)
+        if info_match:
+            rel_path = str(info_match.group(1) or "").strip()
+        else:
+            body_lines = body.splitlines()
+            if not body_lines:
+                continue
+            first_line = str(body_lines[0] or "").strip()
+            header_match = re.match(r"^(?:PATH|FILE)\s*:\s*(.+)$", first_line, flags=re.IGNORECASE)
+            if header_match:
+                rel_path = str(header_match.group(1) or "").strip()
+                body = "\n".join(body_lines[1:])
+        rel_path = rel_path.strip().strip("`").lstrip("./")
+        if not rel_path or rel_path in seen:
+            continue
+        if not str(body or "").strip():
+            continue
+        seen.add(rel_path)
+        out.append({"path": rel_path, "content": body.rstrip() + "\n"})
+    return out
+
+
+def _task_file_targets(*, task: Any, worktree_dir: Path) -> list[str]:
+    if not worktree_dir.is_dir():
+        return []
+    file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    blob = "\n".join(
+        [
+            str(getattr(task, "input_text", "") or ""),
+            json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
+        ]
+    )
+    targets: list[str] = []
+    seen: set[str] = set()
+    for match in file_hint_re.findall(blob):
+        rel_path = str(match or "").strip().lstrip("./")
+        if not rel_path or rel_path in seen:
+            continue
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside = str(disk_path).startswith(str(worktree_dir))
+        except Exception:
+            inside = False
+        if not inside or not disk_path.is_file():
+            continue
+        seen.add(rel_path)
+        targets.append(rel_path)
+    return targets[:8]
+
+
+def _local_role_worktree_dir(role: str) -> Path:
+    base = Path(__file__).resolve().parent
+    return (base / "data" / "worktrees" / str(role or "").strip() / "slot1").resolve()
+
+
+def _latest_local_specialist_response(
+    *,
+    root_ticket: str,
+    role: str,
+    max_chars: int = 6000,
+) -> str:
+    def _truncate(raw: str) -> str:
+        text = str(raw or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return text
+
+    def _read_row_payload(row_obj: sqlite3.Row | tuple | None) -> str:
+        if row_obj is None:
+            return ""
+        try:
+            row_map = dict(row_obj)
+        except Exception:
+            row_map = {}
+        job_id = str(row_map.get("job_id") or "").strip()
+        artifacts_dir = str(row_map.get("artifacts_dir") or "").strip()
+        trace_blob = row_map.get("trace")
+        response_candidates: list[Path] = []
+        if artifacts_dir:
+            response_candidates.append(Path(artifacts_dir) / "local_ollama_response.md")
+        if job_id:
+            response_candidates.append(Path(__file__).resolve().parent / "data" / "artifacts" / job_id / "local_ollama_response.md")
+        for response_path in response_candidates:
+            try:
+                if response_path.exists():
+                    return _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+        trace_obj: dict[str, Any] = {}
+        if isinstance(trace_blob, str) and trace_blob.strip():
+            try:
+                parsed = json.loads(trace_blob)
+                if isinstance(parsed, dict):
+                    trace_obj = parsed
+            except Exception:
+                trace_obj = {}
+        elif isinstance(trace_blob, dict):
+            trace_obj = trace_blob
+        summary = str(trace_obj.get("result_summary") or "").strip()
+        if summary:
+            return _truncate(summary)
+        return ""
+
+    ticket = str(root_ticket or "").strip()
+    wanted_role = str(role or "").strip()
+    if not ticket or not wanted_role:
+        return ""
+    db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "select job_id, artifacts_dir, trace from jobs where parent_job_id=? and role=? and state='done' order by created_at desc limit 12",
+            (ticket, wanted_role),
+        ).fetchall()
+    except Exception:
+        return ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for row in rows or []:
+        payload = _read_row_payload(row)
+        if payload:
+            return payload
+    return ""
+
+
+def _local_specialist_response_for_key(
+    *,
+    role: str,
+    delegated_key: str,
+    max_chars: int = 6000,
+) -> str:
+    def _truncate(raw: str) -> str:
+        text = str(raw or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return text
+
+    def _read_row_payload(row_obj: sqlite3.Row | tuple | None) -> str:
+        if row_obj is None:
+            return ""
+        try:
+            row_map = dict(row_obj)
+        except Exception:
+            row_map = {}
+        job_id = str(row_map.get("job_id") or "").strip()
+        artifacts_dir = str(row_map.get("artifacts_dir") or "").strip()
+        trace_blob = row_map.get("trace")
+        response_candidates: list[Path] = []
+        if artifacts_dir:
+            response_candidates.append(Path(artifacts_dir) / "local_ollama_response.md")
+        if job_id:
+            response_candidates.append(Path(__file__).resolve().parent / "data" / "artifacts" / job_id / "local_ollama_response.md")
+        for response_path in response_candidates:
+            try:
+                if response_path.exists():
+                    return _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+        trace_obj: dict[str, Any] = {}
+        if isinstance(trace_blob, str) and trace_blob.strip():
+            try:
+                parsed = json.loads(trace_blob)
+                if isinstance(parsed, dict):
+                    trace_obj = parsed
+            except Exception:
+                trace_obj = {}
+        elif isinstance(trace_blob, dict):
+            trace_obj = trace_blob
+        summary = str(trace_obj.get("result_summary") or "").strip()
+        if summary:
+            return _truncate(summary)
+        return ""
+
+    wanted_role = str(role or "").strip()
+    wanted_key = str(delegated_key or "").strip()
+    if not wanted_role or not wanted_key:
+        return ""
+    db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            (
+                "select job_id, artifacts_dir, trace "
+                "from jobs "
+                "where role=? "
+                "  and state='done' "
+                "  and (json_extract(labels, '$.key')=? or labels like ?) "
+                "order by created_at desc limit 12"
+            ),
+            (wanted_role, wanted_key, "%" + wanted_key + "%"),
+        ).fetchall()
+    except Exception:
+        return ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    for row in rows or []:
+        payload = _read_row_payload(row)
+        if payload:
+            return payload
+    return ""
+
+
+def _extract_structured_handoff_files(text: str) -> list[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    in_files = False
+    for raw_line in raw.splitlines():
+        stripped = str(raw_line or "").strip()
+        upper = stripped.upper()
+        if upper == "FILES:":
+            in_files = True
+            continue
+        if in_files and re.match(r"^[A-Z_]+:\s*$", stripped):
+            break
+        if not in_files:
+            continue
+        match = re.match(r"^-\s+(.+?)\s*$", stripped)
+        if not match:
+            if stripped:
+                break
+            continue
+        candidate = str(match.group(1) or "").strip().strip("`").strip().lstrip("./")
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        out.append(candidate)
+    return out
+
+
+def _text_mentions_artifact_contract(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    markers = (
+        "artifact",
+        "evidence",
+        "manifest",
+        "bundle",
+        "screenshot",
+        "proof",
+    )
+    return any(tok in blob for tok in markers)
+
+
+def _structured_handoff_is_actionable(
+    text: str,
+    *,
+    require_artifact_contract: bool = False,
+) -> bool:
+    raw = str(text or "")
+    if not raw.strip():
+        return False
+    files = _extract_structured_handoff_files(raw)
+    if not files:
+        return False
+    required_headers = ("CHANGE:", "VALIDATION:", "RISK:")
+    upper = raw.upper()
+    if any(header not in upper for header in required_headers):
+        return False
+    if require_artifact_contract and "ARTIFACT_CONTRACT:" not in upper:
+        return False
+    return True
+
+
+def _missing_handoff_files(*, text: str, worktree_dir: Path) -> list[str]:
+    if not worktree_dir.is_dir():
+        return []
+    missing: list[str] = []
+    for rel_path in _extract_structured_handoff_files(text):
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside = str(disk_path).startswith(str(worktree_dir))
+        except Exception:
+            inside = False
+        if not inside or not disk_path.is_file():
+            missing.append(rel_path)
+    return missing
+
+
+def _augment_local_specialist_prompt_with_workspace_context(
+    *,
+    task: Any,
+    user_prompt: str,
+    worktree_dir: Path,
+    role: str,
+) -> str:
+    if not worktree_dir.is_dir():
+        return user_prompt
+
+    file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    exact_targets: list[str] = []
+    candidate_paths: list[str] = []
+    seen: set[str] = set()
+
+    context_sources = [
+        str(getattr(task, "input_text", "") or ""),
+        json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
+    ]
+    for source in context_sources:
+        for match in file_hint_re.findall(source):
+            rel_path = str(match or "").strip().lstrip("./")
+            if not rel_path or rel_path in seen:
+                continue
+            disk_path = (worktree_dir / rel_path).resolve()
+            try:
+                inside = str(disk_path).startswith(str(worktree_dir))
+            except Exception:
+                inside = False
+            if not inside or not disk_path.is_file():
+                continue
+            seen.add(rel_path)
+            exact_targets.append(rel_path)
+            candidate_paths.append(rel_path)
+            if len(candidate_paths) >= 4:
+                break
+        if len(candidate_paths) >= 4:
+            break
+
+    inventory_lines: list[str] = []
+    try:
+        git_ls = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(worktree_dir),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        repo_files = [line.strip() for line in (git_ls.stdout or "").splitlines() if line.strip()]
+    except Exception:
+        repo_files = []
+
+    if not candidate_paths and repo_files:
+        objective_tokens = _extract_objective_tokens(
+            "\n".join(
+                [
+                    str(user_prompt or ""),
+                    str(getattr(task, "input_text", "") or ""),
+                ]
+            )
+        )
+        preferred_by_role: dict[str, tuple[str, ...]] = {
+            "architect_local": (
+                "bot.py",
+                "orchestrator/agents.yaml",
+                "tools/proactive_health_report.py",
+            ),
+            "implementer_local": (
+                "bot.py",
+                "orchestrator/agents.yaml",
+                "tools/proactive_health_report.py",
+            ),
+            "reviewer_local": (
+                "bot.py",
+                "orchestrator/agents.yaml",
+                "tools/proactive_health_report.py",
+            ),
+        }
+        preferred = preferred_by_role.get(role, ("bot.py", "orchestrator/agents.yaml"))
+        ranked: list[tuple[int, str]] = []
+        seen_ranked: set[str] = set()
+        for rel_path in repo_files:
+            score = 0
+            lower = rel_path.lower()
+            objective_hits = sum(1 for tok in objective_tokens if tok in lower)
+            if rel_path in preferred:
+                score += 24
+            if rel_path.endswith(".md") and rel_path not in preferred:
+                score -= 8
+            if objective_hits:
+                score += objective_hits * 28
+                if lower.startswith(("tools/", "tests/", "test_")):
+                    score += 10
+            if role == "architect_local" and rel_path.endswith((".py", ".yaml", ".yml", ".md")):
+                score += 3
+            if role == "reviewer_local" and rel_path.endswith((".py", ".yaml", ".yml", ".json", ".md")):
+                score += 3
+            if role == "implementer_local" and rel_path.endswith((".py", ".yaml", ".yml", ".json", ".sh")):
+                score += 3
+            if objective_hits and rel_path in preferred:
+                score -= 6
+            if "/" not in rel_path:
+                score += 2
+            if score <= 0:
+                continue
+            if rel_path in seen_ranked:
+                continue
+            seen_ranked.add(rel_path)
+            ranked.append((score, rel_path))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        excerpt_cap = 2 if role in {"architect_local", "reviewer_local"} else 3
+        candidate_paths = [path for _score, path in ranked[:excerpt_cap]]
+        inventory_lines = [path for _score, path in ranked[:10]]
+        if not inventory_lines:
+            inventory_lines = repo_files[:10]
+    elif repo_files:
+        inventory_lines = repo_files[:10]
+    if role == "implementer_local" and candidate_paths:
+        inventory_lines = []
+        ordered_exact = [path for path in exact_targets if path in candidate_paths]
+        ordered_rest = [path for path in candidate_paths if path not in ordered_exact]
+        candidate_paths = ordered_exact + ordered_rest
+        sibling_refs: list[str] = []
+        sibling_seen = set(candidate_paths)
+        for rel_path in candidate_paths[:2]:
+            disk_path = (worktree_dir / rel_path).resolve()
+            try:
+                raw = disk_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for ref_match in file_hint_re.findall(raw):
+                ref_path = str(ref_match or "").strip().lstrip("./")
+                if not ref_path or ref_path in sibling_seen:
+                    continue
+                # Keep implementer prompts focused on executable context; doc siblings add token bloat.
+                if ref_path.lower().endswith(".md"):
+                    continue
+                ref_disk = (worktree_dir / ref_path).resolve()
+                try:
+                    inside = str(ref_disk).startswith(str(worktree_dir))
+                except Exception:
+                    inside = False
+                if not inside or not ref_disk.is_file():
+                    continue
+                sibling_seen.add(ref_path)
+                sibling_refs.append(ref_path)
+                if len(sibling_refs) >= 2:
+                    break
+            if len(sibling_refs) >= 2:
+                break
+        if sibling_refs:
+            candidate_paths = candidate_paths + sibling_refs
+
+    chunks: list[str] = [
+        str(user_prompt or "").rstrip(),
+        "",
+        f"REAL_WORKTREE_DIR: {worktree_dir}",
+        "Use REAL_WORKTREE_DIR as the repository root. Do not propose edits inside ARTIFACTS_DIR.",
+    ]
+    if inventory_lines:
+        chunks.extend([
+            "",
+            "Workspace inventory (candidate repo files to anchor exact paths):",
+            "```text",
+            "\n".join(inventory_lines[:10]),
+            "```",
+        ])
+    if not candidate_paths:
+        return "\n".join(chunks).strip() + "\n"
+
+    chunks.extend(["", "Workspace file context (use exact paths and surrounding lines from these excerpts when building the task response):"])
+    if role == "implementer_local":
+        excerpt_lines_cap = 220
+        excerpt_chars_cap = 14000
+        excerpt_path_cap = 3
+    elif role in {"architect_local", "reviewer_local"}:
+        excerpt_lines_cap = 120
+        excerpt_chars_cap = 6000
+        excerpt_path_cap = 4
+    else:
+        excerpt_lines_cap = 180
+        excerpt_chars_cap = 9000
+        excerpt_path_cap = 4
+    for rel_path in candidate_paths[:excerpt_path_cap]:
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            raw = disk_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        lines = raw.splitlines()
+        if role == "implementer_local" and rel_path in exact_targets:
+            # For exact targets, prefer full-file context when feasible to avoid patch-hunk drift.
+            # Truncated exact-target context has caused repeated `git apply --check` failures.
+            if len(lines) <= 1200 and len(raw) <= 48000:
+                excerpt = raw.rstrip()
+            else:
+                excerpt = raw[:48000].rstrip()
+                if len(raw) > len(excerpt):
+                    excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+        else:
+            excerpt = "\n".join(lines[:excerpt_lines_cap])
+            if len(excerpt) > excerpt_chars_cap:
+                excerpt = excerpt[:excerpt_chars_cap].rstrip()
+        chunks.extend([
+            "",
+            f"FILE: {rel_path}",
+            "```text",
+            excerpt,
+            "```",
+        ])
+    return "\n".join(chunks).strip() + "\n"
+
+
+def _augment_local_implementer_prompt_with_workspace_context(
+    *,
+    task: Any,
+    user_prompt: str,
+    worktree_dir: Path,
+) -> str:
+    return _augment_local_specialist_prompt_with_workspace_context(
+        task=task,
+        user_prompt=user_prompt,
+        worktree_dir=worktree_dir,
+        role="implementer_local",
+    )
+
+
+def _finalize_local_implementer_change(
+    *,
+    artifacts_dir: Path,
+    worktree_dir: Path,
+    artifacts: list[str],
+    apply_mode: str,
+    already_applied: bool = False,
+    patch_repaired: bool = False,
+    patch_artifact: str = "",
+    rewrite_files: list[str] | None = None,
+    changed_files_hint: list[str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    status_proc = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=str(worktree_dir),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    status_text = (status_proc.stdout or "").strip()
+    status_path = artifacts_dir / "local_ollama_git_status.txt"
+    status_path.write_text(status_text + ("\n" if status_text else ""), encoding="utf-8", errors="replace")
+    artifacts.append(str(status_path))
+
+    diff_proc = subprocess.run(
+        ["git", "diff", "--no-ext-diff", "--unified=3"],
+        cwd=str(worktree_dir),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    diff_text = diff_proc.stdout or ""
+    diff_path = artifacts_dir / "local_ollama_git_diff.patch"
+    diff_path.write_text(diff_text, encoding="utf-8", errors="replace")
+    artifacts.append(str(diff_path))
+
+    hinted_files = [str(path or "").strip() for path in (changed_files_hint or []) if str(path or "").strip()]
+    changed_files: list[str]
+    if hinted_files:
+        seen_changed: set[str] = set()
+        changed_files = []
+        for path in hinted_files:
+            if path in seen_changed:
+                continue
+            seen_changed.add(path)
+            changed_files.append(path)
+    else:
+        names_proc = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB"],
+            cwd=str(worktree_dir),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        changed_files = [line.strip() for line in (names_proc.stdout or "").splitlines() if line.strip()]
+    if not changed_files:
+        raise RuntimeError("implementer_local produced no worktree changes after apply")
+
+    validation_lines: list[str] = []
+    changed_py = [p for p in changed_files if p.endswith(".py")]
+    validation_ok = True
+    if changed_py:
+        py_compile = subprocess.run(
+            ["python3", "-m", "py_compile", *changed_py],
+            cwd=str(worktree_dir),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        validation_lines.append("$ python3 -m py_compile " + " ".join(changed_py))
+        validation_lines.append((py_compile.stdout or "").strip())
+        validation_lines.append((py_compile.stderr or "").strip())
+        validation_ok = py_compile.returncode == 0
+    else:
+        validation_lines.append("No Python files changed; skipped py_compile.")
+    validation_text = "\n".join(line for line in validation_lines if line).strip()
+    validation_path = artifacts_dir / "local_ollama_validation.txt"
+    validation_path.write_text(validation_text + ("\n" if validation_text else ""), encoding="utf-8", errors="replace")
+    artifacts.append(str(validation_path))
+
+    if changed_py and not validation_ok:
+        raise RuntimeError(
+            _summarize_validation_failure(
+                changed_files=changed_py,
+                validation_text=validation_text,
+            )
+        )
+
+    info: dict[str, Any] = {
+        "git_status_artifact": str(status_path),
+        "git_diff_artifact": str(diff_path),
+        "validation_artifact": str(validation_path),
+        "worktree_dir": str(worktree_dir),
+        "changed_files": changed_files,
+        "validation_ok": bool(validation_ok),
+        "already_applied": bool(already_applied),
+        "apply_mode": str(apply_mode or "").strip() or "patch",
+    }
+    if patch_artifact:
+        info["patch_artifact"] = str(patch_artifact)
+    if patch_artifact:
+        info["patch_repaired"] = bool(patch_repaired)
+    if rewrite_files:
+        info["rewrite_files"] = [str(path) for path in rewrite_files if str(path).strip()]
+    if hinted_files:
+        info["changed_files_hint"] = changed_files
+    return artifacts, info
+
+
+def _apply_local_implementer_rewrites(
+    *,
+    task: Any,
+    artifacts_dir: Path,
+    content: str,
+    worktree_dir: Path,
+    artifacts: list[str] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    rewrite_blocks = _extract_file_rewrite_blocks(content)
+    if not rewrite_blocks:
+        raise RuntimeError("implementer_local did not return a diff or rewrite block")
+    allowed_targets = _task_file_targets(task=task, worktree_dir=worktree_dir)
+    allowed_parents = {str(Path(path).parent) for path in allowed_targets}
+    created_paths: list[str] = []
+    touched_paths: list[str] = []
+    for block in rewrite_blocks:
+        rel_path = str(block.get("path") or "").strip().lstrip("./")
+        if not rel_path:
+            continue
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside = str(disk_path).startswith(str(worktree_dir))
+        except Exception:
+            inside = False
+        if not inside:
+            raise RuntimeError(f"implementer_local rewrite path escapes worktree: {rel_path}")
+        rel_parent = str(Path(rel_path).parent)
+        exists_now = disk_path.exists()
+        if allowed_targets:
+            allowed_direct = rel_path in allowed_targets
+            allowed_adjacent = rel_parent in allowed_parents
+            if not allowed_direct and not allowed_adjacent:
+                raise RuntimeError(f"implementer_local rewrite path is outside the delegated slice: {rel_path}")
+        if not exists_now:
+            created_paths.append(rel_path)
+        touched_paths.append(rel_path)
+    if len(created_paths) > 1:
+        raise RuntimeError("implementer_local rewrite would create more than one new file")
+    rewrite_manifest_path = artifacts_dir / "local_ollama_rewrite_manifest.json"
+    rewrite_manifest = {
+        "mode": "rewrite",
+        "files": touched_paths,
+        "created_files": created_paths,
+    }
+    rewrite_manifest_path.write_text(json.dumps(rewrite_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="replace")
+    out_artifacts = list(artifacts or [])
+    out_artifacts.append(str(rewrite_manifest_path))
+    for block in rewrite_blocks:
+        rel_path = str(block.get("path") or "").strip().lstrip("./")
+        if not rel_path:
+            continue
+        disk_path = (worktree_dir / rel_path).resolve()
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_path.write_text(str(block.get("content") or ""), encoding="utf-8", errors="replace")
+    return _finalize_local_implementer_change(
+        artifacts_dir=artifacts_dir,
+        worktree_dir=worktree_dir,
+        artifacts=out_artifacts,
+        apply_mode="rewrite",
+        rewrite_files=touched_paths,
+        changed_files_hint=touched_paths,
+    )
+
+
+def _apply_local_implementer_patch(
+    *,
+    task: Any,
+    artifacts_dir: Path,
+    content: str,
+    worktree_dir: Path,
+) -> tuple[list[str], dict[str, Any]]:
+    patch_text = _extract_first_diff_block(content)
+    rewrite_blocks = _extract_file_rewrite_blocks(content)
+    repaired_patch_text, patch_repaired = _repair_unified_diff_text(patch_text)
+    if repaired_patch_text.strip():
+        patch_text = repaired_patch_text
+    patch_path = artifacts_dir / "local_ollama_patch.diff"
+    patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
+    artifacts: list[str] = [str(patch_path)]
+
+    if not patch_text.strip():
+        if rewrite_blocks:
+            return _apply_local_implementer_rewrites(
+                task=task,
+                artifacts_dir=artifacts_dir,
+                content=content,
+                worktree_dir=worktree_dir,
+                artifacts=artifacts,
+            )
+        raise RuntimeError("implementer_local did not return a fenced ```diff``` block")
+    if not worktree_dir.is_dir():
+        raise RuntimeError(f"implementer_local worktree not found: {worktree_dir}")
+
+    git_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=str(worktree_dir),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if git_root.returncode != 0:
+        raise RuntimeError(f"implementer_local worktree is not a git repo: {(git_root.stderr or git_root.stdout or '').strip()}")
+
+    def _run_patch_cmd(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            args,
+            cwd=str(worktree_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    apply_check = _run_patch_cmd(["git", "apply", "--check", str(patch_path)])
+    if apply_check.returncode != 0:
+        recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(patch_path)])
+        if recount_check.returncode == 0:
+            apply_check = recount_check
+    already_applied = False
+    if apply_check.returncode != 0:
+        reverse_check = _run_patch_cmd(["git", "apply", "--reverse", "--check", str(patch_path)])
+        if reverse_check.returncode == 0:
+            already_applied = True
+        else:
+            err_path = artifacts_dir / "local_ollama_patch_error.txt"
+            err_body = (apply_check.stderr or apply_check.stdout or "").strip() or "git apply --check failed"
+            err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
+            artifacts.append(str(err_path))
+            if rewrite_blocks:
+                fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
+                fallback_note.write_text(
+                    "Patch apply failed; falling back to rewrite blocks.\n"
+                    + err_body
+                    + "\n",
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                artifacts.append(str(fallback_note))
+                return _apply_local_implementer_rewrites(
+                    task=task,
+                    artifacts_dir=artifacts_dir,
+                    content=content,
+                    worktree_dir=worktree_dir,
+                    artifacts=artifacts,
+                )
+            raise RuntimeError(f"implementer_local patch rejected by git apply --check: {err_body}")
+
+    if not already_applied:
+        applied = _run_patch_cmd(["git", "apply", str(patch_path)])
+        if applied.returncode != 0:
+            recount_apply = _run_patch_cmd(["git", "apply", "--recount", str(patch_path)])
+            if recount_apply.returncode == 0:
+                applied = recount_apply
+        if applied.returncode != 0:
+            err_path = artifacts_dir / "local_ollama_patch_error.txt"
+            err_body = (applied.stderr or applied.stdout or "").strip() or "git apply failed"
+            err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
+            artifacts.append(str(err_path))
+            if rewrite_blocks:
+                fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
+                fallback_note.write_text(
+                    "Patch apply failed after check; falling back to rewrite blocks.\n"
+                    + err_body
+                    + "\n",
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                artifacts.append(str(fallback_note))
+                return _apply_local_implementer_rewrites(
+                    task=task,
+                    artifacts_dir=artifacts_dir,
+                    content=content,
+                    worktree_dir=worktree_dir,
+                    artifacts=artifacts,
+                )
+            raise RuntimeError(f"implementer_local patch apply failed: {err_body}")
+    return _finalize_local_implementer_change(
+        artifacts_dir=artifacts_dir,
+        worktree_dir=worktree_dir,
+        artifacts=artifacts,
+        apply_mode="patch",
+        already_applied=already_applied,
+        patch_repaired=patch_repaired,
+        patch_artifact=str(patch_path),
+        changed_files_hint=_extract_changed_files_from_patch_text(patch_text),
+    )
+
+
+def _orchestrator_run_local_ollama(
+
+    cfg: BotConfig,
+    task: Task,
+    *,
+    stop_event: threading.Event,
+    orch_q: OrchestratorQueue | None,
+    profiles: dict[str, dict[str, Any]] | None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    started = time.time()
+    role = _coerce_orchestrator_role(task.role)
+    mode = _coerce_orchestrator_mode(task.mode_hint)
+    role_profile = profile if isinstance(profile, dict) else _orchestrator_profile(profiles, role)
+
+    model = _sanitize_model_id(str(task.model or "").strip()) or _sanitize_model_id(str(role_profile.get("model") or "").strip())
+    if not model:
+        model = "qwen3.5:latest"
+
+    timeout_seconds = cfg.codex_timeout_seconds
+    try:
+        profile_timeout = int(task.trace.get("max_runtime_seconds", 0) or 0)
+    except Exception:
+        profile_timeout = 0
+    if profile_timeout > 0:
+        # The delegated contract should be able to extend runtime beyond the
+        # global default for slower local models or heavier specialist slices.
+        timeout_seconds = profile_timeout
+
+    try:
+        num_ctx = int(role_profile.get("local_num_ctx") or 32768)
+    except Exception:
+        num_ctx = 32768
+    if num_ctx < 4096:
+        num_ctx = 4096
+    if num_ctx > 131072:
+        num_ctx = 131072
+
+    try:
+        max_tokens = int(role_profile.get("local_max_tokens") or 900)
+    except Exception:
+        max_tokens = 900
+    if max_tokens < 128:
+        max_tokens = 128
+    if max_tokens > 4096:
+        max_tokens = 4096
+
+    try:
+        keep_alive_s = int(role_profile.get("local_keep_alive_s") or os.environ.get("BOT_LOCAL_OLLAMA_KEEPALIVE_SECONDS", "420"))
+    except Exception:
+        keep_alive_s = 420
+    if keep_alive_s < 30:
+        keep_alive_s = 30
+    if keep_alive_s > 3600:
+        keep_alive_s = 3600
+
+    think_opt_raw = role_profile.get("local_think")
+    think_opt: bool | None
+    if think_opt_raw is None:
+        think_opt = False if role in {"architect_local", "reviewer_local"} else None
+    else:
+        think_opt = str(think_opt_raw).strip().lower() in ("1", "true", "yes", "on")
+
+    installed_models = _ollama_installed_model_names()
+    requested_model = model
+    fallback_model = _sanitize_model_id(str(role_profile.get("local_fallback_model") or "").strip())
+    if installed_models and model not in installed_models:
+        for cand in (fallback_model, "qwen3.5:latest"):
+            if cand and cand in installed_models:
+                model = cand
+                break
+
+    def _candidate_local_models() -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for cand in (model, fallback_model, "qwen3.5:latest"):
+            cand_id = _sanitize_model_id(str(cand or "").strip())
+            if not cand_id or cand_id in seen:
+                continue
+            if installed_models and cand_id not in installed_models:
+                continue
+            seen.add(cand_id)
+            ordered.append(cand_id)
+        if ordered:
+            return ordered
+        return [model or "qwen3.5:latest"]
+
+    artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    shared_local_worktree = _local_role_worktree_dir("implementer_local")
+    if role == "implementer_local" and mode != "ro":
+        worktree_dir = shared_local_worktree if shared_local_worktree.is_dir() else artifacts_dir
+    elif role in {"architect_local", "reviewer_local"} and shared_local_worktree.is_dir():
+        worktree_dir = shared_local_worktree
+    else:
+        worktree_dir = artifacts_dir
+    live_response_path = artifacts_dir / "local_ollama_live.md"
+    live_stream_path = artifacts_dir / "local_ollama_stream.jsonl"
+    prompt_path = artifacts_dir / "local_ollama_prompt.json"
+    try:
+        live_response_path.write_text("", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        live_stream_path.write_text("", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    if stop_event.is_set():
+        return {
+            "status": "cancelled",
+            "summary": "Cancelled before local execution.",
+            "artifacts": [],
+            "logs": "",
+            "next_action": None,
+            "structured_digest": {"role": role, "backend": "local_ollama", "model": model},
+        }
+
+    system_prompt = str(role_profile.get("system_prompt") or "").strip()
+    user_prompt = build_agent_prompt(task, profile=role_profile)
+    if role in {"architect_local", "reviewer_local"}:
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nLOCAL_WORKSPACE_RULES:\n"
+            + "- Use REAL_WORKTREE_DIR as the actual repo root.\n"
+            + "- Do not invent paths under ARTIFACTS_DIR.\n"
+            + "- If the repository context still does not support a safe exact file choice, return BLOCKER immediately.\n"
+        )
+        user_prompt = _augment_local_specialist_prompt_with_workspace_context(
+            task=task,
+            user_prompt=user_prompt,
+            worktree_dir=worktree_dir,
+            role=role,
+        )
+    if role == "implementer_local" and mode != "ro":
+        architect_context = ""
+        arch_key_match = re.search(r"\blocal_arch_guard_[0-9]{6,}\b", str(user_prompt or ""), flags=re.IGNORECASE)
+        if arch_key_match:
+            architect_context = _local_specialist_response_for_key(
+                role="architect_local",
+                delegated_key=str(arch_key_match.group(0) or "").strip(),
+                max_chars=7000,
+            )
+        root_ticket_hint = str(getattr(task, "parent_job_id", "") or "").strip()
+        if not root_ticket_hint:
+            ticket_match = re.search(
+                r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                str(getattr(task, "input_text", "") or ""),
+                flags=re.IGNORECASE,
+            )
+            if ticket_match:
+                root_ticket_hint = str(ticket_match.group(0) or "").strip()
+        if not architect_context:
+            architect_context = _latest_local_specialist_response(
+                root_ticket=root_ticket_hint,
+                role="architect_local",
+                max_chars=7000,
+            )
+        if architect_context:
+            user_prompt = (
+                str(user_prompt or "").rstrip()
+                + "\n\nLATEST_ARCHITECT_LOCAL_OUTPUT (treat this as the primary implementation slice when it is more specific than the generic request):\n```text\n"
+                + architect_context
+                + "\n```\n"
+            )
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nIMPLEMENTER_LOCAL_STRICT_OVERRIDE:\n"
+            + "- Ignore any generic planner/output contract that asks for JSON-only answers or more delegation.\n"
+            + "- Do not delegate subtasks.\n"
+            + "- Do not return another plan.\n"
+            + "- The FILE excerpts below are current workspace content. Do not claim you cannot inspect the file when a FILE section is present.\n"
+            + "- If PRIMARY_ARCHITECT_HANDOFF and FILE excerpts both point to the same file, use that current file content as authoritative.\n"
+            + "- Return either one fenced ```diff``` block that can be applied with git apply at worktree root, or one/more fenced rewrite blocks like ```python path=relative/path.py``` with the full replacement file content.\n"
+            + "- Prefer rewrite blocks when a single small file is shown in full below; prefer diff when changing multiple existing files.\n"
+            + "- After the diff or rewrite block(s), append short evidence notes. If still blocked, return `BLOCKER:` with exact files to inspect next.\n"
+        )
+        user_prompt = _augment_local_implementer_prompt_with_workspace_context(
+            task=task,
+            user_prompt=user_prompt,
+            worktree_dir=worktree_dir,
+        )
+
+    def _write_local_prompt(*, model_name: str, request_body: dict[str, Any]) -> None:
+        payload = {
+            "backend": "local_ollama",
+            "role": role,
+            "requested_model": requested_model,
+            "model": str(model_name or "").strip(),
+            "created_at": time.time(),
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "request_body": request_body if isinstance(request_body, dict) else {},
+        }
+        try:
+            prompt_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    try:
+        if orch_q is not None:
+            try:
+                orch_q.update_trace(
+                    task.job_id,
+                    live_phase="local_ollama",
+                    live_backend="ollama",
+                    live_model=model,
+                    live_at=time.time(),
+                    live_workdir=str(worktree_dir),
+                    live_stdout_path=str(live_response_path),
+                    live_stderr_path=str(live_stream_path),
+                )
+            except Exception:
+                pass
+
+        last_live_flush = 0.0
+        live_content_parts: list[str] = []
+
+        def _on_local_chunk(chunk_text: str, event_payload: dict[str, Any], *, model_name: str) -> None:
+            nonlocal last_live_flush
+            piece = str(chunk_text or "")
+            if piece:
+                live_content_parts.append(piece)
+            now_ts = time.time()
+            done_flag = bool((event_payload or {}).get("done"))
+            if not done_flag and (now_ts - last_live_flush) < 0.30:
+                return
+            joined = "".join(live_content_parts)
+            if joined:
+                try:
+                    live_response_path.write_text(joined, encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+            try:
+                with live_stream_path.open("a", encoding="utf-8", errors="replace") as sf:
+                    sf.write(json.dumps(event_payload or {}, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            if orch_q is not None:
+                try:
+                    orch_q.update_trace(
+                        task.job_id,
+                        live_phase="local_ollama",
+                        live_backend="ollama",
+                        live_model=model_name,
+                        live_at=now_ts,
+                        live_workdir=str(worktree_dir),
+                        live_stdout_path=str(live_response_path),
+                        live_stderr_path=str(live_stream_path),
+                    )
+                except Exception:
+                    pass
+            last_live_flush = now_ts
+
+        def _run_local_once(model_name: str) -> dict[str, Any]:
+            return _ollama_chat(
+                model=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout_seconds=float(timeout_seconds or 900),
+                temperature=0.1,
+                num_ctx=num_ctx,
+                max_tokens=max_tokens,
+                keep_alive_s=keep_alive_s,
+                think=think_opt,
+                stream=True,
+                on_chunk=(lambda chunk_text, event_payload: _on_local_chunk(chunk_text, event_payload, model_name=model_name)),
+                on_request=(lambda body: _write_local_prompt(model_name=model_name, request_body=body if isinstance(body, dict) else {})),
+            )
+
+        used_fallback = False
+        attempt_errors: list[str] = []
+        out: dict[str, Any] = {}
+        content = ""
+        for idx, candidate_model in enumerate(_candidate_local_models()):
+            try:
+                out = _run_local_once(candidate_model)
+                content = str(out.get("content") or "").strip()
+                model = candidate_model
+                used_fallback = idx > 0
+                if content:
+                    break
+                attempt_errors.append(f"{candidate_model}: empty response")
+            except Exception as e_candidate:
+                attempt_errors.append(f"{candidate_model}: {e_candidate}")
+                continue
+
+        if not content:
+            if attempt_errors:
+                raise RuntimeError("; ".join(attempt_errors[-3:]))
+            raise RuntimeError("empty response from local ollama model")
+        try:
+            live_response_path.write_text(content + "\n", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+        response_path = artifacts_dir / "local_ollama_response.md"
+        response_path.write_text(content + "\n", encoding="utf-8", errors="replace")
+
+        patch_artifacts: list[str] = []
+        patch_info: dict[str, Any] = {}
+        if role == "implementer_local" and mode != "ro":
+            patch_text = _extract_first_diff_block(content)
+            blocker_text = _extract_blocker_response(content)
+            if blocker_text:
+                blocker_path = artifacts_dir / "local_ollama_blocker.txt"
+                blocker_path.write_text(blocker_text + "\n", encoding="utf-8", errors="replace")
+                patch_artifacts = [str(blocker_path)]
+                raise RuntimeError(f"implementer_local blocker: {blocker_text}")
+            if (not patch_text.strip()) and _response_signals_no_code_change(content):
+                no_change_path = artifacts_dir / "local_ollama_no_change.txt"
+                no_change_path.write_text(content.strip() + "\n", encoding="utf-8", errors="replace")
+                patch_artifacts = [str(no_change_path)]
+                patch_info = {
+                    "no_code_change_required": True,
+                    "reason": "implementer_local verified no code change was required for this slice",
+                }
+            else:
+                patch_artifacts, patch_info = _apply_local_implementer_patch(
+                    task=task,
+                    artifacts_dir=artifacts_dir,
+                    content=content,
+                    worktree_dir=worktree_dir,
+                )
+
+        raw_resp = out.get("response") if isinstance(out, dict) else {}
+        meta = {
+            "backend": "local_ollama",
+            "role": role,
+            "model": model,
+            "requested_model": requested_model,
+            "num_ctx": int(num_ctx),
+            "max_tokens": int(max_tokens),
+            "keep_alive_s": int(keep_alive_s),
+            "duration_s": round(max(0.0, time.time() - started), 3),
+            "created_at": time.time(),
+            "fallback_used": bool(used_fallback),
+            "stream_events": int(out.get("events") or 0),
+            "worktree_dir": str(worktree_dir),
+            "patch_applied": bool(patch_info),
+            "patch_info": patch_info,
+            "raw": raw_resp,
+            "prompt_path": str(prompt_path) if prompt_path.exists() else "",
+        }
+        meta_path = artifacts_dir / "local_ollama_meta.json"
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="replace")
+
+        summary = content if len(content) <= 3800 else (content[:3800].rstrip() + "...")
+        artifacts = [str(response_path), str(meta_path), str(live_response_path), str(live_stream_path)]
+        if prompt_path.exists():
+            artifacts.append(str(prompt_path))
+        artifacts.extend([p for p in patch_artifacts if p not in artifacts])
+        return {
+            "status": "ok",
+            "summary": summary,
+            "artifacts": artifacts,
+            "logs": "",
+            "next_action": None,
+            "structured_digest": {
+                "role": role,
+                "backend": "local_ollama",
+                "model": model,
+                "requested_model": requested_model,
+                "num_ctx": int(num_ctx),
+                "max_tokens": int(max_tokens),
+                "keep_alive_s": int(keep_alive_s),
+                "duration_s": round(max(0.0, time.time() - started), 3),
+                "fallback_used": bool(used_fallback),
+                "attempt_errors": attempt_errors[:3],
+                "worktree_dir": str(worktree_dir),
+                "patch_applied": bool(patch_info),
+                "patch_info": patch_info,
+            },
+        }
+    except Exception as e:
+        err_path = artifacts_dir / "local_ollama_error.txt"
+        err_text = f"Local Ollama execution failed for role={role} model={model}: {e}\n"
+        try:
+            err_path.write_text(err_text, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        if orch_q is not None:
+            try:
+                orch_q.update_trace(
+                    task.job_id,
+                    live_phase="local_ollama",
+                    live_backend="ollama",
+                    live_model=model,
+                    live_at=time.time(),
+                    live_workdir=str(worktree_dir),
+                    live_stdout_path=str(live_response_path),
+                    live_stderr_path=str(err_path),
+                )
+            except Exception:
+                pass
+        return {
+            "status": "error",
+            "summary": f"Local Ollama execution failed: {e}",
+            "artifacts": [x for x in (str(err_path), str(live_response_path), str(live_stream_path), str(prompt_path)) if x and Path(x).exists()],
+            "logs": err_text,
+            "next_action": "retry",
+            "structured_digest": {"role": role, "backend": "local_ollama", "model": model},
+        }
+
+
 def _codex_version() -> str:
     try:
         proc = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=5)
@@ -3268,6 +5151,8 @@ def _help_text(cfg: BotConfig) -> str:
         "- /approve_merge <id> Approve and execute merge to main for an order",
         "- /rollback <id>      Revert latest merged commit associated to an order",
         "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
+        "- /pause_autonomy    Pause Skynet/local autonomous lane until explicit resume",
+        "- /resume_autonomy   Resume Skynet/local autonomous lane",
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
         "- /cancel <id>        Cancel orchestrator task by id",
@@ -3281,6 +5166,7 @@ def _help_text(cfg: BotConfig) -> str:
         f"- Strict proxy mode:  {'ON' if cfg.strict_proxy else 'off'} (forwards most text directly to Codex)",
         "- /setnotify          Save this chat as the notify target",
         "- /notify <text>      Send a message to the notify target chat",
+        "- /notify policy      Set CEO notification scope",
         "- /synccommands       Re-sync Telegram slash command suggestions",
         "- /model              Show current model selection",
         "- /model <name>       Set model for current provider mode",
@@ -3366,6 +5252,8 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("reset_role", "Reset role memory"),
         ("emergency_stop", "Stop orchestrator"),
         ("emergency_resume", "Resume orchestrator"),
+        ("pause_autonomy", "Pause autonomous lane"),
+        ("resume_autonomy", "Resume autonomous lane"),
         ("daily", "Digest now"),
         ("brief", "Executive brief"),
         ("snapshot", "Request UI snapshot"),
@@ -3385,6 +5273,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("permissions", "Codex permissions"),
         ("p", "Alias for /permissions"),
         ("skills", "Manage skills"),
+        ("notify", "Notify scope/message"),
         ("synccommands", "Re-sync commands"),
     ]
     return cmds
@@ -3483,7 +5372,7 @@ def _maybe_handle_ceo_query(
                     f"Jarvis: Telegram user_id={msg.user_id} chat_id={msg.chat_id} username={display_user}",
                 ]
             ),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
+            reply_to_message_id=msg.message_id if msg.message_id else None,
         )
         return True
 
@@ -3960,6 +5849,7 @@ def _orch_job_id(raw: str) -> str:
 
 _ORCHESTRATOR_ROLES = (
     "jarvis",
+    "skynet",
     "frontend",
     "backend",
     "qa",
@@ -3968,6 +5858,9 @@ _ORCHESTRATOR_ROLES = (
     "security",
     "research",
     "release_mgr",
+    "architect_local",
+    "implementer_local",
+    "reviewer_local",
 )
 
 
@@ -4122,6 +6015,75 @@ def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
     return True, "created_from_main"
 
 
+def _git_branch_integrated_into_main(*, repo: Path, branch: str) -> bool:
+    b = str(branch or "").strip()
+    if not b:
+        return True
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    if not _git_remote_branch_exists(repo, b):
+        # Branch missing remotely: assume already integrated/retired.
+        return True
+
+    _run_git(repo, ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"], check=False)
+    anc = _run_git(repo, ["merge-base", "--is-ancestor", f"origin/{b}", "origin/main"], check=False)
+    return anc.returncode == 0
+
+
+def _order_trace_requires_merge(
+    trace: dict[str, Any] | None,
+    *,
+    repo: Path | None = None,
+) -> tuple[bool, str]:
+    tr = dict(trace or {})
+    branch = str(tr.get("order_branch") or "").strip()
+    if not branch:
+        return False, ""
+    if str(tr.get("superseded_by") or "").strip():
+        return False, branch
+    if bool(tr.get("merge_cancelled", False)):
+        return False, branch
+
+    merged_flag = bool(tr.get("merged_to_main", False))
+    if merged_flag and repo is not None:
+        if _git_branch_integrated_into_main(repo=repo, branch=branch):
+            return False, branch
+        # Metadata says merged, but git history disagrees -> force re-merge.
+        return True, branch
+
+    if merged_flag:
+        return False, branch
+    return True, branch
+
+
+def _retire_order_branch_without_merge(*, repo: Path, order_branch: str) -> tuple[bool, str]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return True, "no_branch"
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    remote_exists = (
+        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+        or _git_ref_exists(repo, f"origin/{b}")
+        or _git_remote_branch_exists(repo, b)
+    )
+    if remote_exists:
+        rm = _run_git(repo, ["push", "origin", "--delete", b], check=False)
+        if rm.returncode != 0:
+            detail = (rm.stderr or rm.stdout or "").strip()
+            low = detail.lower()
+            benign = (
+                "remote ref does not exist" in low
+                or "not found" in low
+                or "unable to delete" in low
+            )
+            if not benign:
+                return False, detail or "remote_delete_failed"
+
+    _run_git(repo, ["branch", "-D", b], check=False)
+    return True, "branch_retired"
+
+
 def _resolve_order_branch_from_task(task: Task, orch_q: OrchestratorQueue | None) -> str:
     tr = dict(task.trace or {})
     direct = str(tr.get("order_branch") or "").strip()
@@ -4247,9 +6209,23 @@ def _merge_order_branch_to_main(
         return True, "no_branch", None
 
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-    if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+    remote_exists = (
+        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+        or _git_ref_exists(repo, f"origin/{b}")
+        or _git_remote_branch_exists(repo, b)
+    )
+    if not remote_exists:
         # If branch no longer exists remotely, treat as already integrated/closed.
         return True, "branch_missing_remote", None
+
+    # Guarantee local visibility for repos using narrow fetch refspecs.
+    if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+        f = _run_git(repo, ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"], check=False)
+        if f.returncode != 0:
+            f2 = _run_git(repo, ["fetch", "origin", b], check=False)
+            if f2.returncode != 0:
+                ferr = (f2.stderr or f2.stdout or f.stderr or f.stdout or "").strip()
+                return False, ferr or "branch_fetch_failed", None
 
     merge_root = (repo / "data" / "merge_worktrees").resolve()
     merge_root.mkdir(parents=True, exist_ok=True)
@@ -4430,13 +6406,19 @@ def _orchestrator_task_from_job(
         # Jarvis planning lane.
         model = _MODEL_JARVIS_PLAN
         effort = _EFFORT_JARVIS_PLAN
+        mode_hint = "full"
+    elif role in _LOCAL_OLLAMA_ROLE_NAMES:
+        # Local specialist lane keeps role profile model/effort.
+        pass
     else:
         # Worker execution lane.
         model = _MODEL_AGENT_EXEC
         effort = _EFFORT_AGENT_EXEC
 
     requires_approval = bool(profile.get("approval_required", False))
-    if mode_hint == "full":
+    if role == "jarvis":
+        requires_approval = False
+    elif mode_hint == "full":
         requires_approval = True
 
     trace: dict[str, str | int | float | bool | list[str]] = {
@@ -4746,7 +6728,12 @@ def _send_orchestrator_marker_response(
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
             return True
-        _send_chunked_text(api, chat_id=chat_id, text=_orchestrator_status_text(orch_q), reply_to_message_id=reply_to_message_id)
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_orchestrator_status_text(orch_q, cfg=cfg),
+            reply_to_message_id=reply_to_message_id,
+        )
         return True
 
     if kind == "dashboard":
@@ -5177,7 +7164,7 @@ def _send_orchestrator_marker_response(
             return True
 
         # Enable: create/update the stored message id and start updating every scheduler tick.
-        msg_txt = _watch_status_text(orch_q)
+        msg_txt = _watch_status_text(cfg, orch_q)
         mid = api.send_message(chat_id, msg_txt, reply_to_message_id=reply_to_message_id)
         if mid is not None:
             def _m_enable(s: dict[str, Any]) -> None:
@@ -5427,6 +7414,46 @@ def _send_orchestrator_marker_response(
         )
         return True
 
+    if kind in ("pause_autonomy", "resume_autonomy"):
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para acciones de orquestador.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if kind == "pause_autonomy":
+            out = _pause_proactive_lane_now(
+                cfg=cfg,
+                orch_q=orch_q,
+                reason="manual_pause_command",
+                manual=True,
+            )
+            api.send_message(
+                chat_id,
+                (
+                    "Autonomia pausada. Skynet y la lane local autonoma no volveran a correr hasta /resume_autonomy.\n"
+                    f"- autonomous_jobs_cancelled: {int(out.get('autonomous_jobs_cancelled', 0))}\n"
+                    f"- manual_pause: {'yes' if bool(out.get('manual_pause', False)) else 'no'}"
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+        else:
+            state = _proactive_lane_state(cfg)
+            if not bool(state.get("paused", False)):
+                api.send_message(chat_id, "Autonomia ya estaba activa.", reply_to_message_id=reply_to_message_id)
+            else:
+                _set_proactive_lane_pause(cfg, paused=False)
+                api.send_message(
+                    chat_id,
+                    "Autonomia reanudada. Skynet puede volver a ejecutar la lane proactiva.",
+                    reply_to_message_id=reply_to_message_id,
+                )
+        return True
+
     if kind in ("pause", "resume"):
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -5467,10 +7494,22 @@ def _send_orchestrator_marker_response(
             return True
         if kind == "emergency_stop":
             orch_q.pause_all_roles()
-            canceled = orch_q.cancel_running_jobs()
+            out = orch_q.stop_all_global(
+                reason="emergency_stop",
+                actor="jarvis",
+                chat_id=None,
+                close_orders=False,
+                close_projects=False,
+                clear_workspace_leases=False,
+            )
             api.send_message(
                 chat_id,
-                f"Emergency stop activo. Roles pausados y tareas en ejecución canceladas: {canceled}.",
+                (
+                    "Emergency stop activo. Roles pausados y cola drenada.\n"
+                    f"- jobs_cancelled: {int(out.get('jobs_cancelled', 0))}\n"
+                    f"- orders_done: {int(out.get('orders_done', 0))}\n"
+                    f"- projects_done: {int(out.get('projects_done', 0))}"
+                ),
                 reply_to_message_id=reply_to_message_id,
             )
         else:
@@ -5624,7 +7663,17 @@ def _send_orchestrator_marker_response(
     return False
 
 
-def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
+def _proactive_lane_status_label(cfg: BotConfig) -> str:
+    state = _proactive_lane_state(cfg)
+    if not bool(state.get("paused", False)):
+        return "active"
+    reason = str(state.get("reason") or "").strip() or "unspecified"
+    if bool(state.get("manual_pause", False)):
+        return f"paused (manual; reason={reason})"
+    return f"paused (reason={reason})"
+
+
+def _orchestrator_status_text(orch_q: OrchestratorQueue, *, cfg: BotConfig | None = None) -> str:
     health = orch_q.get_role_health()
     if not health:
         return "No orchestrator jobs yet."
@@ -5632,6 +7681,9 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue) -> str:
     states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked", "done", "failed", "cancelled")
     system_state = "paused" if orch_q.is_paused_globally() else "active"
     lines = ["Jarvis role health:", f"system: {system_state}", ""]
+    if cfg is not None:
+        lines.insert(2, f"proactive_lane: {_proactive_lane_status_label(cfg)}")
+        lines.insert(3, "")
     for role in sorted(health.keys()):
         vals = health.get(role, {})
         state_parts = [f"{s}={int(vals.get(s, 0))}" for s in states if vals.get(s) is not None]
@@ -5678,7 +7730,7 @@ def _orchestrator_daily_digest_text(orch_q: OrchestratorQueue) -> str:
     return "\n".join(lines)
 
 
-def _watch_status_text(orch_q: OrchestratorQueue) -> str:
+def _watch_status_text(cfg: BotConfig, orch_q: OrchestratorQueue) -> str:
     """
     Single-message "company status" snapshot intended to be edited in-place (no spam).
     """
@@ -5691,6 +7743,7 @@ def _watch_status_text(orch_q: OrchestratorQueue) -> str:
         "Company Status (Jarvis)",
         f"updated_at: {ts}",
         f"system: {system_state}",
+        f"proactive_lane: {_proactive_lane_status_label(cfg)}",
         "",
     ]
 
@@ -5754,7 +7807,7 @@ def _tick_watch_messages(*, cfg: BotConfig, api: TelegramAPI, orch_q: Orchestrat
             continue
 
         try:
-            api.edit_message_text(chat_id, mid, _watch_status_text(orch_q))
+            api.edit_message_text(chat_id, mid, _watch_status_text(cfg, orch_q))
         except Exception:
             # Disable watch to avoid retry loops/spam.
             watch_by_chat.pop(chat_id_str, None)
@@ -5822,12 +7875,16 @@ def _order_command_text(
     chat_id: int,
     payload: str,
     user_id: int | None = None,
+    actor: str = "ceo",
 ) -> str:
     parts = (payload or "").strip().split()
     if len(parts) < 2:
         return "Usage: /order show|pause|done|merge|rollback <id>"
     cmd = parts[0].strip().lower()
     oid = parts[1].strip()
+    actor_norm = str(actor or "ceo").strip().lower() or "ceo"
+    if actor_norm not in ("ceo", "jarvis", "system"):
+        actor_norm = "ceo"
     if cmd == "show":
         it = orch_q.get_order(oid, chat_id=int(chat_id))
         if not it:
@@ -5881,10 +7938,30 @@ def _order_command_text(
                 pass
         return "OK." if ok else f"No such order: {oid}"
     if cmd in ("done", "complete", "completed"):
-        ok = orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+        it = orch_q.get_order(oid, chat_id=int(chat_id))
+        if not it:
+            return f"No such order: {oid}"
+        root_id = str(it.get("order_id") or "").strip()
+        if not root_id:
+            return f"Invalid order id: {oid}"
+
+        root = orch_q.get_job(root_id)
+        trace = dict((root.trace or {}) if root else {})
+        merge_required, _order_branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+        if merge_required:
+            return _order_command_text(
+                cfg,
+                orch_q,
+                chat_id=int(chat_id),
+                payload=f"merge {root_id}",
+                user_id=user_id,
+                actor=actor_norm,
+            )
+
+        ok = orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
         if ok:
             try:
-                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
             except Exception:
                 pass
         return "OK." if ok else f"No such order: {oid}"
@@ -5911,7 +7988,8 @@ def _order_command_text(
                     root_id,
                     merge_ready=False,
                     merge_approved=True,
-                    merge_approved_by=(int(user_id) if user_id is not None else None),
+                    merge_approved_by=(int(user_id) if (user_id is not None and actor_norm == "ceo") else None),
+                    merge_approved_actor=actor_norm,
                     merge_approved_at=time.time(),
                     merged_to_main=True,
                     merge_result=str(merged_msg),
@@ -5928,7 +8006,7 @@ def _order_command_text(
             try:
                 orch_q.append_audit_event(
                     event_type="order.merged",
-                    actor="ceo",
+                    actor=actor_norm,
                     details={
                         "order_id": root_id,
                         "order_branch": order_branch,
@@ -5939,6 +8017,8 @@ def _order_command_text(
             except Exception:
                 pass
             commit_part = f" commit={merge_commit}" if merge_commit else ""
+            if actor_norm == "jarvis":
+                return f"Order {root_id[:8]} auto-merged by Jarvis to main.{commit_part}"
             return f"Order {root_id[:8]} merged to main.{commit_part}"
         try:
             orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
@@ -5949,7 +8029,7 @@ def _order_command_text(
         try:
             orch_q.append_audit_event(
                 event_type="order.merge_failed",
-                actor="ceo",
+                actor=actor_norm,
                 details={
                     "order_id": root_id,
                     "order_branch": order_branch,
@@ -5958,6 +8038,115 @@ def _order_command_text(
             )
         except Exception:
             pass
+        if actor_norm == "jarvis":
+            try:
+                err_txt = str(merged_msg or "")
+                err_low = err_txt.lower()
+                conflict_like = ("conflict" in err_low) or ("merge failed" in err_low)
+                if conflict_like:
+                    try:
+                        max_replans_total = int(os.environ.get("BOT_MERGE_CONFLICT_REPLAN_MAX_TOTAL", "3"))
+                    except Exception:
+                        max_replans_total = 3
+                    max_replans_total = max(1, min(12, int(max_replans_total)))
+
+                    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+                    children = orch_q.jobs_by_parent(parent_job_id=root_id, limit=500)
+                    replan_total = sum(
+                        1
+                        for c in children
+                        if str((c.labels or {}).get("kind") or "").strip().lower() == "merge_conflict_replan"
+                    )
+                    has_active_fix = any(
+                        str((c.labels or {}).get("kind") or "").strip().lower() == "merge_conflict_replan"
+                        and str(c.state or "").strip().lower() in active_states
+                        for c in children
+                    )
+                    try:
+                        last_fix_at = float(trace.get("merge_conflict_replan_at", 0.0) or 0.0)
+                    except Exception:
+                        last_fix_at = 0.0
+                    now_ts = float(time.time())
+                    can_enqueue_replan = int(replan_total) < int(max_replans_total)
+                    if (not has_active_fix) and ((now_ts - last_fix_at) >= 90.0) and can_enqueue_replan:
+                        fix_id = str(uuid.uuid4())
+                        fix_task = Task.new(
+                            source="telegram",
+                            role="jarvis",
+                            input_text=(
+                                "MERGE CONFLICT REPLAN\n"
+                                f"Order: {root_id}\n"
+                                f"Branch: {order_branch}\n"
+                                f"Merge error: {err_txt}\n\n"
+                                "Objective:\n"
+                                "- Resolve the branch against latest origin/main without dropping approved scope.\n"
+                                "- Re-run validation and produce a clean wrapup ready for merge.\n"
+                                "- If one approach fails, try an alternative approach (do not stop at NO-GO).\n"
+                            ),
+                            request_type="maintenance",
+                            priority=1,
+                            model=_MODEL_JARVIS_PLAN,
+                            effort=_EFFORT_JARVIS_PLAN,
+                            mode_hint="full",
+                            requires_approval=False,
+                            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+                            chat_id=int(chat_id),
+                            user_id=user_id,
+                            reply_to_message_id=None,
+                            parent_job_id=root_id,
+                            labels={
+                                "ticket": root_id,
+                                "kind": "merge_conflict_replan",
+                                "key": f"merge_conflict_replan_{root_id[:8]}",
+                            },
+                            artifacts_dir=str((cfg.artifacts_root / fix_id).resolve()),
+                            trace={
+                                "source": "merge_conflict",
+                                "order_id": root_id,
+                                "order_branch": order_branch,
+                                "merge_error": err_txt,
+                                "allow_delegation": True,
+                            },
+                            job_id=fix_id,
+                        )
+                        orch_q.submit_task(fix_task)
+                        orch_q.update_trace(
+                            root_id,
+                            merge_conflict_replan_at=now_ts,
+                            merge_conflict_replan_job_id=fix_id,
+                            merge_conflict_replan_error=err_txt[:800],
+                            merge_conflict_replan_attempts=int(replan_total + 1),
+                            live_at=now_ts,
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.merge_conflict_replan_enqueued",
+                            actor="jarvis",
+                            details={
+                                "order_id": root_id,
+                                "order_branch": order_branch,
+                                "job_id": fix_id,
+                            },
+                        )
+                    elif not can_enqueue_replan:
+                        orch_q.update_trace(
+                            root_id,
+                            merge_conflict_replan_exhausted_at=now_ts,
+                            merge_conflict_replan_attempts=int(replan_total),
+                            live_at=now_ts,
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.merge_conflict_replan_exhausted",
+                            actor="jarvis",
+                            details={
+                                "order_id": root_id,
+                                "order_branch": order_branch,
+                                "attempts": int(replan_total),
+                                "max_attempts": int(max_replans_total),
+                            },
+                        )
+            except Exception:
+                pass
+            return f"Jarvis auto-merge failed for order {root_id[:8]}: {merged_msg}"
         return f"Merge failed for order {root_id[:8]}: {merged_msg}"
 
     if cmd in ("rollback", "revert"):
@@ -6011,6 +8200,792 @@ def _order_command_text(
     return "Usage: /order show|pause|done|merge|rollback <id>"
 
 
+def _jarvis_auto_approve_merge_enabled() -> bool:
+    raw = os.environ.get("BOT_JARVIS_AUTO_APPROVE_MERGE", "1")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _auto_merge_ready_orders_tick(
+    *,
+    cfg: BotConfig,
+    api: "TelegramAPI",
+    orch_q: OrchestratorQueue,
+    now: float,
+) -> int:
+    """
+    Auto-approve + merge orders that reached ready_for_merge.
+    CEO sees final merge results without manual /approve_merge steps.
+    """
+    if not _jarvis_auto_approve_merge_enabled():
+        return 0
+    if orch_q.is_paused_globally():
+        return 0
+    try:
+        retry_seconds = float(os.environ.get("BOT_JARVIS_AUTO_MERGE_RETRY_SECONDS", "180").strip() or "180")
+    except Exception:
+        retry_seconds = 180.0
+    retry_seconds = max(30.0, min(3600.0, float(retry_seconds)))
+    try:
+        max_attempts = int(os.environ.get("BOT_JARVIS_AUTO_MERGE_MAX_ATTEMPTS", "6"))
+    except Exception:
+        max_attempts = 6
+    max_attempts = max(1, min(30, int(max_attempts)))
+    try:
+        notify_cooldown_s = float(os.environ.get("BOT_JARVIS_AUTO_MERGE_NOTIFY_COOLDOWN_SECONDS", "900").strip() or "900")
+    except Exception:
+        notify_cooldown_s = 900.0
+    notify_cooldown_s = max(30.0, min(86400.0, float(notify_cooldown_s)))
+
+    try:
+        orders = list(orch_q.list_orders_global(status="active", limit=180) or [])
+    except Exception:
+        orders = []
+
+    # Optional heal path for historical debt: some orders may be incorrectly marked done without merge evidence.
+    # Disabled by default to avoid reopening legacy orders and spamming repeated merge-conflict notifications.
+    heal_done_orders = str(os.environ.get("BOT_JARVIS_AUTO_MERGE_HEAL_DONE_ORDERS", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        heal_done_max_age_hours = float(os.environ.get("BOT_JARVIS_AUTO_MERGE_HEAL_DONE_MAX_AGE_HOURS", "6").strip() or "6")
+    except Exception:
+        heal_done_max_age_hours = 6.0
+    heal_done_max_age_s = max(300.0, min(168.0 * 3600.0, float(heal_done_max_age_hours) * 3600.0))
+
+    done_orders: list[dict[str, Any]] = []
+    if heal_done_orders:
+        try:
+            done_orders = list(orch_q.list_orders_global(status="done", limit=240) or [])
+        except Exception:
+            done_orders = []
+
+    known_ids = {str(it.get("order_id") or "").strip() for it in orders}
+    if heal_done_orders:
+        for row in done_orders:
+            oid = str(row.get("order_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                updated_at = float(row.get("updated_at") or 0.0)
+            except Exception:
+                updated_at = 0.0
+            if updated_at > 0 and (float(now) - updated_at) > heal_done_max_age_s:
+                continue
+
+            try:
+                chat_for_order = int(row.get("chat_id") or 0)
+            except Exception:
+                chat_for_order = 0
+            if chat_for_order <= 0:
+                continue
+
+            root = orch_q.get_job(oid)
+            trace = dict((root.trace or {}) if root else {})
+            if bool(trace.get("merge_cancelled", False)):
+                continue
+            if bool(trace.get("merge_auto_suspended", False)):
+                continue
+
+            merge_required, _branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+            if not merge_required:
+                continue
+
+            try:
+                orch_q.set_order_status(oid, chat_id=chat_for_order, status="active")
+                orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="ready_for_merge")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=True,
+                    merge_ready_at=float(now),
+                    merge_reopened_for_auto_merge_at=float(now),
+                    live_at=float(now),
+                )
+            except Exception:
+                continue
+
+            if oid not in known_ids:
+                healed = dict(row)
+                healed["status"] = "active"
+                healed["phase"] = "ready_for_merge"
+                orders.append(healed)
+                known_ids.add(oid)
+
+    merged_count = 0
+    for it in orders:
+        oid = str(it.get("order_id") or "").strip()
+        if not oid:
+            continue
+        phase = str(it.get("phase") or "").strip().lower()
+        try:
+            chat_for_order = int(it.get("chat_id") or 0)
+        except Exception:
+            chat_for_order = 0
+        if chat_for_order <= 0:
+            continue
+
+        root = orch_q.get_job(oid)
+        trace = dict((root.trace or {}) if root else {})
+        merge_required_now, _branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+        try:
+            _sync_order_phase_from_runtime(
+                orch_q=orch_q,
+                root_ticket=oid,
+                chat_id=int(chat_for_order),
+            )
+            refreshed = orch_q.get_order(oid, chat_id=int(chat_for_order)) or {}
+            phase = str(refreshed.get("phase") or phase).strip().lower()
+        except Exception:
+            pass
+        if phase != "ready_for_merge":
+            continue
+        if bool(trace.get("merged_to_main", False)) and not merge_required_now:
+            try:
+                orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
+                orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
+            except Exception:
+                pass
+            continue
+
+        active_children = []
+        try:
+            active_children = orch_q.jobs_by_parent(parent_job_id=oid, limit=600)
+        except Exception:
+            active_children = []
+        if any(str(c.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for c in active_children):
+            continue
+
+        try:
+            merge_attempts = int(trace.get("merge_auto_attempts", 0) or 0)
+        except Exception:
+            merge_attempts = 0
+        if merge_attempts >= int(max_attempts):
+            if not bool(trace.get("merge_auto_suspended", False)):
+                try:
+                    orch_q.update_trace(
+                        oid,
+                        merge_auto_suspended=True,
+                        merge_auto_suspended_at=float(now),
+                        merge_auto_error="max_attempts_reached",
+                        live_at=float(now),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.auto_merge_suspended",
+                        actor="jarvis",
+                        details={"order_id": oid, "attempts": int(merge_attempts), "max_attempts": int(max_attempts)},
+                    )
+                except Exception:
+                    pass
+            continue
+
+        try:
+            failed_at = float(trace.get("merge_auto_failed_at", 0.0) or 0.0)
+        except Exception:
+            failed_at = 0.0
+        if failed_at > 0 and (float(now) - failed_at) < retry_seconds:
+            continue
+
+        try:
+            orch_q.update_trace(
+                oid,
+                merge_auto_attempts=int(merge_attempts + 1),
+                merge_auto_last_attempt_at=float(now),
+                merge_auto_suspended=False,
+                live_at=float(now),
+            )
+        except Exception:
+            pass
+
+        result_text = _order_command_text(
+            cfg,
+            orch_q,
+            chat_id=chat_for_order,
+            payload=f"merge {oid}",
+            user_id=None,
+            actor="jarvis",
+        )
+        result_norm = str(result_text or "").strip().lower()
+        merged_ok = False
+        if ("failed" not in result_norm) and (
+            ("merged to main" in result_norm)
+            or ("auto-merged by jarvis to main" in result_norm)
+        ):
+            merged_ok = True
+        if not merged_ok:
+            try:
+                after_order = orch_q.get_order(oid, chat_id=chat_for_order) or {}
+                after_root = orch_q.get_job(oid)
+                after_trace = dict((after_root.trace or {}) if after_root else {})
+                merged_ok = bool(after_trace.get("merged_to_main", False)) or str(after_order.get("status") or "").strip().lower() == "done"
+            except Exception:
+                merged_ok = False
+
+        if merged_ok:
+            merged_count += 1
+            try:
+                orch_q.update_trace(
+                    oid,
+                    merge_auto_failed_at=None,
+                    merge_auto_error=None,
+                    merge_auto_attempts=0,
+                    merge_auto_suspended=False,
+                    merge_auto_fail_notified_at=None,
+                    merge_auto_fail_notified_error=None,
+                    live_at=float(now),
+                )
+            except Exception:
+                pass
+            try:
+                reply_to = it.get("reply_to_message_id")
+                try:
+                    reply_to_i = int(reply_to) if reply_to is not None else None
+                    if reply_to_i is not None and reply_to_i <= 0:
+                        reply_to_i = None
+                except Exception:
+                    reply_to_i = None
+                _send_chunked_text(
+                    api,
+                    chat_id=chat_for_order,
+                    text=f"Jarvis: {result_text}",
+                    reply_to_message_id=reply_to_i,
+                )
+            except Exception:
+                LOG.exception("Failed to notify auto-merge success. order=%s", oid)
+            continue
+
+        should_notify = True
+        try:
+            error_sig = str(result_text or "")[:700]
+            orch_q.update_trace(
+                oid,
+                merge_auto_failed_at=float(now),
+                merge_auto_error=str(result_text or ""),
+                merge_auto_last_error_sig=error_sig,
+                live_at=float(now),
+            )
+            last_notified_at = 0.0
+            try:
+                last_notified_at = float(trace.get("merge_auto_fail_notified_at", 0.0) or 0.0)
+            except Exception:
+                last_notified_at = 0.0
+            last_notified_error = str(trace.get("merge_auto_fail_notified_error") or "")
+            should_notify = True
+            if last_notified_at > 0 and (float(now) - last_notified_at) < float(notify_cooldown_s):
+                if last_notified_error == error_sig:
+                    should_notify = False
+            if should_notify:
+                orch_q.update_trace(
+                    oid,
+                    merge_auto_fail_notified_at=float(now),
+                    merge_auto_fail_notified_error=error_sig,
+                )
+            orch_q.append_audit_event(
+                event_type="order.auto_merge_failed",
+                actor="jarvis",
+                details={
+                    "order_id": oid,
+                    "error": str(result_text or ""),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            if should_notify:
+                _send_chunked_text(
+                    api,
+                    chat_id=chat_for_order,
+                    text=f"Jarvis: {result_text}",
+                    reply_to_message_id=None,
+                )
+        except Exception:
+            LOG.exception("Failed to notify auto-merge failure. order=%s", oid)
+
+    return merged_count
+
+
+_PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
+
+
+def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
+    mobile_path = str(cfg.mobile_app_project_dir)
+    catalog = [
+        {
+            "key": "poncebot-core",
+            "title": "Proactive Sprint: PonceBot Reliability + Workflow Quality",
+            "lane": "bot",
+            "project_hint": "/home/aponce/codexbot",
+            "goal": (
+                "Improve orchestration reliability, reduce noisy notifications, tighten evidence gates, "
+                "and strengthen end-to-end Telegram traceability."
+            ),
+            "success": (
+                "Ship one concrete reliability or workflow-quality improvement inside /home/aponce/codexbot, "
+                "with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
+            ),
+        },
+        {
+            "key": "executive-dashboard",
+            "title": "Proactive Sprint: Executive Dashboard UX + Observability",
+            "lane": "dashboard",
+            "project_hint": "/home/aponce/ExecutiveDashboard",
+            "goal": (
+                "Improve executive readability, reduce visual friction, and strengthen live telemetry "
+                "and agent-trace usability for daily operations."
+            ),
+            "success": (
+                "Ship one operator-facing UX or observability improvement with screenshots, telemetry proof, "
+                "or health evidence and no regression to auth/control paths."
+            ),
+        },
+        {
+            "key": "android-parity",
+            "title": "Proactive Sprint: Android App Parity + Product Polish",
+            "lane": "android",
+            "project_hint": mobile_path,
+            "goal": (
+                "Close parity gaps versus web dashboard, improve native UX quality, and validate via "
+                "emulator evidence with concrete screenshots."
+            ),
+            "success": (
+                "Ship one user-visible parity or polish improvement with emulator screenshots and a concise "
+                "validation note proving the change is real and regression-safe."
+            ),
+        },
+    ]
+
+    # Optional focus filter for proactive lane (comma-separated keys/lanes).
+    raw_focus = str(os.environ.get("BOT_PROACTIVE_KEYS", "") or "").strip()
+    if not raw_focus:
+        return catalog
+    allow = {
+        tok.strip().lower()
+        for tok in raw_focus.split(",")
+        if str(tok or "").strip()
+    }
+    if not allow:
+        return catalog
+    filtered = [
+        item
+        for item in catalog
+        if str(item.get("key") or "").strip().lower() in allow
+        or str(item.get("lane") or "").strip().lower() in allow
+    ]
+    return filtered or catalog
+
+
+def _is_proactive_order_record(row: dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    title = str(row.get("title") or "").strip()
+    body = str(row.get("body") or "").strip()
+    blob = f"{title}\n{body}".lower()
+    if "autonomous proactive sprint" in blob:
+        return True
+    if title.lower().startswith("proactive sprint"):
+        return True
+    return bool(_PROACTIVE_MARKER_RX.search(f"{title}\n{body}"))
+
+
+def _has_active_ceo_orders(*, orch_q: OrchestratorQueue, chat_id: int) -> bool:
+    try:
+        active_orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
+    except Exception:
+        return False
+    return any(not _is_proactive_order_record(o) for o in (active_orders or []))
+
+
+def _active_proactive_keys(orders: list[dict[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for row in (orders or []):
+        if not _is_proactive_order_record(row):
+            continue
+        blob = f"{str(row.get('title') or '')}\n{str(row.get('body') or '')}"
+        for m in _PROACTIVE_MARKER_RX.finditer(blob):
+            key = str(m.group(1) or "").strip().lower()
+            if key:
+                out.add(key)
+    return out
+
+
+def _controller_role_for_root_ticket(
+    *,
+    orch_q: OrchestratorQueue | None,
+    root_ticket: str,
+    default: str = "jarvis",
+) -> str:
+    rid = str(root_ticket or "").strip()
+    if not rid or orch_q is None:
+        return default
+    try:
+        root = orch_q.get_job(rid)
+    except Exception:
+        root = None
+    if root is None:
+        return default
+
+    trace = dict((getattr(root, "trace", {}) or {}))
+    root_input = str(getattr(root, "input_text", "") or "")
+    proactive_blob = root_input.lower()
+    if bool(trace.get("proactive_lane", False)) or str(trace.get("initiative_key") or "").strip():
+        return "skynet"
+    if "autonomous proactive sprint" in proactive_blob or _PROACTIVE_MARKER_RX.search(root_input):
+        return "skynet"
+    try:
+        chat_id = int(getattr(root, "chat_id", 0) or 0)
+    except Exception:
+        chat_id = 0
+    if chat_id > 0:
+        try:
+            order_row = orch_q.get_order(rid, chat_id=chat_id)
+        except Exception:
+            order_row = None
+        if _is_proactive_order_record(order_row):
+            return "skynet"
+
+    root_role = _coerce_orchestrator_role(str(getattr(root, "role", "") or ""))
+    if _is_controller_role(root_role):
+        return root_role
+
+    profile_role = _coerce_orchestrator_role(str(trace.get("profile_role") or ""))
+    if _is_controller_role(profile_role):
+        return profile_role
+    return default
+
+
+def _controller_role_for_task(task: Task, orch_q: OrchestratorQueue | None) -> str:
+    role = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if _is_controller_role(role):
+        return role
+    root_ticket = (getattr(task, "parent_job_id", "") or getattr(task, "job_id", "") or "").strip()
+    return _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket, default="jarvis")
+
+
+def _next_proactive_initiative(
+    *,
+    cfg: BotConfig,
+    occupied_keys: set[str],
+) -> dict[str, str] | None:
+    catalog = _proactive_initiatives_catalog(cfg)
+    if not catalog:
+        return None
+    available = [item for item in catalog if str(item.get("key") or "").strip().lower() not in occupied_keys]
+    if not available:
+        return None
+
+    index = 0
+    try:
+        state = _get_state(cfg)
+        index = int(state.get("proactive_lane_index", 0) or 0)
+    except Exception:
+        index = 0
+    if index < 0:
+        index = 0
+
+    chosen = available[index % len(available)]
+    try:
+        def _m(st: dict[str, Any]) -> None:
+            st["proactive_lane_index"] = int(index + 1)
+
+        _update_state(cfg, _m)
+    except Exception:
+        pass
+    return chosen
+
+
+def _spawn_proactive_order(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    chat_id: int,
+    now: float,
+    initiative: dict[str, str],
+) -> bool:
+    key = str(initiative.get("key") or "").strip().lower()
+    if not key:
+        return False
+
+    controller_role = "skynet"
+    order_id = str(uuid.uuid4())
+    title = str(initiative.get("title") or f"Proactive Sprint ({key})").strip()
+    goal = str(initiative.get("goal") or "").strip()
+    success_definition = str(initiative.get("success") or "").strip()
+    expected_measurable_delta = str(
+        initiative.get("expected_measurable_delta")
+        or initiative.get("expected_delta")
+        or "Increase validated-and-closed slices over 24h while reducing implementer fail rate."
+    ).strip()
+    stop_condition = str(
+        initiative.get("stop_condition")
+        or "Stop this proactive order when at least one VERIFIED_IMPROVEMENT is closed with strict evidence gates."
+    ).strip()
+    lane = str(initiative.get("lane") or "general").strip().lower()
+    project_hint = str(initiative.get("project_hint") or "").strip()
+    sprint_day = 1 + int((int(now) // (24 * 60 * 60)) % 5)
+
+    workspace = _ensure_project_workspace(
+        project_id=str(uuid.uuid4()),
+        title=title,
+        created_by=controller_role,
+        runtime_mode="venv",
+    )
+    project_id = str(workspace.get("project_id") or "").strip()
+    project_name = str(workspace.get("name") or title).strip() or title
+    project_path = str(workspace.get("path") or "").strip()
+
+    if project_id:
+        try:
+            orch_q.upsert_project(
+                project_id=project_id,
+                name=project_name,
+                path=project_path,
+                runtime_mode="venv",
+                ports=[],
+                status="active",
+                created_by=controller_role,
+            )
+            orch_q.append_audit_event(
+                event_type="project.created",
+                actor=controller_role,
+                details={
+                    "project_id": project_id,
+                    "order_id": order_id,
+                    "path": project_path,
+                    "lane": lane,
+                    "proactive": True,
+                },
+            )
+        except Exception:
+            pass
+
+    order_branch = _order_branch_name(order_id, title)
+    ok_branch, branch_msg = _git_ensure_branch_from_main(cfg.codex_workdir, str(order_branch))
+    if not ok_branch:
+        try:
+            orch_q.append_audit_event(
+                event_type="order.proactive_branch_failed",
+                actor=controller_role,
+                details={
+                    "order_id": order_id,
+                    "branch": order_branch,
+                    "error": str(branch_msg),
+                    "initiative": key,
+                },
+            )
+        except Exception:
+            pass
+        return False
+
+    base_profile = _orchestrator_profile(profiles, controller_role)
+    model = _orchestrator_model_for_profile(cfg, base_profile)
+    effort = _orchestrator_effort_for_profile(base_profile, cfg)
+    requires_approval = bool(base_profile.get("approval_required", False))
+
+    proactive_prompt = (
+        "AUTONOMOUS PROACTIVE SPRINT\n"
+        f"[proactive:{key}]\n"
+        f"Lane: {lane}\n"
+        f"Sprint day: {sprint_day} of 5\n"
+        f"Order ID: {order_id}\n"
+        f"Project ID: {project_id or '(pending)'}\n"
+        f"Project workspace: {project_path or '(n/a)'}\n"
+        f"Project hint: {project_hint or '(none)'}\n"
+        f"Goal: {goal}\n"
+        f"Success definition: {success_definition or '(deliver one verified improvement with concrete evidence)'}\n\n"
+        f"Expected measurable delta: {expected_measurable_delta}\n"
+        f"Stop condition: {stop_condition}\n\n"
+        "Execution policy:\n"
+        "- Work only inside this initiative scope; do not touch unrelated projects.\n"
+        "- Avoid work-for-work's-sake: choose the smallest highest-impact improvement that can be validated today.\n"
+        "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.\n"
+        "- Task selection priority (deterministic):\n"
+        "  1) repeated conversion failures in the local funnel,\n"
+        "  2) reliability/evidence tests currently failing or flaky,\n"
+        "  3) debt that measurably reduces operational noise.\n"
+        "- Do not seed a new local task for a role that already has open work on this ticket.\n"
+        "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.\n"
+        "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.\n"
+        "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.\n"
+        "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.\n"
+        "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.\n"
+        "- When delegating implementer_local, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.\n"
+        "- If local-only work becomes repetitive, empty, or low-signal, re-plan one bounded local-only path with clearer evidence requirements.\n"
+        "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.\n"
+        "- If fully validated, publish a concise PASS summary and the next highest-impact opportunity.\n"
+    )
+
+    trace: dict[str, Any] = {
+        "source": "scheduler",
+        "autopilot": True,
+        "proactive_lane": True,
+        "allow_delegation": True,
+        "order_id": order_id,
+        "project_id": project_id,
+        "order_branch": order_branch,
+        "initiative_key": key,
+        "initiative_lane": lane,
+        "expected_measurable_delta": expected_measurable_delta,
+        "stop_condition": stop_condition,
+        "runbook_id": "skynet_proactive_lane",
+        "profile_name": str(base_profile.get("name") or controller_role),
+        "profile_role": controller_role,
+        "max_runtime_seconds": int(base_profile.get("max_runtime_seconds") or 0),
+    }
+
+    task = Task.new(
+        source="telegram",
+        role=controller_role,
+        input_text=proactive_prompt,
+        request_type="maintenance",
+        priority=3,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=requires_approval,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id="",
+        owner="scheduler",
+        labels={
+            "ticket": order_id,
+            "kind": "autopilot",
+            "lane": "proactive",
+            "initiative": key,
+            "runbook": "skynet_proactive_lane",
+        },
+        artifacts_dir=str((cfg.artifacts_root / order_id).resolve()),
+        trace=trace,
+        job_id=order_id,
+    )
+
+    orch_q.submit_task(task)
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=int(chat_id),
+        title=title,
+        body=proactive_prompt,
+        status="active",
+        priority=3,
+        intent_type="order_project_new",
+        source_message_id=None,
+        reply_to_message_id=None,
+        phase="planning",
+        project_id=(project_id or None),
+    )
+    try:
+        orch_q.update_trace(
+            order_id,
+            order_id=order_id,
+            project_id=(project_id or None),
+            order_branch=order_branch,
+            proactive_lane=True,
+            initiative_key=key,
+            initiative_lane=lane,
+            live_at=now,
+        )
+        orch_q.append_audit_event(
+            event_type="order.created",
+            actor=controller_role,
+            details={
+                "order_id": order_id,
+                "intent_type": "order_project_new",
+                "project_id": (project_id or None),
+                "order_branch": order_branch,
+                "initiative": key,
+                "lane": lane,
+                "proactive_lane": True,
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _proactive_lane_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    chat_id: int,
+    now: float,
+) -> int:
+    if not bool(cfg.proactive_lane_enabled):
+        return 0
+    try:
+        st = _get_state(cfg)
+        if bool(st.get("proactive_lane_paused", False)):
+            return 0
+    except Exception:
+        pass
+    if orch_q.is_paused_globally():
+        return 0
+
+    runbook_id = "skynet_proactive_lane"
+    try:
+        last = float(orch_q.get_runbook_last_run(runbook_id=runbook_id) or 0.0)
+    except Exception:
+        last = 0.0
+    if last > 0 and (now - last) < float(cfg.proactive_lane_interval_seconds):
+        return 0
+
+    try:
+        hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
+        if hard_pressured:
+            return 0
+    except Exception:
+        pass
+
+    try:
+        if int(orch_q.get_queued_count()) >= int(cfg.proactive_lane_max_global_queued):
+            return 0
+    except Exception:
+        pass
+
+    try:
+        active_orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
+    except Exception:
+        active_orders = []
+
+    # Business policy:
+    # - Proactive lane runs only when there are no active CEO-driven project orders.
+    # - If CEO orders are active, proactive initiatives must stay idle and only support CEO projects.
+    active_ceo_orders = [o for o in active_orders if not _is_proactive_order_record(o)]
+    if active_ceo_orders:
+        return 0
+
+    active_proactive_orders = [o for o in active_orders if _is_proactive_order_record(o)]
+    if len(active_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
+        return 0
+
+    occupied = _active_proactive_keys(active_proactive_orders)
+    created = 0
+    for _ in range(max(1, int(cfg.proactive_lane_max_per_tick))):
+        if len(active_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
+            break
+        initiative = _next_proactive_initiative(cfg=cfg, occupied_keys=occupied)
+        if not initiative:
+            break
+        ok = _spawn_proactive_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            chat_id=int(chat_id),
+            now=now,
+            initiative=initiative,
+        )
+        key = str(initiative.get("key") or "").strip().lower()
+        if key:
+            occupied.add(key)
+        if ok:
+            created += 1
+            active_proactive_orders.append({"title": str(initiative.get("title") or ""), "body": f"[proactive:{key}]"})
+
+    if created > 0:
+        try:
+            orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+        except Exception:
+            pass
+    return created
+
+
 def _autopilot_tick(
     *,
     cfg: BotConfig,
@@ -6032,15 +9007,28 @@ def _autopilot_tick(
     if not orders:
         return 0
 
-    # Avoid growing backlog: if there is already a meaningful queue, do not enqueue new autopilot jobs.
-    # Autopilot should only "fill idle time", not compete with CEO-driven work.
+    # If any CEO-driven order is active, proactive initiatives are deprioritized.
+    has_active_ceo_order = any(not _is_proactive_order_record(o) for o in orders)
+    # By default, continuous autopilot ticks run only for proactive orders.
+    # CEO/manual orders should converge and drain without perpetual scheduler churn.
+    ceo_order_autopilot_enabled = str(os.environ.get("BOT_CEO_ORDER_AUTOPILOT_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+    # Avoid growing backlog: if queue is under pressure, autopilot must not add new load.
     try:
-        if int(orch_q.get_queued_count()) >= 10:
+        hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
+        pressured, _, _ = _queue_is_pressured(orch_q=orch_q)
+        if hard_pressured or pressured:
             return 0
     except Exception:
         pass
 
     for o in orders:
+        is_proactive = _is_proactive_order_record(o)
+        if (not is_proactive) and (not ceo_order_autopilot_enabled):
+            continue
+        if has_active_ceo_order and is_proactive:
+            continue
+        controller_role = "skynet" if is_proactive else "jarvis"
         oid = str(o.get("order_id") or "").strip()
         if not oid:
             continue
@@ -6083,7 +9071,7 @@ def _autopilot_tick(
         }
         t = Task.new(
             source="telegram",
-            role="jarvis",
+            role=controller_role,
             input_text=(
                 "AUTOPILOT TICK\n"
                 f"CEO: {cfg.ceo_name}\n"
@@ -6093,6 +9081,14 @@ def _autopilot_tick(
                 "Rules:\n"
                 "- Only propose work that advances this order.\n"
                 "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
+                "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
+                "- Delegate only local specialist executors: architect_local, implementer_local, reviewer_local.\n"
+                "- Do not seed backend/qa/sre Codex CLI delivery roles for proactive work.\n"
+                "- If a local cycle stalls or returns low-signal output, re-plan another local-only path instead of promoting to CLI.\n"
+                "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
+                "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
+                "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
+                "- Keep WIP bounded: max 3 running tasks and max 12 queued tasks for this order.\n"
                 "- Keep outputs short.\n"
             ),
             request_type="maintenance",
@@ -6106,7 +9102,7 @@ def _autopilot_tick(
             is_autonomous=True,
             parent_job_id=oid,
             owner="scheduler",
-            labels={"ticket": oid, "kind": "autopilot", "order": oid, "runbook": "jarvis_autopilot"},
+            labels={"ticket": oid, "kind": "autopilot", "order": oid, "runbook": f"{controller_role}_autopilot"},
             artifacts_dir=str((cfg.artifacts_root / ap_id).resolve()),
             trace=trace,
             job_id=ap_id,
@@ -6119,6 +9115,8 @@ def _autopilot_tick(
             rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
             rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
             rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (t.mode_hint == "full")
+            if _effective_bypass_sandbox(cfg, chat_id=int(chat_id)):
+                rb_requires_approval = False
             rb_trace = dict(t.trace)
             rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
             rb_trace["profile_role"] = rb_role
@@ -6218,15 +9216,26 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
     eta = max(5, min(7 * 24 * 60, eta))
     sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
 
+    role_norm = str(spec.role or "").strip().lower()
+    mode_hint = str(spec.mode_hint or "").strip().lower()
+    requires_approval = bool(spec.requires_approval)
+
+    # Local specialist lanes are advisory/review lanes and should stay read-only by default,
+    # otherwise they can get stuck in approval gates and stop parallel progress.
+    if role_norm in _LOCAL_OLLAMA_ROLE_NAMES:
+        if mode_hint in ("rw", "full"):
+            mode_hint = "ro"
+        requires_approval = False
+
     # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
     return TaskSpec(
         key=spec.key,
         role=spec.role,
         text=base_text,
-        mode_hint=spec.mode_hint,
+        mode_hint=mode_hint,
         priority=int(spec.priority or 2),
         depends_on=list(spec.depends_on or []),
-        requires_approval=bool(spec.requires_approval),
+        requires_approval=requires_approval,
         acceptance_criteria=acceptance,
         definition_of_done=dod,
         eta_minutes=int(eta),
@@ -6257,6 +9266,88 @@ def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
     return (str(spec.text or "").strip() + "\n" + "\n".join(contract_lines)).strip()
 
 
+def _is_local_guard_key_name(key: str) -> bool:
+    key_norm = str(key or "").strip().lower()
+    return key_norm.startswith(("local_arch_guard_", "local_impl_guard_", "local_review_guard_"))
+
+
+def _subtask_text_signature(text: str) -> str:
+    s = str(text or "").strip().lower()
+    if not s:
+        return ""
+    marker = "execution contract:"
+    idx = s.find(marker)
+    if idx >= 0:
+        s = s[:idx]
+    s = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27,}", "<id>", s)
+    s = re.sub(r"\b[0-9a-f]{7,40}\b", "<hex>", s)
+    s = re.sub(r"\b\d{2,}\b", "<n>", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:240]
+
+
+def _taskspec_signature(spec: TaskSpec) -> str:
+    role = _coerce_orchestrator_role(str(spec.role or ""))
+    key = str(spec.key or "").strip()
+    if role in {"architect_local", "implementer_local", "reviewer_local"} and _is_local_guard_key_name(key):
+        return f"{role}|local_guard"
+    sig = _subtask_text_signature(spec.text)
+    return f"{role}|{sig}" if sig else ""
+
+
+def _task_signature(task: Task) -> str:
+    role = _coerce_orchestrator_role(str(task.role or ""))
+    key = str((task.labels or {}).get("key") or "").strip()
+    if role in {"architect_local", "implementer_local", "reviewer_local"} and _is_local_guard_key_name(key):
+        return f"{role}|local_guard"
+    sig = _subtask_text_signature(task.input_text)
+    return f"{role}|{sig}" if sig else ""
+
+
+def _order_objective_signature(*, title: str, body: str) -> str:
+    title_sig = _subtask_text_signature(title)
+    body_sig = _subtask_text_signature(body)
+    seed = f"{title_sig}|{body_sig}".strip("|")
+    if len(seed) < 24:
+        return ""
+    return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:20]
+
+
+def _dedupe_specs_by_signature(
+    *,
+    specs: list[TaskSpec],
+    existing_subtasks: list[Task],
+    now: float,
+    recent_window_s: float,
+) -> list[TaskSpec]:
+    if not specs:
+        return specs
+
+    cutoff = float(now) - max(60.0, float(recent_window_s))
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running"}
+    existing_signatures: set[str] = set()
+
+    for child in existing_subtasks:
+        state = str(getattr(child, "state", "") or "").strip().lower()
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if state in active_states or ts >= cutoff:
+            sig = _task_signature(child)
+            if sig:
+                existing_signatures.add(sig)
+
+    out: list[TaskSpec] = []
+    seen: set[str] = set()
+    for spec in specs:
+        sig = _taskspec_signature(spec)
+        if not sig:
+            continue
+        if sig in seen or sig in existing_signatures:
+            continue
+        seen.add(sig)
+        out.append(spec)
+    return out
+
+
 def _ttl_seconds_from_spec(spec: TaskSpec) -> int:
     eta_m = max(5, int(spec.eta_minutes or _default_eta_minutes_for_spec(spec)))
     sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
@@ -6269,6 +9360,2627 @@ def _ttl_seconds_from_spec(spec: TaskSpec) -> int:
     return min(ttl, 7 * 24 * 60 * 60)
 
 
+def _local_specialists_enforced() -> bool:
+    raw = os.environ.get("BOT_LOCAL_SPECIALISTS_ENFORCE", "1")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ceo_local_injection_enabled() -> bool:
+    # CEO/manual orders stay Codex CLI-first by default. Local lanes are an experimental opt-in override.
+    raw = os.environ.get("BOT_CEO_INJECT_LOCAL_SPECIALISTS", "0")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _unique_subtask_key(base: str, used_keys: set[str]) -> str:
+    key = str(base or "").strip() or "local_task"
+    if key not in used_keys:
+        used_keys.add(key)
+        return key
+    idx = 2
+    while True:
+        candidate = f"{key}_{idx}"
+        if candidate not in used_keys:
+            used_keys.add(candidate)
+            return candidate
+        idx += 1
+
+
+def _inject_local_specialist_specs(
+    *,
+    specs: list[TaskSpec],
+    root_ticket: str,
+    existing_keys: set[str],
+    request_type: str,
+    is_top_level_manual: bool,
+    proactive_lane: bool,
+    allow_delegation: bool,
+) -> list[TaskSpec]:
+    """
+    Enforce a minimal local specialist lane for non-trivial delegated work.
+
+    Grounded intent: local Ollama roles must be available in live execution, not only in docs.
+    We keep this bounded (max +3 subtasks, leaving room for QA gate).
+    """
+    if not specs:
+        return specs
+    if not _local_specialists_enforced():
+        return specs
+
+    # For CEO/manual tickets, do not auto-inject local lanes unless explicitly enabled.
+    if bool(is_top_level_manual) and (not _ceo_local_injection_enabled()):
+        return specs
+
+    req = str(request_type or "task").strip().lower()
+    if req not in ("task", "review", "maintenance"):
+        return specs
+    if not (bool(is_top_level_manual) or bool(proactive_lane) or bool(allow_delegation)):
+        return specs
+
+    roles_present = {str(s.role or "").strip().lower() for s in specs}
+    delivery_roles = {
+        "frontend",
+        "backend",
+        "qa",
+        "sre",
+        "product_ops",
+        "security",
+        "research",
+        "release_mgr",
+    }
+    if not any(r in delivery_roles for r in roles_present):
+        return specs
+
+    # Keep one slot for the QA gate that can be appended later.
+    available_slots = max(0, 11 - len(specs))
+    if available_slots <= 0:
+        return specs
+
+    out = list(specs)
+    used_keys: set[str] = {str(k).strip() for k in existing_keys if str(k).strip()}
+    used_keys.update(str((x.key or "")).strip() for x in out if str((x.key or "")).strip())
+
+    arch_key: str | None = None
+    impl_key: str | None = None
+
+    if "architect_local" not in roles_present and available_slots > 0:
+        arch_key = _unique_subtask_key("local_architecture", used_keys)
+        out.append(
+            TaskSpec(
+                key=arch_key,
+                role="architect_local",
+                text=(
+                    f"Local architecture checkpoint for ticket {root_ticket}: propose concrete architecture "
+                    "tradeoffs, key constraints, and a short execution plan for the active deliverables."
+                ),
+                mode_hint="ro",
+                priority=2,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Provide 3-6 concrete architecture decisions with rationale and risks.",
+                    "Identify critical integration points and likely failure modes.",
+                ],
+                definition_of_done=[
+                    "Architecture checkpoint shared with actionable recommendations.",
+                ],
+                eta_minutes=45,
+                sla_tier="high",
+            )
+        )
+        roles_present.add("architect_local")
+        available_slots -= 1
+
+    if "implementer_local" not in roles_present and available_slots > 0:
+        impl_key = _unique_subtask_key("local_implementation", used_keys)
+        impl_deps: list[str] = [arch_key] if arch_key else []
+        out.append(
+            TaskSpec(
+                key=impl_key,
+                role="implementer_local",
+                text=(
+                    f"Local implementation pass for ticket {root_ticket}: apply the required code changes directly in the assigned workspace, "
+                    "run targeted validation, and summarize the concrete files changed, commands run, and evidence produced."
+                ),
+                mode_hint="rw",
+                priority=2,
+                depends_on=impl_deps,
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Apply the implementation directly in the workspace with bounded, relevant code changes.",
+                    "Run targeted validation and report concrete outcomes plus regression risks with mitigations.",
+                ],
+                definition_of_done=[
+                    "Workspace contains the implementation and supporting validation evidence.",
+                ],
+                eta_minutes=60,
+                sla_tier="high",
+            )
+        )
+        roles_present.add("implementer_local")
+        available_slots -= 1
+
+    if "reviewer_local" not in roles_present and available_slots > 0:
+        review_key = _unique_subtask_key("local_review", used_keys)
+        review_deps: list[str] = []
+        if impl_key:
+            review_deps.append(impl_key)
+        elif arch_key:
+            review_deps.append(arch_key)
+        out.append(
+            TaskSpec(
+                key=review_key,
+                role="reviewer_local",
+                text=(
+                    f"Independent local review for ticket {root_ticket}: validate correctness/security/maintainability "
+                    "and return READY/NEEDS_REWORK with required fixes."
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=review_deps,
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return READY or NEEDS_REWORK with concise justification.",
+                    "List blocking issues (if any) with specific fix actions.",
+                ],
+                definition_of_done=[
+                    "Independent review verdict delivered with concrete next actions.",
+                ],
+                eta_minutes=40,
+                sla_tier="high",
+            )
+        )
+
+    return out
+
+
+
+def _autonomous_local_first_enabled() -> bool:
+    raw = os.environ.get("BOT_AUTONOMOUS_LOCAL_FIRST", "1")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _autonomous_cli_cooldown_seconds() -> int:
+    try:
+        value = int(os.environ.get("BOT_AUTONOMOUS_CLI_COOLDOWN_SECONDS", "1800"))
+    except Exception:
+        value = 1800
+    return max(300, min(21600, int(value)))
+
+
+def _autonomous_subtask_dedupe_window_seconds() -> int:
+    try:
+        value = int(os.environ.get("BOT_AUTONOMOUS_SUBTASK_DEDUPE_WINDOW_SECONDS", "21600"))
+    except Exception:
+        value = 21600
+    return max(600, min(7 * 24 * 3600, int(value)))
+
+
+def _autonomous_max_active_subtasks() -> int:
+    try:
+        value = int(os.environ.get("BOT_AUTONOMOUS_MAX_ACTIVE_SUBTASKS", "12"))
+    except Exception:
+        value = 12
+    return max(3, min(60, int(value)))
+
+
+def _queue_pressure_limits() -> tuple[int, int]:
+    try:
+        max_queued = int(os.environ.get("BOT_QUEUE_PRESSURE_MAX_QUEUED", "18"))
+    except Exception:
+        max_queued = 18
+    try:
+        max_waiting = int(os.environ.get("BOT_QUEUE_PRESSURE_MAX_WAITING_DEPS", "8"))
+    except Exception:
+        max_waiting = 8
+    return max(5, int(max_queued)), max(3, int(max_waiting))
+
+
+def _queue_hard_limits() -> tuple[int, int]:
+    try:
+        max_queued = int(os.environ.get("BOT_QUEUE_HARD_MAX_QUEUED", "24"))
+    except Exception:
+        max_queued = 24
+    try:
+        max_waiting = int(os.environ.get("BOT_QUEUE_HARD_MAX_WAITING_DEPS", "12"))
+    except Exception:
+        max_waiting = 12
+    soft_q, soft_w = _queue_pressure_limits()
+    hard_q = max(soft_q + 2, int(max_queued))
+    hard_w = max(soft_w + 1, int(max_waiting))
+    return max(8, hard_q), max(4, hard_w)
+
+
+def _queue_recovery_targets() -> tuple[int, int]:
+    soft_q, soft_w = _queue_pressure_limits()
+    hard_q, hard_w = _queue_hard_limits()
+    target_q = min(int(soft_q), max(3, int(hard_q) - max(2, int(hard_q // 3))))
+    target_w = min(int(soft_w), max(2, int(hard_w) - max(1, int(hard_w // 3))))
+    return max(3, target_q), max(2, target_w)
+
+
+def _queue_is_pressured(*, orch_q: OrchestratorQueue) -> tuple[bool, int, int]:
+    queued = int(orch_q.get_queued_count())
+    waiting_deps = int(orch_q.get_waiting_deps_count())
+    max_queued, max_waiting = _queue_pressure_limits()
+    return bool(queued >= max_queued or waiting_deps >= max_waiting), queued, waiting_deps
+
+
+def _queue_is_hard_pressured(*, orch_q: OrchestratorQueue) -> tuple[bool, int, int]:
+    queued = int(orch_q.get_queued_count())
+    waiting_deps = int(orch_q.get_waiting_deps_count())
+    max_queued, max_waiting = _queue_hard_limits()
+    return bool(queued >= max_queued or waiting_deps >= max_waiting), queued, waiting_deps
+
+
+def _ticket_max_active_subtasks() -> int:
+    try:
+        value = int(os.environ.get("BOT_TICKET_MAX_ACTIVE_SUBTASKS", "10"))
+    except Exception:
+        value = 10
+    return max(3, min(30, int(value)))
+
+
+def _proactive_order_backlog_limits() -> tuple[int, int]:
+    try:
+        max_queued = int(os.environ.get("BOT_PROACTIVE_ORDER_MAX_QUEUED", "12"))
+    except Exception:
+        max_queued = 12
+    try:
+        max_waiting = int(os.environ.get("BOT_PROACTIVE_ORDER_MAX_WAITING_DEPS", "12"))
+    except Exception:
+        max_waiting = 12
+    return max(3, min(30, int(max_queued))), max(2, min(30, int(max_waiting)))
+
+
+def _ticket_active_backlog_counts(tasks) -> tuple[int, int, int]:
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running"}
+    active = 0
+    queued = 0
+    waiting = 0
+    for task in tasks or []:
+        state = str(getattr(task, "state", "") or "").strip().lower()
+        if state in active_states:
+            active += 1
+        if state == "queued":
+            queued += 1
+        elif state == "waiting_deps":
+            waiting += 1
+    return active, queued, waiting
+
+
+def _is_local_guard_key(key: str) -> bool:
+    return _is_local_guard_key_name(key)
+
+
+def _prune_local_specs_against_active_backlog(
+    *,
+    specs: list[TaskSpec],
+    existing_children: list[Task],
+) -> list[TaskSpec]:
+    if not specs:
+        return specs
+    local_roles = {"architect_local", "implementer_local", "reviewer_local"}
+    # "blocked" slices are non-runnable outcomes; they must not freeze replanning.
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running"}
+    active_counts: dict[str, int] = {role: 0 for role in local_roles}
+    has_applied_evidence = False
+    for child in existing_children or []:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        state = str(child.state or "").strip().lower()
+        if role_norm in local_roles and state in active_states:
+            active_counts[role_norm] = int(active_counts.get(role_norm, 0)) + 1
+        if role_norm == "implementer_local" and state == "done":
+            trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+            if _trace_local_patch_applied(trace):
+                has_applied_evidence = True
+
+    out: list[TaskSpec] = []
+    seen_roles: set[str] = set()
+    planned_counts: dict[str, int] = {role: 0 for role in local_roles}
+    for spec in specs:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        if role_norm not in local_roles:
+            out.append(spec)
+            continue
+        if role_norm in seen_roles:
+            continue
+        # Strict proactive WIP limit: max one active task per local role.
+        if int(active_counts.get(role_norm, 0)) >= 1:
+            continue
+        # Reviewer lane can open only when there is concrete implementation evidence.
+        if role_norm == "reviewer_local" and not has_applied_evidence:
+            continue
+        # Once implementation or review work exists for the ticket, do not seed
+        # another planning pass until that downstream slice resolves.
+        if role_norm == "architect_local" and (
+            int(active_counts.get("implementer_local", 0)) > 0
+            or int(active_counts.get("reviewer_local", 0)) > 0
+            or int(planned_counts.get("implementer_local", 0)) > 0
+            or int(planned_counts.get("reviewer_local", 0)) > 0
+        ):
+            continue
+        seen_roles.add(role_norm)
+        planned_counts[role_norm] = int(planned_counts.get(role_norm, 0)) + 1
+        out.append(spec)
+    return out
+
+
+def _has_open_local_support_work(tasks: list[Task]) -> bool:
+    # "blocked" should not freeze the proactive lane forever; blocked slices
+    # are re-planned through architect/reviewer follow-ups.
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running"}
+    for task in tasks or []:
+        role_norm = _coerce_orchestrator_role(str(task.role or ""))
+        state = str(task.state or "").strip().lower()
+        if _is_local_support_role_name(role_norm) and state in active_states:
+            return True
+    return False
+
+
+def _extract_objective_tokens(text: str) -> set[str]:
+    raw = str(text or "").lower()
+    toks = re.findall(r"[a-z0-9_]{4,}", raw)
+    stop = {
+        "this",
+        "that",
+        "with",
+        "from",
+        "para",
+        "como",
+        "sobre",
+        "donde",
+        "cuando",
+        "project",
+        "proyecto",
+        "ticket",
+        "order",
+        "lane",
+        "goal",
+        "task",
+        "plan",
+        "work",
+        "sprint",
+        "autonomous",
+        "proactive",
+    }
+    return {t for t in toks if t not in stop}
+
+
+def _spec_is_meta_planning(spec: TaskSpec) -> bool:
+    role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+    delivery_roles = {"backend", "frontend", "sre", "qa", "security", "release_mgr"}
+    if role_norm not in delivery_roles:
+        return False
+    txt = str(spec.text or "").strip().lower()
+    if not txt:
+        return False
+    meta_terms = (
+        "contract",
+        "scope",
+        "architecture",
+        "arquitect",
+        "blueprint",
+        "policy",
+        "strategy",
+        "plan",
+        "definir",
+        "define",
+        "checklist",
+        "guardrail",
+    )
+    action_terms = (
+        "implement",
+        "fix",
+        "patch",
+        "code",
+        "commit",
+        "test",
+        "run",
+        "execute",
+        "regenerate",
+        "rebuild",
+        "publish",
+        "apply",
+        "validate",
+        "verifica",
+        "ejecuta",
+        "corrige",
+        "arregla",
+    )
+    has_meta = any(tok in txt for tok in meta_terms)
+    has_action = any(tok in txt for tok in action_terms)
+    return bool(has_meta and (not has_action))
+
+
+def _spec_is_low_signal(spec: TaskSpec) -> bool:
+    txt = str(spec.text or "").strip().lower()
+    if len(txt) < 24:
+        return True
+    if not (spec.acceptance_criteria or []) or not (spec.definition_of_done or []):
+        return True
+    low_signal_phrases = (
+        "investigar",
+        "investigate",
+        "explorar",
+        "explore",
+        "mejorar",
+        "improve",
+        "revisar",
+        "review",
+        "analizar",
+        "analyze",
+    )
+    has_action_terms = any(
+        k in txt
+        for k in (
+            "fix",
+            "arregla",
+            "corrige",
+            "implement",
+            "create",
+            "crea",
+            "deploy",
+            "test",
+            "valida",
+            "evidencia",
+            "evidence",
+            "entregar",
+            "deliver",
+        )
+    )
+    if any(k in txt for k in low_signal_phrases) and not has_action_terms:
+        return True
+    return False
+
+
+def _objective_filter_specs(
+    *,
+    specs: list[TaskSpec],
+    objective_text: str,
+    max_keep: int,
+) -> tuple[list[TaskSpec], int]:
+    if not specs:
+        return [], 0
+    objective_tokens = _extract_objective_tokens(objective_text)
+    kept: list[TaskSpec] = []
+    dropped = 0
+    for spec in specs:
+        if _spec_is_meta_planning(spec):
+            dropped += 1
+            continue
+        if _spec_is_low_signal(spec):
+            dropped += 1
+            continue
+        txt_tokens = _extract_objective_tokens(str(spec.text or ""))
+        if objective_tokens and txt_tokens and not (objective_tokens & txt_tokens):
+            # Allow high-priority control/qa style tasks even if lexical overlap is weak.
+            role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+            if int(spec.priority or 2) > 1 and role_norm not in ("qa", "sre", "release_mgr"):
+                dropped += 1
+                continue
+        kept.append(spec)
+    if not kept and specs:
+        kept = sorted(specs, key=lambda s: int(s.priority or 2))[: min(2, len(specs))]
+    if len(kept) > int(max_keep):
+        dropped += len(kept) - int(max_keep)
+        kept = kept[: int(max_keep)]
+    return kept, int(dropped)
+
+
+def _prioritize_specs_for_flow(
+    *,
+    specs: list[TaskSpec],
+    objective_text: str,
+) -> list[TaskSpec]:
+    if not specs:
+        return specs
+    objective_tokens = _extract_objective_tokens(objective_text)
+    by_key = {str(s.key or "").strip(): s for s in specs if str(s.key or "").strip()}
+    dependents: dict[str, int] = {k: 0 for k in by_key}
+    for s in specs:
+        for d in (s.depends_on or []):
+            dk = str(d or "").strip()
+            if dk in dependents:
+                dependents[dk] += 1
+
+    critical_role_bonus = {
+        "backend": 20,
+        "frontend": 20,
+        "sre": 16,
+        "qa": 14,
+        "release_mgr": 12,
+        "security": 10,
+        "product_ops": 8,
+        "research": 8,
+        "architect_local": 6,
+        "implementer_local": 6,
+        "reviewer_local": 5,
+    }
+
+    def _score(spec: TaskSpec) -> int:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        pri = int(spec.priority or 2)
+        pri_score = max(0, 40 - (pri * 10))
+        root_bonus = 6 if not list(spec.depends_on or []) else 0
+        dep_bonus = int(dependents.get(str(spec.key or "").strip(), 0)) * 4
+        role_bonus = int(critical_role_bonus.get(role_norm, 0))
+        txt_tokens = _extract_objective_tokens(str(spec.text or ""))
+        align_bonus = 6 if objective_tokens and txt_tokens and (objective_tokens & txt_tokens) else 0
+        return pri_score + root_bonus + dep_bonus + role_bonus + align_bonus
+
+    return sorted(specs, key=_score, reverse=True)
+
+
+def _ticket_local_needs_cli_takeover(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float | None = None,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=500)
+    except Exception:
+        return False
+
+    local_roles = {"architect_local", "implementer_local", "reviewer_local"}
+    now_ts = float(now if now is not None else time.time())
+    try:
+        stall_threshold = max(300, int(os.environ.get("BOT_LOCAL_STALL_SECONDS", "1800")))
+    except Exception:
+        stall_threshold = 1800
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        if role_norm not in local_roles:
+            continue
+        state = str(child.state or "").strip().lower()
+        updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        age_s = max(0.0, now_ts - updated_at) if updated_at > 0 else 0.0
+        if state in ("blocked", "blocked_approval", "failed"):
+            return True
+        if state in ("running", "waiting_deps") and age_s >= float(stall_threshold):
+            return True
+        if role_norm == "reviewer_local" and state == "done":
+            blob = (
+                f"{str((child.trace or {}).get('result_status') or '')}\n"
+                f"{str((child.trace or {}).get('result_summary') or '')}"
+            ).lower()
+            if any(tok in blob for tok in ("no-go", "nogo", "no go", "needs_rework", "needs rework", "rework required", "retrabajo")):
+                return True
+    return False
+
+
+def _text_has_no_go_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    signals = (
+        "no-go",
+        "no go",
+        "nogo",
+        "needs_rework",
+        "needs rework",
+        "rework required",
+        "retrabajo",
+        "not ready for delivery",
+        "not ready",
+        "fail",
+        "failed",
+    )
+    return any(tok in blob for tok in signals)
+
+
+
+def _is_local_support_role_name(role_norm: str) -> bool:
+    return role_norm in {"architect_local", "implementer_local", "reviewer_local"}
+
+
+def _is_delivery_role_name(role_norm: str) -> bool:
+    return role_norm in {"backend", "frontend", "qa", "sre", "product_ops", "security", "research", "release_mgr"}
+
+
+_LOCAL_SLICE_FAILURE_CLASSES = frozenset({"retriable", "terminal", "blocked"})
+_LOCAL_SLICE_STATUS_ORDER = (
+    "planned",
+    "implementing",
+    "applied",
+    "validated",
+    "reviewed_ready",
+    "closed",
+)
+_LOCAL_SLICE_STATUS_TERMINAL = frozenset({"closed", "blocked", "failed_retriable", "failed_terminal"})
+_LOCAL_SLICE_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    "planned": frozenset({"planned", "implementing", "blocked", "failed_retriable", "failed_terminal"}),
+    "implementing": frozenset({"planned", "implementing", "applied", "validated", "blocked", "failed_retriable", "failed_terminal"}),
+    "applied": frozenset({"applied", "validated", "blocked", "failed_retriable", "failed_terminal"}),
+    "validated": frozenset({"validated", "reviewed_ready", "closed", "blocked", "failed_retriable", "failed_terminal"}),
+    "reviewed_ready": frozenset({"reviewed_ready", "closed", "blocked", "failed_retriable", "failed_terminal"}),
+    "closed": frozenset({"closed"}),
+    "blocked": frozenset({"blocked"}),
+    "failed_retriable": frozenset({"failed_retriable", "implementing"}),
+    "failed_terminal": frozenset({"failed_terminal"}),
+}
+
+
+def _normalize_local_slice_status(value: Any, *, fallback: str = "planned") -> str:
+    status = str(value or "").strip().lower()
+    if status in _LOCAL_SLICE_ALLOWED_TRANSITIONS:
+        return status
+    return str(fallback or "planned").strip().lower() or "planned"
+
+
+def _normalize_local_failure_class(value: Any, *, fallback: str = "retriable") -> str:
+    raw = str(value or "").strip().lower()
+    if raw in _LOCAL_SLICE_FAILURE_CLASSES:
+        return raw
+    return str(fallback or "retriable").strip().lower() or "retriable"
+
+
+def _slice_has_applied_and_validated_evidence(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    slice_id: str,
+) -> tuple[bool, bool]:
+    rid = str(root_ticket or "").strip()
+    token = _sanitize_slice_token(slice_id, fallback="")
+    if not rid or not token:
+        return False, False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=700)
+    except Exception:
+        return False, False
+    applied = False
+    validated = False
+    for child in children:
+        if _coerce_orchestrator_role(str(child.role or "")) != "implementer_local":
+            continue
+        state = str(child.state or "").strip().lower()
+        if state != "done":
+            continue
+        child_slice = _task_slice_id(child, root_ticket=rid)
+        if child_slice != token:
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        if _trace_local_patch_applied(trace):
+            applied = True
+        if _trace_has_validated_slice_evidence(trace):
+            validated = True
+        if applied and validated:
+            return True, True
+    return applied, validated
+
+
+def _select_latest_ready_slice_for_closure(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+) -> str:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return ""
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=900)
+    except Exception:
+        return ""
+    latest_by_slice: dict[str, dict[str, Any]] = {}
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        state = str(child.state or "").strip().lower()
+        if role_norm not in {"implementer_local", "reviewer_local"} or state != "done":
+            continue
+        slice_id = _task_slice_id(child, root_ticket=rid)
+        if not slice_id:
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        bucket = latest_by_slice.setdefault(
+            slice_id,
+            {
+                "validated": False,
+                "reviewed_ready": False,
+                "updated_at": 0.0,
+            },
+        )
+        updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if role_norm == "implementer_local" and _trace_has_validated_slice_evidence(trace):
+            bucket["validated"] = True
+        if role_norm == "reviewer_local" and _summary_has_ready_signal(str(trace.get("result_summary") or "")):
+            bucket["reviewed_ready"] = True
+        if updated_at > float(bucket.get("updated_at", 0.0) or 0.0):
+            bucket["updated_at"] = updated_at
+    best_slice = ""
+    best_ts = 0.0
+    for slice_id, bucket in latest_by_slice.items():
+        if not (bool(bucket.get("validated")) and bool(bucket.get("reviewed_ready"))):
+            continue
+        ts = float(bucket.get("updated_at", 0.0) or 0.0)
+        if ts >= best_ts:
+            best_ts = ts
+            best_slice = slice_id
+    return best_slice
+
+
+def _next_slice_attempt_n(
+    *,
+    root_ticket: str,
+    slice_id: str,
+    existing_tasks: list[Task] | None,
+) -> int:
+    rid = str(root_ticket or "").strip()
+    token = _sanitize_slice_token(slice_id, fallback="")
+    if not token:
+        return 1
+    max_attempt = 0
+    for child in existing_tasks or []:
+        child_slice = _task_slice_id(child, root_ticket=rid)
+        if child_slice != token:
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        try:
+            attempt = int(trace.get("attempt_n") or 0)
+        except Exception:
+            attempt = 0
+        if attempt <= 0:
+            try:
+                attempt = int(getattr(child, "retry_count", 0) or 0) + 1
+            except Exception:
+                attempt = 1
+        max_attempt = max(max_attempt, int(attempt))
+    return max(1, int(max_attempt) + 1)
+
+
+def _sanitize_slice_token(value: str, *, fallback: str = "slice") -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "_", str(value or "").strip().lower()).strip("_")
+    if not token:
+        token = fallback
+    if len(token) > 64:
+        token = token[:64].rstrip("_")
+    return token or fallback
+
+
+def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
+    key_norm = str(key or "").strip().lower()
+    if not key_norm:
+        return _sanitize_slice_token(fallback, fallback="slice")
+    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground)_(.+)$", key_norm)
+    if m:
+        return _sanitize_slice_token(m.group(1), fallback=fallback)
+    return _sanitize_slice_token(key_norm, fallback=fallback)
+
+
+def _task_slice_id(task: Task | None, *, root_ticket: str = "") -> str:
+    if task is None:
+        return ""
+    trace_obj = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+    existing = str(trace_obj.get("slice_id") or "").strip()
+    if existing:
+        return _sanitize_slice_token(existing, fallback="slice")
+    labels = dict((getattr(task, "labels", {}) or {}) if isinstance(getattr(task, "labels", {}), dict) else {})
+    key = str(labels.get("key") or "").strip()
+    if key:
+        return _slice_id_from_local_key(key, fallback=f"{str(root_ticket or '')[:8]}_slice")
+    jid = str(getattr(task, "job_id", "") or "").strip()
+    if jid:
+        return _sanitize_slice_token(jid.split("-", 1)[0], fallback="slice")
+    return _sanitize_slice_token(str(root_ticket or "").strip()[:8], fallback="slice")
+
+
+def _task_attempt_n(task: Task | None) -> int:
+    trace_attempt = 0
+    if task is not None:
+        trace_obj = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+        try:
+            trace_attempt = int(trace_obj.get("attempt_n") or 0)
+        except Exception:
+            trace_attempt = 0
+    try:
+        retry_n = int(getattr(task, "retry_count", 0) or 0)
+    except Exception:
+        retry_n = 0
+    return max(1, int(trace_attempt), retry_n + 1)
+
+
+def _summary_has_ready_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    if _text_has_no_go_signal(blob):
+        return False
+    ready_tokens = (
+        "ready",
+        "approved",
+        "approval granted",
+        "pass",
+        "passed",
+        "verified",
+    )
+    return any(tok in blob for tok in ready_tokens)
+
+
+def _summary_has_blocked_with_root_cause_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    return ("blocked_with_root_cause" in blob) or ("blocked with root cause" in blob)
+
+
+def _trace_patch_info(trace: dict[str, Any] | None) -> dict[str, Any]:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    patch_info = trace_obj.get("local_patch_info")
+    if isinstance(patch_info, dict):
+        return patch_info
+    patch_info = trace_obj.get("patch_info")
+    if isinstance(patch_info, dict):
+        return patch_info
+    return {}
+
+
+def _trace_local_no_change(trace: dict[str, Any] | None) -> bool:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if bool(trace_obj.get("slice_no_code_change", False)):
+        return True
+    patch_info = _trace_patch_info(trace_obj)
+    return bool(patch_info.get("no_code_change_required", False))
+
+
+def _trace_local_patch_applied(trace: dict[str, Any] | None) -> bool:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if bool(trace_obj.get("slice_patch_applied", False)):
+        return not _trace_local_no_change(trace_obj)
+    patch_info = _trace_patch_info(trace_obj)
+    if _trace_local_no_change(trace_obj):
+        return False
+    changed = patch_info.get("changed_files")
+    changed_ok = bool(isinstance(changed, list) and any(str(x or "").strip() for x in changed))
+    return bool(patch_info and changed_ok)
+
+
+def _trace_local_patch_validated(trace: dict[str, Any] | None) -> bool:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if bool(trace_obj.get("slice_validation_ok", False)):
+        return True
+    patch_info = _trace_patch_info(trace_obj)
+    return bool(patch_info.get("validation_ok", False))
+
+
+def _trace_has_validated_slice_evidence(trace: dict[str, Any] | None) -> bool:
+    return bool(_trace_local_patch_applied(trace) and _trace_local_patch_validated(trace))
+
+
+def _classify_local_slice_failure(
+    *,
+    role_norm: str,
+    orch_state: str,
+    summary: str,
+    attempt_n: int,
+) -> str:
+    state_norm = str(orch_state or "").strip().lower()
+    if state_norm in ("blocked", "blocked_approval"):
+        return "blocked"
+    if role_norm != "implementer_local":
+        return "retriable" if state_norm == "failed" else "blocked"
+
+    blob = str(summary or "").strip().lower()
+    if not blob:
+        return "retriable"
+
+    terminal_markers = (
+        "rewrite path escapes worktree",
+        "rewrite path is outside the delegated slice",
+        "rewrite would create more than one new file",
+        "worktree not found",
+        "worktree is not a git repo",
+        "did not return a diff or rewrite block",
+        "did not return a fenced ```diff``` block",
+        "produced no worktree changes after apply",
+        "touched python files but py_compile failed",
+        "outside the delegated slice",
+        "escapes worktree",
+    )
+    if any(tok in blob for tok in terminal_markers):
+        return "terminal"
+
+    blocker_markers = (
+        "blocker:",
+        "latest_implementer_blocker",
+        "missing requirement",
+        "smallest next action needed",
+        "cannot safely implement",
+        "handoff is still not actionable",
+        "provide the exact file path",
+    )
+    if any(tok in blob for tok in blocker_markers):
+        return "blocked"
+
+    patch_invalid_markers = (
+        "patch rejected by git apply --check",
+        "patch apply failed",
+    )
+    if any(tok in blob for tok in patch_invalid_markers):
+        return "terminal" if int(attempt_n) >= 2 else "retriable"
+
+    return "retriable"
+
+
+def _collect_order_local_autonomy_funnel(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float | None = None,
+) -> dict[str, Any]:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return {
+            "slices_started": 0,
+            "slices_applied": 0,
+            "slices_validated": 0,
+            "slices_closed": 0,
+            "implementer_fail_rate": 0.0,
+            "mean_time_to_validated_improvement": None,
+            "loop_breaker_count": 0,
+            "quality_gate_status": "planned",
+            "improvement_verified": False,
+        }
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=800)
+    except Exception:
+        children = []
+    now_ts = float(now if now is not None else time.time())
+    controller_roles = {"skynet", "jarvis"}
+    slices: dict[str, dict[str, Any]] = {}
+    implementer_attempts = 0
+    implementer_failures = 0
+    loop_breaker_count = 0
+    controller_verifications_no_slice: list[float] = []
+
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        state = str(getattr(child, "state", "") or "").strip().lower()
+        trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
+        summary = str(trace.get("result_summary") or "")
+        created_ts = float(getattr(child, "created_at", 0.0) or 0.0)
+        updated_ts = float(getattr(child, "updated_at", 0.0) or created_ts or 0.0)
+        explicit_slice_id = _sanitize_slice_token(str(trace.get("slice_id") or ""), fallback="")
+        if bool(trace.get("loop_breaker_triggered", False)):
+            loop_breaker_count += 1
+        if role_norm == "implementer_local":
+            implementer_attempts += 1
+            if state in ("failed", "cancelled", "blocked", "blocked_approval"):
+                implementer_failures += 1
+        if role_norm not in {"architect_local", "implementer_local", "reviewer_local"} and role_norm not in controller_roles:
+            continue
+        slice_id = _task_slice_id(child, root_ticket=rid)
+        if not slice_id:
+            continue
+        bucket = slices.setdefault(
+            slice_id,
+            {
+                "started": False,
+                "applied": False,
+                "validated": False,
+                "review_ready_candidate": False,
+                "reviewed_ready": False,
+                "controller_verified": False,
+                "started_at": 0.0,
+                "closed_at": 0.0,
+                "has_failed": False,
+            },
+        )
+        if created_ts > 0 and (bucket["started_at"] <= 0.0 or created_ts < bucket["started_at"]):
+            bucket["started_at"] = created_ts
+        if state in ("failed", "cancelled", "blocked", "blocked_approval"):
+            bucket["has_failed"] = True
+
+        if role_norm == "implementer_local":
+            bucket["started"] = True
+            if state == "done":
+                if _trace_local_patch_applied(trace):
+                    bucket["applied"] = True
+                if _trace_has_validated_slice_evidence(trace):
+                    bucket["validated"] = True
+            continue
+
+        if role_norm == "reviewer_local" and state == "done":
+            if _summary_has_ready_signal(summary):
+                bucket["review_ready_candidate"] = True
+            continue
+
+        if role_norm in controller_roles and state == "done":
+            if ("verified_improvement" in summary.lower()) or bool(trace.get("improvement_verified", False)):
+                if explicit_slice_id and explicit_slice_id in slices:
+                    target = slices.get(explicit_slice_id) or bucket
+                    target["controller_verified"] = True
+                    if updated_ts > float(target.get("closed_at") or 0.0):
+                        target["closed_at"] = updated_ts
+                else:
+                    controller_verifications_no_slice.append(updated_ts if updated_ts > 0 else now_ts)
+
+    # Reviewer READY only counts when implementation evidence exists for that slice.
+    for bucket in slices.values():
+        bucket["reviewed_ready"] = bool(bucket.get("review_ready_candidate") and bucket.get("validated"))
+
+    # Controller closures without explicit slice_id map to the newest ready slice.
+    if controller_verifications_no_slice:
+        for event_ts in sorted(controller_verifications_no_slice):
+            chosen_slice = ""
+            chosen_started = 0.0
+            for sid, bucket in slices.items():
+                if bool(bucket.get("controller_verified")):
+                    continue
+                if not (bool(bucket.get("validated")) and bool(bucket.get("reviewed_ready"))):
+                    continue
+                started_at = float(bucket.get("started_at") or 0.0)
+                if started_at > (event_ts + 5.0):
+                    continue
+                if started_at >= chosen_started:
+                    chosen_started = started_at
+                    chosen_slice = sid
+            if not chosen_slice:
+                continue
+            chosen_bucket = slices.get(chosen_slice) or {}
+            chosen_bucket["controller_verified"] = True
+            chosen_bucket["closed_at"] = max(float(chosen_bucket.get("closed_at") or 0.0), float(event_ts or now_ts))
+
+    slices_started = 0
+    slices_applied = 0
+    slices_validated = 0
+    slices_closed = 0
+    has_failed_slice = False
+    mtv_samples: list[float] = []
+    for bucket in slices.values():
+        started = bool(bucket.get("started")) or bool(bucket.get("applied")) or bool(bucket.get("validated")) or bool(bucket.get("reviewed_ready"))
+        if started:
+            slices_started += 1
+        if bool(bucket.get("applied")):
+            slices_applied += 1
+        if bool(bucket.get("validated")):
+            slices_validated += 1
+        closed = bool(bucket.get("validated") and bucket.get("reviewed_ready") and bucket.get("controller_verified"))
+        if closed:
+            slices_closed += 1
+            started_at = float(bucket.get("started_at") or 0.0)
+            closed_at = float(bucket.get("closed_at") or 0.0)
+            if closed_at <= 0.0:
+                closed_at = now_ts
+            if started_at > 0 and closed_at >= started_at:
+                mtv_samples.append(closed_at - started_at)
+        if bool(bucket.get("has_failed")):
+            has_failed_slice = True
+
+    quality_gate_status = "planned"
+    if slices_closed > 0:
+        quality_gate_status = "closed"
+    elif any(bool(v.get("reviewed_ready")) for v in slices.values()):
+        quality_gate_status = "reviewed_ready"
+    elif slices_validated > 0:
+        quality_gate_status = "validated"
+    elif slices_applied > 0:
+        quality_gate_status = "applied"
+    elif has_failed_slice:
+        quality_gate_status = "failed"
+    elif slices_started > 0:
+        quality_gate_status = "implementing"
+
+    fail_rate = 0.0
+    if implementer_attempts > 0:
+        fail_rate = float(implementer_failures) / float(implementer_attempts)
+    mean_time_to_validated_improvement = None
+    if mtv_samples:
+        mean_time_to_validated_improvement = float(sum(mtv_samples) / max(1, len(mtv_samples)))
+
+    return {
+        "slices_started": int(slices_started),
+        "slices_applied": int(slices_applied),
+        "slices_validated": int(slices_validated),
+        "slices_closed": int(slices_closed),
+        "implementer_fail_rate": round(float(fail_rate), 4),
+        "mean_time_to_validated_improvement": mean_time_to_validated_improvement,
+        "loop_breaker_count": int(loop_breaker_count),
+        "quality_gate_status": quality_gate_status,
+        "improvement_verified": bool(slices_closed > 0),
+    }
+
+
+def _trace_has_nontrivial_artifacts(trace: dict[str, Any] | None) -> bool:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    items = trace_obj.get("result_artifacts") or []
+    if not isinstance(items, list):
+        return False
+    ignore_tokens = (
+        "local_ollama_response",
+        "local_ollama_meta",
+        "local_ollama_live",
+        "local_ollama_stream",
+        "local_ollama_prompt",
+    )
+    for raw in items:
+        path = str(raw or "").strip().lower()
+        if not path:
+            continue
+        if not any(tok in path for tok in ignore_tokens):
+            return True
+    return False
+
+
+def _summary_has_progress_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if len(blob) < 60:
+        return False
+    progress_tokens = (
+        "implemented",
+        "fixed",
+        "patched",
+        "updated",
+        "added",
+        "removed",
+        "refactored",
+        "validated",
+        "verified",
+        "tested",
+        "passing",
+        "pass",
+        "coverage",
+        "screenshot",
+        "artifact",
+        "evidence",
+        "log",
+        "diff",
+        "branch",
+        "commit",
+        "pull request",
+        "healthz",
+        "latency",
+        "alert",
+        "migration",
+        "deploy",
+        "build",
+        "smoke",
+    )
+    return any(tok in blob for tok in progress_tokens)
+
+
+def _latest_done_local_implementer_with_evidence(
+    tasks: list[Task],
+    *,
+    now: float | None = None,
+    max_age_s: float = 3600.0,
+) -> Task | None:
+    best_task: Task | None = None
+    best_ts = 0.0
+    now_ts = float(now if now is not None else time.time())
+    for task in tasks or []:
+        role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+        state = str(getattr(task, "state", "") or "").strip().lower()
+        if role_norm != "implementer_local" or state != "done":
+            continue
+        trace = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+        summary = str(trace.get("result_summary") or "").strip()
+        if not _trace_has_validated_slice_evidence(trace):
+            continue
+        ts = float(getattr(task, "updated_at", 0.0) or getattr(task, "created_at", 0.0) or 0.0)
+        if ts <= 0 or (now_ts - ts) > float(max_age_s):
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best_task = task
+    return best_task
+
+
+def _task_local_specialist_response(task: Task | None, *, max_chars: int = 7000) -> str:
+    def _truncate(raw: str) -> str:
+        text = str(raw or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return text
+
+    if task is None:
+        return ""
+    artifacts_dir = str(getattr(task, "artifacts_dir", "") or "").strip()
+    job_id = str(getattr(task, "job_id", "") or "").strip()
+    candidates: list[Path] = []
+    if artifacts_dir:
+        candidates.append(Path(artifacts_dir) / "local_ollama_response.md")
+    if job_id:
+        candidates.append(Path(__file__).resolve().parent / "data" / "artifacts" / job_id / "local_ollama_response.md")
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return _truncate(candidate.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+    trace_obj = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    return _truncate(summary)
+
+
+def _response_has_exact_file_targets(text: str) -> bool:
+    blob = str(text or "").strip()
+    if not blob:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ya?ml|json|sh|md)\b",
+            blob,
+        )
+    )
+
+
+def _response_signals_no_code_change(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    signals = (
+        "no code changes required",
+        "no code changes are required",
+        "no actionable code change",
+        "already implemented",
+        "already complete",
+        "slice complete",
+        "slice is complete",
+        "request is satisfied by existing implementation",
+    )
+    return any(token in blob for token in signals)
+
+
+def _latest_done_local_specialist_with_response(
+    tasks: list[Task],
+    *,
+    role: str,
+    now: float | None = None,
+    max_age_s: float = 3600.0,
+    require_file_targets: bool = False,
+) -> tuple[Task | None, str]:
+    wanted_role = _coerce_orchestrator_role(str(role or ""))
+    if not wanted_role:
+        return None, ""
+    best_task: Task | None = None
+    best_text = ""
+    best_ts = 0.0
+    now_ts = float(now if now is not None else time.time())
+    for task in tasks or []:
+        role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+        state = str(getattr(task, "state", "") or "").strip().lower()
+        if role_norm != wanted_role or state != "done":
+            continue
+        ts = float(getattr(task, "updated_at", 0.0) or getattr(task, "created_at", 0.0) or 0.0)
+        if ts <= 0 or (now_ts - ts) > float(max_age_s):
+            continue
+        response_text = _task_local_specialist_response(task, max_chars=7000)
+        if not response_text:
+            continue
+        if require_file_targets and not _response_has_exact_file_targets(response_text):
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best_task = task
+            best_text = response_text
+    return best_task, best_text
+
+
+def _summary_has_validation_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if len(blob) < 24:
+        return False
+    validation_tokens = (
+        "pass",
+        "passed",
+        "fail",
+        "failed",
+        "ready",
+        "needs_rework",
+        "no-go",
+        "go/no-go",
+        "validated",
+        "verified",
+        "regression",
+        "smoke",
+        "tests",
+        "qa",
+        "evidence",
+        "artifact",
+    )
+    return any(tok in blob for tok in validation_tokens)
+
+
+def _proactive_cli_promotion_enabled() -> bool:
+    raw = os.environ.get("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", "1")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _proactive_local_failure_threshold() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_LOCAL_FAILURES_FOR_CLI_PROMOTION", "2"))
+    except Exception:
+        value = 2
+    return max(1, min(6, int(value)))
+
+
+def _proactive_local_stale_seconds() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_LOCAL_STALE_SECONDS", "1800"))
+    except Exception:
+        value = 1800
+    return max(300, min(12 * 3600, int(value)))
+
+
+def _proactive_local_guard_cycles_for_cli_promotion() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_LOCAL_GUARD_CYCLES_FOR_CLI_PROMOTION", "2"))
+    except Exception:
+        value = 2
+    return max(1, min(6, int(value)))
+
+
+def _ticket_proactive_needs_cli_promotion(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float | None = None,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=500)
+    except Exception:
+        return False
+
+    now_ts = float(now if now is not None else time.time())
+    stale_after_s = float(_proactive_local_stale_seconds())
+    failure_threshold = int(_proactive_local_failure_threshold())
+    guard_cycle_threshold = int(_proactive_local_guard_cycles_for_cli_promotion())
+    improvement_seen = _order_has_meaningful_improvement(
+        orch_q=orch_q,
+        root_ticket=rid,
+    )
+    local_failures = 0
+    stale_locals = 0
+    empty_response_failures = 0
+    local_guard_cycles: set[str] = set()
+
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        if not _is_local_support_role_name(role_norm):
+            continue
+        state = str(child.state or "").strip().lower()
+        updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        age_s = max(0.0, now_ts - updated_at) if updated_at > 0 else 0.0
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        labels = dict((child.labels or {}) if isinstance(child.labels, dict) else {})
+        key = str(labels.get("key") or "").strip().lower()
+        summary_blob = (
+            f"{str(trace.get('result_status') or '')}\n"
+            f"{str(trace.get('result_summary') or '')}"
+        ).lower()
+        for prefix in ("local_arch_guard_", "local_impl_guard_", "local_review_guard_"):
+            if key.startswith(prefix):
+                cycle_id = key[len(prefix) :].strip()
+                if cycle_id:
+                    local_guard_cycles.add(cycle_id)
+                break
+
+        if role_norm == "reviewer_local" and state == "done" and _text_has_no_go_signal(summary_blob):
+            return True
+        if "empty response from local ollama model" in summary_blob:
+            empty_response_failures += 1
+        if state in ("failed", "blocked", "blocked_approval"):
+            local_failures += 1
+        if state in ("running", "waiting_deps") and age_s >= stale_after_s:
+            stale_locals += 1
+
+    if stale_locals > 0:
+        return True
+    if local_failures >= failure_threshold:
+        return True
+    if empty_response_failures > 0 and local_failures > 0:
+        return True
+    if (not improvement_seen) and len(local_guard_cycles) >= guard_cycle_threshold:
+        return True
+    return False
+
+
+def _order_has_meaningful_improvement(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return False
+    try:
+        root_job = orch_q.get_job(rid)
+    except Exception:
+        root_job = None
+    root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+    if bool(root_trace.get("merged_to_main", False)):
+        return True
+
+    funnel = _collect_order_local_autonomy_funnel(
+        orch_q=orch_q,
+        root_ticket=rid,
+    )
+    if int(funnel.get("slices_started", 0) or 0) > 0:
+        return bool(funnel.get("improvement_verified", False))
+
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
+    except Exception:
+        return False
+
+    delivery_roles = {"backend", "frontend", "implementer_local", "sre", "product_ops", "security", "research", "release_mgr"}
+    delivery_ok = False
+    validation_ok = False
+    latest_delivery_ts = 0.0
+    latest_validation_ts = 0.0
+    for child in children:
+        if str(child.state or "").strip().lower() != "done":
+            continue
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        result_status = str(trace.get("result_status") or child.state or "").strip().lower()
+        summary = str(trace.get("result_summary") or "").strip()
+        updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if result_status in ("error", "failed", "blocked", "blocked_approval", "cancelled"):
+            continue
+        if role_norm in delivery_roles and (_trace_has_nontrivial_artifacts(trace) or _summary_has_progress_signal(summary)):
+            delivery_ok = True
+            latest_delivery_ts = max(latest_delivery_ts, updated_at)
+        if role_norm in {"qa", "reviewer_local"}:
+            validation_blob = f"{result_status}\n{summary}"
+            validation_verdict = _text_has_no_go_signal(validation_blob) or _summary_has_validation_signal(summary)
+            validation_evidence = _trace_has_nontrivial_artifacts(trace) or len(summary) >= 80
+            if validation_verdict and validation_evidence:
+                validation_ok = True
+                latest_validation_ts = max(latest_validation_ts, updated_at)
+        if delivery_ok and validation_ok and latest_validation_ts >= max(0.0, latest_delivery_ts - 30.0):
+            return True
+    return bool(delivery_ok and validation_ok and latest_validation_ts >= max(0.0, latest_delivery_ts - 30.0))
+
+
+def _order_has_verified_no_change_resolution(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float | None = None,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
+    except Exception:
+        return False
+    now_ts = float(now if now is not None else time.time())
+    latest_review_ts = 0.0
+    latest_review_summary = ""
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        state = str(child.state or "").strip().lower()
+        if role_norm != "reviewer_local" or state != "done":
+            continue
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts <= 0 or (now_ts - ts) > 3600.0:
+            continue
+        summary = _task_local_specialist_response(child, max_chars=5000)
+        if not summary:
+            trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+            summary = str(trace.get("result_summary") or "").strip()
+        if not summary:
+            continue
+        if ts >= latest_review_ts:
+            latest_review_ts = ts
+            latest_review_summary = summary
+    if latest_review_ts <= 0.0 or not latest_review_summary:
+        return False
+    if not _response_signals_no_code_change(latest_review_summary):
+        return False
+    if not (
+        _summary_has_validation_signal(latest_review_summary)
+        or " is correct" in latest_review_summary.lower()
+        or "architect's claim" in latest_review_summary.lower()
+    ):
+        return False
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        if role_norm not in {"architect_local", "implementer_local"}:
+            continue
+        st = str(child.state or "").strip().lower()
+        if st in {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}:
+            return False
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts > (latest_review_ts + 5.0):
+            return False
+    return True
+
+def _is_manual_root_ticket(*, orch_q: OrchestratorQueue, root_ticket: str) -> bool:
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return False
+    try:
+        root = orch_q.get_job(rid)
+    except Exception:
+        return False
+    if root is None:
+        return False
+    if str(getattr(root, "parent_job_id", "") or "").strip():
+        return False
+    if bool(getattr(root, "is_autonomous", False)):
+        return False
+    req = str(getattr(root, "request_type", "") or "task").strip().lower()
+    if req not in ("task", "review", "maintenance"):
+        return False
+    return True
+
+
+def _apply_ceo_cli_first_policy(
+    *,
+    specs: list[TaskSpec],
+    force_cli_takeover: bool = False,
+) -> list[TaskSpec]:
+    if not specs:
+        return specs
+
+    cli_roles = {"frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr"}
+    local_roles = {"architect_local", "implementer_local", "reviewer_local"}
+
+    def _map_local_to_cli(role_norm: str) -> str:
+        if role_norm == "reviewer_local":
+            return "qa"
+        if role_norm == "architect_local":
+            return "backend"
+        return "backend"
+
+    def _clone_spec(spec: TaskSpec, *, role: str | None = None, depends_on: list[str] | None = None) -> TaskSpec:
+        return TaskSpec(
+            key=spec.key,
+            role=(role or spec.role),
+            text=spec.text,
+            mode_hint=spec.mode_hint,
+            priority=spec.priority,
+            depends_on=(list(spec.depends_on or []) if depends_on is None else list(depends_on)),
+            requires_approval=spec.requires_approval,
+            acceptance_criteria=list(spec.acceptance_criteria or []),
+            definition_of_done=list(spec.definition_of_done or []),
+            eta_minutes=spec.eta_minutes,
+            sla_tier=spec.sla_tier,
+        )
+
+    def _supportify_local_spec(spec: TaskSpec) -> TaskSpec:
+        text = str(spec.text or "").strip()
+        support_prefix = (
+            "Support lane only (advisory): provide analysis/recommendations for Jarvis and Codex CLI. "
+            "Do not gate delivery or merge decisions."
+        )
+        if text:
+            if "support lane only" not in text.lower():
+                text = support_prefix + "\n" + text
+        else:
+            text = support_prefix
+        eta = int(spec.eta_minutes or 45)
+        return TaskSpec(
+            key=spec.key,
+            role=spec.role,
+            text=text,
+            mode_hint="ro",
+            priority=max(3, int(spec.priority or 3)),
+            depends_on=[],
+            requires_approval=False,
+            acceptance_criteria=(
+                list(spec.acceptance_criteria or [])
+                or [
+                    "Deliver concise recommendations with concrete implementation/QA implications.",
+                ]
+            ),
+            definition_of_done=(
+                list(spec.definition_of_done or [])
+                or [
+                    "Advisory output delivered; no CLI task blocked by this local lane.",
+                ]
+            ),
+            eta_minutes=max(15, eta),
+            sla_tier="normal",
+        )
+
+    try:
+        max_local_support = int(os.environ.get("BOT_CEO_LOCAL_SUPPORT_MAX", "1"))
+    except Exception:
+        max_local_support = 1
+    # Default policy for CEO/manual lanes: local roles are optional support only.
+    # If local injection is disabled, do not keep local support subtasks in the plan.
+    if not _ceo_local_injection_enabled():
+        max_local_support = 0
+    max_local_support = max(0, min(2, max_local_support))
+
+    has_cli = any(_coerce_orchestrator_role(str(s.role or "")) in cli_roles for s in specs)
+    out: list[TaskSpec] = []
+
+    if force_cli_takeover or (not has_cli):
+        for spec in specs:
+            role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+            if role_norm in local_roles:
+                out.append(_clone_spec(spec, role=_map_local_to_cli(role_norm)))
+            else:
+                out.append(spec)
+    else:
+        cli_specs: list[TaskSpec] = []
+        local_candidates: list[TaskSpec] = []
+        local_rank = {"reviewer_local": 0, "architect_local": 1, "implementer_local": 2}
+
+        for spec in specs:
+            role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+            if role_norm in cli_roles:
+                cli_specs.append(spec)
+            elif role_norm in local_roles:
+                local_candidates.append(spec)
+
+        local_candidates.sort(key=lambda s: local_rank.get(_coerce_orchestrator_role(str(s.role or "")), 99))
+        local_support = [_supportify_local_spec(s) for s in local_candidates[:max_local_support]]
+        out = cli_specs + local_support
+
+    out = out[:12]
+    kept_keys = {str(s.key or "").strip() for s in out if str(s.key or "").strip()}
+    role_by_key: dict[str, str] = {}
+    for spec in out:
+        k = str(spec.key or "").strip()
+        if k:
+            role_by_key[k] = _coerce_orchestrator_role(str(spec.role or ""))
+
+    normalized: list[TaskSpec] = []
+    for spec in out:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        deps = [str(d).strip() for d in (spec.depends_on or []) if str(d).strip() in kept_keys]
+        # Keep local specialists as advisory/support lanes: they must not block
+        # CLI execution on CEO-driven tickets.
+        if role_norm in local_roles:
+            deps = []
+        elif role_norm in cli_roles and deps:
+            deps = [d for d in deps if role_by_key.get(d) not in local_roles]
+        normalized.append(_clone_spec(spec, depends_on=deps))
+    return normalized
+
+
+def _recent_ticket_role_activity(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    role: str,
+    now: float,
+    cooldown_seconds: int,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    role_norm = _coerce_orchestrator_role(role)
+    if not rid or not role_norm:
+        return False
+    cutoff = float(now) - float(max(0, int(cooldown_seconds or 0)))
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=500)
+    except Exception:
+        return False
+    for child in children:
+        if _coerce_orchestrator_role(str(child.role or "")) != role_norm:
+            continue
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts >= cutoff:
+            return True
+    return False
+
+
+def _apply_autonomous_local_first_policy(
+    *,
+    specs: list[TaskSpec],
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float,
+) -> list[TaskSpec]:
+    if not specs:
+        return specs
+    if not _autonomous_local_first_enabled():
+        return specs
+
+    rid = str(root_ticket or "").strip() or "ticket"
+
+    def _latest_meta(role_name: str, *, states: tuple[str, ...] = ("done",), limit: int = 20) -> list[dict[str, Any]]:
+        db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+        if not db_path.exists():
+            db_rows = []
+        else:
+            normalized_states = tuple(
+                str(state or "").strip().lower()
+                for state in (states or ("done",))
+                if str(state or "").strip()
+            )
+            if not normalized_states:
+                normalized_states = ("done",)
+            state_placeholders = ",".join("?" for _ in normalized_states)
+            try:
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                db_rows = conn.execute(
+                    f"""
+                    select job_id, artifacts_dir, trace, labels, created_at, updated_at, state
+                    from jobs
+                    where parent_job_id=? and role=? and state in ({state_placeholders})
+                    order by created_at desc
+                    limit ?
+                    """,
+                    (rid, str(role_name or "").strip(), *normalized_states, int(limit)),
+                ).fetchall()
+            except Exception:
+                db_rows = []
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if not db_rows:
+            fallback_rows: list[dict[str, Any]] = []
+            wanted_role = _coerce_orchestrator_role(str(role_name or ""))
+            wanted_states = {
+                str(state or "").strip().lower()
+                for state in (states or ("done",))
+                if str(state or "").strip()
+            } or {"done"}
+            for child in (existing_children or []):
+                role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+                state_norm = str(getattr(child, "state", "") or "").strip().lower()
+                if role_norm != wanted_role or state_norm not in wanted_states:
+                    continue
+                fallback_rows.append(
+                    {
+                        "job_id": str(getattr(child, "job_id", "") or ""),
+                        "artifacts_dir": str(getattr(child, "artifacts_dir", "") or ""),
+                        "trace": dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {}),
+                        "labels": dict((getattr(child, "labels", {}) or {}) if isinstance(getattr(child, "labels", {}), dict) else {}),
+                        "created_at": float(getattr(child, "created_at", 0.0) or 0.0),
+                        "updated_at": float(getattr(child, "updated_at", 0.0) or 0.0),
+                        "state": state_norm,
+                    }
+                )
+            fallback_rows.sort(
+                key=lambda row: float(row.get("created_at") or 0.0),
+                reverse=True,
+            )
+            return fallback_rows[: int(limit)]
+        out: list[dict[str, Any]] = []
+        for row in db_rows or []:
+            item = dict(row)
+            for key in ("trace", "labels"):
+                raw = item.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                        item[key] = parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        item[key] = {}
+                elif not isinstance(raw, dict):
+                    item[key] = {}
+            out.append(item)
+        return out
+
+    def _latest_done_meta(role_name: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        return _latest_meta(role_name, states=("done",), limit=limit)
+
+    def _row_local_response(meta: dict[str, Any], *, max_chars: int = 7000) -> str:
+        def _truncate(raw: str) -> str:
+            text = str(raw or "").strip()
+            if len(text) > max_chars:
+                text = text[:max_chars].rstrip()
+            return text
+
+        if not isinstance(meta, dict):
+            return ""
+        job_id = str(meta.get("job_id") or "").strip()
+        artifacts_dir = str(meta.get("artifacts_dir") or "").strip()
+        candidates: list[Path] = []
+        if artifacts_dir:
+            candidates.append(Path(artifacts_dir) / "local_ollama_response.md")
+        if job_id:
+            candidates.append(Path(__file__).resolve().parent / "data" / "artifacts" / job_id / "local_ollama_response.md")
+        for candidate in candidates:
+            try:
+                if candidate.exists():
+                    text = _truncate(candidate.read_text(encoding="utf-8", errors="replace"))
+                    if text:
+                        return text
+            except Exception:
+                continue
+        trace = dict(meta.get("trace") or {}) if isinstance(meta.get("trace"), dict) else {}
+        return _truncate(str(trace.get("result_summary") or ""))
+
+    try:
+        existing_children = orch_q.jobs_by_parent(parent_job_id=rid, limit=2000)
+    except Exception:
+        existing_children = []
+    try:
+        order_row = orch_q.get_order(rid, chat_id=0)
+    except Exception:
+        order_row = None
+    try:
+        order_rows = orch_q.list_orders_global(status="active", limit=400)
+    except Exception:
+        order_rows = []
+    if not order_row:
+        for row in order_rows:
+            if str(row.get("order_id") or "").strip() == rid:
+                order_row = row
+                break
+    objective_title = str((order_row or {}).get("title") or "").strip()
+    objective_body = str((order_row or {}).get("body") or "").strip()
+    objective_snippet = "\n".join(x for x in (objective_title, objective_body) if x).strip()
+    if len(objective_snippet) > 600:
+        objective_snippet = objective_snippet[:600].rstrip() + "..."
+    try:
+        root_job = orch_q.get_job(rid)
+    except Exception:
+        root_job = None
+    root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+
+    local_roles = {"architect_local", "implementer_local", "reviewer_local"}
+    kept_specs: list[TaskSpec] = []
+    for spec in specs:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        if role_norm in local_roles:
+            kept_specs.append(spec)
+
+    latest_impl_done: dict[str, Any] | None = None
+    latest_impl_no_change_done: dict[str, Any] | None = None
+    for meta in _latest_done_meta("implementer_local", limit=40):
+        trace = dict(meta.get("trace") or {}) if isinstance(meta.get("trace"), dict) else {}
+        summary = str(trace.get("result_summary") or "").strip()
+        ts = float(meta.get("updated_at") or meta.get("created_at") or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        if _trace_has_validated_slice_evidence(trace):
+            latest_impl_done = meta
+            break
+        if latest_impl_no_change_done is None and _trace_local_no_change(trace):
+            latest_impl_no_change_done = meta
+    latest_impl_failed_summary = ""
+    latest_impl_failed_job_id = ""
+    latest_impl_failed_slice_id = ""
+    latest_impl_failed_attempt_n = 0
+    latest_impl_failed_failure_class = ""
+    latest_impl_failed_ts = 0.0
+    failure_candidates: list[tuple[str, str, str, int, str, float]] = []
+    for meta in _latest_meta("implementer_local", states=("failed", "cancelled", "blocked"), limit=120):
+        trace = dict(meta.get("trace") or {}) if isinstance(meta.get("trace"), dict) else {}
+        summary = str(trace.get("result_summary") or "").strip()
+        if not summary:
+            summary = str(trace.get("blocked_reason") or "").strip()
+        if not summary:
+            summary = str(meta.get("state") or "").strip()
+        summary = _augment_implementer_failure_summary(
+            summary=summary,
+            job_id=str(meta.get("job_id") or "").strip(),
+            artifacts_dir=str(meta.get("artifacts_dir") or "").strip(),
+        )
+        ts = float(meta.get("updated_at") or meta.get("created_at") or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        if not summary:
+            continue
+        state_norm = str(meta.get("state") or "").strip().lower()
+        failed_slice_id = _sanitize_slice_token(
+            str(trace.get("slice_id") or ""),
+            fallback="",
+        )
+        try:
+            failed_attempt_n = int(trace.get("attempt_n") or 0)
+        except Exception:
+            failed_attempt_n = 0
+        failed_failure_class = str(trace.get("failure_class") or "").strip().lower()
+        if _should_ignore_cancelled_local_failure(
+            state_norm=state_norm,
+            failure_class=failed_failure_class,
+            attempt_n=int(failed_attempt_n),
+            summary=summary,
+        ):
+            continue
+        candidate_failure_class = failed_failure_class
+        if (not candidate_failure_class) and state_norm in ("blocked", "blocked_approval"):
+            candidate_failure_class = "blocked"
+        failure_candidates.append(
+            (
+                summary[:2000],
+                str(meta.get("job_id") or "").strip(),
+                failed_slice_id,
+                int(failed_attempt_n),
+                candidate_failure_class,
+                float(ts),
+            )
+        )
+    preferred_impl_failed = _select_preferred_implementer_failure(failure_candidates)
+    if preferred_impl_failed is not None:
+        (
+            latest_impl_failed_summary,
+            latest_impl_failed_job_id,
+            latest_impl_failed_slice_id,
+            latest_impl_failed_attempt_n,
+            latest_impl_failed_failure_class,
+            latest_impl_failed_ts,
+        ) = preferred_impl_failed
+    latest_impl_failed_blocker = _extract_blocker_response(latest_impl_failed_summary)
+    if (not latest_impl_failed_blocker) and latest_impl_failed_summary:
+        latest_impl_failed_blocker = latest_impl_failed_summary.strip()
+    if (
+        (not latest_impl_failed_blocker)
+        and latest_impl_failed_job_id
+        and (
+            latest_impl_failed_failure_class in ("terminal", "blocked")
+            or int(latest_impl_failed_attempt_n) >= 2
+        )
+    ):
+        latest_impl_failed_blocker = (
+            "Implementer reported terminal/blocked failure without structured blocker details. "
+            "Re-ground this slice using fresh file scope and validation command."
+        )
+    impl_failure_requires_replan = bool(
+        latest_impl_failed_job_id
+        and (
+            latest_impl_failed_failure_class in ("terminal", "blocked")
+            or int(latest_impl_failed_attempt_n) >= 2
+        )
+    )
+    latest_review_done_summary = ""
+    for meta in _latest_done_meta("reviewer_local", limit=12):
+        trace = dict(meta.get("trace") or {}) if isinstance(meta.get("trace"), dict) else {}
+        summary = str(trace.get("result_summary") or "").strip()
+        ts = float(meta.get("updated_at") or meta.get("created_at") or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        if not summary:
+            text = _row_local_response(meta, max_chars=4000)
+            summary = str(text or "").strip()
+        if summary:
+            latest_review_done_summary = summary[:4000]
+            break
+    arch_rows = _latest_done_meta("architect_local", limit=12)
+    latest_arch_done: dict[str, Any] | None = None
+    latest_arch_response = ""
+    latest_arch_job_id = ""
+    latest_arch_key_raw = ""
+    trace_handoff = str(root_trace.get("latest_local_architect_handoff") or "").strip()
+    trace_arch_job_id = str(root_trace.get("latest_local_architect_job_id") or "").strip()
+    try:
+        trace_handoff_ts = float(root_trace.get("latest_local_architect_done_at") or 0.0)
+    except Exception:
+        trace_handoff_ts = 0.0
+    if trace_handoff and _response_has_exact_file_targets(trace_handoff):
+        if trace_handoff_ts <= 0.0 or (float(now) - trace_handoff_ts) <= 3600.0:
+            latest_arch_response = trace_handoff
+            latest_arch_job_id = trace_arch_job_id
+    for meta in arch_rows:
+        if latest_arch_response:
+            break
+        text = _row_local_response(meta, max_chars=7000)
+        if not text:
+            continue
+        if not _response_has_exact_file_targets(text):
+            continue
+        latest_arch_done = meta
+        latest_arch_response = text
+        latest_arch_job_id = str(meta.get("job_id") or "").strip()
+        latest_arch_key_raw = str(
+            (
+                (meta.get("labels") or {})
+                if isinstance(meta.get("labels"), dict)
+                else {}
+            ).get("key")
+            or ""
+        ).strip()
+        break
+    latest_arch_ts = float(trace_handoff_ts or 0.0)
+    if latest_arch_done is not None:
+        try:
+            latest_arch_ts = max(
+                latest_arch_ts,
+                float(latest_arch_done.get("updated_at") or latest_arch_done.get("created_at") or 0.0),
+            )
+        except Exception:
+            pass
+    require_arch_artifact_contract = bool(_text_mentions_artifact_contract(latest_impl_failed_blocker))
+    latest_arch_actionable = bool(
+        latest_arch_response
+        and _structured_handoff_is_actionable(
+            latest_arch_response,
+            require_artifact_contract=require_arch_artifact_contract,
+        )
+    )
+    if latest_arch_response and not latest_arch_actionable:
+        latest_arch_response = ""
+        latest_arch_job_id = ""
+        latest_arch_key_raw = ""
+    # Once a newer architect blocker handoff exists after the failure timestamp,
+    # consume that failure signal and advance to implementer instead of replanning
+    # architect repeatedly for the same episode.
+    if (
+        impl_failure_requires_replan
+        and latest_arch_actionable
+        and latest_arch_ts > 0.0
+        and latest_impl_failed_ts > 0.0
+        and latest_arch_ts >= (latest_impl_failed_ts + 5.0)
+    ):
+        impl_failure_requires_replan = False
+    recent_non_actionable_arch_count = 0
+    for meta in _latest_done_meta("architect_local", limit=10):
+        ts = float(meta.get("updated_at") or meta.get("created_at") or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        text = _row_local_response(meta, max_chars=7000)
+        if not text:
+            continue
+        if _structured_handoff_is_actionable(
+            text,
+            require_artifact_contract=require_arch_artifact_contract,
+        ):
+            break
+        recent_non_actionable_arch_count += 1
+    # Keep strict WIP on runnable work; blocked outcomes should trigger replan.
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running"}
+    active_arch_open = any(
+        _coerce_orchestrator_role(str(child.role or "")) == "architect_local"
+        and str(child.state or "").strip().lower() in active_states
+        for child in existing_children
+    )
+    active_implementer_open = any(
+        _coerce_orchestrator_role(str(child.role or "")) == "implementer_local"
+        and str(child.state or "").strip().lower() in active_states
+        for child in existing_children
+    )
+    active_reviewer_open = any(
+        _coerce_orchestrator_role(str(child.role or "")) == "reviewer_local"
+        and str(child.state or "").strip().lower() in active_states
+        for child in existing_children
+    )
+
+    def _no_change_review_specs() -> list[TaskSpec]:
+        arch_key_raw_local = latest_arch_key_raw
+        review_suffix = ""
+        if arch_key_raw_local.startswith("local_arch_guard_"):
+            review_suffix = arch_key_raw_local[len("local_arch_guard_") :].strip()
+        if not review_suffix and latest_arch_job_id:
+            review_suffix = latest_arch_job_id.split("-", 1)[0].strip()
+        review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        return [
+            TaskSpec(
+                key=review_key,
+                role="reviewer_local",
+                text=(
+                    f"Validate whether the latest architect_local handoff for ticket {rid} is correct that no code change is needed.\n"
+                    f"Architect job: {latest_arch_job_id or '(unknown)'}\n\n"
+                    "PRIMARY_ARCHITECT_HANDOFF:\n"
+                    f"{latest_arch_response}\n\n"
+                    "Rules:\n"
+                    "- Inspect the named files directly in the workspace.\n"
+                    "- If the implementation already exists and works, return READY with exact file evidence and one validation command.\n"
+                    "- If the architect is wrong or incomplete, return NEEDS_REWORK with the smallest concrete implementer slice.\n"
+                    "- Do not request another architecture pass.\n"
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return READY if the claimed existing implementation is verified with exact file evidence.",
+                    "Otherwise return NEEDS_REWORK with exact files and the smallest implementer slice.",
+                ],
+                definition_of_done=[
+                    "Existing implementation is verified or a concrete rework path is identified without another architecture loop.",
+                ],
+                eta_minutes=20,
+                sla_tier="high",
+            )
+        ]
+
+    def _impl_no_change_review_specs() -> list[TaskSpec]:
+        if latest_impl_no_change_done is None:
+            return []
+        impl_job_id = str(latest_impl_no_change_done.get("job_id") or "").strip()
+        impl_labels = (
+            (latest_impl_no_change_done.get("labels") or {})
+            if isinstance(latest_impl_no_change_done.get("labels"), dict)
+            else {}
+        )
+        impl_key_raw = str(impl_labels.get("key") or "").strip().lower()
+        review_suffix = ""
+        if impl_key_raw.startswith("local_impl_guard_"):
+            review_suffix = impl_key_raw[len("local_impl_guard_") :].strip()
+        if not review_suffix and impl_job_id:
+            review_suffix = impl_job_id.split("-", 1)[0].strip()
+        review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        return [
+            TaskSpec(
+                key=review_key,
+                role="reviewer_local",
+                text=(
+                    f"Validate implementer_local no-change claim for ticket {rid}.\n"
+                    f"Implementer job: {impl_job_id or '(unknown)'}\n"
+                    "Inspect the target files directly in the workspace.\n"
+                    "- If no code change is truly required and behavior is already correct, return READY with exact file evidence + one validation command.\n"
+                    "- If code change is required, return NEEDS_REWORK with exact files and the smallest implementer slice.\n"
+                    "- Do not request another architecture pass."
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return READY/NEEDS_REWORK with exact file evidence and one validation command.",
+                    "If rework is needed, provide the smallest concrete implementer slice.",
+                ],
+                definition_of_done=[
+                    "No-change claim independently validated or rejected with concrete rework path.",
+                ],
+                eta_minutes=20,
+                sla_tier="high",
+            )
+        ]
+
+    def _blocker_replan_specs() -> list[TaskSpec]:
+        old_slice = _sanitize_slice_token(latest_impl_failed_slice_id, fallback="")
+        blocker_suffix = str(max(1, int(now)))
+        if old_slice:
+            blocker_suffix = f"{old_slice}_r{int(max(2, latest_impl_failed_attempt_n + 1))}"
+        blocker_suffix = _sanitize_slice_token(blocker_suffix, fallback=str(max(1, int(now))))
+        arch_key = f"local_arch_blocker_{blocker_suffix}"
+        return [
+            TaskSpec(
+                key=arch_key,
+                role="architect_local",
+                text=(
+                    f"Re-ground the implementation slice for ticket {rid} using the latest implementer blocker.\n"
+                    f"Implementer job: {latest_impl_failed_job_id or '(unknown)'}\n"
+                    f"Previous slice_id: {latest_impl_failed_slice_id or '(none)'}\n"
+                    f"Attempt count observed: {max(1, int(latest_impl_failed_attempt_n or 1))}\n"
+                    f"Failure class: {latest_impl_failed_failure_class or 'retriable'}\n"
+                    f"NEW_SLICE_ID: {blocker_suffix}\n"
+                    "LATEST_IMPLEMENTER_BLOCKER:\n"
+                    f"{latest_impl_failed_blocker}\n\n"
+                    "Return one bounded replacement handoff that either:\n"
+                    "- edits only existing files already present in REAL_WORKTREE_DIR, or\n"
+                    "- introduces one adjacent new file only if the blocker proves it is required.\n"
+                    "- Do not recycle the previous slice_id; this must be a fresh replacement slice.\n"
+                    "- If the blocker references missing artifact/evidence requirements, define an explicit artifact path or glob.\n"
+                    "Required handoff format:\n"
+                    "FILES:\n- exact/path.py\nCHANGE:\n- smallest concrete edit to make\nVALIDATION:\n- one command to run\nARTIFACT_CONTRACT:\n- exact artifact path/pattern to validate (required when blocker mentions evidence)\nRISK:\n- main residual risk\n"
+                ),
+                mode_hint="ro",
+                priority=2,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Use the implementer blocker to produce one replacement handoff with 1-3 exact paths.",
+                    "Prefer existing files; introduce one adjacent new file only when the blocker makes it necessary.",
+                    "When blocker mentions evidence/artifacts, include exact artifact contract path or pattern.",
+                    "Declare a fresh replacement slice_id and keep scope bounded to that new slice.",
+                ],
+                definition_of_done=[
+                    "Replacement architect handoff grounded in the latest implementer blocker without reusing the failed slice_id.",
+                ],
+                eta_minutes=25,
+                sla_tier="high",
+            )
+        ]
+
+    def _direct_blocker_implementer_specs() -> list[TaskSpec]:
+        blocker_payload = str(latest_impl_failed_blocker or "").strip()
+        arch_payload = str(latest_arch_response or "").strip()
+        if not blocker_payload and not arch_payload:
+            return []
+        worktree = _local_role_worktree_dir("implementer_local")
+        if not worktree.is_dir():
+            return []
+        file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+        candidate_files: list[str] = []
+        seen_files: set[str] = set()
+        for source_text in (blocker_payload, arch_payload):
+            if not source_text:
+                continue
+            for match in file_hint_re.findall(source_text):
+                rel_path = str(match or "").strip().lstrip("./")
+                if not rel_path or rel_path in seen_files:
+                    continue
+                disk_path = (worktree / rel_path).resolve()
+                try:
+                    inside = str(disk_path).startswith(str(worktree))
+                except Exception:
+                    inside = False
+                if not inside or not disk_path.is_file():
+                    continue
+                seen_files.add(rel_path)
+                candidate_files.append(rel_path)
+                if len(candidate_files) >= 3:
+                    break
+            if len(candidate_files) >= 3:
+                break
+        if not candidate_files:
+            return []
+        # Keep direct unblock scope tight: prefer executable/source files over docs.
+        non_doc_candidates = [p for p in candidate_files if not str(p).lower().endswith(".md")]
+        if non_doc_candidates:
+            candidate_files = non_doc_candidates[:3]
+        blocker_lc = str(blocker_payload or arch_payload).lower()
+        evidence_contract = ""
+        if (
+            "evidence_artifact_exists" in blocker_lc
+            or "evidence artifact" in blocker_lc
+            or "artifact path pattern" in blocker_lc
+            or "artifact path" in blocker_lc
+        ):
+            evidence_contract = (
+                "EXPLICIT_ARTIFACT_CONTRACT:\n"
+                "- For `evidence_artifact_exists`, use `final_evidence.json` relative to `--artifacts-dir`.\n"
+                "- Treat this as authoritative for this slice; do not return BLOCKER for missing artifact-path specification.\n\n"
+            )
+        test_target = ""
+        for rel_path in candidate_files:
+            low = rel_path.lower()
+            if low.startswith("test") or "/test" in low or low.startswith("tests/"):
+                test_target = rel_path
+                break
+        validation_cmd = f"pytest -q {test_target}" if test_target else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        suffix_base = _sanitize_slice_token(latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
+        direct_suffix = _sanitize_slice_token(
+            f"{suffix_base}_direct_r{int(max(2, recent_non_actionable_arch_count + 1))}",
+            fallback=str(max(1, int(now))),
+        )
+        files_block = "\n".join(f"- {path}" for path in candidate_files)
+        actionable_failure_contract = ""
+        if _implementer_failure_summary_has_actionable_signal(latest_impl_failed_summary):
+            actionable_failure_contract = (
+                "ACTIONABLE_FAILURE_SIGNAL:\n"
+                "- FAILED_VALIDATION_OUTPUT already contains a concrete compiler/runtime/test error.\n"
+                "- Treat that concrete error as sufficient implementation target for this slice.\n"
+                "- If the failure names a file/line inside MANDATORY_FILE_SCOPE, fix that exact issue first.\n"
+                "- Do not ask for more failing-test context when the named file and validation error are already present.\n\n"
+            )
+        return [
+            TaskSpec(
+                key=f"local_impl_guard_{direct_suffix}",
+                role="implementer_local",
+                text=(
+                    f"Direct unblock implementation for ticket {rid} after repeated non-actionable architect passes.\n"
+                    f"Slice: {direct_suffix}\n"
+                    "This is a quality-safe bypass: implement the blocker fix directly using concrete files from the latest implementer blocker.\n\n"
+                    "LATEST_IMPLEMENTER_BLOCKER:\n"
+                    f"{blocker_payload or arch_payload}\n\n"
+                    f"{evidence_contract}"
+                    f"{actionable_failure_contract}"
+                    "MANDATORY_FILE_SCOPE:\n"
+                    f"{files_block}\n\n"
+                    "Execution rules:\n"
+                    "- Edit only files in MANDATORY_FILE_SCOPE unless one adjacent test/config file is strictly required.\n"
+                    "- Produce one single fenced ```diff``` block with all hunks.\n"
+                    f"- Run validation command: {validation_cmd}\n"
+                    "- If requirements are still missing, return BLOCKER with the exact missing field/value (no generic blocker).\n"
+                ),
+                mode_hint="rw",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Apply a concrete unblock patch in the named files with a real diff.",
+                    "Run one explicit validation command and report result.",
+                    "If blocked, provide exact missing requirement/value tied to named files.",
+                ],
+                definition_of_done=[
+                    "A validated unblock patch is applied, or a concrete blocker is returned with exact missing requirement.",
+                ],
+                eta_minutes=45,
+                sla_tier="high",
+            )
+        ]
+
+    planner_local_roles = {
+        _coerce_orchestrator_role(str(spec.role or ""))
+        for spec in kept_specs
+        if _coerce_orchestrator_role(str(spec.role or "")) in {"architect_local", "implementer_local", "reviewer_local"}
+    }
+    planner_arch_only = bool(planner_local_roles) and planner_local_roles.issubset({"architect_local"})
+    recent_arch_done_count = 0
+    for meta in _latest_done_meta("architect_local", limit=8):
+        ts = float(meta.get("updated_at") or meta.get("created_at") or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        recent_arch_done_count += 1
+    # Break architect-only churn early: if we already have a recent architect pass but planner keeps
+    # outputting only architect tasks for the same blocked episode, force one direct implementer attempt.
+    if (
+        planner_arch_only
+        and latest_arch_done is not None
+        and int(recent_arch_done_count) >= 2
+        and not active_arch_open
+        and not active_implementer_open
+        and not active_reviewer_open
+        and latest_impl_done is None
+    ):
+        direct_specs = _direct_blocker_implementer_specs()
+        if direct_specs:
+            return direct_specs
+
+    review_already_validated_no_change = bool(
+        latest_review_done_summary and _response_signals_no_code_change(latest_review_done_summary)
+    )
+
+    if not kept_specs:
+        active_existing, queued_existing, waiting_existing = _ticket_active_backlog_counts(existing_children)
+        max_order_queued, max_order_waiting = _proactive_order_backlog_limits()
+        if (
+            active_existing >= _ticket_max_active_subtasks()
+            or queued_existing >= max_order_queued
+            or waiting_existing >= max_order_waiting
+        ):
+            return []
+        has_active_guard_chain = any(
+            _is_local_support_role_name(_coerce_orchestrator_role(str(child.role or "")))
+            and str(child.state or "").strip().lower() in active_states
+            and _is_local_guard_key(str((child.labels or {}).get("key") or ""))
+            for child in existing_children
+        )
+        if has_active_guard_chain:
+            return []
+        # Anti-loop breaker: if planner keeps yielding no actionable local specs while architect
+        # churn has already happened multiple times, force a direct implementer slice.
+        if (not active_arch_open) and (not active_implementer_open) and (not active_reviewer_open):
+            repeated_arch_churn = int(recent_arch_done_count) >= 2 and (
+                int(recent_non_actionable_arch_count) >= 1 or bool(latest_impl_failed_job_id)
+            )
+            if repeated_arch_churn:
+                direct_specs = _direct_blocker_implementer_specs()
+                if direct_specs:
+                    return direct_specs
+        if latest_impl_done is not None and not active_reviewer_open:
+            impl_key_raw = str(((latest_impl_done.get("labels") or {}) if isinstance(latest_impl_done.get("labels"), dict) else {}).get("key") or "").strip()
+            review_suffix = ""
+            if impl_key_raw.startswith("local_impl_guard_"):
+                review_suffix = impl_key_raw[len("local_impl_guard_") :].strip()
+            review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+            return [
+                TaskSpec(
+                    key=review_key,
+                    role="reviewer_local",
+                    text=(
+                        f"Independent local review for ticket {rid}: review the newest implementer_local diff/evidence only and issue READY/NEEDS_REWORK.\n"
+                        f"Review target job: {latest_impl_done.get('job_id')}\n"
+                        "Do not ask for another architecture pass. If diff/evidence is weak, return NEEDS_REWORK with exact fixes."
+                    ),
+                    mode_hint="ro",
+                    priority=1,
+                    depends_on=[],
+                    requires_approval=False,
+                    acceptance_criteria=[
+                        "Return READY/NEEDS_REWORK with concrete blocking issues.",
+                        "Reference the newest diff, validation command output, or artifact paths used for the verdict.",
+                    ],
+                    definition_of_done=[
+                        "Independent verdict delivered for the newest implementation slice.",
+                    ],
+                    eta_minutes=30,
+                    sla_tier="high",
+                )
+            ]
+        if latest_impl_no_change_done is not None and not active_reviewer_open and not active_implementer_open:
+            return _impl_no_change_review_specs()
+        shared_local_worktree = _local_role_worktree_dir("implementer_local")
+        invalid_arch_paths = _missing_handoff_files(text=latest_arch_response, worktree_dir=shared_local_worktree)
+        if invalid_arch_paths and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+            invalid_suffix = latest_arch_job_id.split("-", 1)[0].strip() if latest_arch_job_id else str(max(1, int(now)))
+            retry_key = f"local_arch_ground_{invalid_suffix or max(1, int(now))}"
+            missing_lines = "\n".join(f"- {path}" for path in invalid_arch_paths[:6])
+            return [
+                TaskSpec(
+                    key=retry_key,
+                    role="architect_local",
+                    text=(
+                        f"Re-ground the local implementation slice for ticket {rid}. The previous architect handoff referenced missing repo paths.\n"
+                        f"Previous architect job: {latest_arch_job_id or '(unknown)'}\n"
+                        "Missing paths:\n"
+                        f"{missing_lines}\n\n"
+                        "Return one replacement handoff that references only files that already exist under REAL_WORKTREE_DIR.\n"
+                        "Do not invent test files. If a new file is absolutely necessary, anchor it to one adjacent existing file and explain why.\n"
+                        "Required handoff format:\n"
+                        "FILES:\n- exact/existing/path.py\nCHANGE:\n- smallest concrete edit to make\nVALIDATION:\n- one command to run\nRISK:\n- main residual risk\n"
+                    ),
+                    mode_hint="ro",
+                    priority=2,
+                    depends_on=[],
+                    requires_approval=False,
+                    acceptance_criteria=[
+                        "Reference only existing repo paths unless one adjacent new file is strictly necessary and justified.",
+                        "Provide one bounded implementation slice with a targeted validation command.",
+                    ],
+                    definition_of_done=[
+                        "Replacement architect handoff grounded in real repository files.",
+                    ],
+                    eta_minutes=25,
+                    sla_tier="high",
+                )
+            ]
+        if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and review_already_validated_no_change:
+            return []
+        if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
+            return _no_change_review_specs()
+        if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+            if int(recent_non_actionable_arch_count) >= 2:
+                direct_specs = _direct_blocker_implementer_specs()
+                if direct_specs:
+                    return direct_specs
+            return _blocker_replan_specs()
+        if latest_arch_response and not active_implementer_open and not active_reviewer_open:
+            arch_key_raw = latest_arch_key_raw
+            impl_suffix = ""
+            for prefix in ("local_arch_guard_", "local_arch_blocker_", "local_arch_ground_"):
+                if arch_key_raw.startswith(prefix):
+                    impl_suffix = arch_key_raw[len(prefix) :].strip()
+                    break
+            if not impl_suffix and latest_arch_job_id:
+                impl_suffix = latest_arch_job_id.split("-", 1)[0].strip()
+            retry_block = ""
+            if latest_impl_failed_summary:
+                retry_block = (
+                    "PREVIOUS_IMPLEMENTER_FAILURE:\n"
+                    f"job_id={latest_impl_failed_job_id or '(unknown)'}\n"
+                    f"{latest_impl_failed_summary}\n\n"
+                    "Correct the failure above. Emit one single fenced ```diff``` block containing every file hunk needed for this slice.\n\n"
+                )
+            impl_key = f"local_impl_guard_{impl_suffix or max(1, int(now))}"
+            return [
+                TaskSpec(
+                    key=impl_key,
+                    role="implementer_local",
+                    text=(
+                        f"Implement exactly one bounded improvement directly in the assigned workspace for ticket {rid}.\n"
+                        "Treat the architect handoff below as authoritative unless it is internally inconsistent.\n\n"
+                        f"{retry_block}"
+                        "PRIMARY_ARCHITECT_HANDOFF:\n"
+                        f"{latest_arch_response}\n\n"
+                        "Rules:\n"
+                        "- Modify only the exact files named in the architect handoff unless one closely related test/config file is required.\n"
+                        "- If the handoff contains ARTIFACT_CONTRACT, implement/validate against that exact contract.\n"
+                        "- Produce one real diff and one targeted validation command.\n"
+                        "- If multiple files change, include all hunks inside one single fenced ```diff``` block.\n"
+                        "- If the handoff is still not actionable, stop immediately and return BLOCKER with the smallest concrete unblock path.\n"
+                    ),
+                    mode_hint="rw",
+                    priority=2,
+                    depends_on=[],
+                    requires_approval=False,
+                    acceptance_criteria=[
+                        "Apply one concrete improvement from the architect handoff with a real diff.",
+                        "Report exact files changed, one validation command, and the observed result.",
+                    ],
+                    definition_of_done=[
+                        "Workspace contains one bounded improvement diff derived from the latest architect handoff, or a precise blocker tied to that handoff.",
+                    ],
+                    eta_minutes=60,
+                    sla_tier="high",
+                )
+            ]
+        # Guardrail: autonomous lane must remain local-first.
+        # If Jarvis proposes only non-local roles, synthesize a bounded local fallback chain.
+        stamp = max(1, int(now))
+        source_lines: list[str] = []
+        if objective_snippet:
+            source_lines.append("- objective: " + objective_snippet.replace("\n", " "))
+        for spec in specs[:3]:
+            role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+            txt = str(spec.text or "").strip().replace("\n", " ")
+            if len(txt) > 140:
+                txt = txt[:140] + "..."
+            source_lines.append(f"- {role_norm}: {txt}")
+        source_block = "\n".join(source_lines) if source_lines else "- (no source subtasks)"
+
+        if active_arch_open or active_implementer_open or active_reviewer_open:
+            return []
+        arch_key = f"local_arch_guard_{stamp}"
+        return [
+            TaskSpec(
+                key=arch_key,
+                role="architect_local",
+                text=(
+                    f"Local-first fallback for ticket {rid}: define exactly one smallest high-signal implementation slice from pending work.\n"
+                    "Source backlog snapshot:\n"
+                    f"{source_block}\n"
+                    "Return a handoff for the implementer, not another roadmap.\n"
+                    "Required handoff format:\n"
+                    "FILES:\n- exact/path.py\nCHANGE:\n- smallest concrete edit to make\nVALIDATION:\n- one command to run\nRISK:\n- main residual risk\n"
+                    "If you cannot identify exact files, fail closed with BLOCKER and the most likely files to inspect next. Avoid multi-track planning."
+                ),
+                mode_hint="ro",
+                priority=2,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Produce one bounded implementation handoff with 1-3 exact file paths to touch.",
+                    "Include the smallest concrete edit, one targeted validation command, and explicit unblock path.",
+                ],
+                definition_of_done=[
+                    "Single runnable implementation handoff delivered; no open-ended brainstorming.",
+                ],
+                eta_minutes=30,
+                sla_tier="high",
+            ),
+        ]
+
+    if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and review_already_validated_no_change:
+        return []
+    if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
+        planner_local_roles = {
+            _coerce_orchestrator_role(str(spec.role or ""))
+            for spec in kept_specs
+        }
+        if "reviewer_local" not in planner_local_roles and planner_local_roles.intersection({"architect_local", "implementer_local"}):
+            return _no_change_review_specs()
+    if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+        if int(recent_non_actionable_arch_count) >= 2:
+            direct_specs = _direct_blocker_implementer_specs()
+            if direct_specs:
+                return direct_specs
+        return _blocker_replan_specs()
+
+    kept_keys = {str(spec.key or "").strip() for spec in kept_specs if str(spec.key or "").strip()}
+    normalized_specs: list[TaskSpec] = []
+    for spec in kept_specs:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        if role_norm == "architect_local" and (latest_arch_done is not None or active_implementer_open or active_reviewer_open):
+            continue
+        if role_norm == "reviewer_local" and latest_impl_done is None and latest_impl_no_change_done is None:
+            continue
+        spec_text = str(spec.text or "")
+        if role_norm == "implementer_local":
+            if active_implementer_open or not latest_arch_response:
+                continue
+            if "PRIMARY_ARCHITECT_HANDOFF:" not in spec_text:
+                spec_text = (
+                    spec_text.rstrip()
+                    + "\n\nPRIMARY_ARCHITECT_HANDOFF:\n"
+                    + latest_arch_response
+                    + "\n\nRules:\n"
+                    + "- Follow this handoff over generic backlog text.\n"
+                    + "- Touch only the named files unless one adjacent test/config file is required.\n"
+                ).strip()
+        deps = [str(d).strip() for d in (spec.depends_on or []) if str(d).strip() in kept_keys]
+        if deps == list(spec.depends_on or []):
+            if spec_text == str(spec.text or ""):
+                normalized_specs.append(spec)
+            else:
+                normalized_specs.append(
+                    TaskSpec(
+                        key=spec.key,
+                        role=spec.role,
+                        text=spec_text,
+                        mode_hint=spec.mode_hint,
+                        priority=spec.priority,
+                        depends_on=deps,
+                        requires_approval=spec.requires_approval,
+                        acceptance_criteria=list(spec.acceptance_criteria or []),
+                        definition_of_done=list(spec.definition_of_done or []),
+                        eta_minutes=spec.eta_minutes,
+                        sla_tier=spec.sla_tier,
+                    )
+                )
+            continue
+        normalized_specs.append(
+            TaskSpec(
+                key=spec.key,
+                role=spec.role,
+                text=spec_text,
+                mode_hint=spec.mode_hint,
+                priority=spec.priority,
+                depends_on=deps,
+                requires_approval=spec.requires_approval,
+                acceptance_criteria=list(spec.acceptance_criteria or []),
+                definition_of_done=list(spec.definition_of_done or []),
+                eta_minutes=spec.eta_minutes,
+                sla_tier=spec.sla_tier,
+            )
+        )
+    return _prune_local_specs_against_active_backlog(
+        specs=normalized_specs,
+        existing_children=existing_children,
+    )
 def _sync_order_phase_from_runtime(
     *,
     orch_q: OrchestratorQueue,
@@ -6281,16 +11993,39 @@ def _sync_order_phase_from_runtime(
     order = orch_q.get_order(rid, chat_id=int(chat_id))
     if not order:
         return
+    root_job = orch_q.get_job(rid)
+    root_trace = dict((root_job.trace or {}) if root_job else {})
+    merge_required, _order_branch = _order_trace_requires_merge(root_trace)
+    proactive_order = bool(_is_proactive_order_record(order))
+    proactive_verified_no_change = False
+    if proactive_order:
+        proactive_verified_no_change = _order_has_verified_no_change_resolution(
+            orch_q=orch_q,
+            root_ticket=rid,
+        )
+
     status = str(order.get("status") or "").strip().lower()
     if status == "done":
+        if merge_required:
+            try:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=True,
+                    merge_ready_at=time.time(),
+                    merge_reopened_for_policy_at=time.time(),
+                    live_at=time.time(),
+                )
+            except Exception:
+                pass
+            return
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
         return
     if status == "paused":
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="paused")
         return
 
-    root_job = orch_q.get_job(rid)
-    root_trace = dict((root_job.trace or {}) if root_job else {})
     merged_to_main = bool(root_trace.get("merged_to_main", False))
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
@@ -6298,10 +12033,110 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
 
+    proactive_evidence_ok = True
+    proactive_funnel: dict[str, Any] | None = None
+    if proactive_order:
+        proactive_funnel = _collect_order_local_autonomy_funnel(
+            orch_q=orch_q,
+            root_ticket=rid,
+        )
+        proactive_evidence_ok = _order_has_meaningful_improvement(
+            orch_q=orch_q,
+            root_ticket=rid,
+        )
+        try:
+            orch_q.update_trace(
+                rid,
+                proactive_slices_started=int(proactive_funnel.get("slices_started", 0) or 0),
+                proactive_slices_applied=int(proactive_funnel.get("slices_applied", 0) or 0),
+                proactive_slices_validated=int(proactive_funnel.get("slices_validated", 0) or 0),
+                proactive_slices_closed=int(proactive_funnel.get("slices_closed", 0) or 0),
+                proactive_implementer_fail_rate=float(proactive_funnel.get("implementer_fail_rate", 0.0) or 0.0),
+                proactive_mean_time_to_validated_improvement=proactive_funnel.get("mean_time_to_validated_improvement"),
+                proactive_loop_breaker_count=int(proactive_funnel.get("loop_breaker_count", 0) or 0),
+                proactive_quality_gate_status=str(proactive_funnel.get("quality_gate_status") or "planned"),
+                proactive_improvement_verified=bool(proactive_funnel.get("improvement_verified", False)),
+                proactive_improvement_checked_at=time.time(),
+                live_at=time.time(),
+            )
+        except Exception:
+            pass
+
     states = [str(c.state or "").strip().lower() for c in children]
     wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
     wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
     wrapup_active = any(str(w.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for w in wrapups)
+    any_live = any(s in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for s in states)
+
+    latest_controller_terminal_summary = str(root_trace.get("result_summary") or "").strip()
+    latest_controller_terminal_ts = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
+    for child in children:
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        state = str(child.state or "").strip().lower()
+        if not _is_controller_role(role_norm) or state != "done":
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        summary = str(trace.get("result_summary") or "").strip()
+        if not summary:
+            continue
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts >= latest_controller_terminal_ts:
+            latest_controller_terminal_ts = ts
+            latest_controller_terminal_summary = summary
+
+    if proactive_order and proactive_verified_no_change and not any_live:
+        try:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            orch_q.update_trace(
+                rid,
+                proactive_no_change_validated=True,
+                proactive_no_change_validated_at=time.time(),
+                proactive_no_change_resolution="reviewer_validated_existing_implementation",
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.proactive_no_change_closed",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "chat_id": int(chat_id),
+                    "reason": "reviewer_validated_existing_implementation",
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    if (
+        proactive_order
+        and (not any_live)
+        and _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
+    ):
+        try:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                proactive_improvement_missing=False,
+                proactive_blocked_with_root_cause=True,
+                proactive_blocked_with_root_cause_at=time.time(),
+                proactive_blocked_with_root_cause_summary=latest_controller_terminal_summary[:4000],
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.proactive_blocked_root_cause_closed",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "chat_id": int(chat_id),
+                    "reason": "blocked_with_root_cause",
+                },
+            )
+        except Exception:
+            pass
+        return
 
     if any(s in ("blocked", "blocked_approval", "failed") for s in states):
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
@@ -6316,6 +12151,20 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
         return
     if wrapup_done:
+        if proactive_order and (not merged_to_main) and (not proactive_evidence_ok):
+            try:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    proactive_improvement_missing=True,
+                    proactive_improvement_checked_at=time.time(),
+                    live_at=time.time(),
+                )
+            except Exception:
+                pass
+            return
         if merged_to_main:
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
@@ -6330,6 +12179,20 @@ def _sync_order_phase_from_runtime(
     # If there are no active/blocked jobs, close only when all children reached terminal states.
     terminal_ok = all(s in ("done", "cancelled") for s in states)
     if terminal_ok:
+        if proactive_order and (not merged_to_main) and (not proactive_evidence_ok):
+            try:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    proactive_improvement_missing=True,
+                    proactive_improvement_checked_at=time.time(),
+                    live_at=time.time(),
+                )
+            except Exception:
+                pass
+            return
         if merged_to_main:
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
@@ -6341,6 +12204,377 @@ def _sync_order_phase_from_runtime(
                 pass
         return
     orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+
+
+def _collapse_redundant_orders_tick(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Keep one active order per objective signature and auto-close redundant siblings.
+    This prevents duplicate active projects from consuming workers indefinitely.
+    """
+    try:
+        scan_limit = max(20, min(800, int(os.environ.get("BOT_ORDER_DEDUPE_SCAN_LIMIT", "300"))))
+    except Exception:
+        scan_limit = 300
+    try:
+        max_collapses = max(1, min(20, int(os.environ.get("BOT_ORDER_DEDUPE_MAX_PER_TICK", "6"))))
+    except Exception:
+        max_collapses = 6
+    try:
+        dedupe_window_s = max(900.0, float(os.environ.get("BOT_ORDER_DEDUPE_WINDOW_SECONDS", "172800").strip() or "172800"))
+    except Exception:
+        dedupe_window_s = 172800.0
+
+    try:
+        rows = orch_q.list_orders_global(status="active", limit=scan_limit)
+    except Exception:
+        return 0
+    if len(rows) < 2:
+        return 0
+
+    groups: dict[tuple[int, str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        sig = _order_objective_signature(
+            title=str(row.get("title") or ""),
+            body=str(row.get("body") or ""),
+        )
+        if not sig:
+            continue
+        project_id = str(row.get("project_id") or "").strip().lower() or "-"
+        key = (int(chat_id), project_id, sig)
+        groups.setdefault(key, []).append(row)
+
+    if not groups:
+        return 0
+
+    non_terminal = {"queued", "waiting_deps", "blocked_approval", "blocked", "running"}
+    collapsed = 0
+    for (_chat_id, _project_id, sig), siblings in groups.items():
+        if collapsed >= max_collapses:
+            break
+        if len(siblings) < 2:
+            continue
+
+        scored: list[tuple[tuple[int, int, int, float], dict[str, Any], list[Task]]] = []
+        for row in siblings:
+            oid = str(row.get("order_id") or "").strip()
+            if not oid:
+                continue
+            children = orch_q.jobs_by_parent(parent_job_id=oid, limit=600)
+            running_n = 0
+            active_n = 0
+            blocked_n = 0
+            for child in children:
+                st = str(child.state or "").strip().lower()
+                if st == "running":
+                    running_n += 1
+                if st in non_terminal:
+                    active_n += 1
+                if st in ("blocked", "blocked_approval"):
+                    blocked_n += 1
+            try:
+                updated_at = float(row.get("updated_at") or 0.0)
+            except Exception:
+                updated_at = 0.0
+            freshness = 1 if (updated_at > 0 and (float(now) - updated_at) <= dedupe_window_s) else 0
+            score = (running_n, active_n, freshness, updated_at - (blocked_n * 60.0))
+            scored.append((score, row, children))
+
+        if len(scored) < 2:
+            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        keep_row = scored[0][1]
+        keep_id = str(keep_row.get("order_id") or "").strip()
+        keep_chat_id = int(keep_row.get("chat_id") or 0)
+        if not keep_id or keep_chat_id <= 0:
+            continue
+
+        for _score, row, children in scored[1:]:
+            if collapsed >= max_collapses:
+                break
+            oid = str(row.get("order_id") or "").strip()
+            if not oid or oid == keep_id:
+                continue
+            try:
+                chat_id = int(row.get("chat_id") or 0)
+            except Exception:
+                chat_id = 0
+            if chat_id <= 0:
+                continue
+
+            try:
+                updated_at = float(row.get("updated_at") or 0.0)
+            except Exception:
+                updated_at = 0.0
+            if updated_at > 0 and (float(now) - updated_at) > (dedupe_window_s * 2.0):
+                continue
+
+            cancelled_children = 0
+            for child in children:
+                st = str(child.state or "").strip().lower()
+                if st not in non_terminal:
+                    continue
+                if str(child.job_id or "").strip() == keep_id:
+                    continue
+                try:
+                    ok = orch_q.update_state(
+                        child.job_id,
+                        "cancelled",
+                        blocked_reason="order_superseded",
+                        result_summary=f"Auto-cancelled: redundant order superseded by {keep_id}.",
+                        result_next_action=f"Continue execution under order {keep_id}.",
+                    )
+                    if ok:
+                        cancelled_children += 1
+                except Exception:
+                    continue
+
+            root_job = orch_q.get_job(oid)
+            root_trace = dict((root_job.trace or {}) if root_job else {})
+            _needs_merge, superseded_branch = _order_trace_requires_merge(root_trace)
+            branch_retired_ok = True
+            branch_retired_result = "no_branch"
+            if superseded_branch:
+                branch_retired_ok, branch_retired_result = _retire_order_branch_without_merge(
+                    repo=cfg.codex_workdir,
+                    order_branch=superseded_branch,
+                )
+
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                orch_q.update_trace(
+                    oid,
+                    superseded_by=keep_id,
+                    superseded_at=float(now),
+                    superseded_reason="duplicate_active_order",
+                    cancelled_children=int(cancelled_children),
+                    merge_cancelled=True,
+                    superseded_branch=(superseded_branch or None),
+                    superseded_branch_retired=bool(branch_retired_ok),
+                    superseded_branch_retire_result=str(branch_retired_result or ""),
+                    live_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.superseded",
+                    actor="jarvis",
+                    details={
+                        "order_id": oid,
+                        "superseded_by": keep_id,
+                        "chat_id": int(chat_id),
+                        "cancelled_children": int(cancelled_children),
+                        "objective_signature": str(sig),
+                        "superseded_branch": (superseded_branch or None),
+                        "superseded_branch_retired": bool(branch_retired_ok),
+                        "superseded_branch_retire_result": str(branch_retired_result or ""),
+                    },
+                )
+                collapsed += 1
+            except Exception:
+                continue
+    return collapsed
+
+
+def _queued_job_dedupe_key(task: Task) -> str:
+    parent = str(task.parent_job_id or "").strip()
+    if not parent:
+        return ""
+    role_norm = _coerce_orchestrator_role(str(task.role or ""))
+    labels = task.labels or {}
+    key = str(labels.get("key") or "").strip()
+    if key:
+        return f"{parent}|{role_norm}|key:{key}"
+    sig = _task_signature(task)
+    if sig:
+        return f"{parent}|{sig}"
+    return ""
+
+
+def _is_protected_backlog_job(task: Task) -> bool:
+    state = str(task.state or "").strip().lower()
+    if state not in ("queued", "waiting_deps"):
+        return True
+    req = str(task.request_type or "").strip().lower()
+    if req in ("query", "status"):
+        return True
+    kind = str((task.labels or {}).get("kind") or "").strip().lower()
+    role_norm = _coerce_orchestrator_role(task.role)
+    if kind == "wrapup":
+        return True
+    # Let proactive-specific cleanup manage local specialist subtasks; the
+    # generic hard-pressure drain was cancelling implementer/reviewer work
+    # before it had a chance to execute.
+    if kind == "subtask" and _is_local_support_role_name(role_norm):
+        return True
+    is_top_level_manual = (
+        role_norm == "jarvis"
+        and (not bool(task.is_autonomous))
+        and not (task.parent_job_id or "").strip()
+    )
+    if is_top_level_manual:
+        return True
+    return False
+
+
+def _is_low_value_backlog_job(task: Task) -> bool:
+    if _is_protected_backlog_job(task):
+        return False
+    kind = str((task.labels or {}).get("kind") or "").strip().lower()
+    req = str(task.request_type or "").strip().lower()
+    if bool(task.is_autonomous):
+        return True
+    if kind in ("autopilot", "post_review", "evidence", "stalled_replan", "sla_replan", "blocked_replan", "delivery_replan"):
+        return True
+    if _is_controller_role(_coerce_orchestrator_role(task.role)) and req == "maintenance":
+        return True
+    return False
+
+
+def _drain_backlog_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Hard-pressure queue hygiene:
+    - Remove duplicate queued/waiting subtasks.
+    - Prefer dropping low-value autonomous maintenance when backlog is saturated.
+    """
+    hard_pressured, queued_now, waiting_now = _queue_is_hard_pressured(orch_q=orch_q)
+    if not hard_pressured:
+        return 0
+
+    try:
+        max_cancel = max(1, min(60, int(os.environ.get("BOT_BACKLOG_MAX_CANCEL_PER_TICK", "16"))))
+    except Exception:
+        max_cancel = 16
+    try:
+        stale_waiting_s = max(900.0, float(os.environ.get("BOT_BACKLOG_STALE_WAITING_SECONDS", "5400").strip() or "5400"))
+    except Exception:
+        stale_waiting_s = 5400.0
+
+    target_queued, target_waiting = _queue_recovery_targets()
+    queued_jobs = orch_q.peek(state="queued", limit=800)
+    waiting_jobs = orch_q.peek(state="waiting_deps", limit=800)
+    all_jobs = queued_jobs + waiting_jobs
+    if not all_jobs:
+        return 0
+
+    ordered_for_dedupe = sorted(
+        all_jobs,
+        key=lambda t: (int(t.priority or 2), float(getattr(t, "created_at", 0.0) or 0.0)),
+    )
+    seen_keys: set[str] = set()
+    duplicate_jobs: list[Task] = []
+    for item in ordered_for_dedupe:
+        dk = _queued_job_dedupe_key(item)
+        if not dk:
+            continue
+        if dk in seen_keys:
+            if not _is_protected_backlog_job(item):
+                duplicate_jobs.append(item)
+            continue
+        seen_keys.add(dk)
+
+    low_value_jobs = sorted(
+        [item for item in all_jobs if _is_low_value_backlog_job(item)],
+        key=lambda t: float(getattr(t, "created_at", 0.0) or 0.0),
+        reverse=True,
+    )
+
+    stale_waiting_jobs: list[Task] = []
+    for item in waiting_jobs:
+        if _is_protected_backlog_job(item):
+            continue
+        updated_at = float(getattr(item, "updated_at", 0.0) or getattr(item, "created_at", 0.0) or 0.0)
+        age_s = max(0.0, float(now) - updated_at) if updated_at > 0 else 0.0
+        if age_s >= stale_waiting_s and _is_low_value_backlog_job(item):
+            stale_waiting_jobs.append(item)
+
+    overflow_jobs = sorted(
+        [
+            item
+            for item in all_jobs
+            if (not _is_protected_backlog_job(item))
+            and (not _is_low_value_backlog_job(item))
+        ],
+        key=lambda t: (int(t.priority or 2), float(getattr(t, "created_at", 0.0) or 0.0)),
+        reverse=True,
+    )
+
+    cancel_plan: list[Task] = []
+    seen_jobs: set[str] = set()
+    for bucket in (duplicate_jobs, low_value_jobs, stale_waiting_jobs, overflow_jobs):
+        for item in bucket:
+            jid = str(item.job_id or "").strip()
+            if not jid or jid in seen_jobs:
+                continue
+            seen_jobs.add(jid)
+            cancel_plan.append(item)
+
+    if not cancel_plan:
+        return 0
+
+    cancelled = 0
+    cancelled_duplicates = 0
+    cancelled_low_value = 0
+    for item in cancel_plan:
+        if cancelled >= max_cancel:
+            break
+        if int(queued_now) <= int(target_queued) and int(waiting_now) <= int(target_waiting):
+            break
+        st = str(item.state or "").strip().lower()
+        if st not in ("queued", "waiting_deps"):
+            continue
+        if _is_protected_backlog_job(item):
+            continue
+        try:
+            ok = orch_q.update_state(
+                item.job_id,
+                "cancelled",
+                blocked_reason="queue_backlog_drain",
+                result_summary="Auto-cancelled by queue hygiene to keep backlog healthy.",
+                result_next_action="Jarvis should replan only the highest-impact remaining work.",
+            )
+            if not ok:
+                continue
+        except Exception:
+            continue
+        cancelled += 1
+        if st == "queued":
+            queued_now = max(0, int(queued_now) - 1)
+        elif st == "waiting_deps":
+            waiting_now = max(0, int(waiting_now) - 1)
+
+        if _queued_job_dedupe_key(item):
+            cancelled_duplicates += 1
+        if _is_low_value_backlog_job(item):
+            cancelled_low_value += 1
+
+    if cancelled > 0:
+        try:
+            hard_q, hard_w = _queue_hard_limits()
+            orch_q.append_audit_event(
+                event_type="queue.backlog_drain",
+                actor="jarvis",
+                details={
+                    "cancelled": int(cancelled),
+                    "cancelled_duplicates": int(cancelled_duplicates),
+                    "cancelled_low_value": int(cancelled_low_value),
+                    "queued_after": int(queued_now),
+                    "waiting_deps_after": int(waiting_now),
+                    "hard_max_queued": int(hard_q),
+                    "hard_max_waiting_deps": int(hard_w),
+                    "target_queued": int(target_queued),
+                    "target_waiting_deps": int(target_waiting),
+                },
+            )
+        except Exception:
+            pass
+    return cancelled
 
 
 def _orchestrator_min_evidence_gate(
@@ -6356,8 +12590,8 @@ def _orchestrator_min_evidence_gate(
     kind = str((task.labels or {}).get("kind") or "").strip().lower()
     if req in ("query", "status"):
         return True, None, {"skipped": "conversational_lane"}
-    if role == "jarvis":
-        return True, None, {"skipped": f"jarvis_{kind or 'controller'}"}
+    if _is_controller_role(role):
+        return True, None, {"skipped": f"{role}_{kind or 'controller'}"}
 
     summary_clean = str(summary or "").strip()
     logs_clean = str(logs or "").strip()
@@ -6420,6 +12654,10 @@ def _stalled_replan_tick(
         stale_after_s = max(300.0, float(os.environ.get("BOT_STALLED_TTL_SECONDS", "1800").strip() or "1800"))
     except Exception:
         stale_after_s = 1800.0
+    try:
+        replan_cooldown_s = max(600.0, float(os.environ.get("BOT_STALLED_ESCALATION_COOLDOWN_SECONDS", "7200").strip() or "7200"))
+    except Exception:
+        replan_cooldown_s = 7200.0
 
     stalled = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=80)
     if not stalled:
@@ -6439,10 +12677,11 @@ def _stalled_replan_tick(
             escalated_at = float(root_trace.get("stalled_escalated_at", 0.0) or 0.0)
         except Exception:
             escalated_at = 0.0
-        if escalated_at > 0 and (now - escalated_at) < 600.0:
+        if escalated_at > 0 and (now - escalated_at) < replan_cooldown_s:
             continue
 
-        profile = _orchestrator_profile(profiles, "jarvis")
+        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+        profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
 
@@ -6450,7 +12689,7 @@ def _stalled_replan_tick(
         task_id = str(uuid.uuid4())
         escalation = Task.new(
             source="telegram",
-            role="jarvis",
+            role=controller_role,
             input_text=(
                 "STALL ESCALATION\n"
                 f"Order/Ticket: {root_ticket}\n"
@@ -6482,6 +12721,9 @@ def _stalled_replan_tick(
                 "stalled_job_id": item.job_id,
                 "stalled_state": item.state,
                 "stalled_reason": reason,
+                "profile_name": str(profile.get("name") or controller_role),
+                "profile_role": controller_role,
+                "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
             },
             job_id=task_id,
         )
@@ -6492,7 +12734,7 @@ def _stalled_replan_tick(
             orch_q.set_order_phase(root_ticket, chat_id=int(item.chat_id), phase="planning")
             orch_q.append_audit_event(
                 event_type="task.stalled",
-                actor="jarvis",
+                actor=controller_role,
                 details={
                     "order_id": root_ticket,
                     "job_id": item.job_id,
@@ -6509,19 +12751,738 @@ def _stalled_replan_tick(
     return created
 
 
+def _blocked_pressure_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Escalate quickly when blocked/backlog pressure is high, before tickets stagnate for hours.
+    """
+    try:
+        threshold = max(2, int(os.environ.get("BOT_BLOCKED_PRESSURE_THRESHOLD", "5")))
+    except Exception:
+        threshold = 5
+    try:
+        min_stale_s = max(120.0, float(os.environ.get("BOT_BLOCKED_PRESSURE_STALE_SECONDS", "900").strip() or "900"))
+    except Exception:
+        min_stale_s = 900.0
+    try:
+        cooldown_s = max(300.0, float(os.environ.get("BOT_BLOCKED_PRESSURE_ESCALATION_COOLDOWN_SECONDS", "1800").strip() or "1800"))
+    except Exception:
+        cooldown_s = 1800.0
+    try:
+        max_per_tick = max(1, min(10, int(os.environ.get("BOT_BLOCKED_PRESSURE_MAX_PER_TICK", "4"))))
+    except Exception:
+        max_per_tick = 4
+
+    blocked = orch_q.peek(state="blocked", limit=500)
+    blocked_approval = orch_q.peek(state="blocked_approval", limit=500)
+    all_blocked = blocked + blocked_approval
+    if len(all_blocked) < threshold:
+        return 0
+
+    grouped: dict[str, list[Task]] = {}
+    for item in all_blocked:
+        root_ticket = (item.parent_job_id or item.job_id or "").strip() or item.job_id
+        if not root_ticket:
+            continue
+        grouped.setdefault(root_ticket, []).append(item)
+    if not grouped:
+        return 0
+
+    ranked = sorted(grouped.items(), key=lambda it: len(it[1]), reverse=True)
+    created = 0
+    for root_ticket, items in ranked:
+        if created >= max_per_tick:
+            break
+        if len(items) < threshold:
+            continue
+        sample = items[0]
+        try:
+            chat_id = int(sample.chat_id)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+
+        oldest_age = 0.0
+        reasons: dict[str, int] = {}
+        for item in items:
+            updated_at = float(getattr(item, "updated_at", 0.0) or getattr(item, "created_at", 0.0) or 0.0)
+            age_s = max(0.0, float(now) - updated_at) if updated_at > 0 else 0.0
+            if age_s > oldest_age:
+                oldest_age = age_s
+            reason = str(item.blocked_reason or item.state or "blocked").strip().lower()
+            reasons[reason] = int(reasons.get(reason, 0)) + 1
+        if oldest_age < min_stale_s:
+            continue
+
+        children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=300)
+        if any(
+            str((c.labels or {}).get("kind") or "").strip().lower() in ("blocked_replan", "stalled_replan", "sla_replan")
+            and str(c.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+            for c in children
+        ):
+            continue
+
+        root_job = orch_q.get_job(root_ticket)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            escalated_at = float(root_trace.get("blocked_pressure_escalated_at", 0.0) or 0.0)
+        except Exception:
+            escalated_at = 0.0
+        if escalated_at > 0 and (float(now) - escalated_at) < cooldown_s:
+            continue
+
+        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+        profile = _orchestrator_profile(profiles, controller_role)
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+        task_id = str(uuid.uuid4())
+        top_reasons = sorted(reasons.items(), key=lambda kv: kv[1], reverse=True)[:4]
+        reasons_txt = ", ".join(f"{k}:{int(v)}" for k, v in top_reasons) or "n/a"
+        escalation = Task.new(
+            source="telegram",
+            role=controller_role,
+            input_text=(
+                "BLOCKED PRESSURE ESCALATION\n"
+                f"Order/Ticket: {root_ticket}\n"
+                f"Blocked items: {len(items)}\n"
+                f"Oldest blocked age (s): {int(max(0.0, oldest_age))}\n"
+                f"Reason histogram: {reasons_txt}\n"
+                "Action required:\n"
+                "- Cancel/replace low-value blocked work.\n"
+                "- Re-plan only high-impact runnable tasks.\n"
+                "- Keep queue bounded and remove dead dependencies.\n"
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            user_id=sample.user_id,
+            reply_to_message_id=sample.reply_to_message_id,
+            parent_job_id=root_ticket,
+            labels={"ticket": root_ticket, "kind": "blocked_replan"},
+            artifacts_dir=str((cfg.artifacts_root / task_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": root_ticket,
+                "blocked_count": int(len(items)),
+                "blocked_oldest_age_s": float(oldest_age),
+                "profile_name": str(profile.get("name") or controller_role),
+                "profile_role": controller_role,
+                "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
+            },
+            job_id=task_id,
+        )
+        orch_q.submit_task(escalation)
+        created += 1
+        try:
+            orch_q.update_trace(
+                root_ticket,
+                blocked_pressure_escalated_at=float(now),
+                blocked_pressure_count=int(len(items)),
+                blocked_pressure_oldest_age_s=float(oldest_age),
+                blocked_pressure_job_id=task_id,
+                live_at=float(now),
+            )
+            orch_q.set_order_phase(root_ticket, chat_id=int(chat_id), phase="planning")
+            orch_q.append_audit_event(
+                event_type="task.blocked_pressure",
+                actor=controller_role,
+                details={
+                    "order_id": root_ticket,
+                    "blocked_count": int(len(items)),
+                    "oldest_age_s": float(oldest_age),
+                    "escalation_job_id": task_id,
+                },
+            )
+        except Exception:
+            pass
+    return created
+
+
+def _jarvis_final_sweep_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    End-of-cycle guardrail: if a ticket is only blocked/waiting (no runnable work),
+    or it remains active with no live child jobs, force a Jarvis sweep so leftovers
+    are either discarded, closed explicitly, or replanned.
+    """
+    try:
+        # Avoid meta-loop thrash from very short sweep intervals.
+        cooldown_s = max(600.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "900").strip() or "900"))
+    except Exception:
+        cooldown_s = 900.0
+    try:
+        idle_order_stale_s = max(120.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300"))
+    except Exception:
+        idle_order_stale_s = 300.0
+    try:
+        max_per_tick = max(1, min(8, int(os.environ.get("BOT_JARVIS_FINAL_SWEEP_MAX_PER_TICK", "3").strip() or "3")))
+    except Exception:
+        max_per_tick = 3
+
+    try:
+        orders = orch_q.list_orders_global(status="active", limit=240)
+    except Exception:
+        return 0
+    if not orders:
+        return 0
+
+    active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+    meta_active_kinds = ("delivery_replan", "blocked_replan", "stalled_replan", "sla_replan", "final_sweep")
+    terminal_states = ("done", "failed", "cancelled")
+    terminal_phases = {"ready_for_merge", "done", "failed", "cancelled", "merged"}
+    created = 0
+
+    for row in orders:
+        if created >= max_per_tick:
+            break
+
+        order_id = str(row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+
+        children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=500)
+        if not children:
+            continue
+        proactive_order = bool(_is_proactive_order_record(row))
+
+        if proactive_order and _order_has_verified_no_change_resolution(
+            orch_q=orch_q,
+            root_ticket=order_id,
+            now=now,
+        ):
+            active_local = any(
+                _coerce_orchestrator_role(str(c.role or "")) in {"architect_local", "implementer_local", "reviewer_local"}
+                and str(c.state or "").strip().lower() in active_states
+                for c in children
+            )
+            if not active_local:
+                try:
+                    orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done")
+                    orch_q.update_trace(
+                        order_id,
+                        proactive_no_change_validated=True,
+                        proactive_no_change_validated_at=float(now),
+                        proactive_no_change_resolution="reviewer_validated_existing_implementation",
+                        live_at=float(now),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.proactive_no_change_closed",
+                        actor="skynet",
+                        details={
+                            "order_id": order_id,
+                            "chat_id": int(chat_id),
+                            "reason": "reviewer_validated_existing_implementation",
+                            "closed_by": "final_sweep_guard",
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+
+        # Avoid concurrent meta-sweeps for the same ticket.
+        if any(
+            str((c.labels or {}).get("kind") or "").strip().lower() in meta_active_kinds
+            and str(c.state or "").strip().lower() in active_states
+            for c in children
+        ):
+            continue
+
+        running_n = 0
+        queued_n = 0
+        waiting_n = 0
+        blocked_n = 0
+        terminal_n = 0
+        latest_child_activity = 0.0
+        latest_non_meta_child_activity = 0.0
+        for c in children:
+            st = str(c.state or "").strip().lower()
+            updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
+            if updated_at > latest_child_activity:
+                latest_child_activity = updated_at
+            kind = str((c.labels or {}).get("kind") or "").strip().lower()
+            if kind not in meta_active_kinds and updated_at > latest_non_meta_child_activity:
+                latest_non_meta_child_activity = updated_at
+            if st == "running":
+                running_n += 1
+            elif st == "queued":
+                queued_n += 1
+            elif st == "waiting_deps":
+                waiting_n += 1
+            elif st in ("blocked", "blocked_approval"):
+                blocked_n += 1
+            elif st in terminal_states:
+                terminal_n += 1
+
+        phase = str(row.get("phase") or "").strip().lower()
+        active_total = running_n + queued_n + waiting_n + blocked_n
+        sweep_reason = ""
+        prompt_body = ""
+        extra_trace: dict[str, Any] = {}
+
+        if (blocked_n + waiting_n) > 0 and (running_n + queued_n) == 0:
+            sweep_reason = "blocked_waiting_only"
+            prompt_body = (
+                f"Blocked jobs: {blocked_n}\n"
+                f"Waiting dependencies: {waiting_n}\n"
+                "Action required:\n"
+                "- Verify if remaining blockers are still valid.\n"
+                "- Discard/cancel stale or superseded leftovers.\n"
+                "- Re-plan an executable path for unresolved blockers.\n"
+                "- Keep execution aligned with ticket policy; proactive tickets must stay local-only.\n"
+                "- Keep iterating until this ticket has no blocked/waiting leftovers.\n"
+            )
+            extra_trace = {
+                "blocked_count": int(blocked_n),
+                "waiting_count": int(waiting_n),
+            }
+        elif active_total == 0:
+            if phase in terminal_phases:
+                continue
+            idle_age_s = max(0.0, float(now) - latest_child_activity) if latest_child_activity > 0 else float(idle_order_stale_s)
+            if idle_age_s < float(idle_order_stale_s):
+                continue
+            sweep_reason = "idle_no_open_jobs"
+            prompt_body = (
+                f"Terminal child jobs: {terminal_n}\n"
+                f"Last child activity age (s): {int(max(0.0, idle_age_s))}\n"
+                "Action required:\n"
+                "- Do not leave this order active with zero live jobs.\n"
+                "- Either close the order explicitly with evidence, or delegate the next highest-impact executable work now.\n"
+                "- Re-plan using the ticket execution policy; proactive tickets must stay local-only.\n"
+                "- Require validation/evidence before any final wrap-up.\n"
+            )
+            extra_trace = {
+                "terminal_child_count": int(terminal_n),
+                "idle_child_age_s": float(idle_age_s),
+            }
+        else:
+            continue
+
+        root_job = orch_q.get_job(order_id)
+        root_trace = dict((root_job.trace if root_job else {}) or {})
+        try:
+            last_sweep_at = float(root_trace.get("final_sweep_last_at", 0.0) or 0.0)
+        except Exception:
+            last_sweep_at = 0.0
+        # Cooldown should only reset when *non-meta* work moved after the previous
+        # sweep. Otherwise repeated sweep jobs can keep resetting themselves.
+        if latest_non_meta_child_activity > 0 and latest_non_meta_child_activity > (last_sweep_at + 5.0):
+            last_sweep_at = 0.0
+        if last_sweep_at > 0 and (float(now) - last_sweep_at) < float(cooldown_s):
+            continue
+
+        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=order_id)
+        profile = _orchestrator_profile(profiles, controller_role)
+        model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
+        effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
+
+        sweep_id = str(uuid.uuid4())
+        sweep = Task.new(
+            source="telegram",
+            role=controller_role,
+            input_text=(
+                "FINAL SWEEP\n"
+                f"Order/Ticket: {order_id}\n"
+                f"Reason: {sweep_reason}\n"
+                + prompt_body
+            ),
+            request_type="maintenance",
+            priority=1,
+            model=model,
+            effort=effort,
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            user_id=None,
+            reply_to_message_id=None,
+            is_autonomous=True,
+            parent_job_id=order_id,
+            owner="scheduler",
+            labels={"ticket": order_id, "kind": "final_sweep"},
+            artifacts_dir=str((cfg.artifacts_root / sweep_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "allow_delegation": True,
+                "order_id": order_id,
+                "final_sweep_reason": sweep_reason,
+                "profile_name": str(profile.get("name") or controller_role),
+                "profile_role": controller_role,
+                "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
+                **extra_trace,
+            },
+            job_id=sweep_id,
+        )
+        orch_q.submit_task(sweep)
+        created += 1
+
+        try:
+            orch_q.update_trace(
+                order_id,
+                final_sweep_last_at=float(now),
+                final_sweep_job_id=sweep_id,
+                final_sweep_reason=sweep_reason,
+                live_at=float(now),
+                **extra_trace,
+            )
+            orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="planning")
+            orch_q.append_audit_event(
+                event_type="order.final_sweep_enqueued",
+                actor=controller_role,
+                details={
+                    "order_id": order_id,
+                    "job_id": sweep_id,
+                    "reason": sweep_reason,
+                    **extra_trace,
+                },
+            )
+        except Exception:
+            pass
+
+    return created
+
+def _running_watchdog_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Recover very old running jobs so the queue keeps moving even if a worker hangs.
+
+    Safety policy:
+    - Conservative threshold based on role max_runtime_seconds.
+    - Requeue only a small number per tick.
+    """
+    raw_enabled = str(os.environ.get("BOT_RUNNING_WATCHDOG_ENABLED", "1")).strip().lower()
+    if raw_enabled not in ("1", "true", "yes", "on"):
+        return 0
+
+    try:
+        base_timeout_s = max(1200.0, float(os.environ.get("BOT_RUNNING_WATCHDOG_BASE_SECONDS", "3600").strip() or "3600"))
+    except Exception:
+        base_timeout_s = 3600.0
+    try:
+        runtime_mult = max(1.5, min(6.0, float(os.environ.get("BOT_RUNNING_WATCHDOG_RUNTIME_MULTIPLIER", "3.0").strip() or "3.0")))
+    except Exception:
+        runtime_mult = 3.0
+    try:
+        runtime_grace_s = max(120.0, float(os.environ.get("BOT_RUNNING_WATCHDOG_GRACE_SECONDS", "300").strip() or "300"))
+    except Exception:
+        runtime_grace_s = 300.0
+    try:
+        local_base_timeout_s = min(
+            1200.0,
+            max(240.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_BASE_SECONDS", "420").strip() or "420")),
+        )
+    except Exception:
+        local_base_timeout_s = 420.0
+    try:
+        local_runtime_mult = min(
+            3.0,
+            max(1.1, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_RUNTIME_MULTIPLIER", "1.35").strip() or "1.35")),
+        )
+    except Exception:
+        local_runtime_mult = 1.35
+    try:
+        local_runtime_grace_s = min(
+            600.0,
+            max(45.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_GRACE_SECONDS", "90").strip() or "90")),
+        )
+    except Exception:
+        local_runtime_grace_s = 90.0
+    try:
+        local_max_timeout_s = min(
+            7200.0,
+            max(600.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_MAX_SECONDS", "3600").strip() or "3600")),
+        )
+    except Exception:
+        local_max_timeout_s = 3600.0
+    try:
+        local_min_idle_requeue_s = min(
+            1800.0,
+            max(90.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_MIN_IDLE_SECONDS", "300").strip() or "300")),
+        )
+    except Exception:
+        local_min_idle_requeue_s = 300.0
+    try:
+        local_silent_requeue_s = min(
+            900.0,
+            max(120.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", "240").strip() or "240")),
+        )
+    except Exception:
+        local_silent_requeue_s = 240.0
+    try:
+        max_recover = max(1, min(8, int(os.environ.get("BOT_RUNNING_WATCHDOG_MAX_PER_TICK", "2").strip() or "2")))
+    except Exception:
+        max_recover = 2
+
+    def _trace_path_has_bytes(value: Any) -> bool:
+        path_str = str(value or "").strip()
+        if not path_str:
+            return False
+        try:
+            return Path(path_str).expanduser().exists() and Path(path_str).expanduser().stat().st_size > 0
+        except Exception:
+            return False
+
+    running = orch_q.jobs_by_state(state="running", limit=600)
+    if not running:
+        return 0
+
+    # Oldest first so we fix the longest stalls before newer work.
+    running = sorted(
+        running,
+        key=lambda t: float(getattr(t, "updated_at", 0.0) or getattr(t, "created_at", 0.0) or 0.0),
+    )
+
+    recovered = 0
+    for task in running:
+        if recovered >= max_recover:
+            break
+
+        created_ts = float(getattr(task, "created_at", 0.0) or 0.0)
+        touch_ts = float(getattr(task, "updated_at", 0.0) or created_ts or 0.0)
+        runtime_anchor_ts = created_ts if created_ts > 0 else touch_ts
+        if runtime_anchor_ts <= 0:
+            continue
+        age_s = max(0.0, float(now) - runtime_anchor_ts)
+        stale_s = max(0.0, float(now) - touch_ts) if touch_ts > 0 else age_s
+
+        role_norm = _coerce_orchestrator_role(task.role)
+        role_profile = _orchestrator_profile(profiles, role_norm)
+        trace_now = dict(task.trace or {})
+        runtime_hint = 0
+        try:
+            runtime_hint = int(trace_now.get("max_runtime_seconds") or role_profile.get("max_runtime_seconds") or 0)
+        except Exception:
+            runtime_hint = 0
+
+        if role_norm in _LOCAL_OLLAMA_ROLE_NAMES:
+            threshold_s = float(local_base_timeout_s)
+            if runtime_hint > 0:
+                threshold_s = max(
+                    threshold_s,
+                    (float(runtime_hint) * float(local_runtime_mult)) + float(local_runtime_grace_s),
+                )
+            threshold_s = min(float(local_max_timeout_s), float(threshold_s))
+            live_phase = str(trace_now.get("live_phase") or "").strip().lower()
+            live_pid = trace_now.get("live_pid")
+            has_live_output = _trace_path_has_bytes(trace_now.get("live_stdout_path")) or _trace_path_has_bytes(trace_now.get("live_stderr_path"))
+            local_silent_timeout = (
+                live_phase == "local_ollama"
+                and not live_pid
+                and not has_live_output
+                and stale_s >= float(local_silent_requeue_s)
+            )
+        else:
+            threshold_s = float(base_timeout_s)
+            if runtime_hint > 0:
+                threshold_s = max(threshold_s, (float(runtime_hint) * float(runtime_mult)) + float(runtime_grace_s))
+            local_silent_timeout = False
+
+        if role_norm in _LOCAL_OLLAMA_ROLE_NAMES:
+            if not local_silent_timeout:
+                if age_s < threshold_s:
+                    continue
+                if stale_s < local_min_idle_requeue_s:
+                    continue
+        elif age_s < threshold_s:
+            continue
+
+        result_summary = f"Recovered by watchdog after {int(age_s)}s runtime in running (idle {int(stale_s)}s)."
+        if local_silent_timeout:
+            result_summary = (
+                f"Recovered by watchdog after {int(stale_s)}s idle in running with no local Ollama output."
+            )
+
+        ok = orch_q.update_state(
+            task.job_id,
+            "queued",
+            blocked_reason="running_watchdog_requeue",
+            result_summary=result_summary,
+            result_next_action="retry_execution",
+        )
+        if not ok:
+            continue
+
+        recovered += 1
+        root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+        try:
+            orch_q.update_trace(
+                task.job_id,
+                running_watchdog_requeued_at=float(now),
+                running_watchdog_age_s=float(age_s),
+                running_watchdog_threshold_s=float(threshold_s),
+                running_watchdog_silent_local=bool(local_silent_timeout),
+            )
+            orch_q.append_trace_event(
+                order_id=root_ticket,
+                job_id=task.job_id,
+                source_message_id=None,
+                agent_run_id=None,
+                agent_role=role_norm,
+                event_type="job.watchdog_requeued",
+                severity="warn",
+                message=f"job={task.job_id[:8]} recovered after {int(age_s)}s runtime in running",
+                payload={
+                    "age_s": float(age_s),
+                    "stale_s": float(stale_s),
+                    "threshold_s": float(threshold_s),
+                    "role": role_norm,
+                    "silent_local_timeout": bool(local_silent_timeout),
+                },
+            )
+            orch_q.append_audit_event(
+                event_type="task.running_watchdog_requeued",
+                actor="scheduler",
+                details={
+                    "job_id": task.job_id,
+                    "order_id": root_ticket,
+                    "role": role_norm,
+                    "age_s": float(age_s),
+                    "stale_s": float(stale_s),
+                    "threshold_s": float(threshold_s),
+                    "silent_local_timeout": bool(local_silent_timeout),
+                },
+            )
+        except Exception:
+            pass
+
+    return int(recovered)
+
+
 def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
     """
     Periodic hygiene: close very old blocked/waiting jobs so queues don't accumulate dead entries forever.
     """
-    try:
-        stale_after_s = max(1800.0, float(os.environ.get("BOT_HYGIENE_STALE_BLOCKED_SECONDS", "86400").strip() or "86400"))
-    except Exception:
-        stale_after_s = 86400.0
-    try:
-        max_jobs = max(1, int(os.environ.get("BOT_HYGIENE_MAX_CLEANUP_PER_TICK", "12").strip() or "12"))
-    except Exception:
-        max_jobs = 12
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+        return raw in ("1", "true", "yes", "on")
 
+    def _retry_blocking_dependencies_with_backoff(*, current_now: float) -> int:
+        if not _env_bool("BOT_DEPENDENCY_RETRY_BACKOFF_ENABLED", True):
+            return 0
+        try:
+            base_s = max(30.0, float(os.environ.get("BOT_DEPENDENCY_RETRY_BASE_SECONDS", "120").strip() or "120"))
+        except Exception:
+            base_s = 120.0
+        try:
+            max_s = max(base_s, float(os.environ.get("BOT_DEPENDENCY_RETRY_MAX_SECONDS", "1800").strip() or "1800"))
+        except Exception:
+            max_s = 1800.0
+        try:
+            max_per_tick = max(1, int(os.environ.get("BOT_DEPENDENCY_RETRY_MAX_PER_TICK", "3").strip() or "3"))
+        except Exception:
+            max_per_tick = 3
+
+        scheduled = 0
+        waiting = orch_q.peek(state="waiting_deps", limit=600)
+        for task in waiting:
+            deps = list(task.depends_on or [])
+            if not deps:
+                continue
+            for dep_id in deps:
+                dep = orch_q.get_job(dep_id)
+                if dep is None:
+                    continue
+                dep_state = str(dep.state or "").strip().lower()
+                if dep_state not in ("blocked", "failed"):
+                    continue
+                try:
+                    retry_count = int(dep.retry_count or 0)
+                except Exception:
+                    retry_count = 0
+                try:
+                    max_retries = int(dep.max_retries or 0)
+                except Exception:
+                    max_retries = 0
+                if max_retries <= 0 or retry_count >= max_retries:
+                    continue
+
+                dep_trace = dict(dep.trace or {})
+                try:
+                    not_before = float(dep_trace.get("dep_retry_not_before", 0.0) or 0.0)
+                except Exception:
+                    not_before = 0.0
+                if not_before > current_now:
+                    continue
+
+                retry_n = retry_count + 1
+                delay_s = min(max_s, base_s * (2.0 ** max(0, retry_n - 1)))
+                due_at = float(current_now + delay_s)
+                err = f"dependency_retry_from_waiting_deps:{task.job_id[:8]}"
+                if not orch_q.bump_retry(dep.job_id, due_at=due_at, error=err):
+                    continue
+                try:
+                    orch_q.update_trace(
+                        dep.job_id,
+                        dep_retry_source=task.job_id,
+                        dep_retry_scheduled_at=float(current_now),
+                        dep_retry_delay_s=float(delay_s),
+                        dep_retry_not_before=float(due_at),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="task.dependency_retry_scheduled",
+                        actor="scheduler",
+                        details={
+                            "source_job_id": task.job_id,
+                            "dependency_job_id": dep.job_id,
+                            "dependency_state": dep_state,
+                            "retry": int(retry_n),
+                            "max_retries": int(max_retries),
+                            "delay_s": float(delay_s),
+                        },
+                    )
+                except Exception:
+                    pass
+                scheduled += 1
+                break
+            if scheduled >= max_per_tick:
+                break
+        return scheduled
+
+    try:
+        stale_after_s = max(1800.0, float(os.environ.get("BOT_HYGIENE_STALE_BLOCKED_SECONDS", "21600").strip() or "21600"))
+    except Exception:
+        stale_after_s = 21600.0
+    try:
+        max_jobs = max(1, int(os.environ.get("BOT_HYGIENE_MAX_CLEANUP_PER_TICK", "20").strip() or "20"))
+    except Exception:
+        max_jobs = 20
+
+    # Avoid stale cascades: while dependencies are pending, proactively retry blocked deps with backoff.
+    try:
+        _retry_blocking_dependencies_with_backoff(current_now=float(now))
+    except Exception:
+        pass
+
+    close_waiting_deps = _env_bool("BOT_HYGIENE_CLOSE_WAITING_DEPS", False)
     candidates = orch_q.list_stalled_tasks(stale_after_seconds=stale_after_s, limit=max_jobs * 4)
     if not candidates:
         return 0
@@ -6530,6 +13491,9 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
     for task in candidates:
         st = str(task.state or "").strip().lower()
         if st not in ("waiting_deps", "blocked_approval", "blocked"):
+            continue
+        if st == "waiting_deps" and not close_waiting_deps:
+            # Default: preserve dependency waits; stale closure can cascade into false failures.
             continue
         if cleaned >= max_jobs:
             break
@@ -6555,6 +13519,169 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
             continue
     return cleaned
 
+
+
+def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
+    try:
+        orders = orch_q.list_orders_global(status="active", limit=240)
+    except Exception:
+        return 0
+    if not orders:
+        return 0
+
+    stale_after_s = float(_proactive_local_stale_seconds())
+    try:
+        max_cancel = max(1, min(24, int(os.environ.get("BOT_PROACTIVE_LOCAL_MAX_CANCEL_PER_TICK", "8").strip() or "8")))
+    except Exception:
+        max_cancel = 8
+
+    active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+    max_order_queued, max_order_waiting = _proactive_order_backlog_limits()
+    cancelled = 0
+
+    for row in orders:
+        if cancelled >= max_cancel:
+            break
+        if not _is_proactive_order_record(row):
+            continue
+        order_id = str(row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        try:
+            children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=500)
+        except Exception:
+            continue
+        if not children:
+            continue
+
+        active_cli_present = any(
+            _is_delivery_role_name(_coerce_orchestrator_role(str(child.role or "")))
+            and str(child.state or "").strip().lower() in active_states
+            for child in children
+        )
+        local_queued = 0
+        local_waiting = 0
+        newest_guard_by_role: dict[str, float] = {}
+        role_has_running_guard: dict[str, bool] = {}
+        pending_guards_by_role: dict[str, list[tuple[float, Task]]] = {}
+        for child in children:
+            role_norm = _coerce_orchestrator_role(str(child.role or ""))
+            if not _is_local_support_role_name(role_norm):
+                continue
+            state = str(child.state or "").strip().lower()
+            if state == "queued":
+                local_queued += 1
+            elif state == "waiting_deps":
+                local_waiting += 1
+            key = str((child.labels or {}).get("key") or "").strip().lower()
+            if not _is_local_guard_key(key):
+                continue
+            if state not in active_states:
+                continue
+            updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+            if updated_at <= 0:
+                continue
+            newest_guard_by_role[role_norm] = max(updated_at, newest_guard_by_role.get(role_norm, 0.0))
+            if state == "running":
+                role_has_running_guard[role_norm] = True
+            elif state in ("queued", "waiting_deps", "blocked", "blocked_approval"):
+                pending_guards_by_role.setdefault(role_norm, []).append((updated_at, child))
+
+        redundant_guard_ids: set[str] = set()
+        order_backlog_pressured = local_queued >= max_order_queued or local_waiting >= max_order_waiting
+        for role_norm, items in pending_guards_by_role.items():
+            items_sorted = sorted(items, key=lambda item: item[0], reverse=True)
+            keep_n = 0 if role_has_running_guard.get(role_norm) else 1
+            for _updated_at, extra_child in items_sorted[keep_n:]:
+                redundant_guard_ids.add(str(extra_child.job_id))
+        if redundant_guard_ids:
+            max_cancel = max(max_cancel, min(24, len(redundant_guard_ids)))
+
+        for child in children:
+            if cancelled >= max_cancel:
+                break
+            role_norm = _coerce_orchestrator_role(str(child.role or ""))
+            if not _is_local_support_role_name(role_norm):
+                continue
+            key = str((child.labels or {}).get("key") or "").strip().lower()
+            if not _is_local_guard_key(key):
+                continue
+            state = str(child.state or "").strip().lower()
+            if state not in ("queued", "waiting_deps", "blocked", "blocked_approval"):
+                continue
+            updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+            age_s = max(0.0, float(now) - updated_at) if updated_at > 0 else 0.0
+            newer_same_role = newest_guard_by_role.get(role_norm, 0.0) > (updated_at + 60.0)
+            redundant_guard = str(child.job_id) in redundant_guard_ids
+            expedite_due_to_pressure = order_backlog_pressured and age_s >= 300.0
+            if state == "queued":
+                if not redundant_guard and not newer_same_role and not expedite_due_to_pressure:
+                    continue
+            elif (
+                age_s < stale_after_s
+                and not redundant_guard
+                and not newer_same_role
+                and not (active_cli_present and age_s >= 300.0)
+                and not expedite_due_to_pressure
+            ):
+                continue
+            child_trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+            prior_summary = str(child_trace.get("result_summary") or "").strip()
+            cancel_summary = "Auto-cancelled: stale proactive local guard to unblock a higher-signal replanning pass."
+            if prior_summary:
+                cancel_summary = (
+                    cancel_summary
+                    + "\nPrevious local summary (for context only): "
+                    + prior_summary[:320]
+                )
+            try:
+                ok = orch_q.update_state(
+                    child.job_id,
+                    "cancelled",
+                    blocked_reason="proactive_local_stale",
+                    result_summary=cancel_summary,
+                    result_next_action="Jarvis should replan the next highest-impact improvement with stronger evidence.",
+                    # Mark stale auto-cancels as retriable so blocker miners ignore them.
+                    failure_class="retriable",
+                    stale_auto_cancelled=True,
+                    stale_cancelled_from_state=state,
+                    stale_cancelled_prior_summary=prior_summary[:2000],
+                )
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            cancelled += 1
+            try:
+                orch_q.append_audit_event(
+                    event_type="task.proactive_local_stale_cancelled",
+                    actor="scheduler",
+                    details={
+                        "order_id": order_id,
+                        "job_id": str(child.job_id),
+                        "role": role_norm,
+                        "state": state,
+                        "age_seconds": int(age_s),
+                        "active_cli_present": bool(active_cli_present),
+                        "order_backlog_pressured": bool(order_backlog_pressured),
+                        "redundant_guard": bool(redundant_guard),
+                        "local_queued": int(local_queued),
+                        "local_waiting_deps": int(local_waiting),
+                    },
+                )
+                if chat_id > 0:
+                    _sync_order_phase_from_runtime(
+                        orch_q=orch_q,
+                        root_ticket=order_id,
+                        chat_id=int(chat_id),
+                    )
+            except Exception:
+                pass
+    return cancelled
 
 def _sla_overdue_tick(
     *,
@@ -6635,14 +13762,15 @@ def _sla_overdue_tick(
         ):
             continue
 
-        profile = _orchestrator_profile(profiles, "jarvis")
+        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+        profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
 
         task_id = str(uuid.uuid4())
         escalation = Task.new(
             source="telegram",
-            role="jarvis",
+            role=controller_role,
             input_text=(
                 "SLA OVERDUE ESCALATION\n"
                 f"Order/Ticket: {root_ticket}\n"
@@ -6678,6 +13806,9 @@ def _sla_overdue_tick(
                 "overdue_state": item.state,
                 "overdue_by_s": float(overdue_by),
                 "sla_ttl_s": int(item.ttl_seconds or 0),
+                "profile_name": str(profile.get("name") or controller_role),
+                "profile_role": controller_role,
+                "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
             },
             job_id=task_id,
         )
@@ -6694,7 +13825,7 @@ def _sla_overdue_tick(
             _sync_order_phase_from_runtime(orch_q=orch_q, root_ticket=root_ticket, chat_id=int(item.chat_id))
             orch_q.append_audit_event(
                 event_type="task.overdue",
-                actor="jarvis",
+                actor=controller_role,
                 details={
                     "order_id": root_ticket,
                     "job_id": item.job_id,
@@ -6923,7 +14054,10 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
         order_phase = str(order.get("phase") or "").strip().lower() or "planning"
         lines.append(f"Order phase: {order_phase}")
         if order_phase == "ready_for_merge":
-            lines.append(f"Action: /approve_merge {root_id[:8]}")
+            if _jarvis_auto_approve_merge_enabled():
+                lines.append("Action: Jarvis auto-merge enabled (you will receive final result)")
+            else:
+                lines.append(f"Action: /approve_merge {root_id[:8]}")
     lines.append(f"Goal: {goal or '(empty)'}")
     lines.append(f"Progress: {progress}")
 
@@ -7005,6 +14139,12 @@ def _maybe_update_ticket_card(
     if message_id is None:
         return
 
+    card_text = _ticket_card_text(orch_q, ticket_id=root_id)
+    card_sig = hashlib.sha256(card_text.encode("utf-8", errors="replace")).hexdigest()
+    prev_sig = str(trace.get("ticket_card_last_sig") or "").strip()
+    if prev_sig and prev_sig == card_sig:
+        return
+
     now = time.time()
     with _TICKET_CARD_LOCK:
         k = (chat_id, root_id)
@@ -7014,15 +14154,31 @@ def _maybe_update_ticket_card(
         _TICKET_CARD_LAST_EDIT[k] = now
 
     try:
-        api.edit_message_text(chat_id, int(message_id), _ticket_card_text(orch_q, ticket_id=root_id))
-    except Exception:
-        # If edit fails, fall back to sending a fresh card and updating trace.
+        api.edit_message_text(chat_id, int(message_id), card_text)
         try:
-            new_mid = api.send_message(chat_id, _ticket_card_text(orch_q, ticket_id=root_id))
-            if new_mid is not None:
-                orch_q.update_trace(root_id, ticket_card_message_id=int(new_mid), ticket_card_replaced_at=time.time())
+            orch_q.update_trace(root_id, ticket_card_last_sig=card_sig, ticket_card_last_edit_at=time.time())
         except Exception:
             pass
+        return
+    except Exception as e:
+        # IMPORTANT: do not fallback to send_message here; that creates spam loops.
+        err = str(e or "").strip()
+        err_l = err.lower()
+        if "message is not modified" in err_l:
+            try:
+                orch_q.update_trace(root_id, ticket_card_last_sig=card_sig, ticket_card_last_edit_at=time.time())
+            except Exception:
+                pass
+            return
+        try:
+            orch_q.update_trace(
+                root_id,
+                ticket_card_edit_error=_first_line(err or "ticket_card_edit_failed", max_chars=220),
+                ticket_card_edit_error_at=time.time(),
+            )
+        except Exception:
+            pass
+        return
 
 
 def _orchestrator_inbox_text(orch_q: OrchestratorQueue, role: str | None) -> str:
@@ -7271,6 +14427,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/pause":
         return "Uso: /pause <role>", None
 
+    if text in ("/pause_autonomy", "/pause_autonomia"):
+        return _orch_marker("pause_autonomy"), None
+
     if text.startswith("/pause "):
         role = _orch_job_id(text[len("/pause ") :]).lower()
         if not role:
@@ -7285,6 +14444,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/resume":
         return "Uso: /resume <role>", None
+
+    if text in ("/resume_autonomy", "/resume_autonomia"):
+        return _orch_marker("resume_autonomy"), None
 
     if text.startswith("/resume "):
         role = _orch_job_id(text[len("/resume ") :]).lower()
@@ -7337,6 +14499,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text.startswith("/permissions "):
         arg = text[len("/permissions ") :].strip().lower()
+        profile = ""
         if cfg.auth_enabled:
             profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id)
             if profile and not _profile_can_set_permissions(cfg, profile_name=profile):
@@ -7345,29 +14508,40 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
                 return f"No permitido por tu perfil ({profile}).", None
         if arg in ("default", "full"):
             _set_access_mode(cfg, arg, chat_id=msg.chat_id)
-            return f"OK. permissions={arg}", None
+            eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
+            status = _dangerous_bypass_status(eff_cfg, chat_id=msg.chat_id)
+            extra = f" note={status['note']}" if status["note"] else ""
+            return (
+                "OK. "
+                f"access_mode_selected={status['selected_mode']} "
+                f"dangerous_bypass={'ACTIVE' if status['bypass'] else 'inactive'} "
+                f"breakglass={'ACTIVE' if status['breakglass_active'] else 'inactive'}"
+                f"{extra}",
+                None,
+            )
         if arg == "clear":
             _set_access_mode(cfg, None, chat_id=msg.chat_id)
-            return "OK. permissions cleared (using env defaults).", None
+            eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
+            status = _dangerous_bypass_status(eff_cfg, chat_id=msg.chat_id)
+            return (
+                "OK. permissions cleared "
+                f"(access_mode_selected={status['selected_mode']} "
+                f"dangerous_bypass={'ACTIVE' if status['bypass'] else 'inactive'}).",
+                None,
+            )
         return "Usage: /permissions default|full|clear", None
 
     if text == "/botpermissions":
         # Bot + Codex CLI execution policy (not OS permissions).
         profile = _auth_effective_profile_name(cfg, chat_id=msg.chat_id) if cfg.auth_enabled else ""
         eff_cfg = _apply_profile_to_cfg(cfg, profile_name=profile) if profile else cfg
-        bypass = _effective_bypass_sandbox(eff_cfg, chat_id=msg.chat_id)
-        bg_active, bg = _breakglass_is_active(eff_cfg)
-        bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
-        bg_exp = (bg or {}).get("expires_at")
-        try:
-            bg_left = max(0, int(float(bg_exp) - time.time())) if bg_exp is not None else 0
-        except Exception:
-            bg_left = 0
+        status = _dangerous_bypass_status(eff_cfg, chat_id=msg.chat_id)
         lines = [
-            f"permissions: {'full' if bypass else 'default'}",
-            f"breakglass: {'ACTIVE' if bg_active else 'inactive'}",
-            f"breakglass_left_seconds: {bg_left}",
-            f"breakglass_reason: {bg_reason}",
+            f"access_mode_selected: {status['selected_mode']}",
+            f"dangerous_bypass: {'ACTIVE' if status['bypass'] else 'inactive'}",
+            f"breakglass: {'ACTIVE' if status['breakglass_active'] else 'inactive'}",
+            f"breakglass_left_seconds: {status['breakglass_seconds_left']}",
+            f"breakglass_reason: {status['breakglass_reason']}",
             f"profile: {profile or '(none)'}",
             f"strict_proxy: {'ON' if eff_cfg.strict_proxy else 'off'}",
             f"unsafe_direct_codex: {'ON' if eff_cfg.unsafe_direct_codex else 'off'}",
@@ -7376,7 +14550,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             f"default_mode: {eff_cfg.codex_default_mode}",
             f"force_full_access: {'ON' if eff_cfg.codex_force_full_access else 'off'}",
         ]
-        if bypass:
+        if status["note"]:
+            lines.append(f"note: {status['note']}")
+        if status["bypass"]:
             lines.append("codex: --dangerously-bypass-approvals-and-sandbox (no approvals, no sandbox)")
         else:
             lines.append("codex: -a never (no approval prompts)")
@@ -7385,23 +14561,28 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/breakglass":
         active, raw = _breakglass_is_active(cfg)
+        status = _dangerous_bypass_status(cfg, chat_id=msg.chat_id)
         reason = str(raw.get("reason") or "").strip() or "(none)"
         source = str(raw.get("source") or "").strip() or "(none)"
-        exp = raw.get("expires_at")
-        try:
-            left_s = max(0, int(float(exp) - time.time())) if exp is not None else 0
-        except Exception:
-            left_s = 0
+        left_s = int(status["breakglass_seconds_left"])
         lines = [
             f"status: {'ACTIVE' if active else 'inactive'}",
             f"seconds_left: {left_s}",
             f"reason: {reason}",
             f"source: {source}",
+            f"access_mode_selected: {status['selected_mode']}",
+            f"dangerous_bypass: {'ACTIVE' if status['bypass'] else 'inactive'}",
+        ]
+        if status["note"]:
+            lines.append(f"note: {status['note']}")
+        lines.extend(
+            [
             "",
             "Usage:",
             "- /breakglass on <minutes> <reason>",
             "- /breakglass off",
-        ]
+            ]
+        )
         if not _is_admin_actor(cfg, chat_id=msg.chat_id, user_id=msg.user_id):
             lines.append("(read-only: admin required for changes)")
         return "\n".join(lines), None
@@ -7946,7 +15127,29 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text.startswith("/notify "):
         payload = text[len("/notify ") :].strip()
         if not payload:
-            return "Usage: /notify <text>", None
+            scope_now = _effective_notify_scope(cfg, chat_id=msg.chat_id)
+            return "Usage: /notify <text> | /notify policy <critical|state_change|digest_only>\nCurrent policy: " + scope_now, None
+
+        low = payload.lower()
+        if low == "policy":
+            scope_now = _effective_notify_scope(cfg, chat_id=msg.chat_id)
+            return (
+                "Notify policy controls what reaches CEO chat:\n"
+                "- critical: only failures/blocks/timeouts\n"
+                "- state_change: critical + key transitions + wrapups\n"
+                "- digest_only: only explicit digests/wrapups\n"
+                f"Current policy: {scope_now}\n"
+                "Usage: /notify policy <critical|state_change|digest_only>",
+                None,
+            )
+
+        if low.startswith("policy "):
+            wanted = _normalize_notify_scope(payload.split(None, 1)[1] if len(payload.split(None, 1)) > 1 else "")
+            if wanted not in ("critical", "state_change", "digest_only"):
+                return "Usage: /notify policy <critical|state_change|digest_only>", None
+            _set_notify_scope(cfg, wanted, chat_id=msg.chat_id)
+            return f"OK. notify policy for this chat: {wanted}", None
+
         state = _read_json(cfg.state_file)
         chat_id = cfg.notify_chat_id or state.get("notify_chat_id")
         try:
@@ -8251,7 +15454,7 @@ def _extract_thread_id_from_jsonl(text: str) -> str:
         except Exception:
             continue
         if not isinstance(obj, dict):
-            continue
+            continue
         t = obj.get("type")
         if t == "thread.started" and isinstance(obj.get("thread_id"), str):
             tid = obj["thread_id"].strip()
@@ -8598,8 +15801,14 @@ def _submit_orchestrator_task(
         )
 
         # Safety guard: conversational lanes must not create persistent orders/projects.
+        # Keep explicit control/order intents intact even when classifier emits query/status.
         task_req = str(task.request_type or "").strip().lower()
-        if task_req in ("query", "status"):
+        normalized_intent = str(intent_type or "").strip().lower()
+        if task_req in ("query", "status") and normalized_intent not in (
+            "control_stop_all",
+            "order_project_new",
+            "order_project_change",
+        ):
             intent_type = "query"
 
         is_top_level_jarvis = (
@@ -8607,10 +15816,110 @@ def _submit_orchestrator_task(
             and not task.is_autonomous
             and not (task.parent_job_id or "").strip()
         )
+        if is_top_level_jarvis and intent_type == "order_project_new":
+            try:
+                active_existing = orch_q.latest_active_order(chat_id=int(task.chat_id))
+            except Exception:
+                active_existing = None
+            if active_existing and str(active_existing.get("order_id") or "").strip():
+                raw_text = str(task.input_text or "").strip().lower()
+                explicit_new_signals = any(
+                    k in raw_text
+                    for k in (
+                        "nuevo proyecto",
+                        "proyecto nuevo",
+                        "new project",
+                        "new order",
+                        "nueva orden",
+                        "desde cero",
+                        "start another project",
+                        "start a new project",
+                    )
+                )
+                change_signals = any(
+                    k in raw_text
+                    for k in (
+                        "proyecto actual",
+                        "orden actual",
+                        "actual",
+                        "activo",
+                        "continua",
+                        "continuar",
+                        "follow up",
+                        "seguimiento",
+                        "modifica",
+                        "ajusta",
+                        "corrige",
+                        "fix",
+                        "replan",
+                        "itera",
+                        "mejora",
+                    )
+                )
+                # If there is already an active order and the user did not explicitly
+                # request a brand-new project, treat this as a plan change.
+                if (not explicit_new_signals) or change_signals:
+                    intent_type = "order_project_change"
+
         order_id = ""
         project_id: str | None = None
         order_branch: str | None = None
         order_phase = "planning"
+
+        if is_top_level_jarvis and intent_type == "control_stop_all":
+            out = orch_q.stop_all_global(
+                reason="ceo_stop_all",
+                actor="jarvis",
+                chat_id=None,
+                close_orders=True,
+                close_projects=True,
+                clear_workspace_leases=True,
+            )
+            try:
+                pause_state = _proactive_lane_state(cfg)
+                _set_proactive_lane_pause(
+                    cfg,
+                    paused=True,
+                    reason=None if bool(pause_state.get("manual_pause", False)) else "ceo_stop_all",
+                    manual=None,
+                )
+            except Exception:
+                pass
+
+            stop_trace = dict(task.trace or {})
+            stop_trace["intent_type"] = "control_stop_all"
+            stop_trace["stop_all_stats"] = dict(out or {})
+            stop_trace["control_action"] = "stop_all_global"
+            task = task.with_updates(
+                request_type="maintenance",
+                priority=1,
+                mode_hint="full",
+                requires_approval=False,
+                trace=stop_trace,
+            )
+            job_id = orch_q.submit_task(task)
+            summary = (
+                "Control global aplicado: "
+                f"jobs_cancelled={int(out.get('jobs_cancelled', 0))}, "
+                f"orders_done={int(out.get('orders_done', 0))}, "
+                f"projects_done={int(out.get('projects_done', 0))}, "
+                f"workspace_leases_cleared={int(out.get('workspace_leases_cleared', 0))}."
+            )
+            orch_q.update_state(
+                job_id,
+                "done",
+                result_status="ok",
+                result_summary=summary,
+                result_next_action="Esperando nueva instruccion del CEO.",
+                stop_all_stats=dict(out or {}),
+            )
+            return True, job_id
+
+        if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
+            try:
+                _maybe_resume_proactive_lane_for_manual_ceo_request(cfg)
+            except Exception:
+                pass
 
         if is_top_level_jarvis and intent_type in ("order_project_new", "order_project_change"):
             if intent_type == "order_project_change":
@@ -8627,15 +15936,25 @@ def _submit_orchestrator_task(
                     ttrace = dict(task.trace or {})
                     ttrace["order_id"] = order_id
                     ttrace["intent_type"] = "order_project_change"
+                    # Plan-change jobs must be allowed to delegate even when attached
+                    # to an existing order (parent_job_id is set).
+                    ttrace["allow_delegation"] = True
                     if order_branch:
                         ttrace["order_branch"] = str(order_branch)
                     if quoted_message_id is not None:
                         ttrace["reply_to_message_id"] = int(quoted_message_id)
-                    task = task.with_updates(parent_job_id=order_id, trace=ttrace, priority=1)
+                    task = task.with_updates(
+                        parent_job_id=order_id,
+                        trace=ttrace,
+                        priority=1,
+                        request_type="task",
+                    )
                 else:
                     intent_type = "order_project_new"
 
             if intent_type == "order_project_new":
+                # New-order intents are execution intents, not conversational queries.
+                task = task.with_updates(request_type="task")
                 order_id = task.job_id
                 title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
                 workspace = _ensure_project_workspace(
@@ -8715,7 +16034,7 @@ def _submit_orchestrator_task(
                 },
             )
 
-        return True, job_id
+        return True, job_id
     except Exception as e:
         LOG.exception("Failed to submit orchestrator task")
         raise RuntimeError(f"Failed to submit orchestrator task: {e}") from e
@@ -8763,7 +16082,9 @@ def _orchestrator_run_codex(
     except Exception:
         profile_timeout = 0
     if profile_timeout > 0:
-        timeout_seconds = min(timeout_seconds, profile_timeout) if timeout_seconds > 0 else profile_timeout
+        # The delegated contract should be able to extend runtime beyond the
+        # global default for slower local models or heavier specialist slices.
+        timeout_seconds = profile_timeout
 
     artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -8809,7 +16130,7 @@ def _orchestrator_run_codex(
             }
         if not cfg.screenshot_enabled:
             return {
-                "status": "error",
+                "status": "error",
                 "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
                 "artifacts": [],
                 "logs": "",
@@ -9089,6 +16410,25 @@ def _orchestrator_run_codex(
         except Exception:
             LOG.exception("Failed to build autopilot context. job=%s", task.job_id)
 
+    requested_codex_model = _sanitize_model_id(str(task.model or "").strip()) or _sanitize_model_id(str(profile.get("model") or "").strip())
+    profile_backend = str(profile.get("execution_backend") or "").strip().lower()
+    if profile_backend in ("codex_oss", "oss_codex", "codex_local_ollama", "codex_local"):
+        provider = str(profile.get("codex_local_provider") or "ollama").strip().lower() or "ollama"
+        if provider == "ollama":
+            installed_models = _ollama_installed_model_names()
+            fallback_model = _sanitize_model_id(str(profile.get("local_fallback_model") or "").strip())
+            if installed_models and requested_codex_model and requested_codex_model not in installed_models:
+                for cand in (fallback_model, eff_cfg.codex_oss_model):
+                    cand_id = _sanitize_model_id(str(cand or "").strip())
+                    if cand_id and cand_id != requested_codex_model and cand_id in installed_models:
+                        requested_codex_model = cand_id
+                        task = task.with_updates(model=cand_id)
+                        break
+
+    codex_overrides = _orchestrator_codex_backend_overrides(profile, model_override=requested_codex_model)
+    if codex_overrides:
+        eff_cfg = dataclasses.replace(eff_cfg, **codex_overrides)
+
     prompt = build_agent_prompt(task, profile=profile)
     try:
         # Safe logging: lengths only (never log prompt contents).
@@ -9208,7 +16548,7 @@ def _orchestrator_run_codex(
                             live_stdout_tail=stdout_tail,
                             live_stderr_tail=stderr_tail,
                             live_at=now,
-                        )
+                        )
                     except Exception:
                         pass
                     last_live_update = now
@@ -9416,14 +16756,21 @@ def _orchestrator_run_codex(
             if str(branch_sync.get("status") or "") == "error":
                 detail = str(branch_sync.get("detail") or "").strip()
                 reason = str(branch_sync.get("reason") or "branch_sync_failed")
-                return {
-                    "status": "blocked",
-                    "summary": f"Branch sync failed: {reason}.",
-                    "artifacts": artifacts_text,
-                    "logs": detail or (logs or body),
-                    "next_action": "resolve_branch_sync",
-                    "structured_digest": structured,
-                }
+                hard_fail = str(os.environ.get("BOT_BRANCH_SYNC_HARD_FAIL", "0") or "").strip().lower() in ("1", "true", "yes", "on")
+                if (not hard_fail) and reason in ("git_push_failed",):
+                    structured["branch_sync_warning"] = {
+                        "reason": reason,
+                        "detail": detail,
+                    }
+                else:
+                    return {
+                        "status": "blocked",
+                        "summary": f"Branch sync failed: {reason}.",
+                        "artifacts": artifacts_text,
+                        "logs": detail or (logs or body),
+                        "next_action": "resolve_branch_sync",
+                        "structured_digest": structured,
+                    }
 
         if code == 0:
             return {
@@ -9478,9 +16825,13 @@ def _send_orchestrator_result(
         s = re.sub(r"\bno puedo\b", "Para avanzar necesito", s, flags=re.IGNORECASE)
         s = re.sub(r"\bno puedo ejecutar\b", "Para ejecutar necesito", s, flags=re.IGNORECASE)
         s = re.sub(r"\bno tengo acceso\b", "Para continuar con precisión necesito validar acceso", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno[\s-]?go\b", "Iteración en curso: ajuste en progreso", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bnecesita retrabajo\b", "Iteración en curso: retrabajo en progreso", s, flags=re.IGNORECASE)
         # English variants
         s = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", s, flags=re.IGNORECASE)
         s = re.sub(r"\bcannot\b", "can proceed when we confirm", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bno[\s-]?go\b", "Iteration in progress: adjustment underway", s, flags=re.IGNORECASE)
+        s = re.sub(r"\bneeds?\s+rework\b", "Iteration in progress: rework underway", s, flags=re.IGNORECASE)
         return s
 
     def _first_line(text: str, *, max_chars: int = 420) -> str:
@@ -9516,6 +16867,8 @@ def _send_orchestrator_result(
         mode = (cfg.orchestrator_notify_mode or "minimal").strip().lower()
         runbook_id = str((task.trace or {}).get("runbook_id") or labels.get("runbook") or "").strip().lower()
 
+        notify_scope = _effective_notify_scope(cfg, chat_id=task.chat_id)
+
         if _coerce_orchestrator_role(task.role) == "jarvis":
             summary = _normalize_jarvis_reply(summary)
 
@@ -9527,19 +16880,73 @@ def _send_orchestrator_result(
         child_or_autonomous = bool((task.parent_job_id or "").strip()) or bool(task.is_autonomous)
         visual_artifacts = [str(a) for a in artifacts if _is_visual_artifact(str(a))]
 
+        def _severity() -> str:
+            s = str(status or "").strip().lower()
+            na = str(next_action or "").strip().lower()
+            if s in ("error", "failed", "blocked", "blocked_approval"):
+                return "critical"
+            if "timeout" in na or "retry" in na:
+                return "critical"
+            if kind in ("wrapup", "daily_digest", "brief"):
+                return "info"
+            if child_or_autonomous:
+                return "state_change"
+            return "info"
+
         def _should_notify() -> bool:
             if mode == "verbose":
                 return True
             # Keep periodic runbook chatter internal. Jarvis can escalate to CEO when relevant.
             if runbook_id:
                 return False
+
+            # Direct CEO conversational queries should always get a reply,
+            # even when notify scope is digest-only.
+            if (
+                _coerce_orchestrator_role(task.role) == "jarvis"
+                and not child_or_autonomous
+                and str(getattr(task, "request_type", "") or "").strip().lower() in ("query", "status")
+            ):
+                return True
+
+            sev = _severity()
+            scope = notify_scope
+
+            # Scope gate first.
+            if scope == "critical":
+                if sev != "critical":
+                    return False
+            elif scope == "digest_only":
+                if kind not in ("wrapup", "daily_digest", "brief") and sev != "critical":
+                    return False
+            else:  # state_change
+                pass
+
+            notify_children = bool(getattr(cfg, "notify_child_worker_completions", False))
+
+            # Keep child/autonomous worker chatter internal by default (including errors).
+            # CEO visibility remains on ticket card/dashboard and Jarvis summaries.
+            if child_or_autonomous and _coerce_orchestrator_role(task.role) != "jarvis":
+                if not notify_children:
+                    return False
+
+            # Autonomous Jarvis replans are operational churn; keep them in dashboard/ticket only.
+            if child_or_autonomous and _coerce_orchestrator_role(task.role) == "jarvis":
+                if kind in ("stalled_replan", "sla_replan", "autopilot"):
+                    return False
+                # Keep CEO chat quiet: internal autonomous snapshots stay in dashboard unless critical or wrap-up.
+                if status == "ok" and kind != "wrapup":
+                    return False
+
             if status != "ok":
                 return True
             if kind == "wrapup":
                 return True
-            # CTO relay: when worker/autonomous work tied to an order/ticket completes, notify CEO.
-            if child_or_autonomous and ticket_hint:
-                return True
+            if child_or_autonomous:
+                # Optional: allow child worker completion notices when explicitly enabled.
+                if ticket_hint:
+                    return notify_children
+
             # Ticket-card UX: top-level ok updates are already reflected by editable card.
             try:
                 if (
@@ -9549,7 +16956,7 @@ def _send_orchestrator_result(
                     return False
             except Exception:
                 pass
-            return True
+            return scope == "state_change"
 
         # For ticket-linked evidence jobs we want both text + attachments (not attachments-only).
         artifacts_only = (
@@ -9562,6 +16969,33 @@ def _send_orchestrator_result(
         prefer_voice = bool((task.trace or {}).get("prefer_voice_reply", False))
         force_notify = prefer_voice and bool(cfg.voice_out_enabled)
         notify = _should_notify() or force_notify
+
+        if child_or_autonomous and _coerce_orchestrator_role(task.role) == "jarvis":
+            dedupe_key = "|".join(
+                [
+                    str((task.parent_job_id or task.job_id or "")[:12]),
+                    "jarvis_autonomous",
+                    str(status or ""),
+                    str(kind or ""),
+                    str(getattr(task, "request_type", "") or "").strip().lower(),
+                ]
+            )
+        else:
+            dedupe_key = "|".join(
+                [
+                    str((task.parent_job_id or task.job_id or "")[:12]),
+                    str(task.role or ""),
+                    str(status or ""),
+                    str(kind or ""),
+                    _first_line(summary, max_chars=120),
+                ]
+            )
+        if notify and (not force_notify):
+            notify = _notification_dedupe_allow(
+                cfg,
+                key=dedupe_key,
+                cooldown_seconds=int(getattr(cfg, "notify_dedupe_cooldown_seconds", 600) or 600),
+            )
 
         if notify:
             role_name = _humanize_orchestrator_role(task.role)
@@ -9676,6 +17110,448 @@ def _send_orchestrator_result(
         LOG.exception("Failed to send orchestrator result. job=%s", task.job_id)
 
 
+def _is_meta_key_for_post_review(key: str) -> bool:
+    k = str(key or "").strip().lower()
+    if not k:
+        return False
+    meta_tokens = (
+        "arch",
+        "architecture",
+        "contract",
+        "scope",
+        "plan",
+        "blueprint",
+        "policy",
+        "local_",
+        "reviewer",
+    )
+    return any(tok in k for tok in meta_tokens)
+
+
+def _maybe_enqueue_post_delivery_review(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    task: Task,
+    orch_state: str,
+    now: float,
+) -> bool:
+    if not bool(cfg.proactive_iteration_enabled):
+        return False
+    base_round_cap = int(cfg.proactive_iteration_max_rounds or 0)
+    if base_round_cap <= 0:
+        return False
+    if str(orch_state or "").strip().lower() != "done":
+        return False
+
+    role = _coerce_orchestrator_role(task.role)
+    if role not in (
+        "frontend",
+        "backend",
+        "qa",
+        "security",
+        "research",
+        "product_ops",
+        "sre",
+        "release_mgr",
+        "implementer_local",
+    ):
+        return False
+
+    labels = task.labels or {}
+    task_kind = str(labels.get("kind") or "").strip().lower()
+    if task_kind != "subtask":
+        return False
+    if task_kind in ("wrapup", "autopilot", "stalled_replan", "sla_replan", "post_review", "evidence"):
+        return False
+    key_norm = str(labels.get("key") or "").strip().lower()
+    if _is_meta_key_for_post_review(key_norm):
+        return False
+
+    root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+    if not root_ticket or root_ticket == task.job_id:
+        # We only iterate on delegated work, not isolated one-off jobs.
+        return False
+    children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=800)
+    post_reviews = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "post_review"]
+    manual_root = _is_manual_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+    if manual_root:
+        try:
+            global_review_cap = int(os.environ.get("BOT_CEO_POST_REVIEW_MAX_TOTAL", "4"))
+        except Exception:
+            global_review_cap = 4
+        global_review_cap = max(2, min(30, int(global_review_cap)))
+        done_or_active_total = sum(
+            1
+            for c in post_reviews
+            if str(c.state or "").strip().lower() in ("done", "queued", "waiting_deps", "blocked_approval", "running")
+        )
+        if done_or_active_total >= int(global_review_cap):
+            return False
+    target_job_id = str(task.job_id or "").strip()
+    # Scope review rounds to the specific target job to avoid exhausting the cap
+    # due to historical post-review loops from older iterations of the same ticket.
+    post_reviews_for_target = [
+        c
+        for c in post_reviews
+        if str((c.labels or {}).get("for") or "").strip() == target_job_id
+    ]
+    active_states = ("queued", "waiting_deps", "blocked_approval", "running")
+    if any(str(c.state or "").strip().lower() in active_states for c in post_reviews_for_target):
+        return False
+
+    # Keep ticket-level review queue bounded to prevent post-review storms.
+    try:
+        max_active_per_ticket = max(1, int(os.environ.get("BOT_POST_REVIEW_MAX_ACTIVE_PER_TICKET", "2").strip() or "2"))
+    except Exception:
+        max_active_per_ticket = 2
+    active_post_reviews_for_ticket = [
+        c for c in post_reviews if str(c.state or "").strip().lower() in active_states
+    ]
+    if len(active_post_reviews_for_ticket) >= int(max_active_per_ticket):
+        return False
+
+    done_rounds = sum(1 for c in post_reviews_for_target if str(c.state or "").strip().lower() == "done")
+    review_cap = int(base_round_cap)
+    if _is_manual_root_ticket(orch_q=orch_q, root_ticket=root_ticket):
+        try:
+            review_cap = max(review_cap, int(os.environ.get("BOT_CEO_DELIVERY_REVIEW_MAX_ROUNDS", "12")))
+        except Exception:
+            review_cap = max(review_cap, 12)
+    review_cap = max(1, min(30, int(review_cap)))
+
+    if done_rounds >= review_cap:
+        return False
+
+    review_round = int(done_rounds + 1)
+    review_id = str(uuid.uuid4())
+    controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+    base_profile = _orchestrator_profile(profiles, controller_role)
+    model = _orchestrator_model_for_profile(cfg, base_profile)
+    effort = _orchestrator_effort_for_profile(base_profile, cfg)
+    order_branch = _resolve_order_branch_from_task(task, orch_q)
+
+    review_text = (
+        "POST-DELIVERY QUALITY REVIEW\n"
+        f"Ticket: {root_ticket}\n"
+        f"Target job: {task.job_id}\n"
+        f"Target role: {role}\n"
+        f"Round: {review_round}/{int(review_cap)}\n\n"
+        "Review protocol:\n"
+        "- Inspect latest artifacts, logs, and implementation evidence from the target job.\n"
+        "- Validate acceptance criteria and user-facing quality.\n"
+        "- For UI/mobile scope, run emulator/browser validation and require screenshots.\n"
+        "- If gaps are found, delegate concrete fix tasks with acceptance criteria and ETA, then re-review.\n"
+        "- Continue fix/review rounds until PASS; if blocked, propose a new approach and keep iterating.\n"
+        "- If quality is acceptable, return explicit PASS with residual risks and next improvement.\n"
+    )
+
+    review_trace: dict[str, Any] = {
+        "source": "scheduler",
+        "allow_delegation": True,
+        "order_id": root_ticket,
+        "post_review_for_job_id": task.job_id,
+        "post_review_round": int(review_round),
+        "runbook_id": f"{controller_role}_post_delivery_loop",
+        "profile_name": str(base_profile.get("name") or controller_role),
+        "profile_role": controller_role,
+        "max_runtime_seconds": int(base_profile.get("max_runtime_seconds") or 0),
+    }
+    if order_branch:
+        review_trace["order_branch"] = str(order_branch)
+
+    review_task = Task.new(
+        source="telegram",
+        role=controller_role,
+        input_text=review_text,
+        request_type="review",
+        priority=1,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(task.chat_id),
+        user_id=task.user_id,
+        reply_to_message_id=task.reply_to_message_id,
+        parent_job_id=root_ticket,
+        depends_on=[task.job_id],
+        labels={
+            "ticket": root_ticket,
+            "kind": "post_review",
+            "for": task.job_id,
+            "runbook": f"{controller_role}_post_delivery_loop",
+        },
+        artifacts_dir=str((cfg.artifacts_root / review_id).resolve()),
+        trace=review_trace,
+        job_id=review_id,
+    )
+
+    orch_q.submit_task(review_task)
+    try:
+        orch_q.append_delegation_edge(
+            root_ticket_id=root_ticket,
+            from_job_id=task.job_id,
+            to_job_id=review_task.job_id,
+            edge_type="review",
+            to_role=review_task.role,
+            to_key=f"post_review_r{review_round}",
+            details={"round": int(review_round)},
+        )
+    except Exception:
+        pass
+    try:
+        orch_q.update_trace(
+            root_ticket,
+            post_review_round=int(review_round),
+            post_review_last_job_id=task.job_id,
+            post_review_last_at=now,
+            live_at=now,
+        )
+        orch_q.append_audit_event(
+            event_type="order.post_review_enqueued",
+            actor=controller_role,
+            details={
+                "order_id": root_ticket,
+                "target_job_id": task.job_id,
+                "target_role": role,
+                "post_review_job_id": review_task.job_id,
+                "round": int(review_round),
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _maybe_enqueue_delivery_replan(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    task: Task,
+    orch_state: str,
+    summary: str,
+    structured_digest: Any,
+    now: float,
+) -> bool:
+    state_norm = str(orch_state or "").strip().lower()
+    if state_norm not in ("done", "blocked", "blocked_approval"):
+        return False
+
+    labels = task.labels or {}
+    task_kind = str(labels.get("kind") or "").strip().lower()
+    role_norm = _coerce_orchestrator_role(task.role)
+    trigger_mode = ""
+    trigger_reason = ""
+
+    if state_norm == "done":
+        if role_norm != "jarvis":
+            return False
+        if task_kind not in ("post_review", "wrapup"):
+            return False
+
+        verdict_blob = str(summary or "")
+        if isinstance(structured_digest, (dict, list)):
+            try:
+                verdict_blob = verdict_blob + "\\n" + json.dumps(structured_digest, ensure_ascii=False)
+            except Exception:
+                verdict_blob = verdict_blob + "\\n" + str(structured_digest)
+        elif structured_digest is not None:
+            verdict_blob = verdict_blob + "\\n" + str(structured_digest)
+
+        if not _text_has_no_go_signal(verdict_blob):
+            return False
+
+        trigger_mode = "quality_nogo"
+        trigger_reason = (str(summary or "").splitlines() or ["quality gap detected"])[0].strip() or "quality gap detected"
+    else:
+        if task_kind in (
+            "post_review",
+            "wrapup",
+            "autopilot",
+            "stalled_replan",
+            "sla_replan",
+            "blocked_replan",
+            "delivery_replan",
+            "final_sweep",
+            "evidence",
+        ):
+            return False
+        trigger_mode = "blocked"
+        trigger_reason = (str(summary or "").splitlines() or ["blocked work item"])[0].strip() or "blocked work item"
+
+    root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+    if not root_ticket:
+        return False
+    if not _is_manual_root_ticket(orch_q=orch_q, root_ticket=root_ticket):
+        return False
+
+    active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+    children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
+    if trigger_mode == "quality_nogo":
+        try:
+            max_replans_total = int(os.environ.get("BOT_CEO_DELIVERY_REPLAN_MAX_TOTAL", "3"))
+        except Exception:
+            max_replans_total = 3
+        max_replans_total = max(1, min(20, int(max_replans_total)))
+        replan_total = sum(
+            1
+            for c in children
+            if str((c.labels or {}).get("kind") or "").strip().lower() in ("delivery_replan", "blocked_replan", "stalled_replan", "sla_replan")
+        )
+        if replan_total >= int(max_replans_total):
+            return False
+    if any(
+        str((c.labels or {}).get("kind") or "").strip().lower()
+        in ("delivery_replan", "blocked_replan", "stalled_replan", "sla_replan")
+        and str(c.state or "").strip().lower() in active_states
+        for c in children
+    ):
+        return False
+
+    has_active_delivery = any(
+        str(c.state or "").strip().lower() in active_states
+        and str((c.labels or {}).get("kind") or "").strip().lower()
+        not in ("wrapup", "post_review", "evidence", "delivery_replan", "autopilot", "stalled_replan", "sla_replan", "blocked_replan", "final_sweep")
+        and str(c.job_id or "") != str(task.job_id or "")
+        for c in children
+    )
+    if trigger_mode == "quality_nogo" and has_active_delivery:
+        return False
+
+    try:
+        cooldown_s = max(60.0, float(os.environ.get("BOT_DELIVERY_REPLAN_COOLDOWN_SECONDS", "240").strip() or "240"))
+    except Exception:
+        cooldown_s = 240.0
+
+    root_job = orch_q.get_job(root_ticket)
+    root_trace = dict((root_job.trace if root_job else {}) or {})
+    try:
+        last_replan_at = float(root_trace.get("delivery_replan_last_at", 0.0) or 0.0)
+    except Exception:
+        last_replan_at = 0.0
+    if last_replan_at > 0 and (float(now) - last_replan_at) < cooldown_s:
+        return False
+
+    profile = _orchestrator_profile(profiles, "jarvis")
+    model = _orchestrator_model_for_profile(cfg, profile)
+    effort = _orchestrator_effort_for_profile(profile, cfg)
+    if len(trigger_reason) > 280:
+        trigger_reason = trigger_reason[:280] + "..."
+
+    replan_id = str(uuid.uuid4())
+    if trigger_mode == "blocked":
+        replan_text = (
+            "DELIVERY UNBLOCK REPLAN\\n"
+            f"Ticket: {root_ticket}\\n"
+            f"Blocked job: {task.job_id}\\n"
+            f"Blocked role: {role_norm}\\n"
+            f"Observed blocker: {trigger_reason}\\n\\n"
+            "Execution policy:\\n"
+            "- Do not stop delivery due to a single blocked lane.\\n"
+            "- Re-plan work so non-blocked, high-impact tasks continue immediately.\\n"
+            "- Replace or bypass dead dependencies with an executable path.\\n"
+            "- For proactive tickets, keep local specialists as primary executors under Skynet supervision.\\n"
+            "- Require QA/evidence before final wrap-up.\\n"
+        )
+    else:
+        replan_text = (
+            "DELIVERY RECOVERY REPLAN\\n"
+            f"Ticket: {root_ticket}\\n"
+            f"Trigger job: {task.job_id}\\n"
+            f"Trigger kind: {task_kind}\\n"
+            f"Observed gap: {trigger_reason}\\n\\n"
+            "Execution policy:\\n"
+            "- Do not close this ticket as NO-GO.\\n"
+            "- Generate a new approach with concrete delegated subtasks.\\n"
+            "- For proactive tickets, prioritize local specialist execution lanes.\\n"
+            "- Keep local execution iterative until PASS-ready quality.\\n"
+            "- Add QA validation and evidence requirements before wrap-up.\\n"
+            "- Continue iterating until delivery quality reaches PASS-ready state.\\n"
+        )
+
+    replan_trace: dict[str, Any] = {
+        "source": "scheduler",
+        "allow_delegation": True,
+        "order_id": root_ticket,
+        "trigger_job_id": task.job_id,
+        "trigger_kind": task_kind,
+        "trigger_state": state_norm,
+        "trigger_mode": trigger_mode,
+        "trigger_summary": trigger_reason,
+        "profile_name": str(profile.get("name") or "jarvis"),
+        "profile_role": "jarvis",
+        "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
+    }
+    order_branch = _resolve_order_branch_from_task(task, orch_q)
+    if order_branch:
+        replan_trace["order_branch"] = str(order_branch)
+
+    replan_deps = [task.job_id] if trigger_mode == "quality_nogo" else []
+    replan_task = Task.new(
+        source="telegram",
+        role="jarvis",
+        input_text=replan_text,
+        request_type="maintenance",
+        priority=1,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(task.chat_id),
+        user_id=task.user_id,
+        reply_to_message_id=task.reply_to_message_id,
+        parent_job_id=root_ticket,
+        depends_on=replan_deps,
+        labels={"ticket": root_ticket, "kind": "delivery_replan"},
+        artifacts_dir=str((cfg.artifacts_root / replan_id).resolve()),
+        trace=replan_trace,
+        job_id=replan_id,
+    )
+
+    orch_q.submit_task(replan_task)
+    try:
+        orch_q.append_delegation_edge(
+            root_ticket_id=root_ticket,
+            from_job_id=task.job_id,
+            to_job_id=replan_task.job_id,
+            edge_type="replan",
+            to_role=replan_task.role,
+            to_key="delivery_replan",
+            details={"reason": trigger_reason, "trigger_mode": trigger_mode},
+        )
+    except Exception:
+        pass
+    try:
+        orch_q.update_trace(
+            root_ticket,
+            delivery_replan_last_at=float(now),
+            delivery_replan_job_id=replan_task.job_id,
+            delivery_replan_trigger_job_id=task.job_id,
+            delivery_replan_trigger_mode=trigger_mode,
+            live_at=float(now),
+        )
+        orch_q.set_order_phase(root_ticket, chat_id=int(task.chat_id), phase="planning")
+        orch_q.append_audit_event(
+            event_type="order.delivery_replan_enqueued",
+            actor="jarvis",
+            details={
+                "order_id": root_ticket,
+                "trigger_job_id": task.job_id,
+                "trigger_kind": task_kind,
+                "trigger_state": state_norm,
+                "trigger_mode": trigger_mode,
+                "delivery_replan_job_id": replan_task.job_id,
+            },
+        )
+    except Exception:
+        pass
+
+    return True
+
 def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) -> str:
     if not orch_q:
         return ""
@@ -9703,6 +17579,17 @@ class _OrchestratorExecutor:
         self._profiles = profiles
 
     def run_task(self, task: Task) -> dict[str, Any]:
+        role = _coerce_orchestrator_role(task.role)
+        profile = _orchestrator_profile(self._profiles, role)
+        if _orchestrator_role_prefers_local_ollama(role, profile):
+            return _orchestrator_run_local_ollama(
+                self._cfg,
+                task,
+                stop_event=self._stop_event,
+                orch_q=self._orch_q,
+                profiles=self._profiles,
+                profile=profile,
+            )
         return _orchestrator_run_codex(
             self._cfg,
             task,
@@ -9721,6 +17608,58 @@ def orchestrator_worker_loop(
     profiles: dict[str, dict[str, Any]] | None,
 ) -> None:
     executor = _OrchestratorExecutor(cfg=cfg, stop_event=stop_event, orch_q=orch_q, profiles=profiles)
+    artifact_id_rx = re.compile(
+        r"^[0-9a-fA-F]{8}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{12}$"
+    )
+
+    def _trace_source_message_id(task_obj: Task, root_ticket: str) -> int | None:
+        trace = task_obj.trace if isinstance(task_obj.trace, dict) else {}
+        candidates = [
+            trace.get("source_message_id"),
+            trace.get("reply_to_message_id"),
+            task_obj.reply_to_message_id,
+        ]
+        for raw in candidates:
+            if raw is None:
+                continue
+            try:
+                val = int(raw)
+                if val > 0:
+                    return val
+            except Exception:
+                continue
+        try:
+            order = orch_q.get_order(root_ticket, chat_id=int(task_obj.chat_id))
+            if isinstance(order, dict):
+                raw = order.get("source_message_id")
+                if raw is not None:
+                    val = int(raw)
+                    if val > 0:
+                        return val
+        except Exception:
+            pass
+        return None
+
+    def _trace_artifact_id(task_obj: Task, artifacts_list: list[str]) -> str | None:
+        candidates: list[str] = []
+        if isinstance(task_obj.artifacts_dir, str) and task_obj.artifacts_dir.strip():
+            candidates.append(Path(task_obj.artifacts_dir.strip()).name)
+        for raw in artifacts_list:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            parts = [p for p in Path(text).parts if p]
+            if parts:
+                candidates.extend(parts[-3:])
+        for token in candidates:
+            tok = str(token or "").strip().strip("/")
+            if artifact_id_rx.match(tok):
+                return tok.lower()
+        return None
 
     while not stop_event.is_set():
         task = orch_q.take_next()
@@ -9732,12 +17671,48 @@ def orchestrator_worker_loop(
             trace = dict(task.trace)
             trace["profile"] = task.role
             task = task.with_updates(trace=trace)
+        source_message_id: int | None = None
+        agent_run_id: str | None = None
         try:
             started = time.time()
+            root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+            role_norm_task = _coerce_orchestrator_role(task.role)
+            source_message_id = _trace_source_message_id(task, root_ticket)
+            agent_run_id = str(uuid.uuid4())
             orch_q.update_state(task.job_id, "running")
+            if role_norm_task in _LOCAL_OLLAMA_ROLE_NAMES:
+                try:
+                    orch_q.update_trace(
+                        task.job_id,
+                        slice_id=_task_slice_id(task, root_ticket=root_ticket),
+                        slice_status="implementing",
+                        quality_gate_status="implementing",
+                        failure_class="retriable",
+                        attempt_n=_task_attempt_n(task),
+                        improvement_verified=False,
+                    )
+                except Exception:
+                    pass
+            try:
+                orch_q.append_trace_event(
+                    order_id=root_ticket,
+                    job_id=task.job_id,
+                    source_message_id=source_message_id,
+                    agent_run_id=agent_run_id,
+                    agent_role=str(task.role or "").strip().lower() or None,
+                    event_type="job.running",
+                    severity="info",
+                    message=f"job={task.job_id[:8]} role={task.role} running",
+                    payload={
+                        "request_type": str(task.request_type or ""),
+                        "priority": int(task.priority or 2),
+                        "retry_count": int(task.retry_count or 0),
+                    },
+                )
+            except Exception:
+                pass
             # Update the single ticket card message (no spam) when work starts.
             try:
-                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
                 _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
             except Exception:
                 pass
@@ -9750,19 +17725,31 @@ def orchestrator_worker_loop(
             if orch_state == "ok":
                 orch_state = "done"
 
+            next_action = getattr(result, "next_action", None)
+            if next_action is not None:
+                next_action = str(next_action).strip() or None
+
             # Persist a minimal structured result into trace so /job and /ticket have "memory".
             summary = str(getattr(result, "summary", "") or "").strip()
             if len(summary) > 4000:
                 summary = summary[:4000] + "..."
-            if _coerce_orchestrator_role(task.role) == "jarvis":
+            blocker_summary = _extract_blocker_response(summary)
+            if blocker_summary and role_norm_task == "implementer_local":
+                # Treat implementer blockers as terminal work outcomes (failed+blocked class),
+                # so the local planner can immediately spawn a replacement slice.
+                orch_state = "failed"
+                summary = f"BLOCKER: {blocker_summary}"
+                if not next_action:
+                    next_action = "replan"
+            if _is_controller_role(role_norm_task):
                 summary = re.sub(r"\bno puedo\b", "Para avanzar necesito", summary, flags=re.IGNORECASE)
                 summary = re.sub(r"\bi can['’]t\b", "I can proceed when you confirm", summary, flags=re.IGNORECASE)
                 summary = re.sub(r"\bcannot\b", "can proceed when we confirm", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bno[\s-]?go\b", "Iteración en curso: ajuste en progreso", summary, flags=re.IGNORECASE)
+                summary = re.sub(r"\bneeds?\s+rework\b", "Iteración en curso: retrabajo en progreso", summary, flags=re.IGNORECASE)
             artifacts = list(getattr(result, "artifacts", []) or [])
             artifacts = [str(a) for a in artifacts if str(a).strip()][:20]
-            next_action = getattr(result, "next_action", None)
-            if next_action is not None:
-                next_action = str(next_action).strip() or None
+            artifact_id = _trace_artifact_id(task, artifacts)
 
             if orch_state == "blocked":
                 na = str(next_action or "").strip().lower()
@@ -9795,11 +17782,168 @@ def orchestrator_worker_loop(
                     pass
             if orch_state == "blocked_approval":
                 result_meta["blocked_reason"] = "requires_approval"
+            elif blocker_summary and role_norm_task == "implementer_local":
+                result_meta["blocked_reason"] = "implementer_blocker"
+            if role_norm_task in _LOCAL_OLLAMA_ROLE_NAMES:
+                slice_id = _task_slice_id(task, root_ticket=root_ticket)
+                attempt_n = _task_attempt_n(task)
+                task_trace = dict((task.trace or {}) if isinstance(task.trace, dict) else {})
+                prev_slice_status = _normalize_local_slice_status(task_trace.get("slice_status"), fallback="planned")
+                result_meta["slice_id"] = slice_id
+                result_meta["attempt_n"] = int(attempt_n)
+                result_meta["improvement_verified"] = False
+                if role_norm_task == "architect_local":
+                    if orch_state == "done":
+                        result_meta["slice_status"] = "planned"
+                        result_meta["quality_gate_status"] = "planned"
+                        result_meta["failure_class"] = "retriable"
+                    elif orch_state in ("blocked", "blocked_approval"):
+                        result_meta["slice_status"] = "blocked"
+                        result_meta["quality_gate_status"] = "blocked"
+                        result_meta["failure_class"] = "blocked"
+                    elif orch_state == "failed":
+                        result_meta["slice_status"] = "failed_retriable"
+                        result_meta["quality_gate_status"] = "failed_retriable"
+                        result_meta["failure_class"] = "retriable"
+                elif role_norm_task == "implementer_local":
+                    patch_info: dict[str, Any] = {}
+                    if isinstance(structured_digest, dict):
+                        raw_patch_info = structured_digest.get("patch_info")
+                        if isinstance(raw_patch_info, dict):
+                            patch_info = dict(raw_patch_info)
+                    no_code_change = bool(patch_info.get("no_code_change_required", False))
+                    changed_files = patch_info.get("changed_files") if isinstance(patch_info.get("changed_files"), list) else []
+                    patch_applied = bool((not no_code_change) and changed_files)
+                    validation_ok = bool(patch_info.get("validation_ok", False))
+                    if patch_info:
+                        result_meta["local_patch_info"] = patch_info
+                    result_meta["slice_no_code_change"] = bool(no_code_change)
+                    result_meta["slice_patch_applied"] = bool(patch_applied)
+                    result_meta["slice_validation_ok"] = bool(validation_ok)
+                    if orch_state == "done":
+                        if patch_applied and validation_ok:
+                            result_meta["slice_status"] = "validated"
+                            result_meta["quality_gate_status"] = "validated"
+                            result_meta["failure_class"] = "retriable"
+                        elif no_code_change:
+                            result_meta["slice_status"] = "blocked"
+                            result_meta["quality_gate_status"] = "blocked"
+                            result_meta["failure_class"] = "blocked"
+                        else:
+                            orch_state = "failed"
+                            result_meta["slice_status"] = "failed_terminal"
+                            result_meta["quality_gate_status"] = "failed_terminal"
+                            result_meta["failure_class"] = "terminal"
+                    elif orch_state in ("blocked", "blocked_approval"):
+                        result_meta["slice_status"] = "blocked"
+                        result_meta["quality_gate_status"] = "blocked"
+                        result_meta["failure_class"] = "blocked"
+                    elif orch_state == "failed":
+                        failure_class = _classify_local_slice_failure(
+                            role_norm=role_norm_task,
+                            orch_state=orch_state,
+                            summary=summary,
+                            attempt_n=int(attempt_n),
+                        )
+                        failed_status = "failed_terminal" if failure_class in ("terminal", "blocked") else "failed_retriable"
+                        result_meta["slice_status"] = failed_status
+                        result_meta["quality_gate_status"] = failed_status
+                        result_meta["failure_class"] = failure_class
+                elif role_norm_task == "reviewer_local":
+                    review_ready = bool(orch_state == "done" and _summary_has_ready_signal(summary))
+                    applied_ev, validated_ev = _slice_has_applied_and_validated_evidence(
+                        orch_q=orch_q,
+                        root_ticket=root_ticket,
+                        slice_id=slice_id,
+                    )
+                    if review_ready and not (applied_ev and validated_ev):
+                        review_ready = False
+                        orch_state = "failed"
+                        summary = (
+                            f"{summary}\n\nReviewer gate rejected: READY requires prior applied+validated "
+                            f"implementer evidence for slice_id={slice_id}."
+                        ).strip()
+                        result_meta["result_summary"] = summary
+                    result_meta["review_ready"] = bool(review_ready)
+                    if orch_state == "done" and review_ready:
+                        result_meta["slice_status"] = "reviewed_ready"
+                        result_meta["quality_gate_status"] = "reviewed_ready"
+                        result_meta["failure_class"] = "retriable"
+                    elif orch_state == "done":
+                        result_meta["slice_status"] = "failed_terminal"
+                        result_meta["quality_gate_status"] = "failed_terminal"
+                        result_meta["failure_class"] = "terminal"
+                    elif orch_state in ("blocked", "blocked_approval"):
+                        result_meta["slice_status"] = "blocked"
+                        result_meta["quality_gate_status"] = "blocked"
+                        result_meta["failure_class"] = "blocked"
+                    elif orch_state == "failed":
+                        result_meta["slice_status"] = "failed_terminal"
+                        result_meta["quality_gate_status"] = "failed_terminal"
+                        result_meta["failure_class"] = "terminal"
+                # Enforce explicit slice workflow transitions to avoid ambiguous gate jumps.
+                next_slice_status = _normalize_local_slice_status(
+                    result_meta.get("slice_status"),
+                    fallback=prev_slice_status,
+                )
+                allowed_next = _LOCAL_SLICE_ALLOWED_TRANSITIONS.get(prev_slice_status, frozenset())
+                if next_slice_status not in allowed_next:
+                    if orch_state in ("blocked", "blocked_approval"):
+                        next_slice_status = "blocked"
+                    elif orch_state in ("failed", "cancelled"):
+                        next_slice_status = "failed_terminal"
+                    elif orch_state == "done" and role_norm_task == "architect_local":
+                        next_slice_status = "planned"
+                    else:
+                        next_slice_status = "failed_terminal"
+                        orch_state = "failed"
+                result_meta["slice_status"] = next_slice_status
+                result_meta["quality_gate_status"] = next_slice_status
+                result_meta["failure_class"] = _normalize_local_failure_class(
+                    result_meta.get("failure_class"),
+                    fallback=(
+                        "blocked"
+                        if next_slice_status == "blocked"
+                        else ("terminal" if next_slice_status == "failed_terminal" else "retriable")
+                    ),
+                )
+            elif _is_controller_role(role_norm_task):
+                verified = bool(
+                    orch_state == "done"
+                    and (
+                        ("verified_improvement" in str(summary or "").lower())
+                        or bool(((task.trace or {}) if isinstance(task.trace, dict) else {}).get("improvement_verified", False))
+                    )
+                )
+                result_meta["improvement_verified"] = bool(verified)
+                if verified:
+                    slice_id = _sanitize_slice_token(
+                        str((((task.trace or {}) if isinstance(task.trace, dict) else {}).get("slice_id") or "")),
+                        fallback="",
+                    )
+                    if not slice_id:
+                        slice_id = _select_latest_ready_slice_for_closure(
+                            orch_q=orch_q,
+                            root_ticket=root_ticket,
+                        )
+                    if slice_id:
+                        result_meta["slice_id"] = slice_id
+                        result_meta["attempt_n"] = int(_task_attempt_n(task))
+                        result_meta["slice_status"] = "closed"
+                        result_meta["quality_gate_status"] = "closed"
+                        result_meta["failure_class"] = "retriable"
+            result_meta["result_status"] = str(orch_state)
 
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
             retry_policy = str(next_action or "").strip().lower()
             retry_allowed = retry_policy in ("retry", "retry_transient", "retry_controlled", "")
-            if orch_state == "failed" and retry_allowed and int(task.retry_count or 0) < int(task.max_retries or 0):
+            failure_class = str(result_meta.get("failure_class") or "").strip().lower()
+            retry_cap = int(task.max_retries or 0)
+            if role_norm_task == "implementer_local":
+                retry_cap = min(retry_cap, 1)
+                if failure_class in ("terminal", "blocked"):
+                    retry_allowed = False
+            if orch_state == "failed" and retry_allowed and int(task.retry_count or 0) < int(retry_cap):
                 retry_n = int(task.retry_count or 0) + 1
                 base = 30.0
                 delay = min(15 * 60.0, base * (2.0 ** max(0, retry_n - 1)))
@@ -9817,7 +17961,27 @@ def orchestrator_worker_loop(
                     except Exception:
                         pass
                     try:
-                        root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                        orch_q.append_trace_event(
+                            order_id=root_ticket,
+                            job_id=task.job_id,
+                            source_message_id=source_message_id,
+                            agent_run_id=agent_run_id,
+                            artifact_id=artifact_id,
+                            agent_role=str(task.role or "").strip().lower() or None,
+                            event_type="job.retry_scheduled",
+                            severity="warn",
+                            message=f"job={task.job_id[:8]} retry={retry_n}/{int(retry_cap)} in {int(delay)}s",
+                            payload={
+                                "retry_count": int(retry_n),
+                                "max_retries": int(retry_cap),
+                                "retry_delay_s": float(delay),
+                                "next_action": str(next_action or ""),
+                                "failure_class": failure_class or None,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    try:
                         _maybe_update_ticket_card(cfg=cfg, api=api, orch_q=orch_q, ticket_id=root_ticket)
                     except Exception:
                         pass
@@ -9825,12 +17989,98 @@ def orchestrator_worker_loop(
                     if (cfg.orchestrator_notify_mode or "minimal").strip().lower() == "verbose":
                         api.send_message(
                             task.chat_id,
-                            f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(task.max_retries or 0)} in {int(delay)}s",
+                            f"Retry scheduled: job={task.job_id[:8]} retry={retry_n}/{int(retry_cap)} in {int(delay)}s",
                             reply_to_message_id=task.reply_to_message_id,
                         )
                     continue
+            if role_norm_task == "implementer_local" and orch_state == "failed":
+                exhausted = int(task.retry_count or 0) >= int(max(0, retry_cap))
+                if (failure_class in ("terminal", "blocked")) or exhausted:
+                    result_meta["loop_breaker_pending"] = True
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            try:
+                role_norm_after = _coerce_orchestrator_role(str(task.role or ""))
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                if orch_state == "done" and role_norm_after == "architect_local":
+                    arch_handoff = str(summary or "").strip()
+                    if not arch_handoff:
+                        art_dir = Path(str(task.artifacts_dir or "")).resolve() if str(task.artifacts_dir or "").strip() else None
+                        for candidate_name in ("local_ollama_response.md", "local_ollama_live.md"):
+                            try:
+                                if art_dir is None:
+                                    break
+                                candidate = art_dir / candidate_name
+                                if candidate.exists():
+                                    arch_handoff = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                                if arch_handoff:
+                                    break
+                            except Exception:
+                                continue
+                    if arch_handoff:
+                        if len(arch_handoff) > 12000:
+                            arch_handoff = arch_handoff[:12000].rstrip()
+                        orch_q.update_trace(
+                            root_ticket,
+                            latest_local_architect_job_id=str(task.job_id),
+                            latest_local_architect_handoff=arch_handoff,
+                            latest_local_architect_done_at=time.time(),
+                        )
+                elif orch_state == "done" and role_norm_after == "implementer_local":
+                    orch_q.update_trace(
+                        root_ticket,
+                        latest_local_implementer_job_id=str(task.job_id),
+                        latest_local_implementer_done_at=time.time(),
+                        latest_local_implementer_summary=str(summary or "")[:8000],
+                    )
+                elif orch_state == "done" and role_norm_after == "reviewer_local":
+                    orch_q.update_trace(
+                        root_ticket,
+                        latest_local_reviewer_job_id=str(task.job_id),
+                        latest_local_reviewer_done_at=time.time(),
+                        latest_local_reviewer_summary=str(summary or "")[:8000],
+                        latest_local_reviewer_ready=bool(_summary_has_ready_signal(summary)),
+                    )
+                elif orch_state == "done" and _is_controller_role(role_norm_after):
+                    if "verified_improvement" in str(summary or "").lower():
+                        orch_q.update_trace(
+                            root_ticket,
+                            proactive_improvement_verified=True,
+                            proactive_improvement_verified_at=time.time(),
+                            proactive_improvement_verified_job_id=str(task.job_id),
+                            proactive_improvement_verified_by=role_norm_after,
+                            live_at=time.time(),
+                        )
+            except Exception:
+                pass
+            try:
+                sev = "info"
+                if orch_state in ("failed", "blocked", "blocked_approval", "cancelled"):
+                    sev = "error"
+                orch_q.append_trace_event(
+                    order_id=root_ticket,
+                    job_id=task.job_id,
+                    source_message_id=source_message_id,
+                    agent_run_id=agent_run_id,
+                    artifact_id=artifact_id,
+                    agent_role=str(task.role or "").strip().lower() or None,
+                    event_type="job.state_transition",
+                    severity=sev,
+                    message=f"job={task.job_id[:8]} state={orch_state}",
+                    payload={
+                        "state": str(orch_state),
+                        "result_status": str(raw_status or orch_state),
+                        "next_action": (str(next_action or "") or None),
+                        "duration_s": float(duration_s),
+                        "summary": (summary[:240] if isinstance(summary, str) else ""),
+                        "slice_id": result_meta.get("slice_id"),
+                        "slice_status": result_meta.get("slice_status"),
+                        "quality_gate_status": result_meta.get("quality_gate_status"),
+                        "failure_class": result_meta.get("failure_class"),
+                    },
+                )
+            except Exception:
+                pass
             # Keep CEO order phase aligned with real execution state.
             try:
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -9841,8 +18091,20 @@ def orchestrator_worker_loop(
                 )
             except Exception:
                 pass
+            try:
+                _maybe_enqueue_post_delivery_review(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    profiles=profiles,
+                    task=task,
+                    orch_state=orch_state,
+                    now=time.time(),
+                )
+            except Exception:
+                LOG.exception("Failed to enqueue post-delivery review loop. job=%s", task.job_id)
             # Git policy: one order/project branch from main.
-            # Merge to main requires explicit CEO approval via Telegram command (/approve_merge or /order merge).
+            # Merge to main can be auto-approved by Jarvis (default) or manually approved by CEO
+            # via Telegram command (/approve_merge or /order merge) when auto-merge is disabled.
             try:
                 labels_now = task.labels or {}
                 task_kind = str(labels_now.get("kind") or "").strip().lower()
@@ -9917,7 +18179,7 @@ def orchestrator_worker_loop(
                             reply_to_message_id=task.reply_to_message_id,
                             parent_job_id=root_ticket,
                             depends_on=[],
-                            labels={"ticket": root_ticket, "kind": "evidence", "for": task.job_id},
+                            labels={"ticket": root_ticket, "kind": "evidence", "for": task.job_id},
                             artifacts_dir=str((cfg.artifacts_root / shot_id).resolve()),
                             trace={
                                 "source": "telegram",
@@ -9954,15 +18216,21 @@ def orchestrator_worker_loop(
             # Jarvis delegation: enqueue child jobs when Jarvis outputs structured subtasks.
             try:
                 allow_delegation = bool(task.trace.get("allow_delegation", False))
-                is_jarvis = _coerce_orchestrator_role(task.role) == "jarvis"
+                controller_actor = _coerce_orchestrator_role(task.role)
+                is_controller = _is_controller_role(controller_actor)
                 is_query = (task.request_type or "task") == "query"
                 is_top_level_manual = (not task.is_autonomous) and (not task.parent_job_id) and ((task.request_type or "task") == "task")
 
-                if orch_state == "done" and is_jarvis and (not is_query) and (is_top_level_manual or allow_delegation):
+                if orch_state == "done" and is_controller and (not is_query) and (is_top_level_manual or allow_delegation):
                     root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
                     order_branch_for_root = _resolve_order_branch_from_task(task, orch_q)
                     existing = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=400)
-                    existing_wrapup = any(str((c.labels or {}).get("kind") or "") == "wrapup" for c in existing)
+                    active_wrapup_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+                    existing_wrapup = any(
+                        str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"
+                        and str(c.state or "").strip().lower() in active_wrapup_states
+                        for c in existing
+                    )
                     existing_subtasks = [c for c in existing if str((c.labels or {}).get("kind") or "") != "wrapup"]
                     existing_keys = {
                         str((c.labels or {}).get("key") or "").strip()
@@ -9977,20 +18245,573 @@ def orchestrator_worker_loop(
                     except Exception:
                         current_plan_revision = 0
                     next_plan_revision = current_plan_revision
+                    proactive_lane = bool(task.trace.get("proactive_lane", False))
+                    job_kind = str((task.labels or {}).get("kind") or "").strip().lower()
+                    autonomous_non_manual = bool(
+                        task.is_autonomous
+                        or proactive_lane
+                        or job_kind in ("autopilot", "stalled_replan", "sla_replan")
+                    )
+                    order_is_proactive = False
+                    if autonomous_non_manual:
+                        try:
+                            order_row = orch_q.get_order(root_ticket, chat_id=int(task.chat_id))
+                            order_is_proactive = _is_proactive_order_record(order_row)
+                        except Exception:
+                            order_is_proactive = False
+
+                    enforce_local_only = bool(proactive_lane) or bool(order_is_proactive)
+                    existing_local_inflight = bool(
+                        autonomous_non_manual
+                        and enforce_local_only
+                        and _has_open_local_support_work(existing_subtasks)
+                    )
+                    if existing_local_inflight:
+                        specs = []
+                        try:
+                            orch_q.append_audit_event(
+                                event_type="delegation.local_inflight_short_circuit",
+                                actor=controller_actor,
+                                details={
+                                    "order_id": root_ticket,
+                                    "reason": "active_local_support_work",
+                                    "job_kind": (job_kind or None),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    if autonomous_non_manual and enforce_local_only:
+                        live_local_children = list(existing_subtasks or [])
+                        next_action_type = ""
+                        if isinstance(structured_digest, dict):
+                            next_action_obj = structured_digest.get("next_action")
+                            if isinstance(next_action_obj, dict):
+                                next_action_type = str(next_action_obj.get("type") or "").strip().lower()
+                        summary_blob = str(summary or "").strip().lower()
+                        continue_live_signal = bool(
+                            next_action_type in ("continue_live_architect_chain", "continue_live_chain", "continue_live_local_chain")
+                            or "architect_local is running" in summary_blob
+                            or "continue current architect run" in summary_blob
+                        )
+                        if continue_live_signal and _has_open_local_support_work(live_local_children):
+                            specs = []
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.proactive_continue_live_suppressed",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "reason": "active_local_support_work",
+                                        "next_action_type": (next_action_type or None),
+                                    },
+                                )
+                            except Exception:
+                                pass
+                    proactive_cli_promotion = bool(
+                        autonomous_non_manual
+                        and (proactive_lane or order_is_proactive)
+                        and (not enforce_local_only)
+                        and _proactive_cli_promotion_enabled()
+                        and _ticket_proactive_needs_cli_promotion(
+                            orch_q=orch_q,
+                            root_ticket=root_ticket,
+                            now=time.time(),
+                        )
+                    )
+                    if (not specs) and autonomous_non_manual and proactive_cli_promotion:
+                        objective_snippet = str(task.input_text or "").strip()
+                        if len(objective_snippet) > 240:
+                            objective_snippet = objective_snippet[:240] + "..."
+                        cli_seed_key_base = f"proactive_cli_seed_r{int(current_plan_revision) + 1}"
+                        cli_seed_key = cli_seed_key_base
+                        cli_validate_key = f"{cli_seed_key_base}_qa"
+                        suffix = 1
+                        while cli_seed_key in existing_keys or cli_validate_key in existing_keys:
+                            suffix += 1
+                            cli_seed_key = f"{cli_seed_key_base}_{suffix}"
+                            cli_validate_key = f"{cli_seed_key}_qa"
+                        cli_seed_specs = [
+                            TaskSpec(
+                                key=cli_seed_key,
+                                role="backend",
+                                text=(
+                                    f"Proactive CLI takeover for ticket {root_ticket}: implement the single highest-impact improvement supported by the objective and current evidence. "
+                                    f"Objective snapshot: {objective_snippet}"
+                                ),
+                                mode_hint="ro",
+                                priority=1,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=[
+                                    "Ship one concrete improvement, not generic analysis.",
+                                    "Produce verifiable evidence such as tests, logs, or diff artifacts.",
+                                ],
+                                definition_of_done=[
+                                    "Improvement is implemented with evidence and residual risks are explicit.",
+                                ],
+                                eta_minutes=60,
+                                sla_tier="high",
+                            ),
+                            TaskSpec(
+                                key=cli_validate_key,
+                                role="qa",
+                                text=(
+                                    f"Validate the proactive CLI improvement for ticket {root_ticket}: confirm the change is real, useful, and regression-safe with concrete evidence."
+                                ),
+                                mode_hint="ro",
+                                priority=1,
+                                depends_on=[cli_seed_key],
+                                requires_approval=False,
+                                acceptance_criteria=[
+                                    "Return PASS/FAIL style validation with findings.",
+                                    "Reference concrete evidence paths or commands used for validation.",
+                                ],
+                                definition_of_done=[
+                                    "Validation verdict delivered with explicit go/no-go rationale.",
+                                ],
+                                eta_minutes=45,
+                                sla_tier="high",
+                            ),
+                        ]
+                        specs = _apply_ceo_cli_first_policy(
+                            specs=cli_seed_specs,
+                            force_cli_takeover=True,
+                        )
+                        try:
+                            orch_q.append_audit_event(
+                                event_type="delegation.proactive_cli_seeded",
+                                actor=controller_actor,
+                                details={
+                                    "order_id": root_ticket,
+                                    "seed_key": cli_seed_key,
+                                    "seeded_specs": int(len(specs)),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    elif (not specs) and autonomous_non_manual and enforce_local_only:
+                        try:
+                            live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
+                        except Exception:
+                            live_local_children = list(existing_subtasks or [])
+                        if _has_open_local_support_work(live_local_children):
+                            specs = []
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.proactive_local_seed_suppressed",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "reason": "open_local_support_work",
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            objective_snippet = str(task.input_text or "").strip()
+                            if len(objective_snippet) > 240:
+                                objective_snippet = objective_snippet[:240] + "..."
+                            seed_key_base = f"proactive_local_seed_r{int(current_plan_revision) + 1}"
+                            seed_key = seed_key_base
+                            suffix = 1
+                            while seed_key in existing_keys:
+                                suffix += 1
+                                seed_key = f"{seed_key_base}_{suffix}"
+                            seed_specs = [
+                                TaskSpec(
+                                    key=seed_key,
+                                    role="backend",
+                                    text=(
+                                        f"Proactive local cycle for ticket {root_ticket}: derive concrete local improvements from objective and deliver evidence-ready actions. "
+                                        f"Objective snapshot: {objective_snippet}"
+                                    ),
+                                    mode_hint="ro",
+                                    priority=2,
+                                    depends_on=[],
+                                    requires_approval=False,
+                                    acceptance_criteria=[
+                                        "Define at least one concrete, testable improvement.",
+                                        "Produce verifiable evidence path for reviewer validation.",
+                                    ],
+                                    definition_of_done=[
+                                        "Improvement plan is actionable and ready for local execution/review.",
+                                    ],
+                                    eta_minutes=45,
+                                    sla_tier="high",
+                                )
+                            ]
+                            specs = _apply_autonomous_local_first_policy(
+                                specs=seed_specs,
+                                orch_q=orch_q,
+                                root_ticket=root_ticket,
+                                now=time.time(),
+                            )
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.proactive_local_seeded",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "seed_key": seed_key,
+                                        "seeded_specs": int(len(specs)),
+                                    },
+                                )
+                            except Exception:
+                                pass
+
                     if specs:
                         # Cap to avoid runaway delegation.
                         specs = specs[:12]
                         # Key-based dedupe: allows multiple waves (autopilot) without duplicating keys.
                         specs = [s for s in specs if s.key not in existing_keys]
+                        specs = _inject_local_specialist_specs(
+                            specs=specs,
+                            root_ticket=root_ticket,
+                            existing_keys=existing_keys,
+                            request_type=str(task.request_type or "task"),
+                            is_top_level_manual=bool(is_top_level_manual),
+                            proactive_lane=proactive_lane,
+                            allow_delegation=bool(allow_delegation),
+                        )
+
+                        now_ts = time.time()
+                        if specs and autonomous_non_manual:
+                            # Policy:
+                            # - Proactive lane (no active CEO projects) stays local-only.
+                            # - CEO-driven projects may mix Codex CLI + local specialists.
+                            enforce_local_only = bool(proactive_lane) or bool(order_is_proactive)
+                            if proactive_cli_promotion:
+                                specs = _apply_ceo_cli_first_policy(
+                                    specs=specs,
+                                    force_cli_takeover=True,
+                                )
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="delegation.proactive_cli_takeover",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "specs_after_takeover": int(len(specs)),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+                            elif enforce_local_only:
+                                # Proactive lane policy: execution and retries stay local-only.
+                                specs = _apply_autonomous_local_first_policy(
+                                    specs=specs,
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    now=now_ts,
+                                )
+
+                            specs = _dedupe_specs_by_signature(
+                                specs=specs,
+                                existing_subtasks=existing_subtasks,
+                                now=now_ts,
+                                recent_window_s=float(_autonomous_subtask_dedupe_window_seconds()),
+                            )
+
+                            active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+                            active_existing = sum(
+                                1
+                                for c in existing_subtasks
+                                if str(c.state or "").strip().lower() in active_states
+                            )
+                            max_active = _autonomous_max_active_subtasks()
+                            available_slots = max(0, int(max_active) - int(active_existing))
+                            if available_slots <= 0:
+                                specs = []
+                            elif len(specs) > available_slots:
+                                specs = specs[:available_slots]
+                        elif specs:
+                            # Manual lane: still avoid duplicating equivalent subtasks too aggressively.
+                            specs = _dedupe_specs_by_signature(
+                                specs=specs,
+                                existing_subtasks=existing_subtasks,
+                                now=now_ts,
+                                recent_window_s=3600.0,
+                            )
+                            local_takeover = _ticket_local_needs_cli_takeover(
+                                orch_q=orch_q,
+                                root_ticket=root_ticket,
+                                now=now_ts,
+                            )
+                            specs = _apply_ceo_cli_first_policy(
+                                specs=specs,
+                                force_cli_takeover=bool(local_takeover),
+                            )
+
+                        # For manual CEO roots, enforce CLI-first role mix on every planning wave
+                        # (including post-review/replan waves) to prevent local-Ollama failures from
+                        # becoming delivery-critical.
+                        if specs and _is_manual_root_ticket(orch_q=orch_q, root_ticket=root_ticket):
+                            local_takeover = _ticket_local_needs_cli_takeover(
+                                orch_q=orch_q,
+                                root_ticket=root_ticket,
+                                now=now_ts,
+                            )
+                            specs = _apply_ceo_cli_first_policy(
+                                specs=specs,
+                                force_cli_takeover=bool(local_takeover),
+                            )
+
+                        if specs:
+                            active_ticket_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+                            active_existing_ticket = sum(
+                                1
+                                for c in existing_subtasks
+                                if str(c.state or "").strip().lower() in active_ticket_states
+                            )
+                            ticket_cap = _ticket_max_active_subtasks()
+                            ticket_slots = max(0, int(ticket_cap) - int(active_existing_ticket))
+                            if ticket_slots <= 0:
+                                specs = []
+                            elif len(specs) > ticket_slots:
+                                specs = specs[:ticket_slots]
+
+                        if specs:
+                            max_keep = 4 if autonomous_non_manual else 6
+                            specs_before_objective = len(specs)
+                            specs, objective_dropped = _objective_filter_specs(
+                                specs=specs,
+                                objective_text=str(task.input_text or ""),
+                                max_keep=int(max_keep),
+                            )
+                            if objective_dropped > 0:
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="delegation.objective_gate",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "dropped_specs": int(objective_dropped),
+                                            "kept_specs": int(len(specs)),
+                                            "before_specs": int(specs_before_objective),
+                                            "autonomous": bool(autonomous_non_manual),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
+                        if specs:
+                            specs = _prioritize_specs_for_flow(
+                                specs=specs,
+                                objective_text=str(task.input_text or ""),
+                            )
+
+                        if specs:
+                            hard_pressured, hard_queued, hard_waiting = _queue_is_hard_pressured(orch_q=orch_q)
+                            if hard_pressured:
+                                before_hard_pressure = len(specs)
+                                if autonomous_non_manual:
+                                    specs = []
+                                else:
+                                    specs = specs[:1]
+                                try:
+                                    hard_q, hard_w = _queue_hard_limits()
+                                    orch_q.append_audit_event(
+                                        event_type="queue.hard_pressure",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "queued": int(hard_queued),
+                                            "waiting_deps": int(hard_waiting),
+                                            "hard_max_queued": int(hard_q),
+                                            "hard_max_waiting_deps": int(hard_w),
+                                            "autonomous": bool(autonomous_non_manual),
+                                            "before_specs": int(before_hard_pressure),
+                                            "kept_specs": int(len(specs)),
+                                            "deferred_specs": int(max(0, before_hard_pressure - len(specs))),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
+                        if specs:
+                            pressured, queued_now, waiting_now = _queue_is_pressured(orch_q=orch_q)
+                            if pressured:
+                                before_pressure = len(specs)
+                                if autonomous_non_manual:
+                                    specs = []
+                                else:
+                                    specs = specs[: min(3, len(specs))]
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="queue.pressure",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "queued": int(queued_now),
+                                            "waiting_deps": int(waiting_now),
+                                            "max_queued": int(_queue_pressure_limits()[0]),
+                                            "max_waiting_deps": int(_queue_pressure_limits()[1]),
+                                            "autonomous": bool(autonomous_non_manual),
+                                            "before_specs": int(before_pressure),
+                                            "kept_specs": int(len(specs)),
+                                            "deferred_specs": int(max(0, before_pressure - len(specs))),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
+                        if (not specs) and autonomous_non_manual and proactive_cli_promotion:
+                            objective_snippet = str(task.input_text or "").strip()
+                            if len(objective_snippet) > 240:
+                                objective_snippet = objective_snippet[:240] + "..."
+                            cli_reseed_key_base = f"proactive_cli_reseed_r{int(current_plan_revision) + 1}"
+                            cli_reseed_key = cli_reseed_key_base
+                            cli_reseed_validate_key = f"{cli_reseed_key_base}_qa"
+                            reseed_suffix = 1
+                            while cli_reseed_key in existing_keys or cli_reseed_validate_key in existing_keys:
+                                reseed_suffix += 1
+                                cli_reseed_key = f"{cli_reseed_key_base}_{reseed_suffix}"
+                                cli_reseed_validate_key = f"{cli_reseed_key}_qa"
+                            cli_reseed_specs = [
+                                TaskSpec(
+                                    key=cli_reseed_key,
+                                    role="backend",
+                                    text=(
+                                        f"Proactive CLI reseed for ticket {root_ticket}: previous local loop produced no runnable value; implement a higher-signal improvement with concrete evidence. "
+                                        f"Objective snapshot: {objective_snippet}"
+                                    ),
+                                    mode_hint="ro",
+                                    priority=1,
+                                    depends_on=[],
+                                    requires_approval=False,
+                                    acceptance_criteria=[
+                                        "Implement or materially advance one concrete improvement.",
+                                        "Produce evidence strong enough for QA or reviewer validation.",
+                                    ],
+                                    definition_of_done=[
+                                        "CLI reseed produced a verifiable improvement path instead of another empty local loop.",
+                                    ],
+                                    eta_minutes=60,
+                                    sla_tier="high",
+                                ),
+                                TaskSpec(
+                                    key=cli_reseed_validate_key,
+                                    role="qa",
+                                    text=(
+                                        f"Validate the proactive CLI reseed for ticket {root_ticket}: confirm the new change is real and regression-safe."
+                                    ),
+                                    mode_hint="ro",
+                                    priority=1,
+                                    depends_on=[cli_reseed_key],
+                                    requires_approval=False,
+                                    acceptance_criteria=[
+                                        "Return PASS/FAIL style validation with concrete findings.",
+                                        "Reference tests, logs, screenshots, or artifacts used for the verdict.",
+                                    ],
+                                    definition_of_done=[
+                                        "Validation verdict delivered for the CLI reseed path.",
+                                    ],
+                                    eta_minutes=45,
+                                    sla_tier="high",
+                                ),
+                            ]
+                            specs = _apply_ceo_cli_first_policy(
+                                specs=cli_reseed_specs,
+                                force_cli_takeover=True,
+                            )
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.proactive_cli_reseeded",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "reseed_key": cli_reseed_key,
+                                        "seeded_specs": int(len(specs)),
+                                        "reason": "post_filter_empty_specs",
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        elif (not specs) and autonomous_non_manual and enforce_local_only:
+                            try:
+                                live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
+                            except Exception:
+                                live_local_children = list(existing_subtasks or [])
+                            if _has_open_local_support_work(live_local_children):
+                                specs = []
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="delegation.proactive_local_reseed_suppressed",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "reason": "open_local_support_work",
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                objective_snippet = str(task.input_text or "").strip()
+                                if len(objective_snippet) > 240:
+                                    objective_snippet = objective_snippet[:240] + "..."
+                                reseed_key_base = f"proactive_local_reseed_r{int(current_plan_revision) + 1}"
+                                reseed_key = reseed_key_base
+                                reseed_suffix = 1
+                                while reseed_key in existing_keys:
+                                    reseed_suffix += 1
+                                    reseed_key = f"{reseed_key_base}_{reseed_suffix}"
+                                reseed_specs = [
+                                    TaskSpec(
+                                        key=reseed_key,
+                                        role="backend",
+                                        text=(
+                                            f"Proactive local reseed for ticket {root_ticket}: previous plan produced no runnable subtasks; derive a new local approach with concrete, evidence-oriented actions. "
+                                            f"Objective snapshot: {objective_snippet}"
+                                        ),
+                                        mode_hint="ro",
+                                        priority=2,
+                                        depends_on=[],
+                                        requires_approval=False,
+                                        acceptance_criteria=[
+                                            "Define at least one new concrete, testable approach.",
+                                            "Produce verifiable evidence path for reviewer validation.",
+                                        ],
+                                        definition_of_done=[
+                                            "New local approach is actionable and avoids prior empty-plan outcome.",
+                                        ],
+                                        eta_minutes=45,
+                                        sla_tier="high",
+                                    )
+                                ]
+                                specs = _apply_autonomous_local_first_policy(
+                                    specs=reseed_specs,
+                                    orch_q=orch_q,
+                                    root_ticket=root_ticket,
+                                    now=time.time(),
+                                )
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="delegation.proactive_local_reseeded",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "reseed_key": reseed_key,
+                                            "seeded_specs": int(len(specs)),
+                                            "reason": "post_filter_empty_specs",
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
                         if specs:
                             next_plan_revision = max(1, current_plan_revision + 1)
-                            # CEO orders should always pass through a QA gate before wrap-up.
-                            # If Jarvis did not include QA explicitly, inject one depending on all delegated keys.
-                            if is_top_level_manual:
+                            # Quality gate:
+                            # - Mandatory for manual CEO tickets (before wrap-up).
+                            # - Also mandatory for autonomous/proactive lanes so improvements iterate with evidence.
+                            quality_gate_required = bool(is_top_level_manual)
+                            if (not quality_gate_required) and autonomous_non_manual:
+                                # Autonomous lane stays local-first by default; no automatic QA delegation.
+                                quality_gate_required = False
+                            if quality_gate_required:
                                 has_qa = any(str(s.role).strip().lower() == "qa" for s in specs)
                                 needs_qa = any(
                                     str(s.role).strip().lower()
-                                    in ("frontend", "backend", "security", "research", "release_mgr", "product_ops", "sre")
+                                    in ("frontend", "backend", "security", "research", "release_mgr", "product_ops", "sre", "architect_local", "implementer_local", "reviewer_local")
                                     for s in specs
                                 )
                                 if needs_qa and (not has_qa):
@@ -10003,7 +18824,8 @@ def orchestrator_worker_loop(
                                         suffix += 1
                                     qa_text = (
                                         f"QA gate for ticket {root_ticket}: validate delegated deliverables, run targeted tests, "
-                                        "and report PASS/FAIL with evidence and residual risks."
+                                        "and report PASS/FAIL with evidence and residual risks. "
+                                        "For UI/mobile deliverables include emulator/browser validation with screenshots."
                                     )
                                     if len(specs) >= 12:
                                         specs = specs[:11]
@@ -10019,6 +18841,7 @@ def orchestrator_worker_loop(
                                             acceptance_criteria=[
                                                 "Validate delegated deliverables against acceptance criteria.",
                                                 "Run targeted tests and report PASS/FAIL with evidence.",
+                                                "For UI/mobile scope include screenshot-backed validation.",
                                             ],
                                             definition_of_done=[
                                                 "QA verdict published with residual risks and next action.",
@@ -10031,21 +18854,62 @@ def orchestrator_worker_loop(
                                 _normalize_task_spec_contract(s, root_ticket=root_ticket)
                                 for s in specs
                             ]
+                            if autonomous_non_manual and enforce_local_only:
+                                try:
+                                    live_existing_subtasks = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
+                                except Exception:
+                                    live_existing_subtasks = list(existing_subtasks or [])
+                                before_local_backlog_gate = len(specs)
+                                specs = _prune_local_specs_against_active_backlog(
+                                    specs=specs,
+                                    existing_children=live_existing_subtasks,
+                                )
+                                if len(specs) < before_local_backlog_gate:
+                                    try:
+                                        orch_q.append_audit_event(
+                                            event_type="delegation.local_backlog_gate",
+                                            actor=controller_actor,
+                                            details={
+                                                "order_id": root_ticket,
+                                                "before_specs": int(before_local_backlog_gate),
+                                                "kept_specs": int(len(specs)),
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
 
                     if specs:
                         key_to_job: dict[str, str] = {s.key: str(uuid.uuid4()) for s in specs}
                         children: list[Task] = []
                         for spec in specs:
-                            child_role = _coerce_orchestrator_role(spec.role)
+                            requested_role = _coerce_orchestrator_role(spec.role)
+                            child_role = requested_role
+                            remapped_from_role: str | None = None
+                            if enforce_local_only and child_role not in _LOCAL_OLLAMA_ROLE_NAMES:
+                                remapped_from_role = child_role
+                                if child_role in {"backend", "frontend", "sre", "product_ops", "release_mgr"}:
+                                    child_role = "implementer_local"
+                                elif child_role in {"qa", "security"}:
+                                    child_role = "reviewer_local"
+                                else:
+                                    child_role = "architect_local"
                             child_profile = _orchestrator_profile(profiles, child_role)
                             model = _orchestrator_model_for_profile(cfg, child_profile)
                             effort = _orchestrator_effort_for_profile(child_profile, cfg)
                             mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+                            if child_role == "implementer_local" and mode_hint == "ro":
+                                mode_hint = "rw"
                             requires_approval = bool(
                                 spec.requires_approval
                                 or bool(child_profile.get("approval_required", False))
                                 or mode_hint == "full"
                             )
+                            # Autonomous/proactive lanes must not stop on manual approval gates.
+                            # If elevated access is needed, host sandbox policy still governs execution.
+                            if autonomous_non_manual:
+                                requires_approval = False
+                            if _effective_bypass_sandbox(cfg, chat_id=int(task.chat_id)):
+                                requires_approval = False
                             deps = [key_to_job[k] for k in spec.depends_on if k in key_to_job]
                             contract_text = _compose_subtask_instruction(spec, root_ticket=root_ticket)
                             ttl_seconds = _ttl_seconds_from_spec(spec)
@@ -10053,6 +18917,7 @@ def orchestrator_worker_loop(
                                 "source": "telegram",
                                 "delegated_by": task.job_id,
                                 "delegated_key": spec.key,
+                                "requested_role": requested_role,
                                 "profile_name": str(child_profile.get("name") or child_role),
                                 "profile_role": child_role,
                                 "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
@@ -10061,8 +18926,33 @@ def orchestrator_worker_loop(
                                 "eta_minutes": int(spec.eta_minutes or 0),
                                 "sla_tier": str(spec.sla_tier or "normal"),
                             }
+                            max_retries = 2
+                            if child_role == "implementer_local":
+                                max_retries = 1
+                            elif child_role in {"architect_local", "reviewer_local"}:
+                                max_retries = 0
+                            if child_role in {"architect_local", "implementer_local", "reviewer_local"}:
+                                root_prefix = _sanitize_slice_token(str(root_ticket or "")[:8], fallback="slice")
+                                delegated_slice = _slice_id_from_local_key(str(spec.key or ""), fallback=f"{root_prefix}_slice")
+                                attempt_n = _next_slice_attempt_n(
+                                    root_ticket=root_ticket,
+                                    slice_id=delegated_slice,
+                                    existing_tasks=list(existing_subtasks or []) + list(children),
+                                )
+                                trace["slice_id"] = delegated_slice
+                                trace["slice_status"] = "planned"
+                                trace["quality_gate_status"] = "planned"
+                                trace["failure_class"] = "retriable"
+                                trace["attempt_n"] = int(attempt_n)
+                                trace["improvement_verified"] = False
+                                if str(spec.key or "").strip().lower().startswith("local_arch_blocker_"):
+                                    trace["loop_breaker_triggered"] = True
+                            if remapped_from_role:
+                                trace["local_only_role_remap_from"] = remapped_from_role
                             if order_branch_for_root:
                                 trace["order_branch"] = str(order_branch_for_root)
+                            if enforce_local_only:
+                                trace["execution_policy"] = "local_only"
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
@@ -10080,6 +18970,7 @@ def orchestrator_worker_loop(
                                 parent_job_id=root_ticket,
                                 depends_on=deps,
                                 ttl_seconds=int(ttl_seconds),
+                                max_retries=int(max_retries),
                                 labels={"ticket": root_ticket, "kind": "subtask", "key": spec.key},
                                 artifacts_dir=str((cfg.artifacts_root / key_to_job[spec.key]).resolve()),
                                 trace=trace,
@@ -10136,7 +19027,7 @@ def orchestrator_worker_loop(
                                 if next_plan_revision > current_plan_revision:
                                     orch_q.append_audit_event(
                                         event_type="plan.revised",
-                                        actor="jarvis",
+                                        actor=controller_actor,
                                         details={
                                             "order_id": root_ticket,
                                             "from_revision": int(current_plan_revision),
@@ -10150,10 +19041,21 @@ def orchestrator_worker_loop(
                     # Wrap-up is only scheduled for manual top-level tickets (avoid autopilot spam).
                     if is_top_level_manual:
                         wrapup_deps: list[str] = []
+                        local_support_roles = {"architect_local", "implementer_local", "reviewer_local"}
                         if existing_subtasks:
-                            wrapup_deps.extend([c.job_id for c in existing_subtasks if c.job_id != task.job_id])
+                            for c in existing_subtasks:
+                                if not c.job_id or c.job_id == task.job_id:
+                                    continue
+                                if _coerce_orchestrator_role(str(c.role or "")) in local_support_roles:
+                                    continue
+                                wrapup_deps.append(str(c.job_id))
                         if specs:
-                            wrapup_deps.extend([str(v) for v in key_to_job.values()])
+                            for s in specs:
+                                if _coerce_orchestrator_role(str(s.role or "")) in local_support_roles:
+                                    continue
+                                jid = str(key_to_job.get(s.key) or "").strip()
+                                if jid:
+                                    wrapup_deps.append(jid)
                         wrapup_deps = [d for d in wrapup_deps if d and d != task.job_id]
                         if wrapup_deps and not existing_wrapup:
                             orch_profile = _orchestrator_profile(profiles, "jarvis")
@@ -10211,10 +19113,38 @@ def orchestrator_worker_loop(
                         pass
             except Exception:
                 LOG.exception("Failed to delegate orchestrator subtasks. job=%s", task.job_id)
+            try:
+                _maybe_enqueue_delivery_replan(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    profiles=profiles,
+                    task=task,
+                    orch_state=orch_state,
+                    summary=summary,
+                    structured_digest=structured_digest,
+                    now=time.time(),
+                )
+            except Exception:
+                LOG.exception("Failed to enqueue delivery recovery replan. job=%s", task.job_id)
         except Exception as e:
             LOG.exception("Orchestrator worker failed for task=%s", task.job_id)
             try:
+                root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
                 orch_q.update_state(task.job_id, "failed", error=str(e))
+                try:
+                    orch_q.append_trace_event(
+                        order_id=root_ticket,
+                        job_id=task.job_id,
+                        source_message_id=source_message_id,
+                        agent_run_id=agent_run_id,
+                        agent_role=str(task.role or "").strip().lower() or None,
+                        event_type="job.worker_exception",
+                        severity="critical",
+                        message=f"worker failed for job={task.job_id[:8]}",
+                        payload={"error": str(e)},
+                    )
+                except Exception:
+                    pass
                 _send_orchestrator_result(
                     api,
                     task,
@@ -11883,6 +20813,10 @@ def poll_loop(
                         "/rollback",
                         "/emergency_stop",
                         "/emergency_resume",
+                        "/pause_autonomy",
+                        "/pause_autonomia",
+                        "/resume_autonomy",
+                        "/resume_autonomia",
                         "/pause",
                         "/resume",
                         "/ticket",
@@ -11921,6 +20855,10 @@ def poll_loop(
                         "/approve ",
                         "/approve_merge ",
                         "/rollback ",
+                        "/pause_autonomy",
+                        "/pause_autonomia",
+                        "/resume_autonomy",
+                        "/resume_autonomia",
                         "/pause ",
                         "/resume ",
                         "/cancel ",
@@ -12327,6 +21265,37 @@ def _load_config() -> BotConfig:
     if orchestrator_notify_mode not in ("minimal", "verbose"):
         orchestrator_notify_mode = "minimal"
 
+    notify_scope = _normalize_notify_scope(os.environ.get("BOT_NOTIFY_SCOPE", "state_change"))
+    notify_dedupe_cooldown_seconds = int(os.environ.get("BOT_NOTIFY_DEDUPE_COOLDOWN_SECONDS", "600"))
+    if notify_dedupe_cooldown_seconds < 0:
+        notify_dedupe_cooldown_seconds = 0
+    notify_child_worker_completions = (
+        os.environ.get("BOT_NOTIFY_CHILD_WORKERS", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    proactive_lane_enabled = os.environ.get("BOT_PROACTIVE_LANE_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    proactive_lane_interval_seconds = int(os.environ.get("BOT_PROACTIVE_LANE_INTERVAL_SECONDS", str(24 * 60 * 60)))
+    if proactive_lane_interval_seconds < 300:
+        proactive_lane_interval_seconds = 300
+    proactive_lane_max_active_orders = int(os.environ.get("BOT_PROACTIVE_LANE_MAX_ACTIVE_ORDERS", "3"))
+    if proactive_lane_max_active_orders < 1:
+        proactive_lane_max_active_orders = 1
+    if proactive_lane_max_active_orders > 12:
+        proactive_lane_max_active_orders = 12
+    proactive_lane_max_global_queued = int(os.environ.get("BOT_PROACTIVE_LANE_MAX_GLOBAL_QUEUED", "14"))
+    if proactive_lane_max_global_queued < 2:
+        proactive_lane_max_global_queued = 2
+    proactive_lane_max_per_tick = int(os.environ.get("BOT_PROACTIVE_LANE_MAX_PER_TICK", "1"))
+    if proactive_lane_max_per_tick < 1:
+        proactive_lane_max_per_tick = 1
+    if proactive_lane_max_per_tick > 3:
+        proactive_lane_max_per_tick = 3
+    proactive_iteration_enabled = os.environ.get("BOT_PROACTIVE_ITERATION_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+    proactive_iteration_max_rounds = int(os.environ.get("BOT_PROACTIVE_ITERATION_MAX_ROUNDS", "2"))
+    if proactive_iteration_max_rounds < 0:
+        proactive_iteration_max_rounds = 0
+    if proactive_iteration_max_rounds > 6:
+        proactive_iteration_max_rounds = 6
+
     worktree_root = Path(
         os.environ.get(
             "BOT_WORKTREE_ROOT",
@@ -12431,7 +21400,7 @@ def _load_config() -> BotConfig:
 
     if codex_use_oss and not codex_oss_model:
         # Reasonable default for local coding tasks. Adjust to your hardware/preferences.
-        codex_oss_model = "qwen2.5-coder:7b"
+        codex_oss_model = "qwen3.5:latest"
     if not codex_use_oss:
         # Avoid accidentally passing a local model name to the OpenAI provider.
         codex_oss_model = ""
@@ -12510,6 +21479,16 @@ def _load_config() -> BotConfig:
         orchestrator_sessions_enabled=orchestrator_sessions_enabled,
         orchestrator_live_update_seconds=orchestrator_live_update_seconds,
         orchestrator_notify_mode=orchestrator_notify_mode,
+        notify_scope=notify_scope,
+        notify_dedupe_cooldown_seconds=notify_dedupe_cooldown_seconds,
+        notify_child_worker_completions=notify_child_worker_completions,
+        proactive_lane_enabled=proactive_lane_enabled,
+        proactive_lane_interval_seconds=proactive_lane_interval_seconds,
+        proactive_lane_max_active_orders=proactive_lane_max_active_orders,
+        proactive_lane_max_global_queued=proactive_lane_max_global_queued,
+        proactive_lane_max_per_tick=proactive_lane_max_per_tick,
+        proactive_iteration_enabled=proactive_iteration_enabled,
+        proactive_iteration_max_rounds=proactive_iteration_max_rounds,
         worktree_root=worktree_root,
         artifacts_root=artifacts_root,
         runbooks_enabled=runbooks_enabled,
@@ -12577,6 +21556,86 @@ def _drain_pending_updates(cfg: BotConfig, api: TelegramAPI) -> int:
     return offset
 
 
+def _normalize_notify_scope(raw: str | None) -> str:
+    v = str(raw or "").strip().lower()
+    if v in ("critical", "state_change", "digest_only"):
+        return v
+    return "state_change"
+
+
+def _effective_notify_scope(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
+    st = _get_state(cfg)
+    if chat_id is not None:
+        by_chat = st.get("notify_scope_by_chat")
+        if isinstance(by_chat, dict):
+            rec = by_chat.get(str(int(chat_id)))
+            if isinstance(rec, str) and rec.strip():
+                return _normalize_notify_scope(rec)
+    global_scope = st.get("notify_scope")
+    if isinstance(global_scope, str) and global_scope.strip():
+        return _normalize_notify_scope(global_scope)
+    return _normalize_notify_scope(getattr(cfg, "notify_scope", "state_change"))
+
+
+def _set_notify_scope(cfg: "BotConfig", scope: str, *, chat_id: int | None = None) -> None:
+    normalized = _normalize_notify_scope(scope)
+
+    def _m(st: dict[str, Any]) -> None:
+        if chat_id is None:
+            st["notify_scope"] = normalized
+            return
+        by_chat = st.get("notify_scope_by_chat")
+        if not isinstance(by_chat, dict):
+            by_chat = {}
+        by_chat[str(int(chat_id))] = normalized
+        st["notify_scope_by_chat"] = by_chat
+
+    _update_state(cfg, _m)
+
+
+def _notification_dedupe_allow(cfg: "BotConfig", *, key: str, cooldown_seconds: int) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return True
+    now = float(time.time())
+    cooldown = max(0, int(cooldown_seconds or 0))
+    allowed = True
+
+    def _m(st: dict[str, Any]) -> None:
+        nonlocal allowed
+        raw = st.get("notify_dedupe")
+        dedupe = dict(raw) if isinstance(raw, dict) else {}
+
+        # prune old entries to keep state compact
+        if dedupe:
+            cutoff = now - max(300.0, float(cooldown) * 2.0)
+            for dk in list(dedupe.keys()):
+                try:
+                    ts = float(dedupe.get(dk) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts <= cutoff:
+                    dedupe.pop(dk, None)
+
+        last = dedupe.get(k)
+        try:
+            last_ts = float(last)
+        except Exception:
+            last_ts = 0.0
+
+        if cooldown > 0 and last_ts > 0 and (now - last_ts) < float(cooldown):
+            allowed = False
+            st["notify_dedupe"] = dedupe
+            return
+
+        dedupe[k] = now
+        st["notify_dedupe"] = dedupe
+        allowed = True
+
+    _update_state(cfg, _m)
+    return bool(allowed)
+
+
 def _configured_notify_chat_id(cfg: BotConfig) -> int | None:
     if cfg.notify_chat_id is not None:
         return cfg.notify_chat_id
@@ -12588,6 +21647,276 @@ def _configured_notify_chat_id(cfg: BotConfig) -> int | None:
         return int(raw)
     except Exception:
         return None
+
+
+def _proactive_health_alerts_enabled() -> bool:
+    raw = os.environ.get("BOT_PROACTIVE_HEALTH_ALERTS_ENABLED", "1")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _proactive_health_alert_cooldown_seconds() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_HEALTH_ALERT_COOLDOWN_SECONDS", "1800"))
+    except Exception:
+        value = 1800
+    return max(60, min(24 * 3600, int(value)))
+
+
+def _proactive_health_report_stale_seconds() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_HEALTH_REPORT_STALE_SECONDS", "900"))
+    except Exception:
+        value = 900
+    return max(300, min(24 * 3600, int(value)))
+
+
+def _proactive_health_signal(cfg: "BotConfig", *, now: float) -> dict[str, Any]:
+    report_path = cfg.artifacts_root / "proactive_health" / "latest.json"
+    signal: dict[str, Any] = {
+        "report_path": str(report_path),
+        "report_found": False,
+        "report_age_s": None,
+        "stale_report": True,
+        "status": "CRITICAL",
+        "operational_status": "CRITICAL",
+        "trend_status": "OK",
+        "anomalies": [{"type": "missing_report"}],
+        "trend_flags": [],
+        "orders": [],
+        "autonomy_funnel": {},
+        "signature": "missing_report",
+        "alert_level": "CRITICAL",
+        "alert_active": True,
+        "summary_reason": "missing_report",
+    }
+    if not report_path.exists():
+        return signal
+
+    raw = _read_json(report_path)
+    report = dict(raw) if isinstance(raw, dict) else {}
+    try:
+        report_ts = float(report.get("ts") or 0.0)
+    except Exception:
+        report_ts = 0.0
+    report_age_s = max(0, int(now - report_ts)) if report_ts > 0 else None
+    stale_after_s = _proactive_health_report_stale_seconds()
+    stale_report = bool(report_age_s is None or report_age_s >= stale_after_s)
+    operational_status = str(report.get("operational_status") or report.get("status") or "OK").strip().upper() or "OK"
+    trend_status = str(report.get("trend_status") or "OK").strip().upper() or "OK"
+    anomalies_raw = report.get("anomalies")
+    anomalies = list(anomalies_raw) if isinstance(anomalies_raw, list) else []
+    trend_flags_raw = report.get("trend_flags")
+    trend_flags = list(trend_flags_raw) if isinstance(trend_flags_raw, list) else []
+    orders_raw = report.get("orders")
+    orders = list(orders_raw) if isinstance(orders_raw, list) else []
+    funnel_raw = report.get("autonomy_funnel")
+    autonomy_funnel = dict(funnel_raw) if isinstance(funnel_raw, dict) else {}
+
+    if stale_report:
+        alert_level = "CRITICAL"
+        summary_reason = "stale_report"
+    elif operational_status in ("CRITICAL", "WARN") and anomalies:
+        alert_level = operational_status
+        summary_reason = ",".join(
+            sorted({str(item.get("type") or "unknown") for item in anomalies if isinstance(item, dict)})
+        ) or operational_status.lower()
+    else:
+        alert_level = "OK"
+        summary_reason = "healthy"
+
+    signature_payload = {
+        "reason": summary_reason,
+        "operational_status": operational_status,
+        "anomalies": [
+            {
+                "type": str(item.get("type") or "unknown"),
+                "order_id": str(item.get("order_id") or ""),
+            }
+            for item in anomalies
+            if isinstance(item, dict)
+        ],
+    }
+    try:
+        signature = json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        signature = summary_reason
+
+    return {
+        "report_path": str(report_path),
+        "report_found": True,
+        "report_age_s": report_age_s,
+        "stale_report": stale_report,
+        "status": str(report.get("status") or operational_status).strip().upper() or operational_status,
+        "operational_status": operational_status,
+        "trend_status": trend_status,
+        "anomalies": anomalies,
+        "trend_flags": trend_flags,
+        "orders": orders,
+        "autonomy_funnel": autonomy_funnel,
+        "signature": signature,
+        "alert_level": alert_level,
+        "alert_active": alert_level in ("WARN", "CRITICAL"),
+        "summary_reason": summary_reason,
+    }
+
+
+def _proactive_health_alert_text(signal: dict[str, Any]) -> str:
+    level = str(signal.get("alert_level") or "CRITICAL").upper()
+    lines = [
+        f"PonceBot proactive health alert: {level}",
+    ]
+    if bool(signal.get("stale_report")):
+        lines.append("Reason: health report is missing or stale.")
+    else:
+        lines.append(f"Reason: {str(signal.get('summary_reason') or '').strip() or 'operational anomaly'}")
+    report_age_s = signal.get("report_age_s")
+    if report_age_s is not None:
+        lines.append(f"Report age: {int(report_age_s)}s")
+    lines.append(f"Operational status: {signal.get('operational_status')}")
+    lines.append(f"Trend status: {signal.get('trend_status')}")
+    funnel = signal.get("autonomy_funnel") if isinstance(signal.get("autonomy_funnel"), dict) else {}
+    if funnel:
+        lines.append(
+            "Funnel: "
+            f"started={int(funnel.get('slices_started', 0) or 0)} "
+            f"validated={int(funnel.get('slices_validated', 0) or 0)} "
+            f"closed={int(funnel.get('slices_closed', 0) or 0)} "
+            f"fail_rate={float(funnel.get('implementer_fail_rate', 0.0) or 0.0):.2%}"
+        )
+
+    anomalies = [item for item in (signal.get("anomalies") or []) if isinstance(item, dict)]
+    if anomalies:
+        lines.append("Anomalies:")
+        for item in anomalies[:4]:
+            order_id = str(item.get("order_id") or "").strip()
+            details = [str(item.get("type") or "unknown")]
+            if order_id:
+                details.append(order_id[:8])
+            if item.get("open_jobs") is not None:
+                details.append(f"open={item.get('open_jobs')}")
+            if item.get("phase"):
+                details.append(f"phase={item.get('phase')}")
+            lines.append(f"- {' '.join(details)}")
+
+    orders = [item for item in (signal.get("orders") or []) if isinstance(item, dict)]
+    if orders:
+        lines.append("Orders:")
+        for item in orders[:3]:
+            funnel = item.get("autonomy_funnel") if isinstance(item.get("autonomy_funnel"), dict) else {}
+            lines.append(
+                "- "
+                f"{str(item.get('order_id') or '')[:8]} "
+                f"phase={item.get('phase')} "
+                f"mode={item.get('mode')} "
+                f"open={item.get('open_jobs')} "
+                f"gate={item.get('quality_gate_status') or funnel.get('quality_gate_status') or 'planned'} "
+                f"quality={item.get('meaningful_improvement_seen')} "
+                f"closed={int(funnel.get('slices_closed', 0) or 0)}"
+            )
+
+    trend_flags = [item for item in (signal.get("trend_flags") or []) if isinstance(item, dict)]
+    if trend_flags:
+        trend_bits = [f"{str(item.get('type') or 'flag')}={item.get('count')}" for item in trend_flags[:4]]
+        lines.append("Trend flags: " + ", ".join(trend_bits))
+    return "\n".join(lines)
+
+
+def _proactive_health_recovery_text(signal: dict[str, Any]) -> str:
+    lines = [
+        "PonceBot proactive health recovered to OK.",
+        f"Operational status: {signal.get('operational_status')}",
+        f"Trend status: {signal.get('trend_status')}",
+    ]
+    funnel = signal.get("autonomy_funnel") if isinstance(signal.get("autonomy_funnel"), dict) else {}
+    if funnel:
+        lines.append(
+            "Funnel: "
+            f"started={int(funnel.get('slices_started', 0) or 0)} "
+            f"validated={int(funnel.get('slices_validated', 0) or 0)} "
+            f"closed={int(funnel.get('slices_closed', 0) or 0)} "
+            f"fail_rate={float(funnel.get('implementer_fail_rate', 0.0) or 0.0):.2%}"
+        )
+    orders = [item for item in (signal.get("orders") or []) if isinstance(item, dict)]
+    if orders:
+        lines.append("Orders:")
+        for item in orders[:3]:
+            funnel = item.get("autonomy_funnel") if isinstance(item.get("autonomy_funnel"), dict) else {}
+            lines.append(
+                "- "
+                f"{str(item.get('order_id') or '')[:8]} "
+                f"phase={item.get('phase')} "
+                f"mode={item.get('mode')} "
+                f"open={item.get('open_jobs')} "
+                f"gate={item.get('quality_gate_status') or funnel.get('quality_gate_status') or 'planned'} "
+                f"quality={item.get('meaningful_improvement_seen')} "
+                f"closed={int(funnel.get('slices_closed', 0) or 0)}"
+            )
+    trend_flags = [item for item in (signal.get("trend_flags") or []) if isinstance(item, dict)]
+    if trend_flags:
+        trend_bits = [f"{str(item.get('type') or 'flag')}={item.get('count')}" for item in trend_flags[:4]]
+        lines.append("Trend flags remain: " + ", ".join(trend_bits))
+    return "\n".join(lines)
+
+
+def _proactive_health_notify_tick(
+    *,
+    cfg: "BotConfig",
+    api: TelegramAPI,
+    notify_chat_id: int,
+    now: float,
+) -> None:
+    if not _proactive_health_alerts_enabled():
+        return
+
+    signal = _proactive_health_signal(cfg, now=float(now))
+    state = _get_state(cfg)
+    rec_raw = state.get("proactive_health_notify")
+    rec = dict(rec_raw) if isinstance(rec_raw, dict) else {}
+    prev_active = bool(rec.get("active", False))
+    prev_signature = str(rec.get("signature") or "").strip()
+    prev_level = str(rec.get("level") or "").strip().upper()
+    try:
+        prev_sent_at = float(rec.get("last_sent_at") or 0.0)
+    except Exception:
+        prev_sent_at = 0.0
+    cooldown_s = float(_proactive_health_alert_cooldown_seconds())
+
+    next_rec = {
+        "active": bool(signal.get("alert_active")),
+        "signature": str(signal.get("signature") or ""),
+        "level": str(signal.get("alert_level") or "OK").upper(),
+        "last_seen_at": float(now),
+        "last_report_age_s": signal.get("report_age_s"),
+        "summary_reason": str(signal.get("summary_reason") or ""),
+        "report_path": str(signal.get("report_path") or ""),
+        "last_sent_at": prev_sent_at,
+    }
+
+    text: str | None = None
+    if bool(signal.get("alert_active")):
+        changed = (not prev_active) or prev_signature != next_rec["signature"] or prev_level != next_rec["level"]
+        reminder_due = (
+            next_rec["level"] == "CRITICAL"
+            and prev_active
+            and prev_signature == next_rec["signature"]
+            and prev_level == next_rec["level"]
+            and prev_sent_at > 0
+            and (float(now) - prev_sent_at) >= cooldown_s
+        )
+        if changed or reminder_due:
+            text = _proactive_health_alert_text(signal)
+            next_rec["last_sent_at"] = float(now)
+    elif prev_active:
+        text = _proactive_health_recovery_text(signal)
+        next_rec["last_sent_at"] = float(now)
+
+    if text:
+        api.send_message(int(notify_chat_id), text)
+
+    def _m(st: dict[str, Any]) -> None:
+        st["proactive_health_notify"] = next_rec
+
+    _update_state(cfg, _m)
 
 
 def _migrate_state_schema(cfg: BotConfig) -> None:
@@ -12720,6 +22049,7 @@ def main() -> None:
                     max_sse = int(os.environ.get("BOT_STATUS_HTTP_MAX_SSE_PER_IP", "2"))
                 except Exception:
                     max_sse = 2
+                legacy_auth = os.environ.get("BOT_STATUS_HTTP_LEGACY_AUTH", "0").strip().lower() in ("1", "true", "yes", "on")
                 http_srv = start_status_http_server(
                     host=host,
                     port=port,
@@ -12727,6 +22057,7 @@ def main() -> None:
                     stream_interval_s=interval_s,
                     auth_token=auth_token,
                     allowed_origins=allowed_origins,
+                    allow_query_token=legacy_auth,
                     snapshot_rate_per_s=snap_rps,
                     snapshot_burst=snap_burst,
                     max_sse_per_ip=max_sse,
@@ -12759,6 +22090,11 @@ def main() -> None:
                 if orchestrator_queue is None or notify_chat_id is None:
                     return
                 try:
+                    if _has_active_ceo_orders(orch_q=orchestrator_queue, chat_id=int(notify_chat_id)):
+                        return
+                except Exception:
+                    pass
+                try:
                     api.send_message(notify_chat_id, _orchestrator_daily_digest_text(orchestrator_queue))
                 except Exception:
                     LOG.exception("Failed to send scheduled orchestrator digest")
@@ -12766,6 +22102,26 @@ def main() -> None:
             orchestrator_scheduler = OrchestratorScheduler(interval_seconds=cfg.orchestrator_daily_digest_seconds, enabled=True)
             orchestrator_scheduler.add_tick(_send_orchestrator_digest)
             orchestrator_scheduler.start()
+
+        if _configured_notify_chat_id(cfg):
+            proactive_health_chat_id = _configured_notify_chat_id(cfg)
+
+            def _send_proactive_health_alerts() -> None:
+                if proactive_health_chat_id is None:
+                    return
+                try:
+                    _proactive_health_notify_tick(
+                        cfg=cfg,
+                        api=api,
+                        notify_chat_id=int(proactive_health_chat_id),
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Failed to send proactive health alerts")
+
+            proactive_health_scheduler = OrchestratorScheduler(interval_seconds=60, enabled=True)
+            proactive_health_scheduler.add_tick(_send_proactive_health_alerts)
+            proactive_health_scheduler.start(name="proactive-health-alerts")
 
         # Runbooks scheduler: enqueues autonomous tasks periodically to the notify chat.
         if cfg.runbooks_enabled:
@@ -12781,6 +22137,30 @@ def main() -> None:
                 except Exception:
                     pass
 
+                try:
+                    _collapse_redundant_orders_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Redundant orders collapse tick failed")
+                try:
+                    _drain_backlog_tick(
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Backlog drain tick failed")
+                try:
+                    _blocked_pressure_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Blocked pressure tick failed")
                 try:
                     _stalled_replan_tick(
                         cfg=cfg,
@@ -12803,6 +22183,52 @@ def main() -> None:
                     _cleanup_stale_blocked_jobs(orch_q=orchestrator_queue, now=time.time())
                 except Exception:
                     LOG.exception("Hygiene stale cleanup tick failed")
+                try:
+                    _cleanup_proactive_local_waiting_jobs(
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Proactive local cleanup tick failed")
+                try:
+                    _running_watchdog_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Running watchdog tick failed")
+                try:
+                    _jarvis_final_sweep_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Jarvis final sweep tick failed")
+                try:
+                    _auto_merge_ready_orders_tick(
+                        cfg=cfg,
+                        api=api,
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Auto-merge ready-orders tick failed")
+
+                if notify_chat_id is not None:
+                    try:
+                        _proactive_lane_tick(
+                            cfg=cfg,
+                            orch_q=orchestrator_queue,
+                            profiles=orchestrator_profiles,
+                            chat_id=int(notify_chat_id),
+                            now=time.time(),
+                        )
+                    except Exception:
+                        LOG.exception("Proactive lane tick failed")
 
                 if notify_chat_id is None:
                     return
@@ -12822,7 +22248,7 @@ def main() -> None:
                             runbook_id=rb.runbook_id,
                             role=rb.role,
                             interval_seconds=rb.interval_seconds,
-                            prompt=_render_placeholders_text(rb.prompt, ceo_name=cfg.ceo_name),
+                            prompt=_render_placeholders_text(rb.prompt, ceo_name=cfg.ceo_name),
                             mode_hint=rb.mode_hint,
                             priority=rb.priority,
                             enabled=rb.enabled,
@@ -12832,10 +22258,17 @@ def main() -> None:
                 except Exception:
                     pass
                 now = time.time()
+                has_active_ceo_order = False
+                try:
+                    has_active_ceo_order = _has_active_ceo_orders(orch_q=orchestrator_queue, chat_id=int(notify_chat_id))
+                except Exception:
+                    has_active_ceo_order = False
                 for rb in rbs:
                     try:
                         last = orchestrator_queue.get_runbook_last_run(runbook_id=rb.runbook_id)
                         if not runbook_due(rb, last_run_at=last, now=now):
+                            continue
+                        if has_active_ceo_order and rb.runbook_id == "jarvis_digest":
                             continue
                         # Autopilot is implemented in-process so it can read persisted orders and current queue state.
                         if rb.runbook_id == "jarvis_autopilot":
@@ -12859,6 +22292,8 @@ def main() -> None:
                             rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
                             rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
                             rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (t.mode_hint == "full")
+                            if _effective_bypass_sandbox(cfg, chat_id=int(notify_chat_id)):
+                                rb_requires_approval = False
                             rb_trace = dict(t.trace)
                             rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
                             rb_trace["profile_role"] = rb_role
@@ -12931,6 +22366,7 @@ def main() -> None:
         if target:
             try:
                 api.send_message(int(target), "Poncebot is online.")
+                LOG.info("Startup notification sent to chat_id=%s", int(target))
             except Exception:
                 LOG.exception("Failed to send startup notification")
 

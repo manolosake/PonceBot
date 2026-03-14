@@ -263,6 +263,25 @@ class OrchestratorQueue:
     def hard_reset_bootstrap(self, *, reason: str = "hard_reset_bootstrap") -> dict[str, int]:
         return self._storage.hard_reset_bootstrap(reason=reason)
 
+    def stop_all_global(
+        self,
+        *,
+        reason: str = "ceo_stop_all",
+        actor: str = "jarvis",
+        chat_id: int | None = None,
+        close_orders: bool = True,
+        close_projects: bool = True,
+        clear_workspace_leases: bool = True,
+    ) -> dict[str, int]:
+        return self._storage.stop_all_global(
+            reason=reason,
+            actor=actor,
+            chat_id=chat_id,
+            close_orders=close_orders,
+            close_projects=close_projects,
+            clear_workspace_leases=clear_workspace_leases,
+        )
+
     # Cached status snapshots (dashboard support).
     def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:
         return self._storage.get_status_cache(cache_key)
@@ -351,6 +370,51 @@ class OrchestratorQueue:
     ) -> list[dict[str, Any]]:
         return self._storage.list_worker_activity(role=role, since_ts=since_ts, limit=limit)
 
+    def append_trace_event(
+        self,
+        *,
+        ts: float | None = None,
+        order_id: str | None = None,
+        job_id: str | None = None,
+        source_message_id: int | None = None,
+        agent_run_id: str | None = None,
+        artifact_id: str | None = None,
+        agent_role: str | None = None,
+        event_type: str,
+        severity: str = "info",
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+        cause_event_id: str | None = None,
+        event_id: str | None = None,
+    ) -> str:
+        return self._storage.append_trace_event(
+            ts=ts,
+            order_id=order_id,
+            job_id=job_id,
+            source_message_id=source_message_id,
+            agent_run_id=agent_run_id,
+            artifact_id=artifact_id,
+            agent_role=agent_role,
+            event_type=event_type,
+            severity=severity,
+            message=message,
+            payload=payload,
+            cause_event_id=cause_event_id,
+            event_id=event_id,
+        )
+
+    def list_trace_events(
+        self,
+        *,
+        order_id: str | None = None,
+        job_id: str | None = None,
+        limit: int = 400,
+    ) -> list[dict[str, Any]]:
+        return self._storage.list_trace_events(order_id=order_id, job_id=job_id, limit=limit)
+
+    def trace_noise_summary(self, *, window_seconds: int = 3600) -> dict[str, Any]:
+        return self._storage.trace_noise_summary(window_seconds=window_seconds)
+
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
             "jarvis": 1,
@@ -362,6 +426,9 @@ class OrchestratorQueue:
             "security": 1,
             "research": 1,
             "release_mgr": 1,
+            "architect_local": 1,
+            "implementer_local": 1,
+            "reviewer_local": 1,
         }
         for key, cfg in self._profiles.items():
             role = cfg.get("role") or key

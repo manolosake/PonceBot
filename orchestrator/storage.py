@@ -335,10 +335,30 @@ class SQLiteTaskStorage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trace_events (
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    order_id TEXT,
+                    job_id TEXT,
+                    source_message_id INTEGER,
+                    agent_run_id TEXT,
+                    artifact_id TEXT,
+                    agent_role TEXT,
+                    event_type TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'info',
+                    message TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    cause_event_id TEXT
+                )
+                """
+            )
 
             # Backward-compatible migration for older DBs that may exist in the field.
             self._migrate_jobs_table(conn)
             self._migrate_orders_table(conn)
+            self._migrate_trace_events_table(conn)
             self._migrate_roles(conn)
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state_due ON jobs(state, due_at)")
@@ -356,6 +376,12 @@ class SQLiteTaskStorage:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_decision_log_order_ts ON decision_log(order_id, ts DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_delegation_log_root_ts ON delegation_log(root_ticket_id, ts DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_activity_role_ts ON worker_activity(role, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_order_ts ON trace_events(order_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_job_ts ON trace_events(job_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_source_msg_ts ON trace_events(source_message_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_agent_run_ts ON trace_events(agent_run_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_artifact_ts ON trace_events(artifact_id, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_events_event_ts ON trace_events(event_type, ts DESC)")
             conn.commit()
 
     def _migrate_roles(self, conn: sqlite3.Connection) -> None:
@@ -444,6 +470,17 @@ class SQLiteTaskStorage:
         for col, ddl in required_cols.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE ceo_orders ADD COLUMN {col} {ddl}")
+
+    def _migrate_trace_events_table(self, conn: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(trace_events)").fetchall()}
+        required_cols = {
+            "source_message_id": "INTEGER",
+            "agent_run_id": "TEXT",
+            "artifact_id": "TEXT",
+        }
+        for col, ddl in required_cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE trace_events ADD COLUMN {col} {ddl}")
 
     def submit_task(self, task: Task) -> str:
         with self._lock:
@@ -860,6 +897,214 @@ class SQLiteTaskStorage:
                 )
             return out
 
+    def append_trace_event(
+        self,
+        *,
+        ts: float | None = None,
+        order_id: str | None = None,
+        job_id: str | None = None,
+        source_message_id: int | None = None,
+        agent_run_id: str | None = None,
+        artifact_id: str | None = None,
+        agent_role: str | None = None,
+        event_type: str,
+        severity: str = "info",
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+        cause_event_id: str | None = None,
+        event_id: str | None = None,
+    ) -> str:
+        et = (event_type or "").strip() or "event"
+        sev = (severity or "").strip().lower() or "info"
+        if sev not in ("debug", "info", "warn", "error", "critical"):
+            sev = "info"
+        msg = (message or "").strip()
+        if len(msg) > 8000:
+            msg = msg[:8000] + "..."
+        eid = (str(event_id or "").strip() or str(uuid.uuid4()))
+        now = float(ts if ts is not None else time.time())
+        oid = (str(order_id or "").strip() or None)
+        jid = (str(job_id or "").strip() or None)
+        source_msg_id: int | None = None
+        if source_message_id is not None:
+            try:
+                source_msg_id = int(source_message_id)
+            except Exception:
+                source_msg_id = None
+        run_id = (str(agent_run_id or "").strip() or None)
+        art_id = (str(artifact_id or "").strip() or None)
+        role = (str(agent_role or "").strip().lower() or None)
+        cause = (str(cause_event_id or "").strip() or None)
+        det = payload or {}
+
+        with self._lock:
+            with self._conn() as conn:
+                self._append_trace_event_in_conn(
+                    conn,
+                    event_id=eid,
+                    ts=now,
+                    order_id=oid,
+                    job_id=jid,
+                    source_message_id=source_msg_id,
+                    agent_run_id=run_id,
+                    artifact_id=art_id,
+                    agent_role=role,
+                    event_type=et,
+                    severity=sev,
+                    message=msg,
+                    payload=det,
+                    cause_event_id=cause,
+                )
+                conn.commit()
+        return eid
+
+    def _append_trace_event_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_id: str,
+        ts: float,
+        order_id: str | None,
+        job_id: str | None,
+        source_message_id: int | None,
+        agent_run_id: str | None,
+        artifact_id: str | None,
+        agent_role: str | None,
+        event_type: str,
+        severity: str,
+        message: str,
+        payload: dict[str, Any],
+        cause_event_id: str | None,
+    ) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO trace_events (id, ts, order_id, job_id, source_message_id, agent_run_id, artifact_id, agent_role, event_type, severity, message, payload_json, cause_event_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(event_id),
+                float(ts),
+                (str(order_id).strip() if isinstance(order_id, str) and str(order_id).strip() else None),
+                (str(job_id).strip() if isinstance(job_id, str) and str(job_id).strip() else None),
+                (int(source_message_id) if isinstance(source_message_id, int) else None),
+                (str(agent_run_id).strip() if isinstance(agent_run_id, str) and str(agent_run_id).strip() else None),
+                (str(artifact_id).strip() if isinstance(artifact_id, str) and str(artifact_id).strip() else None),
+                (str(agent_role).strip().lower() if isinstance(agent_role, str) and str(agent_role).strip() else None),
+                str(event_type or "event"),
+                str(severity or "info"),
+                str(message or ""),
+                json.dumps(payload or {}, ensure_ascii=False),
+                (str(cause_event_id).strip() if isinstance(cause_event_id, str) and str(cause_event_id).strip() else None),
+            ),
+        )
+
+    def list_trace_events(
+        self,
+        *,
+        order_id: str | None = None,
+        job_id: str | None = None,
+        source_message_id: int | None = None,
+        agent_run_id: str | None = None,
+        artifact_id: str | None = None,
+        limit: int = 400,
+    ) -> list[dict[str, Any]]:
+        oid = (str(order_id or "").strip() or None)
+        jid = (str(job_id or "").strip() or None)
+        src_mid: int | None = None
+        if source_message_id is not None:
+            try:
+                src_mid = int(source_message_id)
+            except Exception:
+                src_mid = None
+        run_id = (str(agent_run_id or "").strip() or None)
+        art_id = (str(artifact_id or "").strip() or None)
+        lim = max(1, min(5000, int(limit)))
+
+        where: list[str] = []
+        params: list[Any] = []
+        if oid is not None:
+            where.append("order_id = ?")
+            params.append(oid)
+        if jid is not None:
+            where.append("job_id = ?")
+            params.append(jid)
+        if src_mid is not None:
+            where.append("source_message_id = ?")
+            params.append(src_mid)
+        if run_id is not None:
+            where.append("agent_run_id = ?")
+            params.append(run_id)
+        if art_id is not None:
+            where.append("artifact_id = ?")
+            params.append(art_id)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, ts, order_id, job_id, source_message_id, agent_run_id, artifact_id, agent_role, event_type, severity, message, payload_json, cause_event_id FROM trace_events{clause} ORDER BY ts DESC LIMIT ?",
+                [*params, lim],
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": str(r["id"]),
+                    "ts": float(r["ts"]),
+                    "order_id": (None if r["order_id"] is None else str(r["order_id"])),
+                    "job_id": (None if r["job_id"] is None else str(r["job_id"])),
+                    "source_message_id": (_coerce_int(r["source_message_id"], default=None)),
+                    "agent_run_id": (None if r["agent_run_id"] is None else str(r["agent_run_id"])),
+                    "artifact_id": (None if r["artifact_id"] is None else str(r["artifact_id"])),
+                    "agent_role": (None if r["agent_role"] is None else str(r["agent_role"])),
+                    "event_type": str(r["event_type"]),
+                    "severity": str(r["severity"]),
+                    "message": str(r["message"]),
+                    "payload": _coerce_json_dict(r["payload_json"]),
+                    "cause_event_id": (None if r["cause_event_id"] is None else str(r["cause_event_id"])),
+                }
+            )
+        return out
+
+    def trace_noise_summary(self, *, window_seconds: int = 3600) -> dict[str, Any]:
+        window = max(60, min(7 * 24 * 3600, int(window_seconds)))
+        since = float(time.time() - window)
+        with self._conn() as conn:
+            total_row = conn.execute("SELECT COUNT(*) AS c FROM trace_events WHERE ts >= ?", (since,)).fetchone()
+            sev_rows = conn.execute(
+                "SELECT severity, COUNT(*) AS c FROM trace_events WHERE ts >= ? GROUP BY severity",
+                (since,),
+            ).fetchall()
+            type_rows = conn.execute(
+                "SELECT event_type, COUNT(*) AS c FROM trace_events WHERE ts >= ? GROUP BY event_type ORDER BY c DESC LIMIT 24",
+                (since,),
+            ).fetchall()
+            dup_row = conn.execute(
+                "SELECT COALESCE(SUM(c - 1), 0) AS dups FROM ("
+                "SELECT event_type, COALESCE(job_id, ''), COALESCE(message, ''), COUNT(*) AS c "
+                "FROM trace_events WHERE ts >= ? GROUP BY event_type, COALESCE(job_id, ''), COALESCE(message, '') HAVING c > 1"
+                ")",
+                (since,),
+            ).fetchone()
+
+        total = int(total_row["c"] if total_row is not None else 0)
+        duplicates = int(dup_row["dups"] if dup_row is not None else 0)
+        by_severity: dict[str, int] = {}
+        for r in sev_rows:
+            key = str(r["severity"] or "info")
+            by_severity[key] = int(r["c"] or 0)
+        by_type: list[dict[str, Any]] = []
+        for r in type_rows:
+            by_type.append({"event_type": str(r["event_type"] or "event"), "count": int(r["c"] or 0)})
+
+        return {
+            "window_seconds": int(window),
+            "since_ts": since,
+            "total_events": int(total),
+            "duplicate_events": int(duplicates),
+            "dedupe_ratio": (float(duplicates) / float(total) if total > 0 else 0.0),
+            "by_severity": by_severity,
+            "top_event_types": by_type,
+        }
+
     def claim_next(
         self,
         *,
@@ -1197,10 +1442,18 @@ class SQLiteTaskStorage:
         else:
             blocked_reason = None
             stalled_since = None
-        cur = conn.execute(
-            "UPDATE jobs SET state = ?, updated_at = ?, trace = ?, blocked_reason = ?, stalled_since = ? WHERE job_id = ?",
-            (str(state), now, json.dumps(trace, ensure_ascii=False), blocked_reason, stalled_since, str(job_id)),
-        )
+        if str(state) == "queued":
+            # Returning a job to queued should make it immediately runnable unless
+            # bump_retry() explicitly schedules a future due_at.
+            cur = conn.execute(
+                "UPDATE jobs SET state = ?, updated_at = ?, trace = ?, blocked_reason = ?, stalled_since = ?, due_at = NULL WHERE job_id = ?",
+                (str(state), now, json.dumps(trace, ensure_ascii=False), blocked_reason, stalled_since, str(job_id)),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE jobs SET state = ?, updated_at = ?, trace = ?, blocked_reason = ?, stalled_since = ? WHERE job_id = ?",
+                (str(state), now, json.dumps(trace, ensure_ascii=False), blocked_reason, stalled_since, str(job_id)),
+            )
         if cur.rowcount:
             self._append_event(conn, str(job_id), f"state:{state}", metadata)
 
@@ -1978,6 +2231,113 @@ class SQLiteTaskStorage:
                 conn.commit()
                 return {"jobs_cancelled": cancelled, "orders_done": orders_done}
 
+    def stop_all_global(
+        self,
+        *,
+        reason: str = "ceo_stop_all",
+        actor: str = "jarvis",
+        chat_id: int | None = None,
+        close_orders: bool = True,
+        close_projects: bool = True,
+        clear_workspace_leases: bool = True,
+    ) -> dict[str, int]:
+        """
+        Global stop primitive used by Jarvis control lane.
+
+        - Cancel all non-terminal jobs (queued/running/blocked/waiting_deps/blocked_approval)
+        - Optionally close active orders/projects
+        - Optionally clear workspace leases
+        - Append one consolidated audit event
+        """
+        rsn = (reason or "").strip() or "ceo_stop_all"
+        act = (actor or "").strip() or "jarvis"
+        with self._lock:
+            with self._conn() as conn:
+                now = float(time.time())
+                states = ("queued", "running", "blocked", "waiting_deps", "blocked_approval")
+                placeholders = ",".join("?" for _ in states)
+
+                params: list[Any] = list(states)
+                where_chat = ""
+                if chat_id is not None:
+                    where_chat = " AND chat_id = ?"
+                    params.append(int(chat_id))
+
+                rows = conn.execute(
+                    f"SELECT job_id, state, trace FROM jobs WHERE state IN ({placeholders}){where_chat}",
+                    params,
+                ).fetchall()
+                cancelled = 0
+                for row in rows:
+                    jid = str(row["job_id"])
+                    from_state = str(row["state"] or "")
+                    trace = Task.from_trace_json(row["trace"])
+                    if not isinstance(trace, dict):
+                        trace = {}
+                    trace["cancel_reason"] = rsn
+                    trace["reset_ts"] = now
+                    updated = conn.execute(
+                        "UPDATE jobs SET state = 'cancelled', updated_at = ?, blocked_reason = NULL, stalled_since = NULL, trace = ? WHERE job_id = ? AND state = ?",
+                        (now, json.dumps(trace, ensure_ascii=False), jid, from_state),
+                    )
+                    if updated.rowcount:
+                        cancelled += 1
+                        self._append_event(conn, jid, "stop_all_cancel", {"reason": rsn, "from": from_state, "actor": act})
+
+                orders_done = 0
+                if close_orders:
+                    if chat_id is None:
+                        cur = conn.execute(
+                            "UPDATE ceo_orders SET status = 'done', phase = 'done', updated_at = ? WHERE status = 'active'",
+                            (now,),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "UPDATE ceo_orders SET status = 'done', phase = 'done', updated_at = ? WHERE status = 'active' AND chat_id = ?",
+                            (now, int(chat_id)),
+                        )
+                    orders_done = int(cur.rowcount or 0)
+
+                projects_done = 0
+                if close_projects and chat_id is None:
+                    cur = conn.execute(
+                        "UPDATE projects_registry SET status = 'done', updated_at = ? WHERE status NOT IN ('done','archived')",
+                        (now,),
+                    )
+                    projects_done = int(cur.rowcount or 0)
+
+                leases_cleared = 0
+                if clear_workspace_leases and chat_id is None:
+                    cur = conn.execute("DELETE FROM workspace_leases")
+                    leases_cleared = int(cur.rowcount or 0)
+
+                conn.execute(
+                    "INSERT INTO audit_log (ts, event_type, actor, details) VALUES (?, ?, ?, ?)",
+                    (
+                        now,
+                        "stop_all_global",
+                        act,
+                        json.dumps(
+                            {
+                                "reason": rsn,
+                                "chat_id": (None if chat_id is None else int(chat_id)),
+                                "jobs_cancelled": cancelled,
+                                "orders_done": orders_done,
+                                "projects_done": projects_done,
+                                "workspace_leases_cleared": leases_cleared,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+                conn.commit()
+                return {
+                    "jobs_cancelled": cancelled,
+                    "orders_done": orders_done,
+                    "projects_done": projects_done,
+                    "workspace_leases_cleared": leases_cleared,
+                }
+
     def get_status_cache(self, cache_key: str) -> dict[str, Any] | None:
         """
         Read cached JSON payload if unexpired. Returns parsed dict or None.
@@ -2332,7 +2692,15 @@ class SQLiteTaskStorage:
             return []
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM jobs WHERE parent_job_id = ? ORDER BY created_at ASC LIMIT ?",
+                (
+                    "SELECT * FROM ("
+                    "  SELECT * FROM jobs"
+                    "  WHERE parent_job_id = ?"
+                    "  ORDER BY created_at DESC"
+                    "  LIMIT ?"
+                    ") recent "
+                    "ORDER BY created_at ASC"
+                ),
                 (pid, int(limit)),
             ).fetchall()
             return [self._row_to_task(r) for r in rows]

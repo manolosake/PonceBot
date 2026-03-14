@@ -1,15 +1,17 @@
 .PHONY: verify test lint security coverage
 
+PYTHON ?= python3
+
 verify: lint security test coverage
 
 lint:
-	python -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
+	$(PYTHON) -m py_compile bot.py state_store.py orchestrator/*.py tools/*.py test_*.py
 
 security:
-	python tools/security_check.py --strict
+	$(PYTHON) tools/security_check.py --strict
 
 test:
-	python -m unittest -q
+	$(PYTHON) -m unittest -q
 
 coverage:
-	python tools/coverage_gate.py --min 0.65
+	$(PYTHON) tools/coverage_gate.py --min 0.65

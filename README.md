@@ -140,6 +140,12 @@ Set `BOT_CEO_NAME` (default: `"Alejandro Ponce"`).
 
 In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
 
+## Execution Model
+
+- Manual CEO requests stay on the Codex CLI lane by default (`jarvis` -> frontend/backend/qa/sre/etc).
+- `skynet` owns the autonomous/proactive lane and uses `architect_local`, `implementer_local`, and `reviewer_local` there by default.
+- `BOT_CEO_INJECT_LOCAL_SPECIALISTS=1` is an experimental opt-in override for manual CEO work; keep it off unless you explicitly want mixed manual + local lanes.
+
 ## Safety Notes
 
 - Keep secrets out of git and out of `CODEX_WORKDIR` whenever possible.
@@ -148,6 +154,7 @@ In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
   - `BOT_BREAKGLASS_REASON` at startup
   - short `BOT_BREAKGLASS_TTL_SECONDS`
   - admin-controlled activation/deactivation from Telegram (`/breakglass ...`)
+  - operator awareness that `access_mode=full` can remain selected while dangerous bypass is already OFF after breakglass expiry
 - Status HTTP API requires token auth (`Authorization: Bearer ...`) and strict CORS allowlist.
 
 ## Deliverability Checklist (Safe Defaults)
@@ -178,3 +185,12 @@ make verify
 - Prefer user-level service with `Restart=always` and journal retention policies.
 - For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
 
+
+
+## Notification Scope (CEO UX)
+
+- Use `/notify policy critical|state_change|digest_only` to control what reaches the CEO chat.
+- `critical`: failures/blocks/timeouts only.
+- `state_change` (default): critical + key workflow transitions and wrapups.
+- `digest_only`: periodic noise is suppressed; only digest/wrapup + critical signals.
+- Repeated identical updates are deduped by fingerprint using `BOT_NOTIFY_DEDUPE_COOLDOWN_SECONDS`.
