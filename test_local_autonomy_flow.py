@@ -238,6 +238,16 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "terminal")
 
+    def test_failure_class_no_worktree_changes_after_apply_is_terminal_immediately(self) -> None:
+        msg = "implementer_local produced no worktree changes after apply; nothing to commit"
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "terminal")
+
     def test_failure_class_patch_apply_noop_markers_are_terminal_immediately(self) -> None:
         cases = (
             'patch apply failed: allow with "--allow-empty"',
