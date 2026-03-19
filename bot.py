@@ -3868,6 +3868,37 @@ def _extract_blocker_response(text: str) -> str:
     return blocker[:2000].strip()
 
 
+def _blocker_requests_grounded_workspace_excerpt(*, text: str, worktree_dir: Path) -> bool:
+    raw = str(text or "").strip()
+    if not raw or not worktree_dir.is_dir():
+        return False
+    lower = raw.lower()
+    excerpt_markers = (
+        "missing excerpt",
+        "missing current excerpt",
+        "current excerpt",
+        "full function body",
+        "current function body",
+        "exact current function body",
+        "provide the current function body",
+    )
+    if not any(marker in lower for marker in excerpt_markers):
+        return False
+    file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    for match in file_hint_re.findall(raw):
+        rel_path = str(match or "").strip().lstrip("./")
+        if not rel_path or rel_path.lower().endswith(".md"):
+            continue
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside = str(disk_path).startswith(str(worktree_dir))
+        except Exception:
+            inside = False
+        if inside and disk_path.is_file():
+            return True
+    return False
+
+
 def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
     raw = str(text or "")
     if not raw.strip():
@@ -11440,6 +11471,11 @@ def _apply_autonomous_local_first_policy(
         except Exception:
             pass
     require_arch_artifact_contract = bool(_text_mentions_artifact_contract(latest_impl_failed_blocker))
+    shared_local_worktree = _local_role_worktree_dir("implementer_local")
+    grounded_excerpt_blocker = _blocker_requests_grounded_workspace_excerpt(
+        text=(latest_impl_failed_blocker or latest_impl_failed_summary),
+        worktree_dir=shared_local_worktree,
+    )
     latest_arch_actionable = bool(
         latest_arch_response
         and _structured_handoff_is_actionable(
@@ -11700,7 +11736,7 @@ def _apply_autonomous_local_first_policy(
                 key=f"local_impl_guard_{direct_suffix}",
                 role="implementer_local",
                 text=(
-                    f"Direct unblock implementation for ticket {rid} after repeated non-actionable architect passes.\n"
+                    f"Direct unblock implementation for ticket {rid} using the grounded blocker context.\n"
                     f"Slice: {direct_suffix}\n"
                     "This is a quality-safe bypass: implement the blocker fix directly using concrete files from the latest implementer blocker.\n\n"
                     "LATEST_IMPLEMENTER_BLOCKER:\n"
@@ -11862,6 +11898,10 @@ def _apply_autonomous_local_first_policy(
         if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
             return _no_change_review_specs()
         if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+            if grounded_excerpt_blocker:
+                direct_specs = _direct_blocker_implementer_specs()
+                if direct_specs:
+                    return direct_specs
             if int(recent_non_actionable_arch_count) >= 2:
                 direct_specs = _direct_blocker_implementer_specs()
                 if direct_specs:
@@ -11973,6 +12013,10 @@ def _apply_autonomous_local_first_policy(
         if "reviewer_local" not in planner_local_roles and planner_local_roles.intersection({"architect_local", "implementer_local"}):
             return _no_change_review_specs()
     if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+        if grounded_excerpt_blocker:
+            direct_specs = _direct_blocker_implementer_specs()
+            if direct_specs:
+                return direct_specs
         if int(recent_non_actionable_arch_count) >= 2:
             direct_specs = _direct_blocker_implementer_specs()
             if direct_specs:
