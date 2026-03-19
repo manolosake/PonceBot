@@ -6246,6 +6246,8 @@ def _default_eta_minutes_for_spec(spec: TaskSpec) -> int:
 
 def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSpec:
     base_text = str(spec.text or "").strip()
+    role = str(spec.role or "").strip().lower()
+    is_local_specialist = role in ("architect_local", "implementer_local", "reviewer_local")
     acceptance = _normalize_contract_lines(
         list(spec.acceptance_criteria or []),
         fallback=[
@@ -6269,10 +6271,10 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
         key=spec.key,
         role=spec.role,
         text=base_text,
-        mode_hint=spec.mode_hint,
+        mode_hint=("ro" if is_local_specialist else spec.mode_hint),
         priority=int(spec.priority or 2),
         depends_on=list(spec.depends_on or []),
-        requires_approval=bool(spec.requires_approval),
+        requires_approval=(False if is_local_specialist else bool(spec.requires_approval)),
         acceptance_criteria=acceptance,
         definition_of_done=dod,
         eta_minutes=int(eta),
