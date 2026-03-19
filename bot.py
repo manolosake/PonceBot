@@ -6346,6 +6346,35 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
 
+    proactive_lane = bool(root_trace.get("proactive_lane", False))
+    if not proactive_lane:
+        body = str(order.get("body") or "")
+        proactive_lane = "[proactive:" in body.lower() or "autonomous proactive sprint" in body.lower()
+
+    for child in children:
+        if str(child.role or "").strip().lower() != "skynet":
+            continue
+        if str((child.labels or {}).get("kind") or "").strip().lower() != "final_sweep":
+            continue
+        if str(child.state or "").strip().lower() != "done":
+            continue
+        summary = str((child.trace or {}).get("result_summary") or "").strip().lower()
+        if not summary:
+            continue
+        if proactive_lane and "blocked_with_root_cause" in summary:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            try:
+                orch_q.update_trace(
+                    rid,
+                    proactive_blocked_with_root_cause=True,
+                    proactive_blocked_with_root_cause_at=time.time(),
+                    proactive_blocked_with_root_cause_summary=str((child.trace or {}).get("result_summary") or "").strip(),
+                )
+            except Exception:
+                pass
+            return
+
     states = [str(c.state or "").strip().lower() for c in children]
     wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
     wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
