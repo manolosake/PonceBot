@@ -415,6 +415,98 @@ class OrchestratorQueue:
     def trace_noise_summary(self, *, window_seconds: int = 3600) -> dict[str, Any]:
         return self._storage.trace_noise_summary(window_seconds=window_seconds)
 
+    def cancel_stale_blocked_only(self, *, now_ts: float, max_age_s: float) -> int:
+        cutoff = float(now_ts) - float(max_age_s)
+        tasks = self._storage.peek(state="blocked_waiting_only", limit=200)
+        canceled = 0
+        for task in tasks:
+            if self._task_state(task) != "blocked_waiting_only":
+                continue
+            waiting = self._waiting_deps_count(task)
+            if waiting is None or waiting != 0:
+                continue
+            ts = self._task_timestamp(task)
+            if ts <= 0 or ts >= cutoff:
+                continue
+            job_id = self._task_job_id(task)
+            if not job_id:
+                continue
+            if self._cancel_with_reason(job_id, reason="final_sweep_stale_blocked_only"):
+                canceled += 1
+        return canceled
+
+    @staticmethod
+    def _task_state(task: Task) -> str:
+        for attr in ("status", "state"):
+            v = getattr(task, attr, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+
+    @staticmethod
+    def _waiting_deps_count(task: Task) -> int | None:
+        for attr in (
+            "waiting_dependencies",
+            "waiting_deps",
+            "waiting_dependency_count",
+            "waiting_dependencies_count",
+        ):
+            v = getattr(task, attr, None)
+            if v is None:
+                continue
+            if isinstance(v, int):
+                return v
+            if isinstance(v, (list, tuple, set, dict)):
+                return len(v)
+            try:
+                return int(v)
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _task_timestamp(task: Task) -> float:
+        for attr in (
+            "updated_at",
+            "updated_ts",
+            "updated",
+            "last_updated_at",
+            "last_updated",
+            "modified_at",
+            "created_at",
+        ):
+            v = getattr(task, attr, None)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return 0.0
+
+    @staticmethod
+    def _task_job_id(task: Task) -> str:
+        for attr in ("job_id", "id"):
+            v = getattr(task, attr, None)
+            if v:
+                return str(v)
+        return ""
+
+    def _cancel_with_reason(self, job_id: str, *, reason: str) -> bool:
+        try:
+            ok = self._storage.cancel(job_id=job_id, reason=reason)
+        except TypeError:
+            try:
+                ok = self._storage.cancel(job_id=job_id)
+            except TypeError:
+                ok = self._storage.cancel(job_id)
+        if ok:
+            try:
+                self._storage.update_trace(job_id=job_id, cancel_reason=reason)
+            except Exception:
+                pass
+        return bool(ok)
+
     def _max_parallel_by_role(self) -> dict[str, int]:
         out: dict[str, int] = {
             "jarvis": 1,
