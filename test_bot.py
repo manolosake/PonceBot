@@ -1502,6 +1502,41 @@ class TestImplementerFailureSelection(unittest.TestCase):
         )
 
 
+class TestDiffExtraction(unittest.TestCase):
+    def test_extract_first_diff_block_accepts_patch_fence(self) -> None:
+        text = (
+            "Plan:\n"
+            "```patch\n"
+            "diff --git a/foo.py b/foo.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+            "```\n"
+        )
+        out = bot._extract_first_diff_block(text)
+        self.assertIn("diff --git a/foo.py b/foo.py", out)
+        self.assertIn("+new", out)
+
+    def test_extract_first_diff_block_accepts_udiff_fence(self) -> None:
+        text = (
+            "```udiff\n"
+            "diff --git a/bar.txt b/bar.txt\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/bar.txt\n"
+            "+++ b/bar.txt\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-before\n"
+            "+after\n"
+            "```\n"
+        )
+        out = bot._extract_first_diff_block(text)
+        self.assertIn("diff --git a/bar.txt b/bar.txt", out)
+        self.assertIn("+after", out)
+
+
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
         out = bot._normalize_tts_speak_text("Jarvis: merge completed", backend="piper")

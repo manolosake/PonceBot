@@ -3564,7 +3564,12 @@ def _ollama_chat(
 
 def _extract_first_diff_block(text: str) -> str:
     raw = str(text or "")
-    fenced_blocks = re.findall(r"```diff\s*\n(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    fenced_blocks: list[str] = []
+    for match in re.finditer(r"```(?P<info>[^\n`]*)\n(?P<body>.*?)```", raw, flags=re.IGNORECASE | re.DOTALL):
+        info = str(match.group("info") or "").strip().lower()
+        lang = info.split()[0] if info else ""
+        if lang in {"diff", "patch", "udiff", "unidiff", "unified-diff"}:
+            fenced_blocks.append(str(match.group("body") or ""))
     normalized_blocks = [str(block or "").strip() for block in fenced_blocks if str(block or "").strip()]
     if normalized_blocks:
         return "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
