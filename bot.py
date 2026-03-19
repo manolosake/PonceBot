@@ -4183,14 +4183,31 @@ def _augment_local_specialist_prompt_with_workspace_context(
         return user_prompt
 
     file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    symbol_token_re = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
     exact_targets: list[str] = []
     candidate_paths: list[str] = []
     seen: set[str] = set()
+    mentioned_py_symbols: list[str] = []
+    mentioned_seen: set[str] = set()
 
     context_sources = [
         str(getattr(task, "input_text", "") or ""),
+        str(user_prompt or ""),
         json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
     ]
+    for source in context_sources:
+        for symbol in symbol_token_re.findall(source):
+            # Keep this deterministic and focused on function/class-like mentions.
+            if "_" not in symbol:
+                continue
+            if symbol in mentioned_seen:
+                continue
+            mentioned_seen.add(symbol)
+            mentioned_py_symbols.append(symbol)
+            if len(mentioned_py_symbols) >= 24:
+                break
+        if len(mentioned_py_symbols) >= 24:
+            break
     for source in context_sources:
         for match in file_hint_re.findall(source):
             rel_path = str(match or "").strip().lstrip("./")
@@ -4368,9 +4385,25 @@ def _augment_local_specialist_prompt_with_workspace_context(
             if len(lines) <= 1200 and len(raw) <= 48000:
                 excerpt = raw.rstrip()
             else:
-                excerpt = raw[:48000].rstrip()
-                if len(raw) > len(excerpt):
-                    excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+                excerpt = ""
+                if rel_path.endswith(".py") and mentioned_py_symbols:
+                    for symbol in mentioned_py_symbols:
+                        symbol_re = re.compile(rf"^\s*(?:def|class)\s+{re.escape(symbol)}\b")
+                        symbol_idx = next((idx for idx, line in enumerate(lines) if symbol_re.search(line)), -1)
+                        if symbol_idx < 0:
+                            continue
+                        start = max(0, symbol_idx - 40)
+                        end = min(len(lines), symbol_idx + 180)
+                        excerpt = "\n".join(lines[start:end]).rstrip()
+                        if start > 0:
+                            excerpt = "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n" + excerpt
+                        if end < len(lines):
+                            excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+                        break
+                if not excerpt:
+                    excerpt = raw[:48000].rstrip()
+                    if len(raw) > len(excerpt):
+                        excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
         else:
             excerpt = "\n".join(lines[:excerpt_lines_cap])
             if len(excerpt) > excerpt_chars_cap:

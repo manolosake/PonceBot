@@ -6,6 +6,7 @@ import subprocess
 import unittest
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import bot
 from orchestrator.queue import OrchestratorQueue
@@ -466,6 +467,62 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             self.assertIn("FAILED_VALIDATION_OUTPUT", summary)
             self.assertIn("tools/example.py", summary)
             self.assertIn("FAILED_CHANGED_FILES", summary)
+
+    def test_workspace_context_large_exact_target_includes_symbol_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            filler = 'x = "' + ("a" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            task = SimpleNamespace(
+                input_text="Please patch bot.py around _classify_local_slice_failure.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify bot.py for _classify_local_slice_failure reliability.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("def _classify_local_slice_failure", prompt)
+            self.assertIn("# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]", prompt)
+
+    def test_workspace_context_large_exact_target_symbol_not_found_uses_truncated_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            filler = 'x = "' + ("b" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            task = SimpleNamespace(
+                input_text="Please patch bot.py around _symbol_not_present_in_file.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify bot.py for _symbol_not_present_in_file reliability.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("# [TRUNCATED_EXACT_TARGET_CONTEXT]", prompt)
+            self.assertNotIn("def _classify_local_slice_failure", prompt)
 
 
 if __name__ == "__main__":
