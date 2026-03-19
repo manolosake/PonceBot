@@ -238,6 +238,57 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "terminal")
 
+    def test_failure_class_patch_apply_noop_markers_are_terminal_immediately(self) -> None:
+        cases = (
+            'patch apply failed: allow with "--allow-empty"',
+            "patch apply failed: patch is empty",
+            "patch apply failed: nothing to apply",
+        )
+        for msg in cases:
+            with self.subTest(msg=msg):
+                klass = bot._classify_local_slice_failure(
+                    role_norm="implementer_local",
+                    orch_state="failed",
+                    summary=msg,
+                    attempt_n=1,
+                )
+                self.assertEqual(klass, "terminal")
+
+    def test_failure_class_local_env_blockers_are_terminal_immediately(self) -> None:
+        cases = (
+            "error: read-only file system",
+            "error: filesystem is read-only",
+            "error: read only file system",
+            "bwrap: failed to create namespace",
+            "bubblewrap execution failed",
+        )
+        for msg in cases:
+            with self.subTest(msg=msg):
+                klass = bot._classify_local_slice_failure(
+                    role_norm="implementer_local",
+                    orch_state="failed",
+                    summary=msg,
+                    attempt_n=1,
+                )
+                self.assertEqual(klass, "terminal")
+
+    def test_failure_class_patch_apply_eperm_retries_once_then_terminal(self) -> None:
+        msg = "patch apply failed: operation not permitted"
+        first = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        second = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=2,
+        )
+        self.assertEqual(first, "retriable")
+        self.assertEqual(second, "terminal")
+
     def test_failure_class_blocker_text_is_blocked(self) -> None:
         msg = "BLOCKER: missing requirement for evidence artifact path"
         klass = bot._classify_local_slice_failure(

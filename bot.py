@@ -10283,6 +10283,11 @@ def _classify_local_slice_failure(
         "touched python files but py_compile failed",
         "outside the delegated slice",
         "escapes worktree",
+        "read-only file system",
+        "filesystem is read-only",
+        "read only file system",
+        "bwrap:",
+        "bubblewrap",
     )
     if any(tok in blob for tok in terminal_markers):
         return "terminal"
@@ -10304,7 +10309,13 @@ def _classify_local_slice_failure(
         "patch apply failed",
     )
     if any(tok in blob for tok in patch_invalid_markers):
-        if "no valid patches in input" in blob:
+        no_op_apply_markers = (
+            "no valid patches in input",
+            'allow with "--allow-empty"',
+            "patch is empty",
+            "nothing to apply",
+        )
+        if any(tok in blob for tok in no_op_apply_markers):
             return "terminal"
         return "terminal" if int(attempt_n) >= 2 else "retriable"
 
