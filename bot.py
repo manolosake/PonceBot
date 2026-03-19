@@ -12982,8 +12982,7 @@ def _jarvis_final_sweep_tick(
             continue
 
         children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=500)
-        if not children:
-            continue
+        root_job = orch_q.get_job(order_id)
         proactive_order = bool(_is_proactive_order_record(row))
 
         if proactive_order and _order_has_verified_no_change_resolution(
@@ -13036,6 +13035,11 @@ def _jarvis_final_sweep_tick(
         terminal_n = 0
         latest_child_activity = 0.0
         latest_non_meta_child_activity = 0.0
+        if not children and root_job is not None:
+            root_updated_at = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
+            if root_updated_at > 0.0:
+                latest_child_activity = root_updated_at
+                latest_non_meta_child_activity = root_updated_at
         for c in children:
             st = str(c.state or "").strip().lower()
             updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
@@ -13100,7 +13104,6 @@ def _jarvis_final_sweep_tick(
         else:
             continue
 
-        root_job = orch_q.get_job(order_id)
         root_trace = dict((root_job.trace if root_job else {}) or {})
         try:
             last_sweep_at = float(root_trace.get("final_sweep_last_at", 0.0) or 0.0)

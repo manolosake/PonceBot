@@ -1002,6 +1002,131 @@ class TestOrderBranchPolicy(unittest.TestCase):
             )
 
 
+class TestFinalSweepGuard(unittest.TestCase):
+    def test_final_sweep_enqueues_when_active_order_has_no_children_and_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-stale"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 600.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_jobs = [j for j in children if str((j.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_jobs), 1)
+            sweep = sweep_jobs[0]
+            self.assertEqual(str(sweep.state or ""), "queued")
+            self.assertEqual(str((sweep.trace or {}).get("final_sweep_reason") or ""), "idle_no_open_jobs")
+            self.assertIn("Do not leave this order active with zero live jobs.", str(sweep.input_text or ""))
+
+    def test_final_sweep_does_not_enqueue_when_no_children_but_root_is_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-fresh"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            recent_ts = now - 30.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(recent_ts), float(recent_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "300",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            self.assertEqual(children, [])
+
+
 class TestRunningWatchdog(unittest.TestCase):
     def test_requeues_silent_local_ollama_before_full_runtime_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:
