@@ -524,6 +524,36 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             self.assertIn("# [TRUNCATED_EXACT_TARGET_CONTEXT]", prompt)
             self.assertNotIn("def _classify_local_slice_failure", prompt)
 
+    def test_workspace_context_large_ranked_python_candidate_includes_symbol_excerpt_without_path_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
+            filler = 'x = "' + ("c" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=worktree, check=True, capture_output=True, text=True)
+            task = SimpleNamespace(
+                input_text="Please patch _classify_local_slice_failure reliability.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify the local failure classifier to reduce implementer blockers.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("def _classify_local_slice_failure", prompt)
+            self.assertIn("# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4372,6 +4372,24 @@ def _augment_local_specialist_prompt_with_workspace_context(
         excerpt_lines_cap = 180
         excerpt_chars_cap = 9000
         excerpt_path_cap = 4
+    def _focused_python_symbol_excerpt(file_lines: list[str]) -> str:
+        if not mentioned_py_symbols:
+            return ""
+        for symbol in mentioned_py_symbols:
+            symbol_re = re.compile(rf"^\s*(?:def|class)\s+{re.escape(symbol)}\b")
+            symbol_idx = next((idx for idx, line in enumerate(file_lines) if symbol_re.search(line)), -1)
+            if symbol_idx < 0:
+                continue
+            start = max(0, symbol_idx - 40)
+            end = min(len(file_lines), symbol_idx + 180)
+            excerpt = "\n".join(file_lines[start:end]).rstrip()
+            if start > 0:
+                excerpt = "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n" + excerpt
+            if end < len(file_lines):
+                excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+            return excerpt
+        return ""
+
     for rel_path in candidate_paths[:excerpt_path_cap]:
         disk_path = (worktree_dir / rel_path).resolve()
         try:
@@ -4385,29 +4403,19 @@ def _augment_local_specialist_prompt_with_workspace_context(
             if len(lines) <= 1200 and len(raw) <= 48000:
                 excerpt = raw.rstrip()
             else:
-                excerpt = ""
-                if rel_path.endswith(".py") and mentioned_py_symbols:
-                    for symbol in mentioned_py_symbols:
-                        symbol_re = re.compile(rf"^\s*(?:def|class)\s+{re.escape(symbol)}\b")
-                        symbol_idx = next((idx for idx, line in enumerate(lines) if symbol_re.search(line)), -1)
-                        if symbol_idx < 0:
-                            continue
-                        start = max(0, symbol_idx - 40)
-                        end = min(len(lines), symbol_idx + 180)
-                        excerpt = "\n".join(lines[start:end]).rstrip()
-                        if start > 0:
-                            excerpt = "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n" + excerpt
-                        if end < len(lines):
-                            excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
-                        break
+                excerpt = _focused_python_symbol_excerpt(lines) if rel_path.endswith(".py") else ""
                 if not excerpt:
                     excerpt = raw[:48000].rstrip()
                     if len(raw) > len(excerpt):
                         excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
         else:
-            excerpt = "\n".join(lines[:excerpt_lines_cap])
-            if len(excerpt) > excerpt_chars_cap:
-                excerpt = excerpt[:excerpt_chars_cap].rstrip()
+            excerpt = ""
+            if role == "implementer_local" and rel_path.endswith(".py"):
+                excerpt = _focused_python_symbol_excerpt(lines)
+            if not excerpt:
+                excerpt = "\n".join(lines[:excerpt_lines_cap])
+                if len(excerpt) > excerpt_chars_cap:
+                    excerpt = excerpt[:excerpt_chars_cap].rstrip()
         chunks.extend([
             "",
             f"FILE: {rel_path}",
