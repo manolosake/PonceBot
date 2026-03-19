@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 import hashlib
 import json
 import time
@@ -184,6 +184,7 @@ class StatusService:
     orch_q: OrchestratorQueue
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
+    factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
 
     def _build_alerts(
         self,
@@ -508,9 +509,18 @@ class StatusService:
             "staleness_seconds": staleness_seconds,
         }
 
+        factory_extra: dict[str, Any] = {}
+        if self.factory_snapshot_fn is not None:
+            try:
+                maybe_extra = self.factory_snapshot_fn(chat_id)
+                if isinstance(maybe_extra, dict):
+                    factory_extra = maybe_extra
+            except Exception:
+                factory_extra = {}
+
         payload: dict[str, Any] = {
             "api_version": "v1",
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at": float(now),
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
@@ -531,6 +541,15 @@ class StatusService:
             "source_newest_updated_at": (float(newest_updated_at) if newest_updated_at > 0 else None),
             "staleness_seconds": staleness_seconds,
         }
+        for key in ("factory", "repos", "heartbeats", "lanes", "models", "slo", "mailbox"):
+            if key in factory_extra:
+                payload[key] = factory_extra.get(key)
+        extra_alerts = factory_extra.get("alerts") if isinstance(factory_extra.get("alerts"), list) else []
+        if extra_alerts:
+            payload["alerts"] = [*(payload.get("alerts") or []), *extra_alerts]
+        extra_risks = factory_extra.get("risks") if isinstance(factory_extra.get("risks"), list) else []
+        if extra_risks:
+            payload["risks"] = [*(payload.get("risks") or []), *extra_risks]
 
         # Add a stable hash for SSE clients.
         try:

@@ -228,8 +228,55 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(first, "retriable")
         self.assertEqual(second, "terminal")
 
+    def test_failure_class_no_valid_patches_is_terminal_immediately(self) -> None:
+        msg = "implementer_local patch rejected by git apply --check: error: No valid patches in input"
+        first = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        second = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=2,
+        )
+        self.assertEqual(first, "terminal")
+        self.assertEqual(second, "terminal")
+
+    def test_failure_class_no_worktree_changes_after_apply_is_terminal_immediately(self) -> None:
+        msg = "implementer_local produced no worktree changes after apply; nothing to commit"
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "terminal")
+
     def test_failure_class_blocker_text_is_blocked(self) -> None:
         msg = "BLOCKER: missing requirement for evidence artifact path"
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_failure_class_missing_excerpt_text_is_blocked(self) -> None:
+        msg = "Missing excerpt for `bot.py` around `_classify_local_slice_failure`"
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_failure_class_full_function_body_request_is_blocked(self) -> None:
+        msg = "Please provide the full function body for `_classify_local_slice_failure`"
         klass = bot._classify_local_slice_failure(
             role_norm="implementer_local",
             orch_state="failed",
@@ -334,6 +381,36 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             bot._extract_changed_files_from_patch_text(patch),
             ["orchestrator/workspaces.py", "tools/example.py"],
         )
+
+    def test_extract_first_diff_block_dedents_indented_fence(self) -> None:
+        text = (
+            "Here is the fix:\n"
+            "```diff\n"
+            "    diff --git a/sample.py b/sample.py\n"
+            "    --- a/sample.py\n"
+            "    +++ b/sample.py\n"
+            "    @@ -1 +1 @@\n"
+            "    -x = 1\n"
+            "    +x = 2\n"
+            "```\n"
+        )
+        extracted = bot._extract_first_diff_block(text)
+        self.assertIn("diff --git a/sample.py b/sample.py", extracted)
+        self.assertNotIn("\n    diff --git", extracted)
+
+    def test_extract_first_diff_block_accepts_patch_fence(self) -> None:
+        text = (
+            "```patch\n"
+            "--- a/sample.py\n"
+            "+++ b/sample.py\n"
+            "@@ -1 +1 @@\n"
+            "-x = 1\n"
+            "+x = 3\n"
+            "```\n"
+        )
+        extracted = bot._extract_first_diff_block(text)
+        self.assertTrue(extracted.startswith("--- a/sample.py"))
+        self.assertIn("+++ b/sample.py", extracted)
 
     def test_finalize_local_implementer_change_validates_only_current_slice_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:

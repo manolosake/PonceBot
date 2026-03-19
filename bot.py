@@ -19,6 +19,7 @@ import queue
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -204,10 +205,26 @@ _GREETING_PREFIXES = (
 
 
 _CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
+# Only controller lanes are hard-forced into read-only runner mode.
+# Local specialists still rely on their task mode plus write-policy guards.
+_READ_ONLY_ENFORCED_ROLE_NAMES = frozenset({"jarvis", "skynet"})
+_NO_WRITE_ROLE_NAMES = frozenset({"jarvis", "skynet", "architect_local", "reviewer_local"})
 
 
 def _is_controller_role(role: str) -> bool:
     return (role or "").strip().lower() in _CONTROLLER_ROLE_NAMES
+
+
+def _role_requires_enforced_read_only(role: str) -> bool:
+    return (role or "").strip().lower() in _READ_ONLY_ENFORCED_ROLE_NAMES
+
+
+def _role_disallows_repo_writes(role: str) -> bool:
+    return (role or "").strip().lower() in _NO_WRITE_ROLE_NAMES
+
+
+def _role_allows_branch_sync(role: str) -> bool:
+    return not _role_disallows_repo_writes(role)
 
 
 def _is_greeting(text: str) -> bool:
@@ -633,6 +650,20 @@ def _effective_bypass_sandbox(cfg: "BotConfig", *, chat_id: int | None = None) -
     wants_dangerous = (mode == "full") or bool(cfg.codex_dangerous_bypass_sandbox)
     if not wants_dangerous:
         return False
+    if cfg.codex_dangerous_bypass_sandbox and cfg.breakglass_start_reason:
+        active_now, _ = _breakglass_is_active(cfg)
+        if not active_now:
+            try:
+                _activate_breakglass(
+                    cfg,
+                    reason=cfg.breakglass_start_reason,
+                    ttl_seconds=int(cfg.breakglass_ttl_seconds),
+                    chat_id=0,
+                    user_id=None,
+                    source="auto_env_refresh",
+                )
+            except Exception:
+                LOG.exception("Failed to auto-refresh startup breakglass")
     active, _ = _breakglass_is_active(cfg)
     return bool(active)
 
@@ -646,6 +677,106 @@ def _parse_allowed_origins_env(raw: str) -> list[str]:
         if v not in out:
             out.append(v)
     return out
+
+
+def _home_dir_from_env() -> Path:
+    raw = os.environ.get("HOME", "").strip()
+    base = Path(raw).expanduser() if raw else Path.home()
+    try:
+        return base.resolve()
+    except Exception:
+        return base
+
+
+def _sync_github_pat_git_credentials() -> list[str]:
+    issues: list[str] = []
+    token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+    if not token:
+        return issues
+
+    home = _home_dir_from_env()
+    cred_path = (home / ".config" / "omnicrew" / "git-credentials").expanduser()
+    try:
+        cred_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return [f"Failed to prepare git credential directory: {exc}"]
+
+    github_entry = f"https://x-access-token:{urllib.parse.quote(token, safe='')}@github.com"
+    kept_entries: list[str] = []
+    if cred_path.exists():
+        try:
+            for raw in cred_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = str(raw or "").strip()
+                if not line:
+                    continue
+                host = ""
+                try:
+                    host = str(urllib.parse.urlsplit(line).hostname or "").strip().lower()
+                except Exception:
+                    host = ""
+                if host == "github.com":
+                    continue
+                if line not in kept_entries:
+                    kept_entries.append(line)
+        except Exception as exc:
+            issues.append(f"Failed to read existing git credentials: {exc}")
+    kept_entries.append(github_entry)
+    try:
+        cred_path.write_text("\n".join(kept_entries) + "\n", encoding="utf-8")
+        os.chmod(cred_path, 0o600)
+    except Exception as exc:
+        issues.append(f"Failed to write git credentials store: {exc}")
+        return issues
+
+    git_env = dict(os.environ)
+    git_env["HOME"] = str(home)
+    git_env.setdefault("GIT_TERMINAL_PROMPT", "0")
+
+    def _git_config(*args: str) -> tuple[bool, str]:
+        proc = subprocess.run(
+            ["git", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=git_env,
+        )
+        if proc.returncode == 0:
+            return True, ""
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or "git_config_failed"
+
+    ok_helper, helper_err = _git_config(
+        "config",
+        "--global",
+        "--replace-all",
+        "credential.helper",
+        f"store --file {cred_path}",
+    )
+    if not ok_helper:
+        issues.append(f"Failed to configure git credential.helper: {helper_err}")
+
+    ok_http_path, http_path_err = _git_config(
+        "config",
+        "--global",
+        "credential.useHttpPath",
+        "false",
+    )
+    if not ok_http_path:
+        issues.append(f"Failed to configure git credential.useHttpPath: {http_path_err}")
+
+    _git_config("config", "--global", "--unset-all", "url.https://github.com/.insteadOf")
+    for rewrite in ("ssh://git@github.com/", "git@github.com:"):
+        ok_rewrite, rewrite_err = _git_config(
+            "config",
+            "--global",
+            "--add",
+            "url.https://github.com/.insteadOf",
+            rewrite,
+        )
+        if not ok_rewrite:
+            issues.append(f"Failed to configure git GitHub HTTPS rewrite for {rewrite}: {rewrite_err}")
+
+    return issues
 
 
 def _security_startup_findings(cfg: "BotConfig") -> list[str]:
@@ -850,6 +981,7 @@ def _status_text_for_chat(
         "- /approve <id> (approve blocked job)",
         "- /pause_autonomy (pause Skynet/local autonomy)",
         "- /resume_autonomy (resume Skynet/local autonomy)",
+        "- /factory (factory status/control)",
         "- /pause <role> (pause role)",
         "- /resume <role> (resume role)",
         "- /cancel <id> (cancel orchestrator job)",
@@ -1948,21 +2080,663 @@ def _get_state(cfg: "BotConfig") -> dict[str, Any]:
     return _state_store(cfg).read()
 
 
-def _proactive_lane_state(cfg: "BotConfig") -> dict[str, Any]:
-    st = _get_state(cfg)
-    paused = bool(st.get("proactive_lane_paused", False))
-    manual_pause = bool(st.get("proactive_lane_manual_pause", False))
-    reason = str(st.get("proactive_lane_paused_reason") or "").strip()
-    paused_at = st.get("proactive_lane_paused_at")
+_FACTORY_CEO_STRATEGY_NEXT_ACTION_TYPES = frozenset(
+    {
+        "ceo_approval_needed",
+        "ceo_approval_request",
+        "request_ceo_approval",
+        "strategic_proposal",
+        "strategic_ceo_approval",
+    }
+)
+
+
+def _factory_ceo_strategy_timeout_seconds() -> int:
     try:
-        paused_at_val = float(paused_at) if paused_at is not None else None
+        raw = int(os.environ.get("BOT_FACTORY_CEO_APPROVAL_TIMEOUT_SECONDS", "1800"))
     except Exception:
-        paused_at_val = None
+        raw = 1800
+    return max(300, min(24 * 60 * 60, int(raw)))
+
+
+def _factory_ceo_strategy_records(cfg: "BotConfig") -> dict[str, dict[str, Any]]:
+    state = _get_state(cfg)
+    raw = state.get("factory_ceo_strategy_proposals")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for order_id, record in raw.items():
+        oid = str(order_id or "").strip()
+        if not oid or not isinstance(record, dict):
+            continue
+        out[oid] = dict(record)
+    return out
+
+
+def _update_factory_ceo_strategy_records(
+    cfg: "BotConfig",
+    mutator: Callable[[dict[str, dict[str, Any]]], None],
+) -> dict[str, dict[str, Any]]:
+    updated = _update_state(
+        cfg,
+        lambda st: _mutate_factory_ceo_strategy_records_in_state(st, mutator),
+    )
+    raw = updated.get("factory_ceo_strategy_proposals")
+    if not isinstance(raw, dict):
+        return {}
     return {
-        "paused": paused,
-        "manual_pause": manual_pause,
-        "reason": reason,
-        "paused_at": paused_at_val,
+        str(order_id): dict(record)
+        for order_id, record in raw.items()
+        if str(order_id or "").strip() and isinstance(record, dict)
+    }
+
+
+def _mutate_factory_ceo_strategy_records_in_state(
+    state: dict[str, Any],
+    mutator: Callable[[dict[str, dict[str, Any]]], None],
+) -> None:
+    raw = state.get("factory_ceo_strategy_proposals")
+    records: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for order_id, record in raw.items():
+            oid = str(order_id or "").strip()
+            if oid and isinstance(record, dict):
+                records[oid] = dict(record)
+    mutator(records)
+    state["factory_ceo_strategy_proposals"] = records
+
+
+def _normalize_text_list(value: Any, *, max_items: int = 8, max_chars: int = 240) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for raw in value:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        if len(item) > max_chars:
+            item = item[:max_chars].rstrip() + "..."
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _factory_ceo_strategy_next_action(structured_digest: Any) -> dict[str, Any] | None:
+    if not isinstance(structured_digest, dict):
+        return None
+    raw_next = structured_digest.get("next_action")
+    if not isinstance(raw_next, dict):
+        return None
+    next_type = str(raw_next.get("type") or "").strip().lower()
+    if next_type not in _FACTORY_CEO_STRATEGY_NEXT_ACTION_TYPES:
+        return None
+    return dict(raw_next)
+
+
+def _extract_factory_ceo_strategy_proposal(
+    *,
+    structured_digest: Any,
+    summary: str,
+    order_id: str,
+    repo_id: str = "",
+    repo_path: str = "",
+) -> dict[str, Any] | None:
+    next_action = _factory_ceo_strategy_next_action(structured_digest)
+    if next_action is None:
+        return None
+    proposal_title = str(
+        next_action.get("proposal_title")
+        or next_action.get("title")
+        or next_action.get("plan_title")
+        or "Strategic proposal awaiting CEO approval"
+    ).strip()
+    proposal_summary = str(
+        next_action.get("proposal_summary")
+        or next_action.get("summary")
+        or next_action.get("proposal")
+        or summary
+        or "Skynet proposes a larger strategic change and is waiting for CEO approval."
+    ).strip()
+    why_now = str(next_action.get("why_now") or next_action.get("why") or "").strip()
+    fallback_work = str(
+        next_action.get("fallback_work")
+        or next_action.get("fallback")
+        or "If no reply arrives in time, continue with bounded reliability, maintenance, and delivery work."
+    ).strip()
+    change_class = str(
+        next_action.get("change_class")
+        or next_action.get("change_type")
+        or next_action.get("scope_class")
+        or "strategic_change"
+    ).strip()
+    return {
+        "order_id": str(order_id or "").strip(),
+        "repo_id": str(repo_id or "").strip(),
+        "repo_path": str(repo_path or "").strip(),
+        "proposal_title": proposal_title,
+        "proposal_summary": proposal_summary,
+        "why_now": why_now,
+        "scope": _normalize_text_list(next_action.get("scope") or next_action.get("planned_scope") or []),
+        "risks": _normalize_text_list(next_action.get("risks") or next_action.get("tradeoffs") or []),
+        "questions": _normalize_text_list(next_action.get("questions") or next_action.get("approvals_needed") or []),
+        "assumptions": _normalize_text_list(next_action.get("assumptions") or []),
+        "fallback_work": fallback_work,
+        "change_class": change_class,
+        "next_action_type": str(next_action.get("type") or "").strip().lower(),
+    }
+
+
+def _factory_ceo_strategy_proposal_text(record: dict[str, Any], *, timeout_seconds: int) -> str:
+    order_id = str(record.get("order_id") or "").strip()
+    repo_id = str(record.get("repo_id") or "").strip()
+    repo_path = str(record.get("repo_path") or "").strip()
+    proposal_title = str(record.get("proposal_title") or "").strip() or "Strategic proposal"
+    proposal_summary = str(record.get("proposal_summary") or "").strip()
+    change_class = str(record.get("change_class") or "").strip() or "strategic_change"
+    timeout_minutes = max(1, int(round(float(timeout_seconds) / 60.0)))
+    lines = [
+        "Skynet requests CEO approval for a larger strategic change.",
+        f"Order: {order_id[:8] if order_id else 'n/a'}",
+        f"Type: {change_class}",
+    ]
+    if repo_id:
+        lines.append(f"Repo: {repo_id}")
+    elif repo_path:
+        lines.append(f"Repo path: {repo_path}")
+    lines.extend(["", f"Proposal: {proposal_title}"])
+    if proposal_summary:
+        lines.append(proposal_summary)
+    why_now = str(record.get("why_now") or "").strip()
+    if why_now:
+        lines.extend(["", f"Why now: {why_now}"])
+    for label, key in (
+        ("Scope", "scope"),
+        ("Risks", "risks"),
+        ("Questions", "questions"),
+        ("Assumptions", "assumptions"),
+    ):
+        values = record.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+        lines.append("")
+        lines.append(f"{label}:")
+        for item in values[:8]:
+            lines.append(f"- {str(item)}")
+    fallback_work = str(record.get("fallback_work") or "").strip()
+    if fallback_work:
+        lines.extend(["", f"If no reply in {timeout_minutes} min: {fallback_work}"])
+    lines.extend(
+        [
+            "",
+            "Reply to this message with:",
+            "- si / yes / approve",
+            "- no / reject",
+            "- or plain-text questions/changes and Skynet will replan",
+            f"- command alternative: /proposal approve {order_id[:8] if order_id else ''}".rstrip(),
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def _normalize_factory_ceo_strategy_reply_text(text: str) -> str:
+    raw = str(text or "").strip().lower()
+    return (
+        raw.replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+    )
+
+
+def _classify_factory_ceo_strategy_reply(text: str) -> str:
+    normalized = _normalize_factory_ceo_strategy_reply_text(text)
+    if not normalized:
+        return "replan"
+    if any(
+        token in normalized
+        for token in (
+            " reject",
+            "rechaza",
+            "rechazar",
+            "no apruebo",
+            "no aprobar",
+            "no procede",
+            "cancela",
+            "cancelar",
+        )
+    ) or normalized in ("no", "nop", "nope", "reject", "rechazo"):
+        return "reject"
+    if any(
+        token in normalized
+        for token in ("?", "pero", "cambia", "ajusta", "modifica", "instead", "quiero", "pregunta")
+    ):
+        return "replan"
+    if normalized in ("si", "sí", "yes", "approve", "approved", "dale", "ok", "ok dale", "aprobado"):
+        return "approve"
+    if normalized.startswith(("si ", "yes ", "approve ", "approved ", "aprob", "dale ", "ok ")):
+        return "approve"
+    return "replan"
+
+
+def _resolve_factory_ceo_strategy_order_id(
+    cfg: "BotConfig",
+    *,
+    order_id: str,
+    chat_id: int | None = None,
+) -> str:
+    token = str(order_id or "").strip().lower()
+    if not token:
+        return ""
+    records = _factory_ceo_strategy_records(cfg)
+    exact = records.get(token)
+    if isinstance(exact, dict):
+        if chat_id is None or int(exact.get("chat_id") or 0) == int(chat_id):
+            return token
+    matches = []
+    for oid, record in records.items():
+        if not oid.startswith(token):
+            continue
+        if chat_id is not None and int(record.get("chat_id") or 0) != int(chat_id):
+            continue
+        matches.append(oid)
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _pending_factory_ceo_strategy_proposal_for_order(
+    cfg: "BotConfig",
+    *,
+    order_id: str,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    oid = _resolve_factory_ceo_strategy_order_id(cfg, order_id=order_id)
+    if not oid:
+        return None
+    record = _factory_ceo_strategy_records(cfg).get(oid)
+    if not isinstance(record, dict):
+        return None
+    if str(record.get("status") or "").strip().lower() != "pending":
+        return None
+    try:
+        expires_at = float(record.get("expires_at") or 0.0)
+    except Exception:
+        expires_at = 0.0
+    now_ts = float(time.time() if now is None else now)
+    if expires_at > 0 and now_ts >= expires_at:
+        return None
+    return dict(record)
+
+
+def _pending_factory_ceo_strategy_proposal_for_reply(
+    cfg: "BotConfig",
+    *,
+    chat_id: int,
+    reply_to_message_id: int,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    target_chat = int(chat_id)
+    target_message = int(reply_to_message_id)
+    now_ts = float(time.time() if now is None else now)
+    for record in _factory_ceo_strategy_records(cfg).values():
+        if str(record.get("status") or "").strip().lower() != "pending":
+            continue
+        try:
+            if int(record.get("chat_id") or 0) != target_chat:
+                continue
+            if int(record.get("message_id") or 0) != target_message:
+                continue
+            expires_at = float(record.get("expires_at") or 0.0)
+        except Exception:
+            continue
+        if expires_at > 0 and now_ts >= expires_at:
+            continue
+        return dict(record)
+    return None
+
+
+def _order_has_pending_factory_ceo_strategy_proposal(
+    cfg: "BotConfig",
+    *,
+    order_id: str,
+    now: float | None = None,
+) -> bool:
+    return _pending_factory_ceo_strategy_proposal_for_order(cfg, order_id=order_id, now=now) is not None
+
+
+_FACTORY_RUNTIME_ROLES = ("jarvis", "skynet", "architect_local", "implementer_local", "reviewer_local")
+_FACTORY_ROLE_LANES = {
+    "jarvis": "interactive",
+    "skynet": "factory",
+    "architect_local": "subagent",
+    "implementer_local": "subagent",
+    "reviewer_local": "subagent",
+}
+_FACTORY_REPO_EXCLUDE_NAMES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "node_modules",
+        "vendor",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".next",
+        ".turbo",
+        "dist",
+        "build",
+        "artifacts",
+        "worktrees",
+        ".codex",
+        ".cache",
+    }
+)
+
+
+def _state_float(st: dict[str, Any], key: str) -> float | None:
+    raw = st.get(key)
+    try:
+        return float(raw) if raw is not None else None
+    except Exception:
+        return None
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _factory_repo_roots() -> list[Path]:
+    raw = str(os.environ.get("BOT_FACTORY_REPO_ROOTS", "/home/aponce") or "").strip()
+    out: list[Path] = []
+    seen: set[str] = set()
+    for piece in raw.split(os.pathsep):
+        token = piece.strip()
+        if not token:
+            continue
+        try:
+            path = Path(token).expanduser().resolve()
+        except Exception:
+            path = Path(token).expanduser()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _factory_repo_id(repo_path: Path) -> str:
+    try:
+        resolved = repo_path.expanduser().resolve()
+    except Exception:
+        resolved = repo_path.expanduser()
+    slug = _slug_token(resolved.name or "repo", max_len=32)
+    digest = hashlib.sha1(str(resolved).encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"{slug}-{digest}"
+
+
+def _git_default_branch(repo: Path) -> str:
+    try:
+        ref = _run_git(repo, ["symbolic-ref", "refs/remotes/origin/HEAD"], check=False)
+        raw = str(ref.stdout or "").strip()
+        if raw.startswith("refs/remotes/origin/"):
+            return raw.rsplit("/", 1)[-1].strip() or "main"
+    except Exception:
+        pass
+    for candidate in ("main", "master"):
+        try:
+            if _git_ref_exists(repo, f"refs/remotes/origin/{candidate}") or _git_ref_exists(repo, candidate):
+                return candidate
+        except Exception:
+            continue
+    return "main"
+
+
+def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
+    roots = _factory_repo_roots()
+    skip_prefixes: list[Path] = []
+    for candidate in (cfg.worktree_root, cfg.artifacts_root, Path(__file__).resolve().parent / "data"):
+        try:
+            skip_prefixes.append(candidate.expanduser().resolve())
+        except Exception:
+            skip_prefixes.append(candidate.expanduser())
+
+    discovered: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    base_repo = ""
+    try:
+        base_repo = str(cfg.codex_workdir.expanduser().resolve())
+    except Exception:
+        base_repo = str(cfg.codex_workdir)
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, _filenames in os.walk(root):
+            current = Path(dirpath)
+            try:
+                current_resolved = current.resolve()
+            except Exception:
+                current_resolved = current
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if str(name or "").strip().lower() not in _FACTORY_REPO_EXCLUDE_NAMES
+                and not str(name or "").strip().startswith(".Trash")
+            ]
+            if any(_path_is_relative_to(current_resolved, prefix) for prefix in skip_prefixes):
+                dirnames[:] = []
+                continue
+            if not (current_resolved / ".git").exists():
+                continue
+            repo_key = str(current_resolved)
+            if repo_key in seen_paths:
+                dirnames[:] = []
+                continue
+            seen_paths.add(repo_key)
+            repo_id = _factory_repo_id(current_resolved)
+            discovered.append(
+                {
+                    "repo_id": repo_id,
+                    "path": repo_key,
+                    "default_branch": _git_default_branch(current_resolved),
+                    "autonomy_enabled": True,
+                    "priority": 1 if repo_key == base_repo else 2,
+                    "runtime_mode": "ceo-bounded",
+                    "daily_budget": 0.0,
+                    "status": "active",
+                    "metadata": {
+                        "repo_name": current_resolved.name,
+                        "discovered_by": "factory_scan",
+                        "discovered_at": time.time(),
+                        **_discover_repo_deploy_metadata(cfg, current_resolved),
+                    },
+                }
+            )
+            dirnames[:] = []
+    discovered.sort(key=lambda item: (int(item.get("priority") or 2), str(item.get("path") or "")))
+    return discovered
+
+
+def _factory_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    now = float(time.time())
+    mode = str(st.get("factory_mode") or "ceo-bounded").strip().lower() or "ceo-bounded"
+    hard_stop = bool(st.get("factory_hard_stop", False))
+    soft_pause_until = _state_float(st, "factory_soft_pause_until")
+    soft_pause_active = bool(soft_pause_until is not None and soft_pause_until > now)
+    pause_reason = str(st.get("factory_pause_reason") or st.get("proactive_lane_paused_reason") or "").strip()
+    pause_kind = str(st.get("factory_pause_kind") or "").strip().lower()
+    paused_at = _state_float(st, "factory_paused_at")
+    repo_sync_at = _state_float(st, "factory_repos_last_sync_at")
+
+    # Backward-compatible read path for older state files.
+    legacy_paused = bool(st.get("proactive_lane_paused", False))
+    legacy_manual = bool(st.get("proactive_lane_manual_pause", False))
+    if not hard_stop and not soft_pause_active and legacy_paused:
+        if legacy_manual:
+            hard_stop = True
+        else:
+            soft_pause_active = True
+        if not pause_kind:
+            pause_kind = "hard_stop" if legacy_manual else "soft_pause"
+        if paused_at is None:
+            paused_at = _state_float(st, "proactive_lane_paused_at")
+    if hard_stop:
+        pause_kind = "hard_stop"
+    elif soft_pause_active:
+        pause_kind = "soft_pause"
+    else:
+        pause_kind = ""
+
+    return {
+        "mode": mode,
+        "paused": bool(hard_stop or soft_pause_active),
+        "hard_stop": bool(hard_stop),
+        "soft_pause_active": bool(soft_pause_active),
+        "soft_pause_until": soft_pause_until,
+        "pause_kind": pause_kind,
+        "pause_reason": pause_reason,
+        "paused_at": paused_at,
+        "repo_sync_at": repo_sync_at,
+    }
+
+
+def _write_factory_pause_state(
+    st: dict[str, Any],
+    *,
+    paused: bool,
+    hard_stop: bool,
+    reason: str,
+    paused_at: float | None,
+    soft_pause_until: float | None,
+) -> None:
+    st["factory_hard_stop"] = bool(hard_stop) if paused else False
+    st["factory_pause_kind"] = ("hard_stop" if hard_stop else "soft_pause") if paused else ""
+    if paused_at is not None and paused:
+        st["factory_paused_at"] = float(paused_at)
+        st["proactive_lane_paused_at"] = float(paused_at)
+    else:
+        st.pop("factory_paused_at", None)
+        st.pop("proactive_lane_paused_at", None)
+    if soft_pause_until is not None and paused and not hard_stop:
+        st["factory_soft_pause_until"] = float(soft_pause_until)
+    else:
+        st.pop("factory_soft_pause_until", None)
+    if reason and paused:
+        st["factory_pause_reason"] = str(reason)
+        st["proactive_lane_paused_reason"] = str(reason)
+    else:
+        st.pop("factory_pause_reason", None)
+        st.pop("proactive_lane_paused_reason", None)
+    st["proactive_lane_paused"] = bool(paused)
+    if paused and hard_stop:
+        st["proactive_lane_manual_pause"] = True
+    else:
+        st.pop("proactive_lane_manual_pause", None)
+
+
+def _set_factory_mode(cfg: "BotConfig", *, mode: str) -> dict[str, Any]:
+    normalized = str(mode or "").strip().lower() or "ceo-bounded"
+
+    def _m(st: dict[str, Any]) -> None:
+        st["factory_mode"] = normalized
+
+    return _update_state(cfg, _m)
+
+
+def _set_factory_pause(
+    cfg: "BotConfig",
+    *,
+    hard_stop: bool,
+    reason: str | None = None,
+    ttl_seconds: int | None = None,
+) -> dict[str, Any]:
+    pause_reason = str(reason or "").strip()
+    now = float(time.time())
+    until_ts: float | None = None
+    if not hard_stop and ttl_seconds is not None:
+        until_ts = now + float(max(60, int(ttl_seconds)))
+
+    def _m(st: dict[str, Any]) -> None:
+        _write_factory_pause_state(
+            st,
+            paused=True,
+            hard_stop=bool(hard_stop),
+            reason=pause_reason,
+            paused_at=now,
+            soft_pause_until=until_ts,
+        )
+
+    return _update_state(cfg, _m)
+
+
+def _clear_factory_pause(cfg: "BotConfig") -> dict[str, Any]:
+    def _m(st: dict[str, Any]) -> None:
+        _write_factory_pause_state(
+            st,
+            paused=False,
+            hard_stop=False,
+            reason="",
+            paused_at=None,
+            soft_pause_until=None,
+        )
+
+    return _update_state(cfg, _m)
+
+
+def _factory_auto_resume_if_due(cfg: "BotConfig") -> bool:
+    state = _factory_state(cfg)
+    if bool(state.get("hard_stop", False)):
+        return False
+    if not bool(state.get("soft_pause_active", False)):
+        return False
+    soft_pause_until = state.get("soft_pause_until")
+    try:
+        due = float(soft_pause_until or 0.0) <= float(time.time())
+    except Exception:
+        due = True
+    if not due:
+        return False
+    _clear_factory_pause(cfg)
+    return True
+
+
+def _parse_factory_ttl(raw: str) -> int | None:
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    m = re.fullmatch(r"(\d+)([smhd]?)", text)
+    if not m:
+        return None
+    value = max(1, int(m.group(1)))
+    unit = str(m.group(2) or "m")
+    factor = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 60)
+    ttl = value * factor
+    if ttl < 60:
+        ttl = 60
+    if ttl > 7 * 24 * 60 * 60:
+        ttl = 7 * 24 * 60 * 60
+    return ttl
+
+
+def _proactive_lane_state(cfg: "BotConfig") -> dict[str, Any]:
+    state = _factory_state(cfg)
+    return {
+        "paused": bool(state.get("paused", False)),
+        "manual_pause": bool(state.get("hard_stop", False)),
+        "reason": str(state.get("pause_reason") or "").strip(),
+        "paused_at": state.get("paused_at"),
+        "pause_kind": str(state.get("pause_kind") or "").strip(),
+        "soft_pause_until": state.get("soft_pause_until"),
     }
 
 
@@ -1973,30 +2747,14 @@ def _set_proactive_lane_pause(
     reason: str | None = None,
     manual: bool | None = None,
 ) -> dict[str, Any]:
-    now = float(time.time())
-
-    def _m(st: dict[str, Any]) -> None:
-        current_manual = bool(st.get("proactive_lane_manual_pause", False))
-        current_reason = str(st.get("proactive_lane_paused_reason") or "").strip()
-        if paused:
-            st["proactive_lane_paused"] = True
-            st["proactive_lane_paused_at"] = now
-            next_manual = current_manual if manual is None else bool(manual)
-            if next_manual:
-                st["proactive_lane_manual_pause"] = True
-            else:
-                st.pop("proactive_lane_manual_pause", None)
-            if reason:
-                st["proactive_lane_paused_reason"] = str(reason)
-            elif current_reason:
-                st["proactive_lane_paused_reason"] = current_reason
-        else:
-            st["proactive_lane_paused"] = False
-            st.pop("proactive_lane_paused_reason", None)
-            st.pop("proactive_lane_paused_at", None)
-            st.pop("proactive_lane_manual_pause", None)
-
-    return _update_state(cfg, _m)
+    if not paused:
+        return _clear_factory_pause(cfg)
+    return _set_factory_pause(
+        cfg,
+        hard_stop=bool(manual) if manual is not None else False,
+        reason=reason,
+        ttl_seconds=None,
+    )
 
 
 def _maybe_resume_proactive_lane_for_manual_ceo_request(cfg: "BotConfig") -> bool:
@@ -2005,7 +2763,7 @@ def _maybe_resume_proactive_lane_for_manual_ceo_request(cfg: "BotConfig") -> boo
         return False
     if bool(state.get("manual_pause", False)):
         return False
-    _set_proactive_lane_pause(cfg, paused=False)
+    _clear_factory_pause(cfg)
     return True
 
 
@@ -2036,6 +2794,7 @@ def _pause_proactive_lane_now(
     orch_q: "OrchestratorQueue",
     reason: str,
     manual: bool,
+    ttl_seconds: int | None = None,
 ) -> dict[str, Any]:
     before = _proactive_lane_state(cfg)
     cancelled = 0
@@ -2058,11 +2817,16 @@ def _pause_proactive_lane_now(
                     cancelled += 1
             except Exception:
                 continue
-    after = _set_proactive_lane_pause(cfg, paused=True, reason=reason, manual=manual)
+    after = _set_factory_pause(
+        cfg,
+        hard_stop=bool(manual),
+        reason=reason,
+        ttl_seconds=(None if manual else ttl_seconds),
+    )
     return {
         "autonomous_jobs_cancelled": int(cancelled),
         "was_paused": bool(before.get("paused", False)),
-        "manual_pause": bool(after.get("proactive_lane_manual_pause", False)),
+        "manual_pause": bool(after.get("hard_stop", False) or after.get("manual_pause", False)),
     }
 
 
@@ -2798,8 +3562,6 @@ def _codex_defaults_from_config(path: Path | None = None) -> tuple[str, str]:
 
     Returns: (model, model_reasoning_effort) as strings (possibly empty).
     """
-    if tomllib is None:
-        return "", ""
     p = path or _codex_config_path()
     try:
         raw = p.read_bytes()
@@ -2809,16 +3571,32 @@ def _codex_defaults_from_config(path: Path | None = None) -> tuple[str, str]:
         LOG.exception("Failed to read codex config: %s", p)
         return "", ""
 
-    try:
-        cfg = tomllib.loads(raw.decode("utf-8", errors="replace"))
-    except Exception:
-        LOG.exception("Failed to parse codex config TOML: %s", p)
-        return "", ""
+    decoded = raw.decode("utf-8", errors="replace")
+    if tomllib is not None:
+        try:
+            cfg = tomllib.loads(decoded)
+            model = cfg.get("model") if isinstance(cfg, dict) else None
+            effort = cfg.get("model_reasoning_effort") if isinstance(cfg, dict) else None
+            model = model.strip() if isinstance(model, str) else ""
+            effort = effort.strip() if isinstance(effort, str) else ""
+            return model, effort
+        except Exception:
+            LOG.exception("Failed to parse codex config TOML: %s", p)
 
-    model = cfg.get("model") if isinstance(cfg, dict) else None
-    effort = cfg.get("model_reasoning_effort") if isinstance(cfg, dict) else None
-    model = model.strip() if isinstance(model, str) else ""
-    effort = effort.strip() if isinstance(effort, str) else ""
+    # Compat fallback for older Python runtimes without tomllib/tomli.
+    model = ""
+    effort = ""
+    for line in decoded.splitlines():
+        stripped = str(line or "").strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m_model = re.match(r'^model\s*=\s*["\']([^"\']+)["\']\s*$', stripped)
+        if m_model:
+            model = str(m_model.group(1) or "").strip()
+            continue
+        m_effort = re.match(r'^model_reasoning_effort\s*=\s*["\']([^"\']+)["\']\s*$', stripped)
+        if m_effort:
+            effort = str(m_effort.group(1) or "").strip()
     return model, effort
 
 
@@ -2975,12 +3753,32 @@ def _redact_codex_cmd_for_log(cmd: list[str]) -> list[str]:
 
 
 class CodexRunner:
-    def __init__(self, cfg: BotConfig, *, chat_id: int | None = None) -> None:
+    def __init__(
+        self,
+        cfg: BotConfig,
+        *,
+        chat_id: int | None = None,
+        allow_bypass: bool = True,
+        forced_mode: str | None = None,
+    ) -> None:
         self._cfg = cfg
         self._chat_id = chat_id
+        self._allow_bypass = bool(allow_bypass)
+        if forced_mode not in (None, "ro", "rw", "full"):
+            raise ValueError(f"Invalid forced mode: {forced_mode}")
+        self._forced_mode = forced_mode
     
     def _bypass_sandbox(self) -> bool:
+        if not self._allow_bypass:
+            return False
         return _effective_bypass_sandbox(self._cfg, chat_id=self._chat_id)
+
+    def _effective_mode_hint(self, mode_hint: str) -> str:
+        if mode_hint not in ("ro", "rw", "full"):
+            raise ValueError(f"Invalid mode hint: {mode_hint}")
+        if self._forced_mode in ("ro", "rw", "full"):
+            return str(self._forced_mode)
+        return "full" if self._cfg.codex_force_full_access else mode_hint
 
     @dataclass(frozen=True)
     class Running:
@@ -3192,7 +3990,7 @@ class CodexRunner:
     def _threaded_sandbox_mode(self, mode_hint: str) -> str:
         if mode_hint not in ("ro", "rw", "full"):
             raise ValueError(f"Invalid mode hint: {mode_hint}")
-        effective_mode = "full" if self._cfg.codex_force_full_access else mode_hint
+        effective_mode = self._effective_mode_hint(mode_hint)
         if effective_mode == "ro":
             return "read-only"
         if effective_mode == "rw":
@@ -3265,7 +4063,7 @@ class CodexRunner:
 
             # Sandbox default (only if user didn't choose one).
             if "--sandbox" not in argv and "--full-auto" not in argv and "--dangerously-bypass-approvals-and-sandbox" not in argv:
-                effective_mode = "full" if self._cfg.codex_force_full_access else mode_hint
+                effective_mode = self._effective_mode_hint(mode_hint)
                 if effective_mode == "ro":
                     sandbox = "read-only"
                 elif effective_mode == "rw":
@@ -3573,6 +4371,60 @@ def _extract_first_diff_block(text: str) -> str:
         patch = str(plain.group(1) or "").strip()
         return (patch + "\n") if patch else ""
     return ""
+
+
+def _extract_structured_result_payload(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    seen_blobs: set[str] = set()
+
+    def _maybe_add(candidate_text: str) -> None:
+        blob = str(candidate_text or "").strip()
+        if not blob or blob in seen_blobs:
+            return
+        seen_blobs.add(blob)
+        try:
+            parsed = json.loads(blob)
+        except Exception:
+            return
+        if isinstance(parsed, dict):
+            candidates.append(parsed)
+
+    _maybe_add(raw)
+    for match in re.finditer(r"```(?:json)?\s*\n(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL):
+        _maybe_add(str(match.group(1) or ""))
+
+    if not candidates:
+        return None
+
+    def _score(payload: dict[str, Any]) -> tuple[int, int]:
+        score = 0
+        if isinstance(payload.get("subtasks"), list):
+            score += 100
+        next_action = payload.get("next_action")
+        if isinstance(next_action, dict):
+            score += 40
+            if isinstance(next_action.get("subtasks"), list):
+                score += 100
+            if str(next_action.get("type") or "").strip():
+                score += 10
+        if "summary" in payload:
+            score += 5
+        if isinstance(payload.get("artifacts"), list):
+            score += 2
+        return score, len(json.dumps(payload, ensure_ascii=False))
+
+    return max(candidates, key=_score)
+
+
+def _result_structured_digest(result: Any) -> Any:
+    structured = getattr(result, "structured_digest", None)
+    if structured is None and isinstance(result, dict):
+        structured = result.get("structured_digest")
+    return structured
 
 
 def _extract_changed_files_from_patch_text(text: str) -> list[str]:
@@ -3923,8 +4775,15 @@ def _task_file_targets(*, task: Any, worktree_dir: Path) -> list[str]:
     return targets[:8]
 
 
-def _local_role_worktree_dir(role: str) -> Path:
+def _repo_worktree_root(cfg: BotConfig, *, repo_id: str) -> Path:
+    token = _slug_token(repo_id or "repo", max_len=48)
+    return (cfg.worktree_root / "factory_repos" / token).resolve()
+
+
+def _local_role_worktree_dir(role: str, *, cfg: BotConfig | None = None, repo_id: str | None = None) -> Path:
     base = Path(__file__).resolve().parent
+    if cfg is not None and repo_id:
+        return (_repo_worktree_root(cfg, repo_id=repo_id) / str(role or "").strip() / "slot1").resolve()
     return (base / "data" / "worktrees" / str(role or "").strip() / "slot1").resolve()
 
 
@@ -3958,7 +4817,9 @@ def _latest_local_specialist_response(
         for response_path in response_candidates:
             try:
                 if response_path.exists():
-                    return _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+                    payload = _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+                    if payload:
+                        return payload
             except Exception:
                 continue
         trace_obj: dict[str, Any] = {}
@@ -3971,7 +4832,7 @@ def _latest_local_specialist_response(
                 trace_obj = {}
         elif isinstance(trace_blob, dict):
             trace_obj = trace_blob
-        summary = str(trace_obj.get("result_summary") or "").strip()
+        summary = str(row_map.get("result_summary") or trace_obj.get("result_summary") or "").strip()
         if summary:
             return _truncate(summary)
         return ""
@@ -3987,7 +4848,7 @@ def _latest_local_specialist_response(
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "select job_id, artifacts_dir, trace from jobs where parent_job_id=? and role=? and state='done' order by created_at desc limit 12",
+            "select job_id, artifacts_dir, trace, json_extract(trace, '$.result_summary') as result_summary from jobs where parent_job_id=? and role=? and state='done' order by updated_at desc, created_at desc limit 12",
             (ticket, wanted_role),
         ).fetchall()
     except Exception:
@@ -3997,6 +4858,14 @@ def _latest_local_specialist_response(
             conn.close()
         except Exception:
             pass
+    for row in rows or []:
+        try:
+            row_map = dict(row)
+        except Exception:
+            row_map = {}
+        summary = _truncate(str(row_map.get("result_summary") or ""))
+        if summary:
+            return summary
     for row in rows or []:
         payload = _read_row_payload(row)
         if payload:
@@ -4034,7 +4903,9 @@ def _local_specialist_response_for_key(
         for response_path in response_candidates:
             try:
                 if response_path.exists():
-                    return _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+                    payload = _truncate(response_path.read_text(encoding="utf-8", errors="replace"))
+                    if payload:
+                        return payload
             except Exception:
                 continue
         trace_obj: dict[str, Any] = {}
@@ -4047,7 +4918,7 @@ def _local_specialist_response_for_key(
                 trace_obj = {}
         elif isinstance(trace_blob, dict):
             trace_obj = trace_blob
-        summary = str(trace_obj.get("result_summary") or "").strip()
+        summary = str(row_map.get("result_summary") or trace_obj.get("result_summary") or "").strip()
         if summary:
             return _truncate(summary)
         return ""
@@ -4065,11 +4936,12 @@ def _local_specialist_response_for_key(
         rows = conn.execute(
             (
                 "select job_id, artifacts_dir, trace "
+                "     , json_extract(trace, '$.result_summary') as result_summary "
                 "from jobs "
                 "where role=? "
                 "  and state='done' "
                 "  and (json_extract(labels, '$.key')=? or labels like ?) "
-                "order by created_at desc limit 12"
+                "order by updated_at desc, created_at desc limit 12"
             ),
             (wanted_role, wanted_key, "%" + wanted_key + "%"),
         ).fetchall()
@@ -4080,6 +4952,14 @@ def _local_specialist_response_for_key(
             conn.close()
         except Exception:
             pass
+    for row in rows or []:
+        try:
+            row_map = dict(row)
+        except Exception:
+            row_map = {}
+        summary = _truncate(str(row_map.get("result_summary") or ""))
+        if summary:
+            return summary
     for row in rows or []:
         payload = _read_row_payload(row)
         if payload:
@@ -4167,27 +5047,22 @@ def _missing_handoff_files(*, text: str, worktree_dir: Path) -> list[str]:
     return missing
 
 
-def _augment_local_specialist_prompt_with_workspace_context(
+def _workspace_inventory_and_candidates(
     *,
-    task: Any,
-    user_prompt: str,
     worktree_dir: Path,
     role: str,
-) -> str:
+    context_texts: list[str] | tuple[str, ...],
+) -> tuple[list[str], list[str], list[str]]:
     if not worktree_dir.is_dir():
-        return user_prompt
+        return [], [], []
 
     file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
     exact_targets: list[str] = []
     candidate_paths: list[str] = []
     seen: set[str] = set()
 
-    context_sources = [
-        str(getattr(task, "input_text", "") or ""),
-        json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
-    ]
-    for source in context_sources:
-        for match in file_hint_re.findall(source):
+    for source in context_texts or []:
+        for match in file_hint_re.findall(str(source or "")):
             rel_path = str(match or "").strip().lstrip("./")
             if not rel_path or rel_path in seen:
                 continue
@@ -4206,7 +5081,6 @@ def _augment_local_specialist_prompt_with_workspace_context(
         if len(candidate_paths) >= 4:
             break
 
-    inventory_lines: list[str] = []
     try:
         git_ls = subprocess.run(
             ["git", "ls-files"],
@@ -4219,15 +5093,10 @@ def _augment_local_specialist_prompt_with_workspace_context(
     except Exception:
         repo_files = []
 
+    inventory_cap = 40 if role in {"architect_local", "reviewer_local"} else 10
+    inventory_lines: list[str] = []
     if not candidate_paths and repo_files:
-        objective_tokens = _extract_objective_tokens(
-            "\n".join(
-                [
-                    str(user_prompt or ""),
-                    str(getattr(task, "input_text", "") or ""),
-                ]
-            )
-        )
+        objective_tokens = _extract_objective_tokens("\n".join(str(item or "") for item in (context_texts or [])))
         preferred_by_role: dict[str, tuple[str, ...]] = {
             "architect_local": (
                 "bot.py",
@@ -4270,20 +5139,62 @@ def _augment_local_specialist_prompt_with_workspace_context(
                 score -= 6
             if "/" not in rel_path:
                 score += 2
-            if score <= 0:
-                continue
-            if rel_path in seen_ranked:
+            if score <= 0 or rel_path in seen_ranked:
                 continue
             seen_ranked.add(rel_path)
             ranked.append((score, rel_path))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         excerpt_cap = 2 if role in {"architect_local", "reviewer_local"} else 3
         candidate_paths = [path for _score, path in ranked[:excerpt_cap]]
-        inventory_lines = [path for _score, path in ranked[:10]]
+        inventory_lines = [path for _score, path in ranked[:inventory_cap]]
         if not inventory_lines:
-            inventory_lines = repo_files[:10]
+            inventory_lines = repo_files[:inventory_cap]
     elif repo_files:
-        inventory_lines = repo_files[:10]
+        inventory_lines = repo_files[:inventory_cap]
+
+    return exact_targets, candidate_paths, inventory_lines
+
+
+def _response_signals_repo_access_blocker(text: str) -> bool:
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return False
+    signals = (
+        "can't access the repo filesystem",
+        "cannot access the repo filesystem",
+        "unable to read repository",
+        "unable to access `/home/aponce/codexbot`",
+        "sandbox exec denied",
+        "sandbox denied local filesystem access",
+        "tooling is restricted",
+        "need read access to identify exact files",
+        "can't list or read files",
+        "can't access the repo file list",
+        "bwrap: loopback: failed rtm_newaddr",
+    )
+    return any(sig in raw for sig in signals)
+
+
+def _augment_local_specialist_prompt_with_workspace_context(
+    *,
+    task: Any,
+    user_prompt: str,
+    worktree_dir: Path,
+    role: str,
+) -> str:
+    if not worktree_dir.is_dir():
+        return user_prompt
+
+    file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    exact_targets, candidate_paths, inventory_lines = _workspace_inventory_and_candidates(
+        worktree_dir=worktree_dir,
+        role=role,
+        context_texts=[
+            str(user_prompt or ""),
+            str(getattr(task, "input_text", "") or ""),
+            json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
+        ],
+    )
     if role == "implementer_local" and candidate_paths:
         inventory_lines = []
         ordered_exact = [path for path in exact_targets if path in candidate_paths]
@@ -4326,12 +5237,16 @@ def _augment_local_specialist_prompt_with_workspace_context(
         f"REAL_WORKTREE_DIR: {worktree_dir}",
         "Use REAL_WORKTREE_DIR as the repository root. Do not propose edits inside ARTIFACTS_DIR.",
     ]
+    if role in {"architect_local", "reviewer_local"}:
+        chunks.append(
+            "Controller note: the Workspace inventory and FILE excerpts below are authoritative snapshots captured outside your shell sandbox. Do not claim you need repo listing or shell access when this snapshot is present."
+        )
     if inventory_lines:
         chunks.extend([
             "",
             "Workspace inventory (candidate repo files to anchor exact paths):",
             "```text",
-            "\n".join(inventory_lines[:10]),
+            "\n".join(inventory_lines[:40] if role in {"architect_local", "reviewer_local"} else inventory_lines[:10]),
             "```",
         ])
     if not candidate_paths:
@@ -4394,6 +5309,88 @@ def _augment_local_implementer_prompt_with_workspace_context(
     )
 
 
+def _build_local_specialist_user_prompt(
+    *,
+    task: Any,
+    role_profile: dict[str, Any],
+    role: str,
+    mode: str,
+    worktree_dir: Path,
+) -> str:
+    user_prompt = build_agent_prompt(task, profile=role_profile)
+    if role in {"architect_local", "reviewer_local"}:
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nLOCAL_WORKSPACE_RULES:\n"
+            + "- Use REAL_WORKTREE_DIR as the actual repo root.\n"
+            + "- Do not invent paths under ARTIFACTS_DIR.\n"
+            + "- The controller may provide Workspace inventory and FILE excerpts captured outside your own shell/tool sandbox; treat those snapshots as authoritative repo context.\n"
+            + "- Do not ask for `rg --files`, `ls`, or shell access when that Workspace inventory / FILE context is present.\n"
+            + "- If your own shell commands fail, choose exact files from the provided inventory/excerpts or return BLOCKER naming the most likely files from that same snapshot.\n"
+            + "- If the repository context still does not support a safe exact file choice, return BLOCKER immediately.\n"
+        )
+        return _augment_local_specialist_prompt_with_workspace_context(
+            task=task,
+            user_prompt=user_prompt,
+            worktree_dir=worktree_dir,
+            role=role,
+        )
+    if role == "implementer_local":
+        architect_context = ""
+        arch_key_match = re.search(r"\blocal_arch_guard_[0-9]{6,}\b", str(user_prompt or ""), flags=re.IGNORECASE)
+        if arch_key_match:
+            architect_context = _local_specialist_response_for_key(
+                role="architect_local",
+                delegated_key=str(arch_key_match.group(0) or "").strip(),
+                max_chars=7000,
+            )
+        root_ticket_hint = str(getattr(task, "parent_job_id", "") or "").strip()
+        if not root_ticket_hint:
+            ticket_match = re.search(
+                r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+                str(getattr(task, "input_text", "") or ""),
+                flags=re.IGNORECASE,
+            )
+            if ticket_match:
+                root_ticket_hint = str(ticket_match.group(0) or "").strip()
+        if not architect_context:
+            architect_context = _latest_local_specialist_response(
+                root_ticket=root_ticket_hint,
+                role="architect_local",
+                max_chars=7000,
+            )
+        if architect_context:
+            user_prompt = (
+                str(user_prompt or "").rstrip()
+                + "\n\nLATEST_ARCHITECT_LOCAL_OUTPUT (treat this as the primary implementation slice when it is more specific than the generic request):\n```text\n"
+                + architect_context
+                + "\n```\n"
+            )
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nIMPLEMENTER_LOCAL_STRICT_OVERRIDE:\n"
+            + "- Ignore any generic planner/output contract that asks for JSON-only answers or more delegation.\n"
+            + "- Do not delegate subtasks.\n"
+            + "- Do not return another plan.\n"
+            + "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool from inside Codex.\n"
+            + "- Read-only workspace access is expected for this role; it is not a blocker by itself.\n"
+            + "- The controller will apply your diff/rewrite to REAL_WORKTREE_DIR and will run validation after your turn.\n"
+            + "- The FILE excerpts below are current workspace content. Do not claim you cannot inspect the file when a FILE section is present.\n"
+            + "- If PRIMARY_ARCHITECT_HANDOFF and FILE excerpts both point to the same file, use that current file content as authoritative.\n"
+            + "- Return either one fenced ```diff``` block that can be applied with git apply at worktree root, or one/more fenced rewrite blocks like ```python path=relative/path.py``` with the full replacement file content.\n"
+            + "- Prefer rewrite blocks when a single small file is shown in full below; prefer diff when changing multiple existing files.\n"
+            + "- After the diff or rewrite block(s), append short evidence notes plus EXPECTED_VALIDATION describing the command the controller should run next.\n"
+            + "- Do not claim you executed validation commands unless that output was already provided in the prompt.\n"
+            + "- If still blocked, return `BLOCKER:` with exact files or exact missing values to inspect next.\n"
+        )
+        return _augment_local_implementer_prompt_with_workspace_context(
+            task=task,
+            user_prompt=user_prompt,
+            worktree_dir=worktree_dir,
+        )
+    return user_prompt
+
+
 def _finalize_local_implementer_change(
     *,
     artifacts_dir: Path,
@@ -4430,25 +5427,29 @@ def _finalize_local_implementer_change(
     diff_path.write_text(diff_text, encoding="utf-8", errors="replace")
     artifacts.append(str(diff_path))
 
+    names_proc = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB"],
+        cwd=str(worktree_dir),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    actual_changed_files = [line.strip() for line in (names_proc.stdout or "").splitlines() if line.strip()]
     hinted_files = [str(path or "").strip() for path in (changed_files_hint or []) if str(path or "").strip()]
     changed_files: list[str]
     if hinted_files:
+        actual_changed_set = set(actual_changed_files)
         seen_changed: set[str] = set()
         changed_files = []
         for path in hinted_files:
-            if path in seen_changed:
+            if path in seen_changed or path not in actual_changed_set:
                 continue
             seen_changed.add(path)
             changed_files.append(path)
+        if not changed_files:
+            changed_files = list(actual_changed_files)
     else:
-        names_proc = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=ACMRTUXB"],
-            cwd=str(worktree_dir),
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        changed_files = [line.strip() for line in (names_proc.stdout or "").splitlines() if line.strip()]
+        changed_files = list(actual_changed_files)
     if not changed_files:
         raise RuntimeError("implementer_local produced no worktree changes after apply")
 
@@ -4690,6 +5691,61 @@ def _apply_local_implementer_patch(
     )
 
 
+def _finalize_codex_implementer_change(
+    *,
+    task: Any,
+    artifacts_dir: Path,
+    content: str,
+    worktree_dir: Path,
+) -> tuple[list[str], dict[str, Any], str | None]:
+    if not worktree_dir.is_dir():
+        return [], {}, f"implementer_local worktree not found: {worktree_dir}"
+
+    try:
+        artifacts, patch_info = _finalize_local_implementer_change(
+            artifacts_dir=artifacts_dir,
+            worktree_dir=worktree_dir,
+            artifacts=[],
+            apply_mode="workspace",
+            changed_files_hint=_extract_changed_files_from_patch_text(content),
+        )
+        return artifacts, patch_info, None
+    except Exception as existing_change_error:
+        existing_change_reason = str(existing_change_error).strip() or "implementer_local produced no worktree changes"
+
+    no_change_claim = _response_signals_no_code_change(content)
+    if no_change_claim:
+        no_change_path = artifacts_dir / "codex_implementer_no_change.txt"
+        no_change_path.write_text(content.strip() + "\n", encoding="utf-8", errors="replace")
+        return [
+            str(no_change_path)
+        ], {
+            "no_code_change_required": True,
+            "reason": "implementer_local verified no code change was required for this slice",
+        }, None
+    blocker_text = _extract_blocker_response(content)
+    if blocker_text:
+        blocker_path = artifacts_dir / "codex_implementer_blocker.txt"
+        blocker_path.write_text(blocker_text + "\n", encoding="utf-8", errors="replace")
+        return [str(blocker_path)], {}, f"implementer_local blocker: {blocker_text}"
+
+    patch_text = _extract_first_diff_block(content)
+    rewrite_blocks = _extract_file_rewrite_blocks(content)
+    if patch_text.strip() or rewrite_blocks:
+        try:
+            artifacts, patch_info = _apply_local_implementer_patch(
+                task=task,
+                artifacts_dir=artifacts_dir,
+                content=content,
+                worktree_dir=worktree_dir,
+            )
+            return artifacts, patch_info, None
+        except Exception as patch_error:
+            return [], {}, str(patch_error).strip() or existing_change_reason
+
+    return [], {}, existing_change_reason
+
+
 def _orchestrator_run_local_ollama(
 
     cfg: BotConfig,
@@ -4779,11 +5835,48 @@ def _orchestrator_run_local_ollama(
 
     artifacts_dir = Path((task.artifacts_dir or str(cfg.artifacts_root / task.job_id))).expanduser().resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    repo_record = _repo_record_for_task(task, orch_q)
+    repo_id = str((repo_record or {}).get("repo_id") or "").strip().lower()
+    repo_path = str((repo_record or {}).get("path") or "").strip()
+    repo_base_dir: Path | None = None
+    if repo_path:
+        try:
+            repo_base_dir = Path(repo_path).expanduser().resolve()
+        except Exception:
+            repo_base_dir = Path(repo_path).expanduser()
+    repo_default_branch = str((repo_record or {}).get("default_branch") or "").strip()
+    if not repo_default_branch and repo_base_dir is not None and (repo_base_dir / ".git").exists():
+        repo_default_branch = _git_default_branch(repo_base_dir)
+    repo_default_branch = repo_default_branch or "main"
+    repo_role_worktree: Path | None = None
+    order_branch = _resolve_order_branch_from_task(task, orch_q)
+    if repo_base_dir is not None and (repo_base_dir / ".git").exists():
+        try:
+            role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
+            repo_root = _repo_worktree_root(cfg, repo_id=role_repo_id)
+            ensure_worktree_pool(base_repo=repo_base_dir, root=repo_root, role=role, slots=1)
+            repo_role_worktree = (repo_root / role / "slot1").resolve()
+            prepare_clean_workspace(repo_role_worktree)
+            if order_branch:
+                ok_sync, sync_msg = _sync_worktree_to_order_branch(
+                    base_repo=repo_base_dir,
+                    worktree_dir=repo_role_worktree,
+                    order_branch=order_branch,
+                    default_branch=repo_default_branch,
+                )
+                if not ok_sync:
+                    raise RuntimeError(f"order branch sync failed: {sync_msg}")
+        except Exception:
+            repo_role_worktree = None
     shared_local_worktree = _local_role_worktree_dir("implementer_local")
-    if role == "implementer_local" and mode != "ro":
+    if repo_role_worktree is not None:
+        worktree_dir = repo_role_worktree
+    elif role == "implementer_local" and mode != "ro":
         worktree_dir = shared_local_worktree if shared_local_worktree.is_dir() else artifacts_dir
     elif role in {"architect_local", "reviewer_local"} and shared_local_worktree.is_dir():
         worktree_dir = shared_local_worktree
+    elif repo_base_dir is not None and repo_base_dir.exists():
+        worktree_dir = repo_base_dir
     else:
         worktree_dir = artifacts_dir
     live_response_path = artifacts_dir / "local_ollama_live.md"
@@ -4809,69 +5902,13 @@ def _orchestrator_run_local_ollama(
         }
 
     system_prompt = str(role_profile.get("system_prompt") or "").strip()
-    user_prompt = build_agent_prompt(task, profile=role_profile)
-    if role in {"architect_local", "reviewer_local"}:
-        user_prompt = (
-            str(user_prompt or "").rstrip()
-            + "\n\nLOCAL_WORKSPACE_RULES:\n"
-            + "- Use REAL_WORKTREE_DIR as the actual repo root.\n"
-            + "- Do not invent paths under ARTIFACTS_DIR.\n"
-            + "- If the repository context still does not support a safe exact file choice, return BLOCKER immediately.\n"
-        )
-        user_prompt = _augment_local_specialist_prompt_with_workspace_context(
-            task=task,
-            user_prompt=user_prompt,
-            worktree_dir=worktree_dir,
-            role=role,
-        )
-    if role == "implementer_local" and mode != "ro":
-        architect_context = ""
-        arch_key_match = re.search(r"\blocal_arch_guard_[0-9]{6,}\b", str(user_prompt or ""), flags=re.IGNORECASE)
-        if arch_key_match:
-            architect_context = _local_specialist_response_for_key(
-                role="architect_local",
-                delegated_key=str(arch_key_match.group(0) or "").strip(),
-                max_chars=7000,
-            )
-        root_ticket_hint = str(getattr(task, "parent_job_id", "") or "").strip()
-        if not root_ticket_hint:
-            ticket_match = re.search(
-                r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
-                str(getattr(task, "input_text", "") or ""),
-                flags=re.IGNORECASE,
-            )
-            if ticket_match:
-                root_ticket_hint = str(ticket_match.group(0) or "").strip()
-        if not architect_context:
-            architect_context = _latest_local_specialist_response(
-                root_ticket=root_ticket_hint,
-                role="architect_local",
-                max_chars=7000,
-            )
-        if architect_context:
-            user_prompt = (
-                str(user_prompt or "").rstrip()
-                + "\n\nLATEST_ARCHITECT_LOCAL_OUTPUT (treat this as the primary implementation slice when it is more specific than the generic request):\n```text\n"
-                + architect_context
-                + "\n```\n"
-            )
-        user_prompt = (
-            str(user_prompt or "").rstrip()
-            + "\n\nIMPLEMENTER_LOCAL_STRICT_OVERRIDE:\n"
-            + "- Ignore any generic planner/output contract that asks for JSON-only answers or more delegation.\n"
-            + "- Do not delegate subtasks.\n"
-            + "- Do not return another plan.\n"
-            + "- The FILE excerpts below are current workspace content. Do not claim you cannot inspect the file when a FILE section is present.\n"
-            + "- If PRIMARY_ARCHITECT_HANDOFF and FILE excerpts both point to the same file, use that current file content as authoritative.\n"
-            + "- Return either one fenced ```diff``` block that can be applied with git apply at worktree root, or one/more fenced rewrite blocks like ```python path=relative/path.py``` with the full replacement file content.\n"
-            + "- Prefer rewrite blocks when a single small file is shown in full below; prefer diff when changing multiple existing files.\n"
-            + "- After the diff or rewrite block(s), append short evidence notes. If still blocked, return `BLOCKER:` with exact files to inspect next.\n"
-        )
-        user_prompt = _augment_local_implementer_prompt_with_workspace_context(
-            task=task,
-            user_prompt=user_prompt,
-            worktree_dir=worktree_dir,
-        )
+    user_prompt = _build_local_specialist_user_prompt(
+        task=task,
+        role_profile=role_profile,
+        role=role,
+        mode=mode,
+        worktree_dir=worktree_dir,
+    )
 
     def _write_local_prompt(*, model_name: str, request_body: dict[str, Any]) -> None:
         payload = {
@@ -4993,13 +6030,8 @@ def _orchestrator_run_local_ollama(
         patch_info: dict[str, Any] = {}
         if role == "implementer_local" and mode != "ro":
             patch_text = _extract_first_diff_block(content)
-            blocker_text = _extract_blocker_response(content)
-            if blocker_text:
-                blocker_path = artifacts_dir / "local_ollama_blocker.txt"
-                blocker_path.write_text(blocker_text + "\n", encoding="utf-8", errors="replace")
-                patch_artifacts = [str(blocker_path)]
-                raise RuntimeError(f"implementer_local blocker: {blocker_text}")
-            if (not patch_text.strip()) and _response_signals_no_code_change(content):
+            no_change_claim = _response_signals_no_code_change(content)
+            if (not patch_text.strip()) and no_change_claim:
                 no_change_path = artifacts_dir / "local_ollama_no_change.txt"
                 no_change_path.write_text(content.strip() + "\n", encoding="utf-8", errors="replace")
                 patch_artifacts = [str(no_change_path)]
@@ -5008,6 +6040,12 @@ def _orchestrator_run_local_ollama(
                     "reason": "implementer_local verified no code change was required for this slice",
                 }
             else:
+                blocker_text = _extract_blocker_response(content)
+                if blocker_text:
+                    blocker_path = artifacts_dir / "local_ollama_blocker.txt"
+                    blocker_path.write_text(blocker_text + "\n", encoding="utf-8", errors="replace")
+                    patch_artifacts = [str(blocker_path)]
+                    raise RuntimeError(f"implementer_local blocker: {blocker_text}")
                 patch_artifacts, patch_info = _apply_local_implementer_patch(
                     task=task,
                     artifacts_dir=artifacts_dir,
@@ -5153,6 +6191,7 @@ def _help_text(cfg: BotConfig) -> str:
         "- /emergency_stop     Stop all orchestrator tasks and pause all roles",
         "- /pause_autonomy    Pause Skynet/local autonomous lane until explicit resume",
         "- /resume_autonomy   Resume Skynet/local autonomous lane",
+        "- /factory           Factory status/control (pause, hard_stop, resume, repos, scope, mode)",
         "- /pause <role>       Pause role in orchestrator",
         "- /resume <role>      Resume role in orchestrator",
         "- /cancel <id>        Cancel orchestrator task by id",
@@ -5254,6 +6293,7 @@ def _telegram_commands_for_suggestions(cfg: BotConfig) -> list[tuple[str, str]]:
         ("emergency_resume", "Resume orchestrator"),
         ("pause_autonomy", "Pause autonomous lane"),
         ("resume_autonomy", "Resume autonomous lane"),
+        ("factory", "Factory control"),
         ("daily", "Digest now"),
         ("brief", "Executive brief"),
         ("snapshot", "Request UI snapshot"),
@@ -5958,30 +6998,40 @@ def _run_git(
     check: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    run_env = dict(os.environ)
+    if env:
+        run_env.update(env)
+    run_env.setdefault("GIT_TERMINAL_PROMPT", "0")
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         check=check,
-        env=env,
+        env=run_env,
     )
 
 
 def _git_ref_exists(repo: Path, ref: str) -> bool:
     p = _run_git(repo, ["rev-parse", "--verify", ref], check=False)
-    return int(p.returncode or 1) == 0
+    return int(p.returncode if p.returncode is not None else 1) == 0
 
 
-def _git_pick_main_ref(repo: Path) -> str:
-    if _git_ref_exists(repo, "refs/remotes/origin/main"):
-        return "origin/main"
-    if _git_ref_exists(repo, "origin/main"):
-        return "origin/main"
-    if _git_ref_exists(repo, "refs/heads/main"):
-        return "main"
-    if _git_ref_exists(repo, "main"):
-        return "main"
+def _git_pick_main_ref(repo: Path, *, default_branch: str = "main") -> str:
+    preferred = str(default_branch or "").strip() or "main"
+    candidates: list[str] = []
+    for branch in (preferred, "main", "master"):
+        if branch and branch not in candidates:
+            candidates.append(branch)
+    for branch in candidates:
+        if _git_ref_exists(repo, f"refs/remotes/origin/{branch}"):
+            return f"origin/{branch}"
+        if _git_ref_exists(repo, f"origin/{branch}"):
+            return f"origin/{branch}"
+        if _git_ref_exists(repo, f"refs/heads/{branch}"):
+            return branch
+        if _git_ref_exists(repo, branch):
+            return branch
     return "HEAD"
 
 
@@ -5995,7 +7045,104 @@ def _git_remote_branch_exists(repo: Path, branch: str) -> bool:
     return bool(str(p.stdout or "").strip())
 
 
-def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
+def _git_fetch_remote_branch(repo: Path, branch: str) -> tuple[bool, str]:
+    b = str(branch or "").strip()
+    if not b:
+        return False, "branch_missing"
+    fetch = _run_git(repo, ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"], check=False)
+    if fetch.returncode == 0:
+        return True, "fetched"
+    fallback = _run_git(repo, ["fetch", "origin", b], check=False)
+    if fallback.returncode == 0:
+        return True, "fetched"
+    detail = (fallback.stderr or fallback.stdout or fetch.stderr or fetch.stdout or "").strip()
+    return False, detail or "branch_fetch_failed"
+
+
+def _git_is_non_fast_forward_push_error(detail: str) -> bool:
+    blob = str(detail or "").strip().lower()
+    if not blob:
+        return False
+    return (
+        "non-fast-forward" in blob
+        or "fetch first" in blob
+        or "updates were rejected because a pushed branch tip is behind its remote counterpart" in blob
+    )
+
+
+def _merge_error_is_conflict_like(detail: str) -> bool:
+    blob = str(detail or "").strip().lower()
+    if not blob:
+        return False
+    return (
+        "conflict" in blob
+        or "automatic merge failed" in blob
+        or "merge failed" in blob
+    )
+
+
+def _merge_ready_trace_reset_payload(*, now: float | None = None) -> dict[str, Any]:
+    ts = float(time.time() if now is None else now)
+    return {
+        "merge_error": None,
+        "merge_failed_at": None,
+        "merge_auto_error": None,
+        "merge_auto_failed_at": None,
+        "merge_auto_fail_notified_at": None,
+        "merge_auto_fail_notified_error": None,
+        "merge_auto_last_error_sig": None,
+        "merge_conflict_active": False,
+        "merge_conflict_detected_at": None,
+        "merge_conflict_recovered_at": ts,
+        "merge_conflict_replan_error": None,
+        "merge_conflict_replan_exhausted_at": None,
+        "merge_auto_resume_reason": "new_merge_ready_signal",
+        "merge_auto_resumed_at": ts,
+    }
+
+
+def _git_is_ancestor(repo: Path, older_ref: str, newer_ref: str) -> bool:
+    older = str(older_ref or "").strip()
+    newer = str(newer_ref or "").strip()
+    if not older or not newer:
+        return False
+    anc = _run_git(repo, ["merge-base", "--is-ancestor", older, newer], check=False)
+    return anc.returncode == 0
+
+
+def _git_unmerged_conflict_files(repo: Path) -> list[str]:
+    diff = _run_git(repo, ["diff", "--name-only", "--diff-filter=U"], check=False)
+    if diff.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in str(diff.stdout or "").splitlines():
+        rel_path = str(raw or "").strip()
+        if rel_path and rel_path not in out:
+            out.append(rel_path)
+    return out
+
+
+def _git_remote_branch_ref(repo: Path, branch: str) -> str:
+    b = str(branch or "").strip()
+    if not b:
+        return ""
+    if _git_ref_exists(repo, f"refs/remotes/origin/{b}"):
+        return f"origin/{b}"
+    if _git_ref_exists(repo, f"origin/{b}"):
+        return f"origin/{b}"
+    if _git_ref_exists(repo, f"refs/heads/{b}"):
+        return b
+    if _git_ref_exists(repo, b):
+        return b
+    return ""
+
+
+def _git_ensure_branch_from_main(
+    repo: Path,
+    branch: str,
+    *,
+    default_branch: str = "main",
+) -> tuple[bool, str]:
     b = str(branch or "").strip()
     if not b:
         return False, "branch_missing"
@@ -6006,7 +7153,7 @@ def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
         or _git_remote_branch_exists(repo, b)
     ):
         return True, "already_exists"
-    base = _git_pick_main_ref(repo)
+    base = _git_pick_main_ref(repo, default_branch=default_branch)
     src_ref = f"refs/heads/{b}"
     p = _run_git(repo, ["push", "origin", f"{base}:{src_ref}"], check=False)
     if p.returncode != 0:
@@ -6015,7 +7162,86 @@ def _git_ensure_branch_from_main(repo: Path, branch: str) -> tuple[bool, str]:
     return True, "created_from_main"
 
 
-def _git_branch_integrated_into_main(*, repo: Path, branch: str) -> bool:
+def _reconcile_order_branch_with_main(
+    *,
+    repo: Path,
+    order_branch: str,
+    order_id: str,
+    default_branch: str = "main",
+) -> tuple[bool, str, str | None]:
+    b = str(order_branch or "").strip()
+    if not b:
+        return False, "branch_missing", None
+
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    merge_root.mkdir(parents=True, exist_ok=True)
+    max_push_attempts = 2
+
+    for attempt in range(max_push_attempts):
+        _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        remote_exists = (
+            _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+            or _git_ref_exists(repo, f"origin/{b}")
+            or _git_remote_branch_exists(repo, b)
+        )
+        if not remote_exists:
+            return False, "branch_missing_remote", None
+        if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+            fetched, ferr = _git_fetch_remote_branch(repo, b)
+            if not fetched:
+                return False, ferr or "branch_fetch_failed", None
+
+        base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
+        branch_ref = _git_remote_branch_ref(repo, b)
+        if not branch_ref:
+            return False, "branch_ref_missing", None
+        if _git_is_ancestor(repo, base_ref, branch_ref):
+            rev = _run_git(repo, ["rev-parse", "--short", branch_ref], check=False)
+            branch_head = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+            return True, "branch_contains_latest_main", (branch_head or None)
+
+        merge_dir = (merge_root / f"reconcile-{str(order_id or 'order')[:8]}-{int(time.time())}-{attempt + 1}").resolve()
+        tmp_branch = f"poncebot/reconcile/{str(order_id or 'order')[:8]}-{int(time.time())}-{attempt + 1}"
+        try:
+            add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), branch_ref], check=False)
+            if add.returncode != 0:
+                return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+
+            mg = _run_git(merge_dir, ["merge", "--no-ff", "--no-edit", base_ref], check=False)
+            if mg.returncode != 0:
+                conflicts = _git_unmerged_conflict_files(merge_dir)
+                _run_git(merge_dir, ["merge", "--abort"], check=False)
+                detail = (mg.stderr or mg.stdout or "").strip() or "merge_failed"
+                if conflicts:
+                    detail = detail.rstrip() + "\nConflicts: " + ", ".join(conflicts[:12])
+                return False, detail, None
+
+            rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+            branch_head = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+            push = _run_git(merge_dir, ["push", "origin", f"HEAD:refs/heads/{b}"], check=False)
+            if push.returncode == 0:
+                return True, "branch_reconciled_with_main", (branch_head or None)
+
+            push_detail = (push.stderr or push.stdout or "").strip() or "push_branch_failed"
+            if _git_is_non_fast_forward_push_error(push_detail) and (attempt + 1) < max_push_attempts:
+                continue
+            return False, push_detail, None
+        finally:
+            try:
+                _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+                _run_git(repo, ["worktree", "prune"], check=False)
+                _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+            except Exception:
+                pass
+    return False, "push_branch_failed", None
+
+
+def _git_branch_integrated_into_main(
+    *,
+    repo: Path,
+    branch: str,
+    default_branch: str = "main",
+) -> bool:
     b = str(branch or "").strip()
     if not b:
         return True
@@ -6025,8 +7251,9 @@ def _git_branch_integrated_into_main(*, repo: Path, branch: str) -> bool:
         # Branch missing remotely: assume already integrated/retired.
         return True
 
-    _run_git(repo, ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"], check=False)
-    anc = _run_git(repo, ["merge-base", "--is-ancestor", f"origin/{b}", "origin/main"], check=False)
+    _git_fetch_remote_branch(repo, b)
+    base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
+    anc = _run_git(repo, ["merge-base", "--is-ancestor", f"origin/{b}", base_ref], check=False)
     return anc.returncode == 0
 
 
@@ -6034,6 +7261,7 @@ def _order_trace_requires_merge(
     trace: dict[str, Any] | None,
     *,
     repo: Path | None = None,
+    default_branch: str = "main",
 ) -> tuple[bool, str]:
     tr = dict(trace or {})
     branch = str(tr.get("order_branch") or "").strip()
@@ -6046,7 +7274,7 @@ def _order_trace_requires_merge(
 
     merged_flag = bool(tr.get("merged_to_main", False))
     if merged_flag and repo is not None:
-        if _git_branch_integrated_into_main(repo=repo, branch=branch):
+        if _git_branch_integrated_into_main(repo=repo, branch=branch, default_branch=default_branch):
             return False, branch
         # Metadata says merged, but git history disagrees -> force re-merge.
         return True, branch
@@ -6084,6 +7312,164 @@ def _retire_order_branch_without_merge(*, repo: Path, order_branch: str) -> tupl
     return True, "branch_retired"
 
 
+def _enqueue_merge_conflict_resolution(
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    *,
+    chat_id: int,
+    user_id: int | None,
+    order_id: str,
+    order_branch: str,
+    merge_error: str,
+    root_trace: dict[str, Any] | None,
+) -> str:
+    root_id = str(order_id or "").strip()
+    branch = str(order_branch or "").strip()
+    err_txt = str(merge_error or "").strip()
+    trace = dict(root_trace or {})
+    if not root_id or not branch:
+        return ""
+
+    try:
+        max_replans_total = int(os.environ.get("BOT_MERGE_CONFLICT_REPLAN_MAX_TOTAL", "3"))
+    except Exception:
+        max_replans_total = 3
+    max_replans_total = max(1, min(12, int(max_replans_total)))
+
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    children = orch_q.jobs_by_parent(parent_job_id=root_id, limit=500)
+
+    def _is_skynet_merge_replan(child: Task) -> bool:
+        labels = dict((child.labels or {}) if isinstance(child.labels, dict) else {})
+        if str(labels.get("kind") or "").strip().lower() != "merge_conflict_replan":
+            return False
+        child_trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        if bool(child_trace.get("merge_conflict_resolution", False)):
+            return True
+        return _coerce_orchestrator_role(str(child.role or "")) == "skynet"
+
+    replan_total = sum(
+        1
+        for c in children
+        if _is_skynet_merge_replan(c)
+    )
+    has_active_fix = any(
+        _is_skynet_merge_replan(c)
+        and str(c.state or "").strip().lower() in active_states
+        for c in children
+    )
+    try:
+        last_fix_at = float(trace.get("merge_conflict_replan_at", 0.0) or 0.0)
+    except Exception:
+        last_fix_at = 0.0
+    now_ts = float(time.time())
+    can_enqueue_replan = int(replan_total) < int(max_replans_total)
+    if has_active_fix or ((now_ts - last_fix_at) < 90.0) or (not can_enqueue_replan):
+        if not can_enqueue_replan:
+            try:
+                orch_q.update_trace(
+                    root_id,
+                    merge_conflict_replan_exhausted_at=now_ts,
+                    merge_conflict_replan_attempts=int(replan_total),
+                    live_at=now_ts,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.merge_conflict_replan_exhausted",
+                    actor="skynet",
+                    details={
+                        "order_id": root_id,
+                        "order_branch": branch,
+                        "attempts": int(replan_total),
+                        "max_attempts": int(max_replans_total),
+                    },
+                )
+            except Exception:
+                pass
+        return ""
+
+    fix_id = str(uuid.uuid4())
+    fix_trace: dict[str, Any] = {
+        "source": "merge_conflict",
+        "order_id": root_id,
+        "order_branch": branch,
+        "merge_error": err_txt,
+        "allow_delegation": True,
+        "merge_conflict_resolution": True,
+        "merge_resolution_base_ref": "origin/main",
+        "merge_resolution_target_ref": f"origin/{branch}",
+    }
+    for key in (
+        "repo_id",
+        "repo_path",
+        "project_id",
+        "initiative_key",
+        "proactive_lane",
+    ):
+        val = trace.get(key)
+        if val not in (None, "", []):
+            fix_trace[key] = val
+
+    fix_task = Task.new(
+        source="telegram",
+        role="skynet",
+        input_text=(
+            "MERGE CONFLICT RESOLUTION\n"
+            f"Order: {root_id}\n"
+            f"Branch: {branch}\n"
+            f"Merge error: {err_txt}\n\n"
+            "Objective:\n"
+            "- Treat origin/<branch> as the canonical branch for this order.\n"
+            "- Reconcile that branch against latest origin/main without dropping approved scope.\n"
+            "- Resolve the concrete conflicting files, push the updated branch back to origin/<branch>, and return PASS-ready evidence.\n"
+            "- Use architect_local, implementer_local, and reviewer_local as needed.\n"
+            "- Do not stop at NO-GO; leave the branch cleaner and closer to merge than it was.\n"
+        ),
+        request_type="maintenance",
+        priority=1,
+        model="",
+        effort="",
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        user_id=user_id,
+        reply_to_message_id=None,
+        parent_job_id=root_id,
+        labels={
+            "ticket": root_id,
+            "kind": "merge_conflict_replan",
+            "key": f"merge_conflict_replan_{root_id[:8]}",
+        },
+        artifacts_dir=str((cfg.artifacts_root / fix_id).resolve()),
+        trace=fix_trace,
+        job_id=fix_id,
+    )
+    orch_q.submit_task(fix_task)
+    try:
+        orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="planning")
+        orch_q.update_trace(
+            root_id,
+            merge_conflict_replan_at=now_ts,
+            merge_conflict_replan_job_id=fix_id,
+            merge_conflict_replan_error=err_txt[:800],
+            merge_conflict_replan_attempts=int(replan_total + 1),
+            live_at=now_ts,
+        )
+        orch_q.append_audit_event(
+            event_type="order.merge_conflict_replan_enqueued",
+            actor="skynet",
+            details={
+                "order_id": root_id,
+                "order_branch": branch,
+                "job_id": fix_id,
+                "controller_role": "skynet",
+            },
+        )
+    except Exception:
+        pass
+    return fix_id
+
+
 def _resolve_order_branch_from_task(task: Task, orch_q: OrchestratorQueue | None) -> str:
     tr = dict(task.trace or {})
     direct = str(tr.get("order_branch") or "").strip()
@@ -6108,25 +7494,19 @@ def _sync_worktree_to_order_branch(
     base_repo: Path,
     worktree_dir: Path,
     order_branch: str,
+    default_branch: str = "main",
 ) -> tuple[bool, str]:
     b = str(order_branch or "").strip()
     if not b:
         return True, "no_branch"
-    ok, msg = _git_ensure_branch_from_main(base_repo, b)
+    ok, msg = _git_ensure_branch_from_main(base_repo, b, default_branch=default_branch)
     if not ok:
         return False, f"ensure_branch_failed:{msg}"
 
     # Some repos use narrow fetch refspecs; fetch branch explicitly to guarantee local visibility.
-    f = _run_git(
-        worktree_dir,
-        ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"],
-        check=False,
-    )
-    if f.returncode != 0:
-        f2 = _run_git(worktree_dir, ["fetch", "origin", b], check=False)
-        if f2.returncode != 0:
-            ferr = (f2.stderr or f2.stdout or f.stderr or f.stdout or "").strip()
-            return False, f"fetch_failed:{ferr or 'unknown'}"
+    fetched, ferr = _git_fetch_remote_branch(worktree_dir, b)
+    if not fetched:
+        return False, f"fetch_failed:{ferr or 'unknown'}"
 
     p = _run_git(worktree_dir, ["reset", "--hard", f"origin/{b}"], check=False)
     if p.returncode != 0:
@@ -6198,68 +7578,110 @@ def _autocommit_push_order_branch(
     }
 
 
+def _git_status_porcelain(repo_dir: Path) -> str:
+    proc = _run_git(repo_dir, ["status", "--porcelain"], check=False)
+    return str(proc.stdout or "").rstrip()
+
+
+def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
+    out: list[str] = []
+    for raw_line in str(status_text or "").splitlines():
+        line = str(raw_line or "").rstrip()
+        if len(line) < 4:
+            continue
+        path_part = line[3:].strip()
+        if not path_part:
+            continue
+        if " -> " in path_part:
+            parts = [part.strip() for part in path_part.split(" -> ", 1) if str(part or "").strip()]
+            path_part = parts[-1] if parts else path_part
+        if path_part == ".poncebot_managed_worktree":
+            continue
+        if path_part and path_part not in out:
+            out.append(path_part)
+    return out
+
+
 def _merge_order_branch_to_main(
     *,
     repo: Path,
     order_branch: str,
     order_id: str,
+    default_branch: str = "main",
 ) -> tuple[bool, str, str | None]:
     b = str(order_branch or "").strip()
     if not b:
         return True, "no_branch", None
 
-    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-    remote_exists = (
-        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
-        or _git_ref_exists(repo, f"origin/{b}")
-        or _git_remote_branch_exists(repo, b)
-    )
-    if not remote_exists:
-        # If branch no longer exists remotely, treat as already integrated/closed.
-        return True, "branch_missing_remote", None
-
-    # Guarantee local visibility for repos using narrow fetch refspecs.
-    if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
-        f = _run_git(repo, ["fetch", "origin", f"refs/heads/{b}:refs/remotes/origin/{b}"], check=False)
-        if f.returncode != 0:
-            f2 = _run_git(repo, ["fetch", "origin", b], check=False)
-            if f2.returncode != 0:
-                ferr = (f2.stderr or f2.stdout or f.stderr or f.stdout or "").strip()
-                return False, ferr or "branch_fetch_failed", None
-
     merge_root = (repo / "data" / "merge_worktrees").resolve()
     merge_root.mkdir(parents=True, exist_ok=True)
-    merge_dir = (merge_root / f"{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
-    tmp_branch = f"poncebot/merge/{str(order_id or 'order')[:8]}-{int(time.time())}"
+    max_push_attempts = 2
+    for attempt in range(max_push_attempts):
+        _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        remote_exists = (
+            _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+            or _git_ref_exists(repo, f"origin/{b}")
+            or _git_remote_branch_exists(repo, b)
+        )
+        if not remote_exists:
+            # If branch no longer exists remotely, treat as already integrated/closed.
+            return True, "branch_missing_remote", None
 
-    try:
-        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
-        if add.returncode != 0:
-            return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+        # Guarantee local visibility for repos using narrow fetch refspecs.
+        if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+            fetched, ferr = _git_fetch_remote_branch(repo, b)
+            if not fetched:
+                return False, ferr or "branch_fetch_failed", None
 
-        mg = _run_git(merge_dir, ["merge", "--no-ff", "--no-edit", f"origin/{b}"], check=False)
-        if mg.returncode != 0:
-            _run_git(merge_dir, ["merge", "--abort"], check=False)
-            return False, (mg.stderr or mg.stdout or "").strip() or "merge_failed", None
+        reconciled_ok, reconciled_msg, _branch_head = _reconcile_order_branch_with_main(
+            repo=repo,
+            order_branch=b,
+            order_id=order_id,
+            default_branch=default_branch,
+        )
+        if not reconciled_ok:
+            return False, reconciled_msg, None
+        _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
+            fetched, ferr = _git_fetch_remote_branch(repo, b)
+            if not fetched:
+                return False, ferr or "branch_fetch_failed", None
 
-        rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
-        merge_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+        merge_dir = (merge_root / f"{str(order_id or 'order')[:8]}-{int(time.time())}-{attempt + 1}").resolve()
+        tmp_branch = f"poncebot/merge/{str(order_id or 'order')[:8]}-{int(time.time())}-{attempt + 1}"
+        base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
+        branch_ref = _git_remote_branch_ref(repo, b) or f"origin/{b}"
 
-        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
-        if ps.returncode != 0:
-            return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
-
-        # Hygiene: one branch per project/order, remove after successful merge.
-        _run_git(repo, ["push", "origin", "--delete", b], check=False)
-        _run_git(repo, ["branch", "-D", b], check=False)
-        return True, "merged_to_main", (merge_commit or None)
-    finally:
         try:
-            _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
-            _run_git(repo, ["worktree", "prune"], check=False)
-            _run_git(repo, ["branch", "-D", tmp_branch], check=False)
-        except Exception:
-            pass
+            add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), branch_ref], check=False)
+            if add.returncode != 0:
+                return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
+
+            if not _git_is_ancestor(merge_dir, base_ref, "HEAD"):
+                return False, "branch_not_reconciled_with_main", None
+
+            rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
+            merge_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+
+            ps = _run_git(merge_dir, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False)
+            if ps.returncode == 0:
+                # Hygiene: one branch per project/order, remove after successful merge.
+                _run_git(repo, ["push", "origin", "--delete", b], check=False)
+                _run_git(repo, ["branch", "-D", b], check=False)
+                return True, "merged_to_main", (merge_commit or None)
+
+            push_detail = (ps.stderr or ps.stdout or "").strip() or "push_main_failed"
+            if _git_is_non_fast_forward_push_error(push_detail) and (attempt + 1) < max_push_attempts:
+                continue
+            return False, push_detail, None
+        finally:
+            try:
+                _run_git(repo, ["worktree", "remove", "--force", str(merge_dir)], check=False)
+                _run_git(repo, ["worktree", "prune"], check=False)
+                _run_git(repo, ["branch", "-D", tmp_branch], check=False)
+            except Exception:
+                pass
+    return False, "push_main_failed", None
 
 
 def _rollback_order_merge_on_main(
@@ -6267,6 +7689,7 @@ def _rollback_order_merge_on_main(
     repo: Path,
     order_id: str,
     merge_commit: str,
+    default_branch: str = "main",
 ) -> tuple[bool, str, str | None]:
     mc = str(merge_commit or "").strip()
     if not mc:
@@ -6278,9 +7701,10 @@ def _rollback_order_merge_on_main(
     merge_root.mkdir(parents=True, exist_ok=True)
     merge_dir = (merge_root / f"rollback-{str(order_id or 'order')[:8]}-{int(time.time())}").resolve()
     tmp_branch = f"poncebot/rollback/{str(order_id or 'order')[:8]}-{int(time.time())}"
+    base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
 
     try:
-        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), "origin/main"], check=False)
+        add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), base_ref], check=False)
         if add.returncode != 0:
             return False, (add.stderr or add.stdout or "").strip() or "worktree_add_failed", None
 
@@ -6292,7 +7716,7 @@ def _rollback_order_merge_on_main(
         rev = _run_git(merge_dir, ["rev-parse", "--short", "HEAD"], check=False)
         rollback_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
 
-        ps = _run_git(merge_dir, ["push", "origin", "HEAD:main"], check=False)
+        ps = _run_git(merge_dir, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False)
         if ps.returncode != 0:
             return False, (ps.stderr or ps.stdout or "").strip() or "push_main_failed", None
         return True, "rollback_pushed", (rollback_commit or None)
@@ -6303,6 +7727,73 @@ def _rollback_order_merge_on_main(
             _run_git(repo, ["branch", "-D", tmp_branch], check=False)
         except Exception:
             pass
+
+
+def _tail_text(blob: str, *, max_chars: int = 1200) -> str:
+    text = str(blob or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return "..." + text[-max_chars:]
+
+
+def _sync_repo_checkout_to_default_branch(
+    *,
+    repo: Path,
+    default_branch: str = "main",
+) -> tuple[bool, str, str | None, Path | None]:
+    branch = str(default_branch or "").strip() or "main"
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    fetched, fetch_msg = _git_fetch_remote_branch(repo, branch)
+    if not fetched:
+        return False, f"fetch_failed:{fetch_msg}", None, None
+
+    def _finalize_synced_checkout(target_repo: Path) -> tuple[bool, str, str | None, Path | None]:
+        status = _run_git(target_repo, ["status", "--porcelain", "--untracked-files=no"], check=False)
+        if status.returncode != 0:
+            detail = (status.stderr or status.stdout or "").strip()
+            return False, detail or "status_failed", None, None
+        if str(status.stdout or "").strip():
+            return False, "tracked_changes_present", None, None
+
+        ff = _run_git(target_repo, ["merge", "--ff-only", f"origin/{branch}"], check=False)
+        if ff.returncode != 0:
+            detail = (ff.stderr or ff.stdout or "").strip()
+            return False, detail or "fast_forward_failed", None, None
+
+        rev = _run_git(target_repo, ["rev-parse", "--short", "HEAD"], check=False)
+        deployed_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+        return True, "synced", (deployed_commit or None), target_repo
+
+    def _runtime_worktree_dir() -> Path:
+        branch_slug = _slug_token(branch) or "main"
+        return (repo / "data" / "runtime_worktrees" / branch_slug).resolve()
+
+    head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    current_branch = str(head.stdout or "").strip() if head.returncode == 0 else ""
+    if current_branch in ("", branch):
+        return _finalize_synced_checkout(repo)
+
+    worktree_dir = _runtime_worktree_dir()
+    try:
+        worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return False, f"runtime_worktree_prepare_failed:{exc}", None, None
+
+    runtime_branch = f"poncebot/runtime/{_slug_token(branch) or 'main'}"
+    if not (worktree_dir / ".git").exists():
+        add = _run_git(repo, ["worktree", "add", "-B", runtime_branch, str(worktree_dir), f"origin/{branch}"], check=False)
+        if add.returncode != 0:
+            detail = (add.stderr or add.stdout or "").strip()
+            return False, detail or "runtime_worktree_add_failed", None, None
+    else:
+        wt_head = _run_git(worktree_dir, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        wt_branch = str(wt_head.stdout or "").strip() if wt_head.returncode == 0 else ""
+        if wt_branch != runtime_branch:
+            checkout = _run_git(worktree_dir, ["checkout", "-B", runtime_branch, f"origin/{branch}"], check=False)
+            if checkout.returncode != 0:
+                detail = (checkout.stderr or checkout.stdout or "").strip()
+                return False, detail or "runtime_worktree_checkout_failed", None, None
+    return _finalize_synced_checkout(worktree_dir)
 
 
 def _ensure_project_workspace(
@@ -6357,6 +7848,15 @@ def _orchestrator_effort_for_profile(profile: dict[str, Any], cfg: BotConfig) ->
         return effort
     _, cfg_effort = _codex_defaults_from_config()
     return cfg_effort or "medium"
+
+
+def _orchestrator_threaded_session_enabled(profile: dict[str, Any], *, role: str = "") -> bool:
+    raw = profile.get("threaded_session")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _orchestrator_task_from_job(
@@ -7204,6 +8704,24 @@ def _send_orchestrator_marker_response(
         )
         return True
 
+    if kind == "proposal":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=_factory_ceo_strategy_command_text(
+                cfg=cfg,
+                orch_q=orch_q,
+                profiles=profiles,
+                chat_id=int(chat_id),
+                payload=str(payload or "").strip(),
+            ),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
     if kind == "approve_merge":
         if orch_q is None:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -7454,6 +8972,209 @@ def _send_orchestrator_marker_response(
                 )
         return True
 
+    if kind == "factory":
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para acciones de factory.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        parts = [piece for piece in str(payload or "").strip().split() if piece]
+        sub = str(parts[0] if parts else "status").strip().lower()
+        if sub in ("status", "show"):
+            _send_chunked_text(
+                api,
+                chat_id=chat_id,
+                text=_factory_status_text(cfg, orch_q, chat_id=chat_id),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if sub == "pause":
+            ttl_seconds = _parse_factory_ttl(parts[1] if len(parts) >= 2 else "60m")
+            if ttl_seconds is None:
+                api.send_message(chat_id, "Uso: /factory pause <ttl>; ejemplos: 30m, 2h, 1d", reply_to_message_id=reply_to_message_id)
+                return True
+            out = _pause_proactive_lane_now(
+                cfg=cfg,
+                orch_q=orch_q,
+                reason="factory_soft_pause",
+                manual=False,
+                ttl_seconds=ttl_seconds,
+            )
+            state = _factory_state(cfg)
+            until = state.get("soft_pause_until")
+            until_s = "n/a"
+            try:
+                until_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(until or 0.0)))
+            except Exception:
+                pass
+            api.send_message(
+                chat_id,
+                (
+                    "Factory en soft_pause.\n"
+                    f"- until: {until_s}\n"
+                    f"- autonomous_jobs_cancelled: {int(out.get('autonomous_jobs_cancelled', 0))}"
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if sub == "hard_stop":
+            out = _pause_proactive_lane_now(
+                cfg=cfg,
+                orch_q=orch_q,
+                reason="factory_hard_stop",
+                manual=True,
+            )
+            api.send_message(
+                chat_id,
+                (
+                    "Factory en hard_stop manual.\n"
+                    f"- autonomous_jobs_cancelled: {int(out.get('autonomous_jobs_cancelled', 0))}\n"
+                    "- resume: /factory resume"
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if sub == "resume":
+            state = _factory_state(cfg)
+            if not bool(state.get("paused", False)):
+                api.send_message(chat_id, "Factory ya estaba activa.", reply_to_message_id=reply_to_message_id)
+            else:
+                _clear_factory_pause(cfg)
+                api.send_message(chat_id, "Factory reanudada.", reply_to_message_id=reply_to_message_id)
+            return True
+        if sub == "repos":
+            _send_chunked_text(
+                api,
+                chat_id=chat_id,
+                text=_factory_repos_text(orch_q),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if sub == "scope":
+            action = str(parts[1] if len(parts) >= 2 else "show").strip().lower()
+            if action in ("show", "status"):
+                _send_chunked_text(
+                    api,
+                    chat_id=chat_id,
+                    text=_factory_scope_text(orch_q),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            if action not in ("set", "add", "remove", "rm", "del", "delete"):
+                api.send_message(
+                    chat_id,
+                    "Uso: /factory scope show | /factory scope set <selectors...> | /factory scope add <selectors...> | /factory scope remove <selectors...>",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            selectors = [str(piece or "").strip() for piece in parts[2:] if str(piece or "").strip()]
+            if not selectors:
+                api.send_message(
+                    chat_id,
+                    "Uso: /factory scope set <selectors...>; aliases utiles: poncebot, android, dashboard",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            selected, missing = _resolve_factory_repo_selectors(orch_q, selectors)
+            selected_repo_ids = {
+                str(repo.get("repo_id") or "").strip().lower()
+                for repo in selected
+                if str(repo.get("repo_id") or "").strip()
+            }
+            if not selected_repo_ids:
+                missing_text = ", ".join(missing) if missing else ", ".join(selectors)
+                api.send_message(
+                    chat_id,
+                    f"No se encontro ningun repo para esos selectors: {missing_text}",
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            out = _factory_apply_scope_action(
+                orch_q,
+                action=action,
+                selected_repo_ids=selected_repo_ids,
+            )
+            selected_lines = [
+                f"- {repo.get('repo_id')} path={repo.get('path')}"
+                for repo in selected[:20]
+            ]
+            if len(selected) > 20:
+                selected_lines.append(f"- ... +{len(selected) - 20} more")
+            lines = [
+                f"Factory scope {action} aplicado.",
+                f"- selectors: {', '.join(selectors)}",
+                f"- matched: {len(selected_repo_ids)} repos",
+                f"- enabled_changed: {int(out.get('enabled', 0))}",
+                f"- disabled_changed: {int(out.get('disabled', 0))}",
+            ]
+            if missing:
+                lines.append(f"- missing: {', '.join(missing)}")
+            lines.append("Repos afectados:")
+            lines.extend(selected_lines)
+            api.send_message(
+                chat_id,
+                "\n".join(lines),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        if sub == "mode":
+            if len(parts) < 2:
+                api.send_message(chat_id, "Uso: /factory mode ceo-bounded", reply_to_message_id=reply_to_message_id)
+                return True
+            mode = str(parts[1] or "").strip().lower()
+            if mode != "ceo-bounded":
+                api.send_message(chat_id, "Solo se soporta /factory mode ceo-bounded por ahora.", reply_to_message_id=reply_to_message_id)
+                return True
+            _set_factory_mode(cfg, mode=mode)
+            api.send_message(chat_id, f"Factory mode actualizado: {mode}", reply_to_message_id=reply_to_message_id)
+            return True
+        if sub == "repo":
+            if len(parts) < 3:
+                api.send_message(chat_id, "Uso: /factory repo <enable|disable|status> <repo_id>", reply_to_message_id=reply_to_message_id)
+                return True
+            action = str(parts[1] or "").strip().lower()
+            repo_id = str(parts[2] or "").strip().lower()
+            repo = orch_q.get_repo(repo_id=repo_id)
+            if not repo:
+                api.send_message(chat_id, f"Repo no encontrado: {repo_id}", reply_to_message_id=reply_to_message_id)
+                return True
+            if action == "status":
+                api.send_message(
+                    chat_id,
+                    (
+                        f"Repo {repo_id}\n"
+                        f"- status: {repo.get('status')}\n"
+                        f"- autonomy: {'on' if bool(repo.get('autonomy_enabled', True)) else 'off'}\n"
+                        f"- priority: {int(repo.get('priority') or 2)}\n"
+                        f"- path: {repo.get('path')}"
+                    ),
+                    reply_to_message_id=reply_to_message_id,
+                )
+                return True
+            if action == "enable":
+                orch_q.set_repo_autonomy(repo_id=repo_id, enabled=True)
+                orch_q.set_repo_status(repo_id=repo_id, status="active")
+                api.send_message(chat_id, f"Repo habilitado para factory: {repo_id}", reply_to_message_id=reply_to_message_id)
+                return True
+            if action == "disable":
+                orch_q.set_repo_autonomy(repo_id=repo_id, enabled=False)
+                orch_q.set_repo_status(repo_id=repo_id, status="disabled")
+                api.send_message(chat_id, f"Repo deshabilitado para factory: {repo_id}", reply_to_message_id=reply_to_message_id)
+                return True
+            api.send_message(chat_id, "Uso: /factory repo <enable|disable|status> <repo_id>", reply_to_message_id=reply_to_message_id)
+            return True
+        api.send_message(
+            chat_id,
+            "Uso: /factory | /factory pause <ttl> | /factory hard_stop | /factory resume | /factory repos | /factory scope show|set|add|remove <selectors...> | /factory repo <enable|disable|status> <repo_id> | /factory mode ceo-bounded",
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
     if kind in ("pause", "resume"):
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -7669,8 +9390,224 @@ def _proactive_lane_status_label(cfg: BotConfig) -> str:
         return "active"
     reason = str(state.get("reason") or "").strip() or "unspecified"
     if bool(state.get("manual_pause", False)):
-        return f"paused (manual; reason={reason})"
-    return f"paused (reason={reason})"
+        return f"hard_stop (reason={reason})"
+    until = state.get("soft_pause_until")
+    if until is not None:
+        try:
+            until_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(until)))
+        except Exception:
+            until_s = "n/a"
+        return f"soft_pause (until={until_s}; reason={reason})"
+    return f"soft_pause (reason={reason})"
+
+
+def _factory_status_text(cfg: BotConfig, orch_q: OrchestratorQueue, *, chat_id: int | None = None) -> str:
+    snap = _factory_status_snapshot(cfg=cfg, orch_q=orch_q, chat_id=chat_id)
+    factory = dict(snap.get("factory") or {})
+    lanes = dict(snap.get("lanes") or {})
+    models = dict(snap.get("models") or {})
+    repos = list(snap.get("repos") or [])
+    heartbeats = list(snap.get("heartbeats") or [])
+    stale_agents = int((snap.get("slo") or {}).get("heartbeat_stale_agents") or 0)
+    lines = [
+        "Factory status",
+        f"- state: {factory.get('status') or 'unknown'}",
+        f"- mode: {factory.get('mode') or 'ceo-bounded'}",
+        f"- proactive_lane: {_proactive_lane_status_label(cfg)}",
+        f"- repos: total={int(factory.get('repo_count') or 0)} enabled={int(factory.get('enabled_repo_count') or 0)}",
+        f"- proactive_orders: {int(factory.get('active_proactive_orders') or 0)}",
+        f"- stale_agents: {stale_agents}",
+    ]
+    local_ollama = dict(models.get("local_ollama") or {})
+    lines.append(f"- local_ollama: {'healthy' if bool(local_ollama.get('healthy')) else 'degraded'}")
+    if local_ollama.get("detail"):
+        lines.append(f"  detail: {str(local_ollama.get('detail') or '')}")
+    for lane_name in ("interactive", "factory", "subagent"):
+        lane = dict(lanes.get(lane_name) or {})
+        if lane:
+            lines.append(
+                f"- lane:{lane_name} queued={int(lane.get('queued') or 0)} running={int(lane.get('running') or 0)}"
+            )
+    if repos:
+        lines.append("")
+        lines.append("Repos:")
+        for repo in repos[:12]:
+            lines.append(
+                f"- {repo.get('repo_id')} status={repo.get('status')} autonomy={'on' if bool(repo.get('autonomy_enabled', True)) else 'off'} path={repo.get('path')}"
+            )
+        if len(repos) > 12:
+            lines.append(f"- ... +{len(repos) - 12} more")
+    if heartbeats:
+        stale_rows = [row for row in heartbeats if bool(row.get("stale", False))]
+        if stale_rows:
+            lines.append("")
+            lines.append("Stale heartbeats:")
+            for row in stale_rows[:8]:
+                lines.append(
+                    f"- {row.get('agent_key')} age_s={row.get('heartbeat_age_s')} last_result={row.get('last_result_status')}"
+                )
+    return "\n".join(lines)
+
+
+def _normalize_factory_repo_selector(token: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(token or "").strip().lower())
+
+
+def _factory_repo_selector_aliases(repo: dict[str, Any]) -> list[str]:
+    repo_id = str(repo.get("repo_id") or "").strip().lower()
+    path = str(repo.get("path") or "").strip()
+    base_name = Path(path).name.strip().lower() if path else ""
+    aliases: set[str] = set()
+
+    def _add(value: str) -> None:
+        token = str(value or "").strip().lower()
+        if token:
+            aliases.add(token)
+
+    _add(repo_id)
+    if repo_id and re.fullmatch(r".+-[0-9a-f]{8}", repo_id):
+        _add(repo_id.rsplit("-", 1)[0])
+    if base_name:
+        _add(base_name)
+        _add(base_name.replace(".", "-"))
+        _add(base_name.replace("_", "-"))
+
+    base_norm = _normalize_factory_repo_selector(base_name)
+    repo_norm = _normalize_factory_repo_selector(repo_id)
+    if base_norm == "executivedashboard":
+        _add("dashboard")
+        _add("executive-dashboard")
+        _add("executivedashboard")
+    if "android" in base_norm or "android" in repo_norm:
+        _add("android")
+        _add("omnicrewapp")
+        _add("omnicrewappandroid")
+    if base_name.startswith("codexbot") or repo_id.startswith("codexbot"):
+        _add("poncebot")
+        _add("poncebot-repos")
+        _add("codexbot")
+
+    return sorted(aliases)
+
+
+def _resolve_factory_repo_selectors(
+    orch_q: OrchestratorQueue,
+    selectors: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    repos = orch_q.list_repos(limit=5000)
+    if not selectors:
+        return [], []
+
+    by_id = {str(repo.get("repo_id") or "").strip().lower(): repo for repo in repos}
+    selected_ids: set[str] = set()
+    missing: list[str] = []
+    for raw_selector in selectors:
+        selector = str(raw_selector or "").strip().lower()
+        if not selector:
+            continue
+        if selector in by_id:
+            selected_ids.add(selector)
+            continue
+        selector_norm = _normalize_factory_repo_selector(selector)
+        matched = False
+        for repo in repos:
+            aliases = _factory_repo_selector_aliases(repo)
+            alias_norms = {_normalize_factory_repo_selector(alias) for alias in aliases}
+            if selector_norm and selector_norm in alias_norms:
+                repo_id = str(repo.get("repo_id") or "").strip().lower()
+                if repo_id:
+                    selected_ids.add(repo_id)
+                    matched = True
+        if not matched:
+            missing.append(selector)
+    selected = [repo for repo in repos if str(repo.get("repo_id") or "").strip().lower() in selected_ids]
+    return selected, missing
+
+
+def _factory_set_repo_scope_enabled(orch_q: OrchestratorQueue, repo: dict[str, Any], *, enabled: bool) -> None:
+    repo_id = str(repo.get("repo_id") or "").strip().lower()
+    if not repo_id:
+        return
+    orch_q.set_repo_autonomy(repo_id=repo_id, enabled=enabled)
+    status_now = str(repo.get("status") or "").strip().lower()
+    if status_now == "missing":
+        return
+    orch_q.set_repo_status(repo_id=repo_id, status=("active" if enabled else "disabled"))
+
+
+def _factory_apply_scope_action(
+    orch_q: OrchestratorQueue,
+    *,
+    action: str,
+    selected_repo_ids: set[str],
+) -> dict[str, int]:
+    repos = orch_q.list_repos(limit=5000)
+    changed_enabled = 0
+    changed_disabled = 0
+    for repo in repos:
+        repo_id = str(repo.get("repo_id") or "").strip().lower()
+        if not repo_id:
+            continue
+        current_enabled = bool(repo.get("autonomy_enabled", True))
+        want_enabled = current_enabled
+        if action == "set":
+            want_enabled = repo_id in selected_repo_ids
+        elif action == "add":
+            if repo_id in selected_repo_ids:
+                want_enabled = True
+        elif action in ("remove", "rm", "del", "delete"):
+            if repo_id in selected_repo_ids:
+                want_enabled = False
+        if want_enabled == current_enabled and not (action == "set" and repo_id in selected_repo_ids and str(repo.get("status") or "").strip().lower() != "active"):
+            continue
+        _factory_set_repo_scope_enabled(orch_q, repo, enabled=want_enabled)
+        if want_enabled:
+            changed_enabled += 1
+        else:
+            changed_disabled += 1
+    return {"enabled": int(changed_enabled), "disabled": int(changed_disabled)}
+
+
+def _factory_scope_text(orch_q: OrchestratorQueue) -> str:
+    repos = orch_q.list_repos(limit=500)
+    if not repos:
+        return "Factory scope: no registered repos yet."
+    enabled = [
+        repo
+        for repo in repos
+        if bool(repo.get("autonomy_enabled", True)) and str(repo.get("status") or "").strip().lower() == "active"
+    ]
+    lines = [
+        "Factory scope:",
+        f"- enabled: {len(enabled)} / {len(repos)} repos",
+        "- commands: /factory scope show | /factory scope set <selectors...> | /factory scope add <selectors...> | /factory scope remove <selectors...>",
+        "- aliases: poncebot, android, dashboard",
+    ]
+    if enabled:
+        lines.append("Enabled repos:")
+        for repo in enabled[:20]:
+            aliases = [alias for alias in _factory_repo_selector_aliases(repo) if alias in {"poncebot", "android", "dashboard", "executive-dashboard", "codexbot"}]
+            alias_part = f" selectors={','.join(sorted(set(aliases)))}" if aliases else ""
+            lines.append(
+                f"- {repo.get('repo_id')} path={repo.get('path')}{alias_part}"
+            )
+    else:
+        lines.append("Enabled repos: none")
+    return "\n".join(lines)
+
+
+def _factory_repos_text(orch_q: OrchestratorQueue) -> str:
+    repos = orch_q.list_repos(limit=500)
+    if not repos:
+        return "No registered repos yet."
+    lines = ["Factory repos:"]
+    for repo in repos[:50]:
+        lines.append(
+            f"- {repo.get('repo_id')} status={repo.get('status')} autonomy={'on' if bool(repo.get('autonomy_enabled', True)) else 'off'} priority={int(repo.get('priority') or 2)} path={repo.get('path')}"
+        )
+    if len(repos) > 50:
+        lines.append(f"- ... +{len(repos) - 50} more")
+    return "\n".join(lines)
 
 
 def _orchestrator_status_text(orch_q: OrchestratorQueue, *, cfg: BotConfig | None = None) -> str:
@@ -7902,6 +9839,8 @@ def _order_command_text(
         merge_ready = bool(trace.get("merge_ready", False))
         merged_to_main = bool(trace.get("merged_to_main", False))
         merge_commit = str(trace.get("merge_commit") or "").strip() or "n/a"
+        deploy_status = str(trace.get("deploy_status") or "").strip() or "n/a"
+        deploy_summary = str(trace.get("deploy_summary") or "").strip()
         pr = it.get("priority")
         try:
             pr_s = str(int(pr)) if pr is not None else "n/a"
@@ -7921,6 +9860,8 @@ def _order_command_text(
                 f"merge_ready: {'yes' if merge_ready else 'no'}",
                 f"merged_to_main: {'yes' if merged_to_main else 'no'}",
                 f"merge_commit: {merge_commit}",
+                f"deploy_status: {deploy_status}",
+                *(["deploy_summary: " + deploy_summary] if deploy_summary else []),
                 "",
                 "title:",
                 title,
@@ -7947,7 +9888,17 @@ def _order_command_text(
 
         root = orch_q.get_job(root_id)
         trace = dict((root.trace or {}) if root else {})
-        merge_required, _order_branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+        _repo_record, repo_dir, default_branch = _repo_context_for_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            order_id=root_id,
+            chat_id=int(chat_id),
+        )
+        merge_required, _order_branch = _order_trace_requires_merge(
+            trace,
+            repo=(repo_dir if (repo_dir / ".git").exists() else None),
+            default_branch=default_branch,
+        )
         if merge_required:
             return _order_command_text(
                 cfg,
@@ -7974,15 +9925,33 @@ def _order_command_text(
             return f"Invalid order id: {oid}"
         root = orch_q.get_job(root_id)
         trace = dict((root.trace or {}) if root else {})
+        repo_record, repo_dir, default_branch = _repo_context_for_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            order_id=root_id,
+            chat_id=int(chat_id),
+        )
         order_branch = str(trace.get("order_branch") or "").strip()
         if not order_branch:
             return f"Order {root_id[:8]} has no branch metadata yet."
         merged_ok, merged_msg, merge_commit = _merge_order_branch_to_main(
-            repo=cfg.codex_workdir,
+            repo=repo_dir,
             order_branch=order_branch,
             order_id=root_id,
+            default_branch=default_branch,
         )
         if merged_ok:
+            deploy_result = _deploy_after_order_merge(
+                cfg=cfg,
+                repo_record=repo_record,
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                order_id=root_id,
+                order_branch=order_branch,
+                merge_commit=merge_commit,
+            )
+            deploy_status = str(deploy_result.get("status") or "").strip().lower() or "skipped"
+            deploy_summary = _deploy_result_display(deploy_result)
             try:
                 orch_q.update_trace(
                     root_id,
@@ -7995,12 +9964,33 @@ def _order_command_text(
                     merge_result=str(merged_msg),
                     merge_commit=(merge_commit or None),
                     merged_at=time.time(),
+                    deploy_status=deploy_status,
+                    deploy_result=str(deploy_result.get("reason") or ""),
+                    deploy_summary=deploy_summary,
+                    deploy_command=deploy_result.get("command"),
+                    deployed_commit=deploy_result.get("deployed_commit"),
+                    deployed_at=(time.time() if deploy_status in ("ok", "scheduled") else None),
+                    deploy_error=(deploy_result.get("detail") if deploy_status == "failed" else None),
+                    result_summary=(
+                        f"Merged to {default_branch}"
+                        + (f" commit={merge_commit}" if merge_commit else "")
+                        + (f". {deploy_summary}" if deploy_summary else ".")
+                    ),
+                    result_next_action=(
+                        "Inspect deployment failure and complete rollout."
+                        if deploy_status == "failed"
+                        else "Factory ready for next order."
+                    ),
                 )
             except Exception:
                 pass
             try:
-                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
-                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+                if deploy_status == "failed":
+                    orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+                    orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+                else:
+                    orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
             except Exception:
                 pass
             try:
@@ -8010,20 +10000,37 @@ def _order_command_text(
                     details={
                         "order_id": root_id,
                         "order_branch": order_branch,
+                        "repo_id": ((repo_record or {}).get("repo_id") or None),
+                        "repo_path": str(repo_dir),
+                        "default_branch": default_branch,
                         "merge_commit": (merge_commit or None),
                         "result": str(merged_msg),
+                        "deploy": deploy_result,
                     },
                 )
             except Exception:
                 pass
             commit_part = f" commit={merge_commit}" if merge_commit else ""
+            deploy_part = f" {_deploy_result_display(deploy_result)}" if deploy_summary else ""
             if actor_norm == "jarvis":
-                return f"Order {root_id[:8]} auto-merged by Jarvis to main.{commit_part}"
-            return f"Order {root_id[:8]} merged to main.{commit_part}"
+                return f"Order {root_id[:8]} auto-merged by Jarvis to {default_branch}.{commit_part}{deploy_part}"
+            return f"Order {root_id[:8]} merged to {default_branch}.{commit_part}{deploy_part}"
         try:
+            err_txt = str(merged_msg or "")
+            conflict_like = _merge_error_is_conflict_like(err_txt)
+            failed_at = time.time()
             orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
-            orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
-            orch_q.update_trace(root_id, merge_ready=True, merge_error=str(merged_msg), merge_failed_at=time.time())
+            orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase=("planning" if conflict_like else "review"))
+            orch_q.update_trace(
+                root_id,
+                merge_ready=(False if conflict_like else True),
+                merge_error=err_txt,
+                merge_failed_at=failed_at,
+                merge_auto_failed_at=failed_at,
+                merge_auto_error=err_txt,
+                merge_conflict_active=bool(conflict_like),
+                merge_conflict_detected_at=(failed_at if conflict_like else None),
+            )
         except Exception:
             pass
         try:
@@ -8038,115 +10045,35 @@ def _order_command_text(
             )
         except Exception:
             pass
-        if actor_norm == "jarvis":
+        err_txt = str(merged_msg or "")
+        conflict_like = _merge_error_is_conflict_like(err_txt)
+        fix_id = ""
+        if conflict_like:
             try:
-                err_txt = str(merged_msg or "")
-                err_low = err_txt.lower()
-                conflict_like = ("conflict" in err_low) or ("merge failed" in err_low)
-                if conflict_like:
-                    try:
-                        max_replans_total = int(os.environ.get("BOT_MERGE_CONFLICT_REPLAN_MAX_TOTAL", "3"))
-                    except Exception:
-                        max_replans_total = 3
-                    max_replans_total = max(1, min(12, int(max_replans_total)))
-
-                    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
-                    children = orch_q.jobs_by_parent(parent_job_id=root_id, limit=500)
-                    replan_total = sum(
-                        1
-                        for c in children
-                        if str((c.labels or {}).get("kind") or "").strip().lower() == "merge_conflict_replan"
-                    )
-                    has_active_fix = any(
-                        str((c.labels or {}).get("kind") or "").strip().lower() == "merge_conflict_replan"
-                        and str(c.state or "").strip().lower() in active_states
-                        for c in children
-                    )
-                    try:
-                        last_fix_at = float(trace.get("merge_conflict_replan_at", 0.0) or 0.0)
-                    except Exception:
-                        last_fix_at = 0.0
-                    now_ts = float(time.time())
-                    can_enqueue_replan = int(replan_total) < int(max_replans_total)
-                    if (not has_active_fix) and ((now_ts - last_fix_at) >= 90.0) and can_enqueue_replan:
-                        fix_id = str(uuid.uuid4())
-                        fix_task = Task.new(
-                            source="telegram",
-                            role="jarvis",
-                            input_text=(
-                                "MERGE CONFLICT REPLAN\n"
-                                f"Order: {root_id}\n"
-                                f"Branch: {order_branch}\n"
-                                f"Merge error: {err_txt}\n\n"
-                                "Objective:\n"
-                                "- Resolve the branch against latest origin/main without dropping approved scope.\n"
-                                "- Re-run validation and produce a clean wrapup ready for merge.\n"
-                                "- If one approach fails, try an alternative approach (do not stop at NO-GO).\n"
-                            ),
-                            request_type="maintenance",
-                            priority=1,
-                            model=_MODEL_JARVIS_PLAN,
-                            effort=_EFFORT_JARVIS_PLAN,
-                            mode_hint="full",
-                            requires_approval=False,
-                            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
-                            chat_id=int(chat_id),
-                            user_id=user_id,
-                            reply_to_message_id=None,
-                            parent_job_id=root_id,
-                            labels={
-                                "ticket": root_id,
-                                "kind": "merge_conflict_replan",
-                                "key": f"merge_conflict_replan_{root_id[:8]}",
-                            },
-                            artifacts_dir=str((cfg.artifacts_root / fix_id).resolve()),
-                            trace={
-                                "source": "merge_conflict",
-                                "order_id": root_id,
-                                "order_branch": order_branch,
-                                "merge_error": err_txt,
-                                "allow_delegation": True,
-                            },
-                            job_id=fix_id,
-                        )
-                        orch_q.submit_task(fix_task)
-                        orch_q.update_trace(
-                            root_id,
-                            merge_conflict_replan_at=now_ts,
-                            merge_conflict_replan_job_id=fix_id,
-                            merge_conflict_replan_error=err_txt[:800],
-                            merge_conflict_replan_attempts=int(replan_total + 1),
-                            live_at=now_ts,
-                        )
-                        orch_q.append_audit_event(
-                            event_type="order.merge_conflict_replan_enqueued",
-                            actor="jarvis",
-                            details={
-                                "order_id": root_id,
-                                "order_branch": order_branch,
-                                "job_id": fix_id,
-                            },
-                        )
-                    elif not can_enqueue_replan:
-                        orch_q.update_trace(
-                            root_id,
-                            merge_conflict_replan_exhausted_at=now_ts,
-                            merge_conflict_replan_attempts=int(replan_total),
-                            live_at=now_ts,
-                        )
-                        orch_q.append_audit_event(
-                            event_type="order.merge_conflict_replan_exhausted",
-                            actor="jarvis",
-                            details={
-                                "order_id": root_id,
-                                "order_branch": order_branch,
-                                "attempts": int(replan_total),
-                                "max_attempts": int(max_replans_total),
-                            },
-                        )
+                fix_id = _enqueue_merge_conflict_resolution(
+                    cfg,
+                    orch_q,
+                    chat_id=int(chat_id),
+                    user_id=user_id,
+                    order_id=root_id,
+                    order_branch=order_branch,
+                    merge_error=err_txt,
+                    root_trace=trace,
+                )
             except Exception:
                 pass
+        if actor_norm == "jarvis":
+            if fix_id:
+                return (
+                    f"Jarvis auto-merge failed for order {root_id[:8]}: {merged_msg}\n"
+                    f"Skynet queued merge-conflict resolution as {fix_id[:8]}."
+                )
             return f"Jarvis auto-merge failed for order {root_id[:8]}: {merged_msg}"
+        if fix_id:
+            return (
+                f"Merge failed for order {root_id[:8]}: {merged_msg}\n"
+                f"Skynet queued merge-conflict resolution as {fix_id[:8]}."
+            )
         return f"Merge failed for order {root_id[:8]}: {merged_msg}"
 
     if cmd in ("rollback", "revert"):
@@ -8158,13 +10085,20 @@ def _order_command_text(
             return f"Invalid order id: {oid}"
         root = orch_q.get_job(root_id)
         trace = dict((root.trace or {}) if root else {})
+        _repo_record, repo_dir, default_branch = _repo_context_for_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            order_id=root_id,
+            chat_id=int(chat_id),
+        )
         merge_commit = str(trace.get("merge_commit") or "").strip()
         if not merge_commit:
             return f"Order {root_id[:8]} has no merge commit to rollback."
         ok_rb, rb_msg, rb_commit = _rollback_order_merge_on_main(
-            repo=cfg.codex_workdir,
+            repo=repo_dir,
             order_id=root_id,
             merge_commit=merge_commit,
+            default_branch=default_branch,
         )
         if ok_rb:
             try:
@@ -8198,6 +10132,546 @@ def _order_command_text(
         return f"Rollback failed for order {root_id[:8]}: {rb_msg}"
 
     return "Usage: /order show|pause|done|merge|rollback <id>"
+
+
+def _close_factory_ceo_strategy_source_job(
+    orch_q: OrchestratorQueue,
+    proposal: dict[str, Any],
+    *,
+    summary: str,
+    next_action: str | None = None,
+) -> None:
+    source_job_id = str(proposal.get("source_job_id") or "").strip()
+    if not source_job_id:
+        return
+    try:
+        source_job = orch_q.get_job(source_job_id)
+    except Exception:
+        source_job = None
+    if source_job is None:
+        return
+    if str(source_job.state or "").strip().lower() not in ("queued", "waiting_deps", "blocked_approval", "blocked", "running"):
+        return
+    orch_q.update_state(
+        source_job_id,
+        "done",
+        result_status="ok",
+        result_summary=str(summary or "").strip()[:4000] or "CEO proposal decision recorded.",
+        result_next_action=(str(next_action or "").strip() or None),
+    )
+
+
+def _enqueue_factory_ceo_strategy_followup(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    proposal: dict[str, Any],
+    decision: str,
+    ceo_text: str,
+) -> str:
+    order_id = str(proposal.get("order_id") or "").strip()
+    if not order_id:
+        return ""
+    root_job = orch_q.get_job(order_id)
+    root_trace = dict((root_job.trace or {}) if root_job else {})
+    decision_norm = str(decision or "").strip().lower() or "replan"
+    proposal_title = str(proposal.get("proposal_title") or "").strip()
+    proposal_summary = str(proposal.get("proposal_summary") or "").strip()
+    repo_id = str(proposal.get("repo_id") or root_trace.get("repo_id") or "").strip()
+    repo_path = str(proposal.get("repo_path") or root_trace.get("repo_path") or "").strip()
+    followup_id = str(uuid.uuid4())
+    if decision_norm == "approve":
+        input_text = (
+            "CEO STRATEGIC APPROVAL GRANTED\n"
+            f"Order: {order_id}\n"
+            f"Proposal: {proposal_title or '(untitled)'}\n"
+            f"Summary: {proposal_summary or '(none)'}\n"
+            f"CEO reply: {ceo_text or '(approved without extra notes)'}\n\n"
+            "Rules:\n"
+            "- You may now execute this larger approved plan.\n"
+            "- If scope drifts materially beyond the approved plan, ask the CEO again before proceeding.\n"
+            "- Use only architect_local, implementer_local, reviewer_local.\n"
+            "- Keep evidence explicit and close work in bounded slices.\n"
+        )
+    elif decision_norm in ("reject", "timeout"):
+        reason_line = (
+            "CEO explicitly rejected the larger strategic proposal."
+            if decision_norm == "reject"
+            else "CEO did not reply before the approval timeout."
+        )
+        input_text = (
+            "CEO STRATEGIC APPROVAL NOT AVAILABLE\n"
+            f"Order: {order_id}\n"
+            f"Proposal: {proposal_title or '(untitled)'}\n"
+            f"Summary: {proposal_summary or '(none)'}\n"
+            f"Reason: {reason_line}\n"
+            f"CEO reply: {ceo_text or '(none)'}\n\n"
+            "Rules:\n"
+            "- Do NOT execute the larger/drastic proposal now.\n"
+            "- Continue with simpler bounded work like the normal factory lane.\n"
+            "- Stay inside the current registered repo and keep changes incremental.\n"
+            "- Use only architect_local, implementer_local, reviewer_local.\n"
+        )
+    else:
+        input_text = (
+            "CEO STRATEGIC PROPOSAL FEEDBACK\n"
+            f"Order: {order_id}\n"
+            f"Proposal: {proposal_title or '(untitled)'}\n"
+            f"Summary: {proposal_summary or '(none)'}\n"
+            f"CEO feedback: {ceo_text or '(no additional text)'}\n\n"
+            "Rules:\n"
+            "- Do NOT execute the larger/drastic change yet.\n"
+            "- Replan from the CEO feedback.\n"
+            "- Either produce a revised CEO approval proposal or downgrade to bounded work if possible.\n"
+            "- Use only architect_local, implementer_local, reviewer_local.\n"
+        )
+
+    trace: dict[str, Any] = {
+        "source": "ceo_strategy_approval",
+        "allow_delegation": True,
+        "order_id": order_id,
+        "ceo_strategy_decision": decision_norm,
+        "ceo_strategy_feedback": (ceo_text or "")[:4000],
+        "ceo_strategy_proposal_title": proposal_title,
+        "ceo_strategy_proposal_summary": proposal_summary[:4000],
+    }
+    for key in (
+        "project_id",
+        "order_branch",
+        "initiative_key",
+        "initiative_lane",
+        "repo_id",
+        "repo_path",
+        "repo_default_branch",
+        "factory_order",
+        "proactive_lane",
+    ):
+        value = proposal.get(key)
+        if value in (None, "", []):
+            value = root_trace.get(key)
+        if value not in (None, "", []):
+            trace[key] = value
+
+    task = Task.new(
+        source="telegram",
+        role="skynet",
+        input_text=input_text,
+        request_type="maintenance",
+        priority=1,
+        model="",
+        effort="",
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(proposal.get("chat_id") or 0),
+        is_autonomous=True,
+        parent_job_id=order_id,
+        owner="ceo",
+        labels={
+            "ticket": order_id,
+            "kind": "ceo_strategy_followup",
+            "decision": decision_norm,
+            **({"repo_id": repo_id, "repo_path": repo_path} if repo_id and repo_path else {}),
+        },
+        artifacts_dir=str((cfg.artifacts_root / followup_id).resolve()),
+        trace=trace,
+        job_id=followup_id,
+    )
+    try:
+        rb_role = _coerce_orchestrator_role(task.role)
+        rb_profile = _orchestrator_profile(profiles, rb_role)
+        rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
+        rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
+        task = task.with_updates(
+            role=rb_role,
+            model=rb_model,
+            effort=rb_effort,
+            trace={
+                **trace,
+                "profile_name": str(rb_profile.get("name") or rb_role),
+                "profile_role": rb_role,
+                "max_runtime_seconds": int(rb_profile.get("max_runtime_seconds") or 0),
+            },
+        )
+    except Exception:
+        pass
+    orch_q.submit_task(task)
+    try:
+        orch_q.set_order_phase(order_id, chat_id=int(proposal.get("chat_id") or 0), phase="planning")
+        orch_q.append_audit_event(
+            event_type="order.ceo_strategy_followup_enqueued",
+            actor="skynet",
+            details={
+                "order_id": order_id,
+                "job_id": followup_id,
+                "decision": decision_norm,
+            },
+        )
+    except Exception:
+        pass
+    return followup_id
+
+
+def _register_factory_ceo_strategy_proposal(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    orch_q: OrchestratorQueue,
+    task: Task,
+    summary: str,
+    structured_digest: Any,
+) -> dict[str, Any] | None:
+    if _coerce_orchestrator_role(task.role) != "skynet":
+        return None
+    order_id = str(task.parent_job_id or task.job_id or "").strip()
+    if not order_id:
+        return None
+    existing = _pending_factory_ceo_strategy_proposal_for_order(cfg, order_id=order_id, now=time.time())
+    if existing is not None:
+        return existing
+    root_job = orch_q.get_job(order_id)
+    root_trace = dict((root_job.trace or {}) if root_job else {})
+    proposal = _extract_factory_ceo_strategy_proposal(
+        structured_digest=structured_digest,
+        summary=summary,
+        order_id=order_id,
+        repo_id=str(root_trace.get("repo_id") or (task.trace or {}).get("repo_id") or "").strip(),
+        repo_path=str(root_trace.get("repo_path") or (task.trace or {}).get("repo_path") or "").strip(),
+    )
+    if proposal is None:
+        return None
+    now_ts = float(time.time())
+    timeout_s = _factory_ceo_strategy_timeout_seconds()
+    revision = 1
+    try:
+        records = _factory_ceo_strategy_records(cfg)
+        if order_id in records:
+            revision = max(1, int(records[order_id].get("revision") or 0) + 1)
+    except Exception:
+        revision = 1
+    record = {
+        **proposal,
+        "chat_id": int(task.chat_id),
+        "status": "pending",
+        "requested_at": now_ts,
+        "expires_at": now_ts + float(timeout_s),
+        "message_id": None,
+        "source_job_id": str(task.job_id or "").strip(),
+        "revision": int(revision),
+        "project_id": root_trace.get("project_id"),
+        "order_branch": root_trace.get("order_branch"),
+        "initiative_key": root_trace.get("initiative_key"),
+        "initiative_lane": root_trace.get("initiative_lane"),
+        "repo_default_branch": root_trace.get("repo_default_branch"),
+        "factory_order": bool(root_trace.get("factory_order", False)),
+        "proactive_lane": bool(root_trace.get("proactive_lane", False)),
+    }
+    proposal_text = _factory_ceo_strategy_proposal_text(record, timeout_seconds=timeout_s)
+    try:
+        message_id = api.send_message(
+            int(task.chat_id),
+            proposal_text,
+            reply_to_message_id=(int(task.reply_to_message_id) if task.reply_to_message_id else None),
+        )
+    except Exception:
+        message_id = None
+    if message_id is not None:
+        record["message_id"] = int(message_id)
+    _update_factory_ceo_strategy_records(
+        cfg,
+        lambda records: records.__setitem__(order_id, dict(record)),
+    )
+    try:
+        orch_q.update_trace(
+            order_id,
+            ceo_strategy_approval_pending=True,
+            ceo_strategy_approval_status="pending",
+            ceo_strategy_approval_requested_at=now_ts,
+            ceo_strategy_approval_expires_at=(now_ts + float(timeout_s)),
+            ceo_strategy_approval_message_id=(int(message_id) if message_id is not None else None),
+            ceo_strategy_proposal_title=str(record.get("proposal_title") or ""),
+            ceo_strategy_proposal_summary=str(record.get("proposal_summary") or "")[:4000],
+            ceo_strategy_source_job_id=str(task.job_id or "").strip(),
+            live_at=now_ts,
+        )
+        orch_q.set_order_phase(order_id, chat_id=int(task.chat_id), phase="ceo_approval_pending")
+        orch_q.append_audit_event(
+            event_type="order.ceo_strategy_approval_requested",
+            actor="skynet",
+            details={
+                "order_id": order_id,
+                "chat_id": int(task.chat_id),
+                "message_id": (int(message_id) if message_id is not None else None),
+                "timeout_seconds": int(timeout_s),
+                "proposal_title": str(record.get("proposal_title") or ""),
+            },
+        )
+    except Exception:
+        pass
+    return record
+
+
+def _resolve_factory_ceo_strategy_proposal(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_id: str,
+    chat_id: int,
+    decision: str,
+    response_text: str,
+    actor: str,
+) -> tuple[bool, str]:
+    now_ts = float(time.time())
+    resolved_order_id = _resolve_factory_ceo_strategy_order_id(cfg, order_id=order_id, chat_id=chat_id)
+    if not resolved_order_id:
+        return False, f"No pending strategic proposal found for order {order_id}."
+    decision_norm = str(decision or "").strip().lower() or "replan"
+    records = _factory_ceo_strategy_records(cfg)
+    raw_record = records.get(resolved_order_id)
+    proposal = _pending_factory_ceo_strategy_proposal_for_order(cfg, order_id=resolved_order_id, now=now_ts)
+    if proposal is None and decision_norm == "timeout" and isinstance(raw_record, dict):
+        if str(raw_record.get("status") or "").strip().lower() == "pending":
+            proposal = dict(raw_record)
+    if proposal is None:
+        return False, f"No pending strategic proposal found for order {order_id}."
+    proposal_status = {
+        "approve": "approved",
+        "reject": "rejected",
+        "replan": "replan_requested",
+        "timeout": "timed_out",
+    }.get(decision_norm, "replan_requested")
+    _update_factory_ceo_strategy_records(
+        cfg,
+        lambda records: records.__setitem__(
+            resolved_order_id,
+            {
+                **dict(records.get(resolved_order_id) or proposal),
+                "status": proposal_status,
+                "responded_at": now_ts,
+                "response_text": str(response_text or "").strip()[:4000],
+            },
+        ),
+    )
+    try:
+        orch_q.update_trace(
+            resolved_order_id,
+            ceo_strategy_approval_pending=False,
+            ceo_strategy_approval_status=proposal_status,
+            ceo_strategy_response_at=now_ts,
+            ceo_strategy_response_text=str(response_text or "").strip()[:4000],
+            live_at=now_ts,
+        )
+        orch_q.set_order_phase(resolved_order_id, chat_id=int(chat_id), phase="planning")
+        orch_q.append_audit_event(
+            event_type="order.ceo_strategy_approval_resolved",
+            actor=str(actor or "ceo"),
+            details={
+                "order_id": resolved_order_id,
+                "decision": decision_norm,
+                "proposal_status": proposal_status,
+            },
+        )
+    except Exception:
+        pass
+    close_summary = {
+        "approve": "CEO approved the strategic proposal.",
+        "reject": "CEO rejected the strategic proposal.",
+        "replan": "CEO requested changes/questions on the strategic proposal.",
+        "timeout": "Strategic proposal timed out waiting for CEO reply.",
+    }.get(decision_norm, "Strategic proposal updated.")
+    try:
+        _close_factory_ceo_strategy_source_job(
+            orch_q,
+            proposal,
+            summary=close_summary,
+            next_action=("continue_with_approved_plan" if decision_norm == "approve" else "continue_with_bounded_work"),
+        )
+    except Exception:
+        pass
+    followup_id = _enqueue_factory_ceo_strategy_followup(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        proposal=proposal,
+        decision=decision_norm,
+        ceo_text=response_text,
+    )
+    if decision_norm == "approve":
+        return True, f"CEO approved proposal for order {resolved_order_id[:8]}. Skynet queued follow-up {followup_id[:8]}."
+    if decision_norm == "reject":
+        return True, f"CEO rejected proposal for order {resolved_order_id[:8]}. Skynet queued bounded fallback {followup_id[:8]}."
+    if decision_norm == "timeout":
+        return True, f"Proposal for order {resolved_order_id[:8]} timed out. Skynet queued bounded fallback {followup_id[:8]}."
+    return True, f"CEO feedback recorded for order {resolved_order_id[:8]}. Skynet queued replanning follow-up {followup_id[:8]}."
+
+
+def _factory_ceo_strategy_command_text(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    chat_id: int,
+    payload: str,
+    actor: str = "ceo",
+) -> str:
+    raw = str(payload or "").strip()
+    try:
+        parts = shlex.split(raw) if raw else []
+    except Exception:
+        parts = raw.split()
+    cmd = str(parts[0] if parts else "show").strip().lower() or "show"
+    if cmd in ("show", "pending", "list"):
+        target = str(parts[1] if len(parts) > 1 else "").strip()
+        if target:
+            record = _pending_factory_ceo_strategy_proposal_for_order(cfg, order_id=target, now=time.time())
+        else:
+            record = None
+            for candidate in _factory_ceo_strategy_records(cfg).values():
+                if int(candidate.get("chat_id") or 0) != int(chat_id):
+                    continue
+                if str(candidate.get("status") or "").strip().lower() != "pending":
+                    continue
+                record = dict(candidate)
+                break
+        if record is None:
+            return "No pending Skynet CEO proposals right now."
+        remaining_s = max(60, int(float(record.get("expires_at") or time.time()) - time.time()))
+        return _factory_ceo_strategy_proposal_text(record, timeout_seconds=remaining_s)
+    if cmd in ("approve", "yes"):
+        target = str(parts[1] if len(parts) > 1 else "").strip()
+        if not target:
+            return "Usage: /proposal approve <order_id>"
+        ok, message = _resolve_factory_ceo_strategy_proposal(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_id=target,
+            chat_id=int(chat_id),
+            decision="approve",
+            response_text="Approved by CEO via /proposal.",
+            actor=actor,
+        )
+        return message if ok else message
+    if cmd in ("reject", "no"):
+        target = str(parts[1] if len(parts) > 1 else "").strip()
+        if not target:
+            return "Usage: /proposal reject <order_id>"
+        ok, message = _resolve_factory_ceo_strategy_proposal(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_id=target,
+            chat_id=int(chat_id),
+            decision="reject",
+            response_text="Rejected by CEO via /proposal.",
+            actor=actor,
+        )
+        return message if ok else message
+    return "Usage: /proposal [show [order_id] | approve <order_id> | reject <order_id>]"
+
+
+def _maybe_handle_factory_ceo_strategy_message(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    incoming: IncomingMessage,
+) -> bool:
+    raw = str(incoming.text or "").strip()
+    if not raw:
+        return False
+    lower = raw.lower()
+    if lower == "/proposal" or lower.startswith("/proposal "):
+        _send_chunked_text(
+            api,
+            chat_id=int(incoming.chat_id),
+            text=_factory_ceo_strategy_command_text(
+                cfg=cfg,
+                orch_q=orch_q,
+                profiles=profiles,
+                chat_id=int(incoming.chat_id),
+                payload=raw[len("/proposal") :].strip(),
+            ),
+            reply_to_message_id=int(incoming.message_id),
+        )
+        return True
+    if incoming.reply_to_message_id is None:
+        return False
+    proposal = _pending_factory_ceo_strategy_proposal_for_reply(
+        cfg,
+        chat_id=int(incoming.chat_id),
+        reply_to_message_id=int(incoming.reply_to_message_id),
+        now=time.time(),
+    )
+    if proposal is None:
+        return False
+    decision = _classify_factory_ceo_strategy_reply(raw)
+    ok, message = _resolve_factory_ceo_strategy_proposal(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        order_id=str(proposal.get("order_id") or ""),
+        chat_id=int(incoming.chat_id),
+        decision=decision,
+        response_text=raw,
+        actor="ceo",
+    )
+    api.send_message(
+        int(incoming.chat_id),
+        message if ok else f"Could not process proposal reply: {message}",
+        reply_to_message_id=int(incoming.message_id),
+    )
+    return True
+
+
+def _factory_ceo_strategy_timeout_tick(
+    *,
+    cfg: BotConfig,
+    api: TelegramAPI,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    expired: list[dict[str, Any]] = []
+    now_ts = float(now)
+    for record in _factory_ceo_strategy_records(cfg).values():
+        if str(record.get("status") or "").strip().lower() != "pending":
+            continue
+        try:
+            expires_at = float(record.get("expires_at") or 0.0)
+        except Exception:
+            expires_at = 0.0
+        if expires_at > 0 and now_ts >= expires_at:
+            expired.append(dict(record))
+    resolved = 0
+    for record in expired:
+        chat_id = int(record.get("chat_id") or 0)
+        if chat_id <= 0:
+            continue
+        ok, message = _resolve_factory_ceo_strategy_proposal(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_id=str(record.get("order_id") or ""),
+            chat_id=chat_id,
+            decision="timeout",
+            response_text="No CEO reply within approval timeout.",
+            actor="system",
+        )
+        if ok:
+            resolved += 1
+            try:
+                api.send_message(
+                    chat_id,
+                    message,
+                    reply_to_message_id=(int(record.get("message_id")) if record.get("message_id") else None),
+                )
+            except Exception:
+                pass
+    return resolved
 
 
 def _jarvis_auto_approve_merge_enabled() -> bool:
@@ -8284,7 +10758,17 @@ def _auto_merge_ready_orders_tick(
             if bool(trace.get("merge_auto_suspended", False)):
                 continue
 
-            merge_required, _branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+            _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=chat_for_order,
+            )
+            merge_required, _branch = _order_trace_requires_merge(
+                trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
             if not merge_required:
                 continue
 
@@ -8323,7 +10807,17 @@ def _auto_merge_ready_orders_tick(
 
         root = orch_q.get_job(oid)
         trace = dict((root.trace or {}) if root else {})
-        merge_required_now, _branch = _order_trace_requires_merge(trace, repo=cfg.codex_workdir)
+        _repo_record, repo_dir, default_branch = _repo_context_for_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            order_id=oid,
+            chat_id=chat_for_order,
+        )
+        merge_required_now, _branch = _order_trace_requires_merge(
+            trace,
+            repo=(repo_dir if (repo_dir / ".git").exists() else None),
+            default_branch=default_branch,
+        )
         try:
             _sync_order_phase_from_runtime(
                 orch_q=orch_q,
@@ -8336,7 +10830,8 @@ def _auto_merge_ready_orders_tick(
             pass
         if phase != "ready_for_merge":
             continue
-        if bool(trace.get("merged_to_main", False)) and not merge_required_now:
+        deploy_failed = str(trace.get("deploy_status") or "").strip().lower() == "failed"
+        if bool(trace.get("merged_to_main", False)) and not merge_required_now and (not deploy_failed):
             try:
                 orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
                 orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
@@ -8352,10 +10847,117 @@ def _auto_merge_ready_orders_tick(
         if any(str(c.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for c in active_children):
             continue
 
+        merge_auto_error = str(trace.get("merge_auto_error") or trace.get("merge_error") or "").strip()
+        if _merge_error_is_conflict_like(merge_auto_error):
+            try:
+                merge_ready_at = float(trace.get("merge_ready_at", 0.0) or 0.0)
+            except Exception:
+                merge_ready_at = 0.0
+            try:
+                proactive_closed_at = float(trace.get("proactive_improvement_closed_at", 0.0) or 0.0)
+            except Exception:
+                proactive_closed_at = 0.0
+            try:
+                merge_failed_at = float(
+                    trace.get("merge_auto_failed_at", trace.get("merge_failed_at", 0.0)) or 0.0
+                )
+            except Exception:
+                merge_failed_at = 0.0
+            ready_signal_at = max(float(merge_ready_at), float(proactive_closed_at))
+            order_branch = str(trace.get("order_branch") or "").strip()
+            branch_contains_latest_main = False
+            if order_branch and (repo_dir / ".git").exists():
+                try:
+                    base_ref = _git_pick_main_ref(repo_dir, default_branch=default_branch)
+                    branch_ref = _git_remote_branch_ref(repo_dir, order_branch)
+                    if branch_ref:
+                        branch_contains_latest_main = _git_is_ancestor(repo_dir, base_ref, branch_ref)
+                except Exception:
+                    branch_contains_latest_main = False
+            if branch_contains_latest_main and ready_signal_at > max(float(merge_failed_at), 0.0):
+                try:
+                    orch_q.update_trace(
+                        oid,
+                        **_merge_ready_trace_reset_payload(now=float(now)),
+                        live_at=float(now),
+                    )
+                except Exception:
+                    pass
+                merge_auto_error = ""
+        if _merge_error_is_conflict_like(merge_auto_error):
+            fix_id = ""
+            try:
+                fix_id = _enqueue_merge_conflict_resolution(
+                    cfg,
+                    orch_q,
+                    chat_id=int(chat_for_order),
+                    user_id=None,
+                    order_id=oid,
+                    order_branch=str(trace.get("order_branch") or ""),
+                    merge_error=merge_auto_error,
+                    root_trace=trace,
+                )
+            except Exception:
+                fix_id = ""
+            try:
+                orch_q.set_order_status(oid, chat_id=chat_for_order, status="active")
+                orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="planning")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    merge_conflict_active=True,
+                    merge_conflict_detected_at=float(now),
+                    merge_conflict_recovered_at=float(now),
+                    live_at=float(now),
+                )
+                if fix_id:
+                    orch_q.append_audit_event(
+                        event_type="order.merge_conflict_recovered",
+                        actor="skynet",
+                        details={"order_id": oid, "job_id": fix_id},
+                    )
+            except Exception:
+                pass
+            continue
+
         try:
             merge_attempts = int(trace.get("merge_auto_attempts", 0) or 0)
         except Exception:
             merge_attempts = 0
+        try:
+            failed_at = float(trace.get("merge_auto_failed_at", 0.0) or 0.0)
+        except Exception:
+            failed_at = 0.0
+        try:
+            suspended_at = float(trace.get("merge_auto_suspended_at", 0.0) or 0.0)
+        except Exception:
+            suspended_at = 0.0
+        try:
+            merge_ready_at = float(trace.get("merge_ready_at", 0.0) or 0.0)
+        except Exception:
+            merge_ready_at = 0.0
+        try:
+            proactive_closed_at = float(trace.get("proactive_improvement_closed_at", 0.0) or 0.0)
+        except Exception:
+            proactive_closed_at = 0.0
+        resume_merge_at = max(float(merge_ready_at), float(proactive_closed_at))
+        if bool(trace.get("merge_auto_suspended", False)) and resume_merge_at > max(float(suspended_at), float(failed_at)):
+            merge_attempts = 0
+            failed_at = 0.0
+            try:
+                orch_q.update_trace(
+                    oid,
+                    merge_auto_attempts=0,
+                    merge_auto_suspended=False,
+                    merge_auto_suspended_at=None,
+                    merge_auto_failed_at=None,
+                    merge_auto_error=None,
+                    merge_auto_resumed_at=float(now),
+                    merge_auto_resume_reason="new_merge_ready_signal",
+                    live_at=float(now),
+                )
+            except Exception:
+                pass
         if merge_attempts >= int(max_attempts):
             if not bool(trace.get("merge_auto_suspended", False)):
                 try:
@@ -8375,10 +10977,6 @@ def _auto_merge_ready_orders_tick(
                     pass
             continue
 
-        try:
-            failed_at = float(trace.get("merge_auto_failed_at", 0.0) or 0.0)
-        except Exception:
-            failed_at = 0.0
         if failed_at > 0 and (float(now) - failed_at) < retry_seconds:
             continue
 
@@ -8501,6 +11099,736 @@ def _auto_merge_ready_orders_tick(
 
 
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
+_FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
+
+
+def _repo_id_from_blob(blob: str) -> str:
+    match = _FACTORY_REPO_MARKER_RX.search(str(blob or ""))
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip().lower()
+
+
+def _repo_id_from_order_record(row: dict[str, Any] | None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return _repo_id_from_blob(f"{str(row.get('title') or '')}\n{str(row.get('body') or '')}")
+
+
+def _repo_record_for_task(task: Task, orch_q: OrchestratorQueue | None) -> dict[str, Any] | None:
+    trace = dict((task.trace or {}) if isinstance(task.trace, dict) else {})
+    labels = dict((task.labels or {}) if isinstance(task.labels, dict) else {})
+    repo_id = str(trace.get("repo_id") or labels.get("repo_id") or "").strip().lower()
+    repo_path = str(trace.get("repo_path") or labels.get("repo_path") or "").strip()
+    if repo_id and orch_q is not None:
+        try:
+            row = orch_q.get_repo(repo_id=repo_id)
+        except Exception:
+            row = None
+        if isinstance(row, dict):
+            return row
+    if repo_path and orch_q is not None:
+        try:
+            row = orch_q.get_repo_by_path(path=repo_path)
+        except Exception:
+            row = None
+        if isinstance(row, dict):
+            return row
+    if repo_id or repo_path:
+        return {
+            "repo_id": repo_id or (repo_path and _factory_repo_id(Path(repo_path))) or "",
+            "path": repo_path,
+            "default_branch": str(trace.get("repo_default_branch") or "").strip() or "main",
+            "autonomy_enabled": True,
+            "priority": 2,
+            "runtime_mode": "ceo-bounded",
+            "daily_budget": 0.0,
+            "status": "active",
+            "metadata": {},
+        }
+    root_ticket = str(task.parent_job_id or task.job_id or "").strip()
+    if root_ticket and orch_q is not None:
+        try:
+            order_row = orch_q.get_order(root_ticket, chat_id=int(task.chat_id))
+        except Exception:
+            order_row = None
+        order_repo_id = _repo_id_from_order_record(order_row)
+        if order_repo_id:
+            try:
+                row = orch_q.get_repo(repo_id=order_repo_id)
+            except Exception:
+                row = None
+            if isinstance(row, dict):
+                return row
+    return None
+
+
+def _repo_record_for_order(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int | None = None,
+) -> dict[str, Any] | None:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    try:
+        root = orch_q.get_job(oid)
+    except Exception:
+        root = None
+    if root is not None:
+        row = _repo_record_for_task(root, orch_q)
+        if isinstance(row, dict):
+            return row
+    if chat_id is None:
+        return None
+    try:
+        order_row = orch_q.get_order(oid, chat_id=int(chat_id))
+    except Exception:
+        order_row = None
+    order_repo_id = _repo_id_from_order_record(order_row)
+    if not order_repo_id:
+        return None
+    try:
+        row = orch_q.get_repo(repo_id=order_repo_id)
+    except Exception:
+        row = None
+    return row if isinstance(row, dict) else None
+
+
+def _repo_context_for_order(
+    *,
+    cfg: BotConfig | None,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int | None = None,
+) -> tuple[dict[str, Any] | None, Path, str]:
+    repo_record = _repo_record_for_order(orch_q=orch_q, order_id=order_id, chat_id=chat_id)
+    repo_path = str((repo_record or {}).get("path") or "").strip()
+    if repo_path:
+        try:
+            repo_dir = Path(repo_path).expanduser().resolve()
+        except Exception:
+            repo_dir = Path(repo_path).expanduser()
+    elif cfg is not None:
+        repo_dir = cfg.codex_workdir
+    else:
+        repo_dir = Path.cwd()
+    default_branch = str((repo_record or {}).get("default_branch") or "").strip()
+    if not default_branch and (repo_dir / ".git").exists():
+        default_branch = _git_default_branch(repo_dir)
+    default_branch = default_branch or "main"
+    return repo_record, repo_dir, default_branch
+
+
+def _discover_repo_deploy_metadata(cfg: "BotConfig", repo_path: Path) -> dict[str, Any]:
+    try:
+        repo_dir = repo_path.expanduser().resolve()
+    except Exception:
+        repo_dir = repo_path.expanduser()
+
+    for candidate in (repo_dir / "scripts" / "deploy.sh", repo_dir / "deploy.sh"):
+        if candidate.exists() and candidate.is_file():
+            rel = os.path.relpath(str(candidate), str(repo_dir))
+            return {
+                "deploy": {
+                    "enabled": True,
+                    "source": "repo_script",
+                    "cwd": str(repo_dir),
+                    "command": ["bash", rel],
+                    "background": False,
+                    "timeout_seconds": 1800,
+                }
+            }
+
+    try:
+        base_repo = cfg.codex_workdir.expanduser().resolve()
+    except Exception:
+        base_repo = cfg.codex_workdir.expanduser()
+    if str(repo_dir) == str(base_repo):
+        service_name = str(os.environ.get("BOT_SELF_DEPLOY_SERVICE", "codexbot.service") or "").strip() or "codexbot.service"
+        try:
+            delay_seconds = int(os.environ.get("BOT_SELF_DEPLOY_RESTART_DELAY_SECONDS", "5"))
+        except Exception:
+            delay_seconds = 5
+        delay_seconds = max(2, min(60, int(delay_seconds)))
+        shell_cmd = f"sleep {int(delay_seconds)} && systemctl --user restart {shlex.quote(service_name)}"
+        return {
+            "deploy": {
+                "enabled": True,
+                "source": "factory_default_codexbot",
+                "cwd": str(repo_dir),
+                "command": ["bash", "-lc", shell_cmd],
+                "background": True,
+                "timeout_seconds": 30,
+                "service": service_name,
+            }
+        }
+    return {}
+
+
+def _repo_deploy_policy(
+    *,
+    cfg: BotConfig,
+    repo_record: dict[str, Any] | None,
+    repo_dir: Path,
+) -> dict[str, Any]:
+    def _cmd_list(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple)):
+            return [str(piece) for piece in value if str(piece).strip()]
+        if isinstance(value, str) and value.strip():
+            return [str(piece) for piece in shlex.split(value) if str(piece).strip()]
+        return []
+
+    metadata = dict((repo_record or {}).get("metadata") or {})
+    deploy = dict(metadata.get("deploy") or {})
+    if not deploy:
+        deploy = dict(_discover_repo_deploy_metadata(cfg, repo_dir).get("deploy") or {})
+    if not deploy:
+        return {}
+    if not bool(deploy.get("enabled", True)):
+        return {}
+
+    command = _cmd_list(deploy.get("command"))
+    if not command:
+        return {}
+
+    verify_command = _cmd_list(deploy.get("verify_command"))
+    cwd = str(deploy.get("cwd") or "").strip() or str(repo_dir)
+    try:
+        timeout_seconds = int(deploy.get("timeout_seconds") or 900)
+    except Exception:
+        timeout_seconds = 900
+    timeout_seconds = max(5, min(3600, int(timeout_seconds)))
+    return {
+        "source": str(deploy.get("source") or "repo_metadata").strip() or "repo_metadata",
+        "cwd": cwd,
+        "command": command,
+        "verify_command": verify_command,
+        "background": bool(deploy.get("background", False)),
+        "service": str(deploy.get("service") or "").strip(),
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def _deploy_after_order_merge(
+    *,
+    cfg: BotConfig,
+    repo_record: dict[str, Any] | None,
+    repo_dir: Path,
+    default_branch: str,
+    order_id: str,
+    order_branch: str,
+    merge_commit: str | None,
+) -> dict[str, Any]:
+    try:
+        repo_dir = repo_dir.expanduser().resolve()
+    except Exception:
+        repo_dir = repo_dir.expanduser()
+    policy = _repo_deploy_policy(cfg=cfg, repo_record=repo_record, repo_dir=repo_dir)
+    if not policy:
+        return {
+            "status": "skipped",
+            "reason": "no_deploy_policy",
+            "summary": "No deploy policy configured for this repo.",
+        }
+
+    sync_ok, sync_msg, deployed_commit, deploy_repo_dir = _sync_repo_checkout_to_default_branch(
+        repo=repo_dir,
+        default_branch=default_branch,
+    )
+    if not sync_ok:
+        return {
+            "status": "failed",
+            "reason": "repo_sync_failed",
+            "summary": f"Deploy blocked: repo checkout could not fast-forward to {default_branch} ({sync_msg}).",
+            "detail": str(sync_msg),
+        }
+    deploy_repo_dir = deploy_repo_dir or repo_dir
+
+    env = dict(os.environ)
+    env.update(
+        {
+            "PONCEBOT_ORDER_ID": str(order_id or ""),
+            "PONCEBOT_ORDER_BRANCH": str(order_branch or ""),
+            "PONCEBOT_MERGE_COMMIT": str(merge_commit or ""),
+            "PONCEBOT_DEPLOY_COMMIT": str(deployed_commit or merge_commit or ""),
+            "PONCEBOT_DEFAULT_BRANCH": str(default_branch or "main"),
+            "PONCEBOT_REPO_ID": str((repo_record or {}).get("repo_id") or ""),
+            "PONCEBOT_REPO_PATH": str(deploy_repo_dir),
+            "PONCEBOT_DEPLOY_REASON": "post_merge",
+        }
+    )
+    command = [str(piece) for piece in policy.get("command") or [] if str(piece).strip()]
+    if not command:
+        return {
+            "status": "failed",
+            "reason": "missing_command",
+            "summary": "Deploy policy is missing a command.",
+        }
+
+    policy_cwd = str(policy.get("cwd") or "").strip()
+    if not policy_cwd:
+        cwd = str(deploy_repo_dir)
+    else:
+        try:
+            policy_cwd_path = Path(policy_cwd).expanduser().resolve()
+        except Exception:
+            policy_cwd_path = Path(policy_cwd).expanduser()
+        if str(policy_cwd_path) == str(repo_dir):
+            cwd = str(deploy_repo_dir)
+        else:
+            cwd = str(policy_cwd_path)
+    timeout_seconds = int(policy.get("timeout_seconds") or 900)
+    command_text = shlex.join(command)
+
+    try:
+        if bool(policy.get("background", False)):
+            subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            service_name = str(policy.get("service") or "").strip()
+            service_part = f" ({service_name})" if service_name else ""
+            return {
+                "status": "scheduled",
+                "reason": "deploy_scheduled",
+                "summary": f"Deploy scheduled{service_part}.",
+                "command": command_text,
+                "deployed_commit": (deployed_commit or merge_commit or None),
+            }
+
+        run = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "failed",
+            "reason": "timeout",
+            "summary": f"Deploy timed out after {timeout_seconds}s.",
+            "command": command_text,
+            "detail": _tail_text((exc.stdout or "") + "\n" + (exc.stderr or "")),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "reason": "exec_failed",
+            "summary": f"Deploy command failed to start: {exc}",
+            "command": command_text,
+            "detail": str(exc),
+        }
+
+    stdout_tail = _tail_text(str(run.stdout or ""))
+    stderr_tail = _tail_text(str(run.stderr or ""))
+    if run.returncode != 0:
+        return {
+            "status": "failed",
+            "reason": "command_failed",
+            "summary": f"Deploy command exited with code {int(run.returncode)}.",
+            "command": command_text,
+            "stdout": stdout_tail,
+            "stderr": stderr_tail,
+            "detail": stderr_tail or stdout_tail,
+        }
+
+    verify_command = [str(piece) for piece in policy.get("verify_command") or [] if str(piece).strip()]
+    if verify_command:
+        verify_text = shlex.join(verify_command)
+        verify = subprocess.run(
+            verify_command,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=min(timeout_seconds, 120),
+            check=False,
+        )
+        if verify.returncode != 0:
+            return {
+                "status": "failed",
+                "reason": "verify_failed",
+                "summary": "Deploy completed but verification failed.",
+                "command": command_text,
+                "verify_command": verify_text,
+                "stdout": stdout_tail,
+                "stderr": _tail_text(str(verify.stderr or "")),
+                "detail": _tail_text(str(verify.stdout or "") or str(verify.stderr or "")),
+            }
+
+    return {
+        "status": "ok",
+        "reason": "deploy_ok",
+        "summary": "Deploy completed successfully.",
+        "command": command_text,
+        "stdout": stdout_tail,
+        "stderr": stderr_tail,
+        "deployed_commit": (deployed_commit or merge_commit or None),
+    }
+
+
+def _deploy_result_display(result: dict[str, Any] | None) -> str:
+    res = dict(result or {})
+    status = str(res.get("status") or "").strip().lower()
+    summary = str(res.get("summary") or "").strip()
+    if not status:
+        return ""
+    label = {
+        "ok": "Deploy OK",
+        "scheduled": "Deploy scheduled",
+        "skipped": "Deploy skipped",
+        "failed": "Deploy failed",
+    }.get(status, f"Deploy {status}")
+    if summary:
+        return f"{label}: {summary}"
+    return label
+
+
+def _factory_sync_repo_registry(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    now: float,
+    force: bool = False,
+) -> list[dict[str, Any]]:
+    state = _factory_state(cfg)
+    last_sync = state.get("repo_sync_at")
+    try:
+        last_sync_f = float(last_sync or 0.0)
+    except Exception:
+        last_sync_f = 0.0
+    if (not force) and last_sync_f > 0 and (float(now) - last_sync_f) < 300.0:
+        try:
+            return orch_q.list_repos(limit=2000)
+        except Exception:
+            return []
+
+    discovered = _discover_factory_repos(cfg)
+    try:
+        existing_rows = {str(item.get("repo_id") or ""): item for item in orch_q.list_repos(limit=5000)}
+    except Exception:
+        existing_rows = {}
+    discovered_ids: set[str] = set()
+    for row in discovered:
+        repo_id = str(row.get("repo_id") or "").strip()
+        if not repo_id:
+            continue
+        discovered_ids.add(repo_id)
+        existing = existing_rows.get(repo_id) or {}
+        metadata = dict(existing.get("metadata") or {})
+        metadata.update(dict(row.get("metadata") or {}))
+        metadata["last_seen_at"] = float(now)
+        orch_q.upsert_repo(
+            repo_id=repo_id,
+            path=str(row.get("path") or ""),
+            default_branch=str(existing.get("default_branch") or row.get("default_branch") or "main"),
+            autonomy_enabled=bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True))),
+            priority=int(existing.get("priority") or row.get("priority") or 2),
+            runtime_mode=str(existing.get("runtime_mode") or row.get("runtime_mode") or "ceo-bounded"),
+            daily_budget=float(existing.get("daily_budget") or row.get("daily_budget") or 0.0),
+            status=str(existing.get("status") or row.get("status") or "active"),
+            metadata=metadata,
+        )
+    for repo_id, existing in existing_rows.items():
+        if not repo_id or repo_id in discovered_ids:
+            continue
+        status = str(existing.get("status") or "").strip().lower()
+        if status != "missing":
+            try:
+                orch_q.set_repo_status(repo_id=repo_id, status="missing")
+            except Exception:
+                pass
+    try:
+        def _m(st: dict[str, Any]) -> None:
+            st["factory_repos_last_sync_at"] = float(now)
+
+        _update_state(cfg, _m)
+    except Exception:
+        pass
+    try:
+        return orch_q.list_repos(limit=2000)
+    except Exception:
+        return []
+
+
+def _factory_touch_runtime_agents(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    chat_id: int | None,
+    now: float,
+    repos: list[dict[str, Any]],
+) -> None:
+    for repo in repos:
+        repo_id = str(repo.get("repo_id") or "").strip()
+        repo_path = str(repo.get("path") or "").strip()
+        if not repo_id or not repo_path:
+            continue
+        status = str(repo.get("status") or "").strip().lower()
+        if status not in ("active", "paused", "disabled"):
+            continue
+        for role in _FACTORY_RUNTIME_ROLES:
+            thread_id = None
+            if chat_id is not None:
+                try:
+                    thread_id = orch_q.get_agent_thread(chat_id=int(chat_id), role=role)
+                except Exception:
+                    thread_id = None
+            try:
+                orch_q.upsert_agent_runtime_state(
+                    repo_id=repo_id,
+                    role=role,
+                    chat_id=chat_id,
+                    session_thread_id=thread_id,
+                    lane=_FACTORY_ROLE_LANES.get(role, "factory"),
+                    heartbeat_at=float(now),
+                    metadata={
+                        "repo_path": repo_path,
+                        "default_branch": str(repo.get("default_branch") or "main"),
+                        "autonomy_enabled": bool(repo.get("autonomy_enabled", True)),
+                        "repo_status": status,
+                    },
+                )
+            except Exception:
+                continue
+
+
+def _factory_recent_audit_counts(orch_q: OrchestratorQueue, *, now: float) -> dict[str, int]:
+    counts = {
+        "model_fallback_24h": 0,
+        "repo_orders_24h": 0,
+    }
+    try:
+        items = orch_q.list_audit_events(limit=800)
+    except Exception:
+        return counts
+    cutoff = float(now) - 86400.0
+    for item in items:
+        try:
+            ts = float(item.get("ts") or 0.0)
+        except Exception:
+            ts = 0.0
+        if ts < cutoff:
+            continue
+        event_type = str(item.get("event_type") or "").strip().lower()
+        if event_type == "factory.model_fallback":
+            counts["model_fallback_24h"] += 1
+        elif event_type == "factory.repo_order.created":
+            counts["repo_orders_24h"] += 1
+    return counts
+
+
+def _factory_status_snapshot(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    chat_id: int | None,
+) -> dict[str, Any]:
+    now = float(time.time())
+    factory_state = _factory_state(cfg)
+    try:
+        repos = orch_q.list_repos(limit=2000)
+    except Exception:
+        repos = []
+    try:
+        runtime_rows = orch_q.list_agent_runtime_state(limit=5000)
+    except Exception:
+        runtime_rows = []
+    try:
+        mailbox = orch_q.list_agent_mailbox(limit=100)
+    except Exception:
+        mailbox = []
+    active_repos = [row for row in repos if str(row.get("status") or "").strip().lower() == "active"]
+    enabled_repos = [row for row in active_repos if bool(row.get("autonomy_enabled", True))]
+    proactive_orders = []
+    try:
+        orders = orch_q.list_orders_global(status="active", limit=400)
+        proactive_orders = [row for row in orders if _is_proactive_order_record(row)]
+    except Exception:
+        proactive_orders = []
+    role_health = {}
+    try:
+        role_health = orch_q.get_role_health(chat_id=chat_id)
+    except Exception:
+        role_health = {}
+    local_role_names = set(_LOCAL_OLLAMA_ROLE_NAMES)
+    lanes = {
+        "interactive": {
+            "roles": ["jarvis"],
+            "queued": int((role_health.get("jarvis") or {}).get("queued", 0) or 0),
+            "running": int((role_health.get("jarvis") or {}).get("running", 0) or 0),
+        },
+        "factory": {
+            "roles": ["skynet"],
+            "queued": int((role_health.get("skynet") or {}).get("queued", 0) or 0),
+            "running": int((role_health.get("skynet") or {}).get("running", 0) or 0),
+            "active_orders": len(proactive_orders),
+        },
+        "cron": {
+            "runbooks_enabled": bool(cfg.runbooks_enabled),
+            "scheduler_enabled": bool(cfg.runbooks_enabled),
+        },
+        "subagent": {
+            "roles": sorted(local_role_names),
+            "queued": sum(int((role_health.get(role) or {}).get("queued", 0) or 0) for role in local_role_names),
+            "running": sum(int((role_health.get(role) or {}).get("running", 0) or 0) for role in local_role_names),
+        },
+    }
+    ollama_ok, ollama_detail = _ollama_status()
+    audit_counts = _factory_recent_audit_counts(orch_q, now=now)
+    stale_cutoff = float(now) - 15 * 60.0
+    heartbeats: list[dict[str, Any]] = []
+    stale_agents = 0
+    local_failures = 0
+    local_terminal = 0
+    last_success_by_role_repo: dict[str, float] = {}
+    for row in runtime_rows:
+        heartbeat_at = row.get("heartbeat_at")
+        try:
+            heartbeat_at_f = float(heartbeat_at) if heartbeat_at is not None else None
+        except Exception:
+            heartbeat_at_f = None
+        stale = bool(heartbeat_at_f is None or heartbeat_at_f <= stale_cutoff)
+        if stale:
+            stale_agents += 1
+        repo_role_key = f"{str(row.get('repo_id') or '')}:{str(row.get('role') or '')}"
+        if str(row.get("last_result_status") or "").strip().lower() == "done":
+            try:
+                last_success_by_role_repo[repo_role_key] = max(
+                    float(last_success_by_role_repo.get(repo_role_key, 0.0) or 0.0),
+                    float(row.get("last_run_at") or 0.0),
+                )
+            except Exception:
+                pass
+        if str(row.get("role") or "").strip().lower() in local_role_names:
+            status_norm = str(row.get("last_result_status") or "").strip().lower()
+            if status_norm in ("failed", "error"):
+                local_failures += 1
+            if status_norm in ("failed", "error", "done"):
+                local_terminal += 1
+        heartbeats.append(
+            {
+                **row,
+                "heartbeat_age_s": (None if heartbeat_at_f is None else max(0, int(now - heartbeat_at_f))),
+                "stale": stale,
+            }
+        )
+    repos_out: list[dict[str, Any]] = []
+    runtime_by_repo_role = {(str(r.get("repo_id") or ""), str(r.get("role") or "")): r for r in runtime_rows}
+    repo_delivery_successes = 0
+    for repo in repos:
+        repo_id = str(repo.get("repo_id") or "")
+        latest_success = 0.0
+        role_summaries: list[dict[str, Any]] = []
+        for role in _FACTORY_RUNTIME_ROLES:
+            runtime = runtime_by_repo_role.get((repo_id, role)) or {}
+            try:
+                latest_success = max(latest_success, float(runtime.get("last_run_at") or 0.0))
+            except Exception:
+                pass
+            role_summaries.append(
+                {
+                    "role": role,
+                    "lane": str(runtime.get("lane") or _FACTORY_ROLE_LANES.get(role, "factory")),
+                    "last_result_status": runtime.get("last_result_status"),
+                    "last_job_id": runtime.get("last_job_id"),
+                    "heartbeat_at": runtime.get("heartbeat_at"),
+                }
+            )
+        if latest_success > 0:
+            repo_delivery_successes += 1
+        repos_out.append({**repo, "last_successful_run_at": (latest_success or None), "roles": role_summaries})
+    repo_count = len(repos_out)
+    enabled_repo_count = len(enabled_repos)
+    local_failure_rate = (float(local_failures) / float(local_terminal)) if local_terminal > 0 else 0.0
+    repo_delivery_rate = (float(repo_delivery_successes) / float(enabled_repo_count)) if enabled_repo_count > 0 else 0.0
+    factory_status = "active"
+    if bool(factory_state.get("hard_stop", False)):
+        factory_status = "hard_stop"
+    elif bool(factory_state.get("soft_pause_active", False)):
+        factory_status = "soft_pause"
+    alerts: list[dict[str, Any]] = []
+    risks: list[dict[str, Any]] = []
+    if factory_status == "hard_stop":
+        alerts.append({"kind": "factory_hard_stop", "severity": "critical", "summary": "Factory en hard_stop manual"})
+    elif factory_status == "soft_pause":
+        alerts.append({"kind": "factory_soft_pause", "severity": "warning", "summary": "Factory en soft_pause con auto-resume pendiente"})
+    if enabled_repo_count <= 0:
+        alerts.append({"kind": "factory_no_enabled_repos", "severity": "warning", "summary": "No hay repos activos para autonomia"})
+    if stale_agents > 0:
+        alerts.append(
+            {
+                "kind": "factory_stale_heartbeats",
+                "severity": "warning",
+                "count": int(stale_agents),
+                "summary": f"{stale_agents} agente(s) con heartbeat stale",
+            }
+        )
+    if not ollama_ok:
+        risks.append(
+            {
+                "kind": "local_model_degraded",
+                "severity": "warning",
+                "summary": "Ollama degradado; runtime local debe hacer failover a Codex",
+                "detail": ollama_detail,
+            }
+        )
+    return {
+        "factory": {
+            "status": factory_status,
+            "mode": str(factory_state.get("mode") or "ceo-bounded"),
+            "paused": bool(factory_state.get("paused", False)),
+            "pause_kind": str(factory_state.get("pause_kind") or ""),
+            "pause_reason": str(factory_state.get("pause_reason") or ""),
+            "paused_at": factory_state.get("paused_at"),
+            "soft_pause_until": factory_state.get("soft_pause_until"),
+            "repo_count": int(repo_count),
+            "enabled_repo_count": int(enabled_repo_count),
+            "active_proactive_orders": int(len(proactive_orders)),
+            "repo_sync_at": factory_state.get("repo_sync_at"),
+        },
+        "repos": repos_out,
+        "heartbeats": heartbeats,
+        "mailbox": mailbox,
+        "lanes": lanes,
+        "models": {
+            "local_ollama": {
+                "healthy": bool(ollama_ok),
+                "detail": ollama_detail,
+            },
+            "codex": {
+                "healthy": True,
+                "detail": "codex primary backend available by configuration",
+            },
+            "failover_policy": {
+                "controllers": "codex_primary",
+                "local_roles": "ollama_primary_codex_fallback",
+                "model_fallback_24h": int(audit_counts.get("model_fallback_24h", 0)),
+            },
+        },
+        "slo": {
+            "heartbeat_stale_agents": int(stale_agents),
+            "repo_delivery_rate": round(float(repo_delivery_rate), 4),
+            "local_failure_rate": round(float(local_failure_rate), 4),
+            "fallback_rate_24h": int(audit_counts.get("model_fallback_24h", 0)),
+            "repo_orders_24h": int(audit_counts.get("repo_orders_24h", 0)),
+            "last_successful_run": last_success_by_role_repo,
+        },
+        "alerts": alerts,
+        "risks": risks,
+    }
 
 
 def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
@@ -8657,6 +11985,50 @@ def _controller_role_for_task(task: Task, orch_q: OrchestratorQueue | None) -> s
     return _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket, default="jarvis")
 
 
+def _order_row_for_root_ticket(
+    *,
+    orch_q: OrchestratorQueue | None,
+    root_ticket: str,
+    chat_id: int | None = None,
+) -> dict[str, Any] | None:
+    rid = str(root_ticket or "").strip()
+    if not rid or orch_q is None:
+        return None
+    chat_candidates: list[int] = []
+    try:
+        chat_value = int(chat_id or 0)
+    except Exception:
+        chat_value = 0
+    if chat_value > 0:
+        chat_candidates.append(chat_value)
+    try:
+        root = orch_q.get_job(rid)
+    except Exception:
+        root = None
+    if root is not None:
+        try:
+            root_chat = int(getattr(root, "chat_id", 0) or 0)
+        except Exception:
+            root_chat = 0
+        if root_chat > 0 and root_chat not in chat_candidates:
+            chat_candidates.append(root_chat)
+    for candidate_chat in chat_candidates:
+        try:
+            row = orch_q.get_order(rid, chat_id=int(candidate_chat))
+        except Exception:
+            row = None
+        if row:
+            return row
+    try:
+        rows = orch_q.list_orders_global(status="active", limit=300)
+    except Exception:
+        rows = []
+    for row in rows or []:
+        if str(row.get("order_id") or "").strip() == rid:
+            return row
+    return None
+
+
 def _next_proactive_initiative(
     *,
     cfg: BotConfig,
@@ -8697,6 +12069,7 @@ def _spawn_proactive_order(
     chat_id: int,
     now: float,
     initiative: dict[str, str],
+    repo_record: dict[str, Any] | None = None,
 ) -> bool:
     key = str(initiative.get("key") or "").strip().lower()
     if not key:
@@ -8719,44 +12092,59 @@ def _spawn_proactive_order(
     lane = str(initiative.get("lane") or "general").strip().lower()
     project_hint = str(initiative.get("project_hint") or "").strip()
     sprint_day = 1 + int((int(now) // (24 * 60 * 60)) % 5)
+    repo = dict(repo_record or {})
+    repo_id = str(repo.get("repo_id") or "").strip().lower()
+    repo_path = str(repo.get("path") or "").strip()
+    repo_default_branch = str(repo.get("default_branch") or "").strip() or "main"
+    repo_name = Path(repo_path).name if repo_path else ""
 
-    workspace = _ensure_project_workspace(
-        project_id=str(uuid.uuid4()),
-        title=title,
-        created_by=controller_role,
-        runtime_mode="venv",
-    )
-    project_id = str(workspace.get("project_id") or "").strip()
-    project_name = str(workspace.get("name") or title).strip() or title
-    project_path = str(workspace.get("path") or "").strip()
+    if repo_id and repo_path:
+        project_id = repo_id
+        project_name = repo_name or title
+        project_path = repo_path
+    else:
+        workspace = _ensure_project_workspace(
+            project_id=str(uuid.uuid4()),
+            title=title,
+            created_by=controller_role,
+            runtime_mode="venv",
+        )
+        project_id = str(workspace.get("project_id") or "").strip()
+        project_name = str(workspace.get("name") or title).strip() or title
+        project_path = str(workspace.get("path") or "").strip()
 
-    if project_id:
-        try:
-            orch_q.upsert_project(
-                project_id=project_id,
-                name=project_name,
-                path=project_path,
-                runtime_mode="venv",
-                ports=[],
-                status="active",
-                created_by=controller_role,
-            )
-            orch_q.append_audit_event(
-                event_type="project.created",
-                actor=controller_role,
-                details={
-                    "project_id": project_id,
-                    "order_id": order_id,
-                    "path": project_path,
-                    "lane": lane,
-                    "proactive": True,
-                },
-            )
-        except Exception:
-            pass
+        if project_id:
+            try:
+                orch_q.upsert_project(
+                    project_id=project_id,
+                    name=project_name,
+                    path=project_path,
+                    runtime_mode="venv",
+                    ports=[],
+                    status="active",
+                    created_by=controller_role,
+                )
+                orch_q.append_audit_event(
+                    event_type="project.created",
+                    actor=controller_role,
+                    details={
+                        "project_id": project_id,
+                        "order_id": order_id,
+                        "path": project_path,
+                        "lane": lane,
+                        "proactive": True,
+                    },
+                )
+            except Exception:
+                pass
 
     order_branch = _order_branch_name(order_id, title)
-    ok_branch, branch_msg = _git_ensure_branch_from_main(cfg.codex_workdir, str(order_branch))
+    branch_repo = Path(repo_path).expanduser().resolve() if repo_path else cfg.codex_workdir
+    ok_branch, branch_msg = _git_ensure_branch_from_main(
+        branch_repo,
+        str(order_branch),
+        default_branch=str(repo_default_branch or "main"),
+    )
     if not ok_branch:
         try:
             orch_q.append_audit_event(
@@ -8767,6 +12155,8 @@ def _spawn_proactive_order(
                     "branch": order_branch,
                     "error": str(branch_msg),
                     "initiative": key,
+                    "repo_id": (repo_id or None),
+                    "repo_path": (repo_path or None),
                 },
             )
         except Exception:
@@ -8778,38 +12168,50 @@ def _spawn_proactive_order(
     effort = _orchestrator_effort_for_profile(base_profile, cfg)
     requires_approval = bool(base_profile.get("approval_required", False))
 
-    proactive_prompt = (
-        "AUTONOMOUS PROACTIVE SPRINT\n"
-        f"[proactive:{key}]\n"
-        f"Lane: {lane}\n"
-        f"Sprint day: {sprint_day} of 5\n"
-        f"Order ID: {order_id}\n"
-        f"Project ID: {project_id or '(pending)'}\n"
-        f"Project workspace: {project_path or '(n/a)'}\n"
-        f"Project hint: {project_hint or '(none)'}\n"
-        f"Goal: {goal}\n"
-        f"Success definition: {success_definition or '(deliver one verified improvement with concrete evidence)'}\n\n"
-        f"Expected measurable delta: {expected_measurable_delta}\n"
-        f"Stop condition: {stop_condition}\n\n"
-        "Execution policy:\n"
-        "- Work only inside this initiative scope; do not touch unrelated projects.\n"
-        "- Avoid work-for-work's-sake: choose the smallest highest-impact improvement that can be validated today.\n"
-        "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.\n"
-        "- Task selection priority (deterministic):\n"
-        "  1) repeated conversion failures in the local funnel,\n"
-        "  2) reliability/evidence tests currently failing or flaky,\n"
-        "  3) debt that measurably reduces operational noise.\n"
-        "- Do not seed a new local task for a role that already has open work on this ticket.\n"
-        "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.\n"
-        "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.\n"
-        "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.\n"
-        "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.\n"
-        "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.\n"
-        "- When delegating implementer_local, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.\n"
-        "- If local-only work becomes repetitive, empty, or low-signal, re-plan one bounded local-only path with clearer evidence requirements.\n"
-        "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.\n"
-        "- If fully validated, publish a concise PASS summary and the next highest-impact opportunity.\n"
-    )
+    prompt_lines = [
+        "AUTONOMOUS PROACTIVE SPRINT",
+        f"[proactive:{key}]",
+        *( [f"[repo:{repo_id}]"] if repo_id else [] ),
+        f"Lane: {lane}",
+        f"Sprint day: {sprint_day} of 5",
+        f"Order ID: {order_id}",
+        f"Project ID: {project_id or '(pending)'}",
+        f"Project workspace: {project_path or '(n/a)'}",
+        *( [f"Authorized repo root: {repo_path}"] if repo_path else [] ),
+        *( [f"Repo default branch: {repo_default_branch}"] if repo_path else [] ),
+        f"Project hint: {project_hint or '(none)'}",
+        f"Goal: {goal}",
+        f"Success definition: {success_definition or '(deliver one verified improvement with concrete evidence)'}",
+        "",
+        f"Expected measurable delta: {expected_measurable_delta}",
+        f"Stop condition: {stop_condition}",
+        "",
+        "Execution policy:",
+        (
+            "- Work only inside the registered repo root above; do not create new repos or touch sibling repos."
+            if repo_path
+            else "- Work only inside this initiative scope; do not touch unrelated projects."
+        ),
+        "- Avoid work-for-work's-sake: choose the smallest highest-impact improvement that can be validated today.",
+        "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.",
+        "- Task selection priority (deterministic):",
+        "  1) repeated conversion failures in the local funnel,",
+        "  2) reliability/evidence tests currently failing or flaky,",
+        "  3) debt that measurably reduces operational noise.",
+        "- Do not seed a new local task for a role that already has open work on this ticket.",
+        "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.",
+        "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.",
+        "- If the best next move is a new capability, a drastic change, or a materially broader plan, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.",
+        "- If CEO approval is pending for a larger/drastic idea, do not delegate execution subtasks for that idea.",
+        "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
+        "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
+        "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
+        "- When delegating implementer_local, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.",
+        "- If local-only work becomes repetitive, empty, or low-signal, re-plan one bounded local-only path with clearer evidence requirements.",
+        "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.",
+        "- If fully validated, publish a concise PASS summary and the next highest-impact opportunity.",
+    ]
+    proactive_prompt = "\n".join(prompt_lines).strip() + "\n"
 
     trace: dict[str, Any] = {
         "source": "scheduler",
@@ -8821,6 +12223,7 @@ def _spawn_proactive_order(
         "order_branch": order_branch,
         "initiative_key": key,
         "initiative_lane": lane,
+        "factory_order": bool(repo_id),
         "expected_measurable_delta": expected_measurable_delta,
         "stop_condition": stop_condition,
         "runbook_id": "skynet_proactive_lane",
@@ -8828,6 +12231,11 @@ def _spawn_proactive_order(
         "profile_role": controller_role,
         "max_runtime_seconds": int(base_profile.get("max_runtime_seconds") or 0),
     }
+    if repo_id:
+        trace["repo_id"] = repo_id
+    if repo_path:
+        trace["repo_path"] = repo_path
+        trace["repo_default_branch"] = repo_default_branch
 
     task = Task.new(
         source="telegram",
@@ -8850,6 +12258,7 @@ def _spawn_proactive_order(
             "lane": "proactive",
             "initiative": key,
             "runbook": "skynet_proactive_lane",
+            **({"repo_id": repo_id, "repo_path": repo_path} if repo_id and repo_path else {}),
         },
         artifacts_dir=str((cfg.artifacts_root / order_id).resolve()),
         trace=trace,
@@ -8879,10 +12288,12 @@ def _spawn_proactive_order(
             proactive_lane=True,
             initiative_key=key,
             initiative_lane=lane,
+            repo_id=(repo_id or None),
+            repo_path=(repo_path or None),
             live_at=now,
         )
         orch_q.append_audit_event(
-            event_type="order.created",
+            event_type=("factory.repo_order.created" if repo_id else "order.created"),
             actor=controller_role,
             details={
                 "order_id": order_id,
@@ -8892,8 +12303,32 @@ def _spawn_proactive_order(
                 "initiative": key,
                 "lane": lane,
                 "proactive_lane": True,
+                "repo_id": (repo_id or None),
+                "repo_path": (repo_path or None),
             },
         )
+        if repo_id:
+            try:
+                orch_q.upsert_agent_runtime_state(
+                    repo_id=repo_id,
+                    role=controller_role,
+                    chat_id=int(chat_id),
+                    lane=_FACTORY_ROLE_LANES.get(controller_role, "factory"),
+                    heartbeat_at=float(now),
+                    last_job_id=order_id,
+                    last_run_at=float(now),
+                    metadata={"repo_path": repo_path, "order_id": order_id, "factory_order": True},
+                )
+                orch_q.append_agent_mailbox(
+                    repo_id=repo_id,
+                    from_agent_key=f"{repo_id}:factory",
+                    to_agent_key=f"{repo_id}:{controller_role}",
+                    kind="spawn",
+                    correlation_id=order_id,
+                    payload={"order_id": order_id, "repo_path": repo_path, "initiative": key},
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     return True
@@ -8910,8 +12345,25 @@ def _proactive_lane_tick(
     if not bool(cfg.proactive_lane_enabled):
         return 0
     try:
-        st = _get_state(cfg)
-        if bool(st.get("proactive_lane_paused", False)):
+        _factory_auto_resume_if_due(cfg)
+    except Exception:
+        pass
+    try:
+        repos = _factory_sync_repo_registry(cfg=cfg, orch_q=orch_q, now=now, force=False)
+    except Exception:
+        repos = []
+    try:
+        _factory_touch_runtime_agents(
+            cfg=cfg,
+            orch_q=orch_q,
+            chat_id=int(chat_id),
+            now=now,
+            repos=repos,
+        )
+    except Exception:
+        pass
+    try:
+        if bool(_factory_state(cfg).get("paused", False)):
             return 0
     except Exception:
         pass
@@ -8952,13 +12404,84 @@ def _proactive_lane_tick(
         return 0
 
     active_proactive_orders = [o for o in active_orders if _is_proactive_order_record(o)]
-    if len(active_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
+    countable_proactive_orders = [
+        row
+        for row in active_proactive_orders
+        if not _order_has_pending_factory_ceo_strategy_proposal(
+            cfg,
+            order_id=str(row.get("order_id") or ""),
+            now=float(now),
+        )
+    ]
+    if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
         return 0
 
-    occupied = _active_proactive_keys(active_proactive_orders)
+    occupied = _active_proactive_keys(countable_proactive_orders)
     created = 0
+    repo_candidates = [
+        row
+        for row in repos
+        if str(row.get("status") or "").strip().lower() == "active" and bool(row.get("autonomy_enabled", True))
+    ]
+    active_repo_ids = {_repo_id_from_order_record(row) for row in countable_proactive_orders}
+    active_repo_ids.discard("")
+    if repo_candidates:
+        repo_candidates = sorted(repo_candidates, key=lambda row: (int(row.get("priority") or 2), str(row.get("path") or "")))
+        for repo in repo_candidates:
+            if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
+                break
+            if created >= max(1, int(cfg.proactive_lane_max_per_tick)):
+                break
+            repo_id = str(repo.get("repo_id") or "").strip().lower()
+            if (not repo_id) or repo_id in active_repo_ids:
+                continue
+            repo_key = re.sub(r"[^a-z0-9_-]+", "_", repo_id)
+            initiative = {
+                "key": f"repo_{repo_key}",
+                "title": f"Proactive Sprint: {Path(str(repo.get('path') or repo_id)).name} Reliability + Delivery",
+                "lane": "factory",
+                "project_hint": str(repo.get("path") or ""),
+                "goal": (
+                    "Ship one bounded reliability, quality, maintenance, or delivery improvement inside this registered repo, "
+                    "with real evidence and no cross-repo writes."
+                ),
+                "success": (
+                    "Close one verified improvement for this repo with concrete evidence such as tests, validation logs, or a reviewed patch."
+                ),
+                "expected_measurable_delta": (
+                    "Increase validated improvements per repo while keeping local failure rate and queue pressure bounded."
+                ),
+                "stop_condition": (
+                    "Stop when one verified improvement is closed for this repo or when the repo is blocked with a concrete root cause."
+                ),
+            }
+            ok = _spawn_proactive_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                profiles=profiles,
+                chat_id=int(chat_id),
+                now=now,
+                initiative=initiative,
+                repo_record=repo,
+            )
+            if ok:
+                created += 1
+                active_repo_ids.add(repo_id)
+                countable_proactive_orders.append(
+                    {
+                        "title": str(initiative.get("title") or ""),
+                        "body": f"[proactive:{initiative.get('key')}] [repo:{repo_id}]",
+                    }
+                )
+        if created > 0:
+            try:
+                orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+            except Exception:
+                pass
+        return created
+
     for _ in range(max(1, int(cfg.proactive_lane_max_per_tick))):
-        if len(active_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
+        if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
             break
         initiative = _next_proactive_initiative(cfg=cfg, occupied_keys=occupied)
         if not initiative:
@@ -8976,7 +12499,7 @@ def _proactive_lane_tick(
             occupied.add(key)
         if ok:
             created += 1
-            active_proactive_orders.append({"title": str(initiative.get("title") or ""), "body": f"[proactive:{key}]"})
+            countable_proactive_orders.append({"title": str(initiative.get("title") or ""), "body": f"[proactive:{key}]"})
 
     if created > 0:
         try:
@@ -8984,6 +12507,193 @@ def _proactive_lane_tick(
         except Exception:
             pass
     return created
+
+
+def _enqueue_order_autopilot_task(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_row: dict[str, Any],
+    chat_id: int,
+    now: float,
+    reason: str,
+    min_idle_seconds: float = 0.0,
+    cooldown_seconds: float = 0.0,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid:
+        return False
+
+    phase = str(order_row.get("phase") or "").strip().lower()
+    if phase in {"ceo_approval_pending", "ready_for_merge", "done", "failed", "cancelled", "merged"}:
+        return False
+    if _order_has_pending_factory_ceo_strategy_proposal(cfg, order_id=oid, now=float(now)):
+        return False
+
+    children = orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(
+        str((c.labels or {}).get("kind") or "").strip().lower() == "autopilot"
+        and str(c.state or "").strip().lower() in active_states
+        for c in children
+    ):
+        return False
+    if any(
+        str(c.state or "").strip().lower() in active_states
+        and str((c.labels or {}).get("kind") or "").strip().lower() not in ("autopilot", "wrapup", "evidence")
+        for c in children
+    ):
+        return False
+
+    root_job = orch_q.get_job(oid)
+    root_trace = dict((root_job.trace if root_job else {}) or {})
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    latest_activity = 0.0
+    for index, candidate in enumerate([root_job, *children]):
+        if candidate is None:
+            continue
+        candidate_state = str(getattr(candidate, "state", "") or "").strip().lower()
+        created_at = float(getattr(candidate, "created_at", 0.0) or 0.0)
+        updated_at = float(getattr(candidate, "updated_at", 0.0) or 0.0)
+        # For terminal root jobs, prefer created_at: maintenance syncs may update the trace/order row
+        # without meaning a worker is actively advancing the order.
+        if index == 0 and candidate_state not in active_states:
+            activity_ts = created_at or updated_at
+        else:
+            activity_ts = updated_at or created_at
+        if activity_ts > latest_activity:
+            latest_activity = activity_ts
+    try:
+        order_updated_at = float(order_row.get("updated_at") or 0.0)
+    except Exception:
+        order_updated_at = 0.0
+    # Treat order.updated_at as activity only before any runtime job exists for the order.
+    # Grounded reason: phase/status syncs can keep the order row fresh even when no worker is alive.
+    if latest_activity <= 0.0 and order_updated_at > latest_activity:
+        latest_activity = order_updated_at
+    idle_age_s = max(0.0, float(now) - latest_activity) if latest_activity > 0 else float(min_idle_seconds)
+    if float(min_idle_seconds) > 0 and idle_age_s < float(min_idle_seconds):
+        return False
+
+    try:
+        last_enqueued_at = float(root_trace.get("autopilot_last_enqueued_at", 0.0) or 0.0)
+    except Exception:
+        last_enqueued_at = 0.0
+    if last_enqueued_at > 0 and latest_activity > (last_enqueued_at + 5.0):
+        last_enqueued_at = 0.0
+    if last_enqueued_at > 0 and float(cooldown_seconds) > 0 and (float(now) - last_enqueued_at) < float(cooldown_seconds):
+        return False
+
+    is_proactive = _is_proactive_order_record(order_row)
+    controller_role = "skynet" if is_proactive else "jarvis"
+    title = str(order_row.get("title") or "").strip()
+    body = str(order_row.get("body") or "").strip()
+    pr = order_row.get("priority")
+    try:
+        pr_i = int(pr) if pr is not None else 2
+    except Exception:
+        pr_i = 2
+    pr_i = max(1, min(3, pr_i))
+    pr_i = 3
+
+    ap_id = str(uuid.uuid4())
+    trace: dict[str, Any] = {
+        "source": "scheduler",
+        "autopilot": True,
+        "allow_delegation": True,
+        "order_id": oid,
+        "autopilot_reason": str(reason or "").strip() or "autopilot",
+        "autopilot_idle_age_s": float(idle_age_s),
+    }
+    task = Task.new(
+        source="telegram",
+        role=controller_role,
+        input_text=(
+            "AUTOPILOT TICK\n"
+            f"CEO: {cfg.ceo_name}\n"
+            f"Order ID: {oid}\n"
+            f"Order title: {title}\n"
+            f"Reason: {trace['autopilot_reason']}\n"
+            f"Idle age (s): {int(max(0.0, idle_age_s))}\n\n"
+            f"Order body:\n{body}\n\n"
+            "Rules:\n"
+            "- Only propose work that advances this order.\n"
+            "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
+            "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
+            "- If the best next move is a larger strategic idea, a new capability, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
+            "- Delegate only local specialist executors: architect_local, implementer_local, reviewer_local.\n"
+            "- Do not seed backend/qa/sre Codex CLI delivery roles for proactive work.\n"
+            "- If a local cycle stalls or returns low-signal output, re-plan another local-only path instead of promoting to CLI.\n"
+            "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
+            "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
+            "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
+            "- Keep WIP bounded: max 3 running tasks and max 12 queued tasks for this order.\n"
+            "- Keep outputs short.\n"
+        ),
+        request_type="maintenance",
+        priority=int(pr_i),
+        model="",
+        effort="medium",
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id=oid,
+        owner="scheduler",
+        labels={"ticket": oid, "kind": "autopilot", "order": oid, "runbook": f"{controller_role}_autopilot"},
+        artifacts_dir=str((cfg.artifacts_root / ap_id).resolve()),
+        trace=trace,
+        job_id=ap_id,
+    )
+
+    try:
+        rb_role = _coerce_orchestrator_role(task.role)
+        rb_profile = _orchestrator_profile(profiles, rb_role)
+        rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
+        rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
+        rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (task.mode_hint == "full")
+        if _effective_bypass_sandbox(cfg, chat_id=int(chat_id)):
+            rb_requires_approval = False
+        rb_trace = dict(task.trace)
+        rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
+        rb_trace["profile_role"] = rb_role
+        rb_trace["max_runtime_seconds"] = int(rb_profile.get("max_runtime_seconds") or 0)
+        task = task.with_updates(
+            role=rb_role,
+            model=rb_model,
+            effort=rb_effort,
+            requires_approval=rb_requires_approval,
+            trace=rb_trace,
+        )
+    except Exception:
+        pass
+
+    orch_q.submit_task(task)
+    try:
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
+        orch_q.update_trace(
+            oid,
+            autopilot_last_enqueued_at=float(now),
+            autopilot_last_job_id=ap_id,
+            autopilot_last_reason=str(reason or "").strip() or "autopilot",
+            autopilot_last_idle_age_s=float(idle_age_s),
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.autopilot_enqueued",
+            actor=controller_role,
+            details={
+                "order_id": oid,
+                "job_id": ap_id,
+                "reason": str(reason or "").strip() or "autopilot",
+                "idle_age_s": float(idle_age_s),
+            },
+        )
+    except Exception:
+        pass
+    return True
 
 
 def _autopilot_tick(
@@ -8999,21 +12709,78 @@ def _autopilot_tick(
 
     Grounded design:
     - Orders are persisted in SQLite (`ceo_orders`).
-    - Autopilot enqueues an autonomous Jarvis job per active order only when the order is idle.
-    - The Jarvis job is labeled `kind=autopilot` and is allowed to delegate.
+    - Autopilot enqueues an autonomous Jarvis/Skynet job per active order only when the order is idle.
+    - The job is labeled `kind=autopilot` and is allowed to delegate.
+    - Manual proactive-lane pause must also suppress proactive autopilot work.
     """
     created = 0
     orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=30)
     if not orders:
         return 0
+    proactive_lane_paused = False
+    try:
+        proactive_lane_paused = bool(_proactive_lane_state(cfg).get("paused", False))
+    except Exception:
+        proactive_lane_paused = False
 
-    # If any CEO-driven order is active, proactive initiatives are deprioritized.
     has_active_ceo_order = any(not _is_proactive_order_record(o) for o in orders)
-    # By default, continuous autopilot ticks run only for proactive orders.
-    # CEO/manual orders should converge and drain without perpetual scheduler churn.
     ceo_order_autopilot_enabled = str(os.environ.get("BOT_CEO_ORDER_AUTOPILOT_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
 
-    # Avoid growing backlog: if queue is under pressure, autopilot must not add new load.
+    try:
+        hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
+        pressured, _, _ = _queue_is_pressured(orch_q=orch_q)
+        if hard_pressured or pressured:
+            return 0
+    except Exception:
+        pass
+    try:
+        cooldown_s = max(
+            60.0,
+            float(os.environ.get("BOT_AUTOPILOT_IDLE_REQUEUE_COOLDOWN_SECONDS", "180").strip() or "180"),
+        )
+    except Exception:
+        cooldown_s = 180.0
+
+    for row in orders:
+        is_proactive = _is_proactive_order_record(row)
+        if is_proactive and proactive_lane_paused:
+            continue
+        if (not is_proactive) and (not ceo_order_autopilot_enabled):
+            continue
+        if has_active_ceo_order and is_proactive:
+            continue
+        if _enqueue_order_autopilot_task(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_row=row,
+            chat_id=int(chat_id),
+            now=float(now),
+            reason=("proactive_autopilot" if is_proactive else "ceo_autopilot"),
+            min_idle_seconds=0.0,
+            cooldown_seconds=float(cooldown_s),
+        ):
+            created += 1
+        if created >= 1:
+            break
+
+    return created
+
+
+def _active_order_watchdog_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    chat_id: int,
+    now: float,
+) -> int:
+    raw_enabled = str(os.environ.get("BOT_ACTIVE_ORDER_WATCHDOG_ENABLED", "1") or "1").strip().lower()
+    if raw_enabled not in ("1", "true", "yes", "on"):
+        return 0
+    if orch_q.is_paused_globally():
+        return 0
+
     try:
         hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
         pressured, _, _ = _queue_is_pressured(orch_q=orch_q)
@@ -9022,125 +12789,61 @@ def _autopilot_tick(
     except Exception:
         pass
 
-    for o in orders:
-        is_proactive = _is_proactive_order_record(o)
+    try:
+        idle_threshold_s = max(
+            45.0,
+            float(os.environ.get("BOT_ACTIVE_ORDER_WATCHDOG_IDLE_SECONDS", "90").strip() or "90"),
+        )
+    except Exception:
+        idle_threshold_s = 90.0
+    try:
+        cooldown_s = max(
+            60.0,
+            float(os.environ.get("BOT_ACTIVE_ORDER_WATCHDOG_COOLDOWN_SECONDS", "180").strip() or "180"),
+        )
+    except Exception:
+        cooldown_s = 180.0
+    try:
+        max_per_tick = max(1, min(4, int(os.environ.get("BOT_ACTIVE_ORDER_WATCHDOG_MAX_PER_TICK", "1").strip() or "1")))
+    except Exception:
+        max_per_tick = 1
+
+    orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=40)
+    if not orders:
+        return 0
+
+    proactive_lane_paused = False
+    try:
+        proactive_lane_paused = bool(_proactive_lane_state(cfg).get("paused", False))
+    except Exception:
+        proactive_lane_paused = False
+
+    has_active_ceo_order = any(not _is_proactive_order_record(o) for o in orders)
+    ceo_order_autopilot_enabled = str(os.environ.get("BOT_CEO_ORDER_AUTOPILOT_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+    created = 0
+    for row in orders:
+        if created >= max_per_tick:
+            break
+        is_proactive = _is_proactive_order_record(row)
+        if is_proactive and proactive_lane_paused:
+            continue
         if (not is_proactive) and (not ceo_order_autopilot_enabled):
             continue
         if has_active_ceo_order and is_proactive:
             continue
-        controller_role = "skynet" if is_proactive else "jarvis"
-        oid = str(o.get("order_id") or "").strip()
-        if not oid:
-            continue
-
-        # Don't enqueue another autopilot job if one is already queued/running.
-        children = orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
-        if any(
-            str((c.labels or {}).get("kind") or "").strip().lower() == "autopilot"
-            and c.state in ("queued", "waiting_deps", "blocked_approval", "running")
-            for c in children
-        ):
-            continue
-
-        # If there is any real work already queued/running for this order, do nothing.
-        has_active_work = any(
-            c.state in ("queued", "waiting_deps", "blocked_approval", "running")
-            and str((c.labels or {}).get("kind") or "").strip().lower() not in ("autopilot", "wrapup", "evidence")
-            for c in children
-        )
-        if has_active_work:
-            continue
-
-        title = str(o.get("title") or "").strip()
-        body = str(o.get("body") or "").strip()
-        pr = o.get("priority")
-        try:
-            pr_i = int(pr) if pr is not None else 2
-        except Exception:
-            pr_i = 2
-        pr_i = max(1, min(3, pr_i))
-        # Autopilot should always be lowest priority.
-        pr_i = 3
-
-        ap_id = str(uuid.uuid4())
-        trace: dict[str, Any] = {
-            "source": "scheduler",
-            "autopilot": True,
-            "allow_delegation": True,
-            "order_id": oid,
-        }
-        t = Task.new(
-            source="telegram",
-            role=controller_role,
-            input_text=(
-                "AUTOPILOT TICK\n"
-                f"CEO: {cfg.ceo_name}\n"
-                f"Order ID: {oid}\n"
-                f"Order title: {title}\n\n"
-                f"Order body:\n{body}\n\n"
-                "Rules:\n"
-                "- Only propose work that advances this order.\n"
-                "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
-                "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
-                "- Delegate only local specialist executors: architect_local, implementer_local, reviewer_local.\n"
-                "- Do not seed backend/qa/sre Codex CLI delivery roles for proactive work.\n"
-                "- If a local cycle stalls or returns low-signal output, re-plan another local-only path instead of promoting to CLI.\n"
-                "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
-                "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
-                "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
-                "- Keep WIP bounded: max 3 running tasks and max 12 queued tasks for this order.\n"
-                "- Keep outputs short.\n"
-            ),
-            request_type="maintenance",
-            priority=int(pr_i),
-            model="",
-            effort="medium",
-            mode_hint="ro",
-            requires_approval=False,
-            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        if _enqueue_order_autopilot_task(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_row=row,
             chat_id=int(chat_id),
-            is_autonomous=True,
-            parent_job_id=oid,
-            owner="scheduler",
-            labels={"ticket": oid, "kind": "autopilot", "order": oid, "runbook": f"{controller_role}_autopilot"},
-            artifacts_dir=str((cfg.artifacts_root / ap_id).resolve()),
-            trace=trace,
-            job_id=ap_id,
-        )
-
-        # Apply profile defaults for Jarvis so the autopilot behaves like the same agent.
-        try:
-            rb_role = _coerce_orchestrator_role(t.role)
-            rb_profile = _orchestrator_profile(profiles, rb_role)
-            rb_model = _orchestrator_model_for_profile(cfg, rb_profile)
-            rb_effort = _orchestrator_effort_for_profile(rb_profile, cfg)
-            rb_requires_approval = bool(rb_profile.get("approval_required", False)) or (t.mode_hint == "full")
-            if _effective_bypass_sandbox(cfg, chat_id=int(chat_id)):
-                rb_requires_approval = False
-            rb_trace = dict(t.trace)
-            rb_trace["profile_name"] = str(rb_profile.get("name") or rb_role)
-            rb_trace["profile_role"] = rb_role
-            rb_trace["max_runtime_seconds"] = int(rb_profile.get("max_runtime_seconds") or 0)
-            t = t.with_updates(
-                role=rb_role,
-                model=rb_model,
-                effort=rb_effort,
-                requires_approval=rb_requires_approval,
-                trace=rb_trace,
-            )
-        except Exception:
-            pass
-
-        orch_q.submit_task(t)
-        try:
-            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
-        except Exception:
-            pass
-        created += 1
-        # Cap per tick to avoid spam / runaway job creation.
-        if created >= 1:
-            break
-
+            now=float(now),
+            reason=("proactive_idle_watchdog" if is_proactive else "ceo_idle_watchdog"),
+            min_idle_seconds=float(idle_threshold_s),
+            cooldown_seconds=float(cooldown_s),
+        ):
+            created += 1
     return created
 
 
@@ -9330,7 +13033,7 @@ def _dedupe_specs_by_signature(
     for child in existing_subtasks:
         state = str(getattr(child, "state", "") or "").strip().lower()
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
-        if state in active_states or ts >= cutoff:
+        if state in active_states or (state == "done" and ts >= cutoff):
             sig = _task_signature(child)
             if sig:
                 existing_signatures.add(sig)
@@ -9478,19 +13181,19 @@ def _inject_local_specialist_specs(
                 key=impl_key,
                 role="implementer_local",
                 text=(
-                    f"Local implementation pass for ticket {root_ticket}: apply the required code changes directly in the assigned workspace, "
-                    "run targeted validation, and summarize the concrete files changed, commands run, and evidence produced."
+                    f"Local implementation pass for ticket {root_ticket}: return one bounded diff or rewrite for the required code change, "
+                    "then name the expected validation and evidence the controller should collect."
                 ),
-                mode_hint="rw",
+                mode_hint="ro",
                 priority=2,
                 depends_on=impl_deps,
                 requires_approval=False,
                 acceptance_criteria=[
-                    "Apply the implementation directly in the workspace with bounded, relevant code changes.",
-                    "Run targeted validation and report concrete outcomes plus regression risks with mitigations.",
+                    "Return one bounded implementation diff or rewrite block grounded in the delegated file scope.",
+                    "Name the expected validation command and regression risks without claiming unrun shell output.",
                 ],
                 definition_of_done=[
-                    "Workspace contains the implementation and supporting validation evidence.",
+                    "Controller can apply the implementation and run validation using the returned patch contract.",
                 ],
                 eta_minutes=60,
                 sla_tier="high",
@@ -9981,6 +13684,141 @@ def _is_delivery_role_name(role_norm: str) -> bool:
     return role_norm in {"backend", "frontend", "qa", "sre", "product_ops", "security", "research", "release_mgr"}
 
 
+_SKYNET_LOCAL_EXECUTOR_ROLE_NAMES = frozenset({"architect_local", "implementer_local", "reviewer_local"})
+_SKYNET_LOCAL_ONLY_ALLOWED_ROLE_NAMES = frozenset({"skynet", *_SKYNET_LOCAL_EXECUTOR_ROLE_NAMES})
+
+
+def _filter_specs_to_skynet_local_executors(
+    specs: list[TaskSpec],
+) -> tuple[list[TaskSpec], list[str]]:
+    kept: list[TaskSpec] = []
+    dropped_roles: list[str] = []
+    for spec in specs or []:
+        role_norm = _coerce_orchestrator_role(str(spec.role or ""))
+        if role_norm in _SKYNET_LOCAL_EXECUTOR_ROLE_NAMES:
+            kept.append(spec)
+            continue
+        dropped_roles.append(role_norm or str(spec.role or ""))
+    return kept, dropped_roles
+
+
+def _cancel_non_local_children_for_skynet_factory_orders_tick(
+    *,
+    orch_q: OrchestratorQueue,
+    now: float,
+    chat_id: int | None = None,
+) -> int:
+    """
+    Enforce the Skynet factory contract in live orders.
+
+    Grounded intent: proactive Skynet work must use only architect/implementer/reviewer
+    local specialists. If older code paths already enqueued backend/qa/sre/jarvis jobs for
+    an active proactive order, cancel those non-local children so the next scheduler tick
+    can re-plan inside the allowed trio.
+    """
+    try:
+        orders = orch_q.list_orders_global(status="active", limit=240)
+    except Exception:
+        return 0
+    if not orders:
+        return 0
+
+    non_terminal = {"queued", "waiting_deps", "blocked_approval", "blocked", "running"}
+    cancelled = 0
+    for row in orders:
+        if not _is_proactive_order_record(row):
+            continue
+        try:
+            row_chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            row_chat_id = 0
+        if chat_id is not None and row_chat_id != int(chat_id):
+            continue
+        order_id = str(row.get("order_id") or "").strip()
+        if not order_id:
+            continue
+        try:
+            children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=600)
+        except Exception:
+            continue
+        if not children:
+            continue
+
+        cancelled_roles: dict[str, int] = {}
+        cancelled_children = 0
+        for child in children:
+            state = str(child.state or "").strip().lower()
+            if state not in non_terminal:
+                continue
+            role_norm = _coerce_orchestrator_role(str(child.role or ""))
+            if role_norm in _SKYNET_LOCAL_ONLY_ALLOWED_ROLE_NAMES:
+                continue
+            try:
+                ok = orch_q.update_state(
+                    child.job_id,
+                    "cancelled",
+                    blocked_reason="skynet_local_only_policy",
+                    result_summary=(
+                        "Auto-cancelled: Skynet factory orders may only delegate to "
+                        "architect_local, implementer_local, and reviewer_local."
+                    ),
+                    result_next_action="Re-plan this proactive order with local specialists only.",
+                )
+            except Exception:
+                ok = False
+            if not ok:
+                continue
+            cancelled += 1
+            cancelled_children += 1
+            cancelled_roles[role_norm] = int(cancelled_roles.get(role_norm, 0) or 0) + 1
+
+        if cancelled_children <= 0:
+            continue
+        refreshed_children: list[Task] = []
+        try:
+            refreshed_children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=600)
+        except Exception:
+            refreshed_children = []
+        has_live_local = _has_open_local_support_work(refreshed_children)
+        try:
+            orch_q.update_trace(
+                order_id,
+                skynet_local_only_scrubbed_at=float(now),
+                skynet_local_only_scrubbed_children=int(cancelled_children),
+                skynet_local_only_scrubbed_roles=dict(cancelled_roles),
+                local_only_revive_requested=bool(not has_live_local),
+                local_only_revive_requested_at=(float(now) if not has_live_local else None),
+                autopilot_last_enqueued_at=(0.0 if not has_live_local else None),
+                stalled_escalated_at=(0.0 if not has_live_local else None),
+                sla_escalated_at=(0.0 if not has_live_local else None),
+                final_sweep_last_at=(0.0 if not has_live_local else None),
+                live_at=float(now),
+            )
+            if row_chat_id > 0:
+                if has_live_local:
+                    _sync_order_phase_from_runtime(
+                        orch_q=orch_q,
+                        root_ticket=order_id,
+                        chat_id=int(row_chat_id),
+                    )
+                else:
+                    orch_q.set_order_phase(order_id, chat_id=int(row_chat_id), phase="planning")
+            orch_q.append_audit_event(
+                event_type="order.skynet_local_only_scrubbed",
+                actor="skynet",
+                details={
+                    "order_id": order_id,
+                    "chat_id": int(row_chat_id),
+                    "cancelled_children": int(cancelled_children),
+                    "cancelled_roles": dict(cancelled_roles),
+                    "local_only_revive_requested": bool(not has_live_local),
+                },
+            )
+        except Exception:
+            pass
+    return int(cancelled)
+
+
 _LOCAL_SLICE_FAILURE_CLASSES = frozenset({"retriable", "terminal", "blocked"})
 _LOCAL_SLICE_STATUS_ORDER = (
     "planned",
@@ -10051,6 +13889,63 @@ def _slice_has_applied_and_validated_evidence(
         if applied and validated:
             return True, True
     return applied, validated
+
+
+def _slice_has_review_ready_evidence(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    slice_id: str,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    token = _sanitize_slice_token(slice_id, fallback="")
+    if not rid or not token:
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=700)
+    except Exception:
+        return False
+    for child in children:
+        if _coerce_orchestrator_role(str(child.role or "")) != "reviewer_local":
+            continue
+        state = str(child.state or "").strip().lower()
+        if state != "done":
+            continue
+        child_slice = _task_slice_id(child, root_ticket=rid)
+        if child_slice != token:
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        if _summary_has_ready_signal(str(trace.get("result_summary") or "")):
+            return True
+    return False
+
+
+def _controller_verified_slice_for_closure(
+    *,
+    orch_q: OrchestratorQueue | None,
+    root_ticket: str,
+    trace: dict[str, Any] | None = None,
+) -> str:
+    if orch_q is None:
+        return ""
+    rid = str(root_ticket or "").strip()
+    if not rid:
+        return ""
+    trace_obj = trace if isinstance(trace, dict) else {}
+    hinted = _sanitize_slice_token(str(trace_obj.get("slice_id") or ""), fallback="")
+    if hinted:
+        applied, validated = _slice_has_applied_and_validated_evidence(
+            orch_q=orch_q,
+            root_ticket=rid,
+            slice_id=hinted,
+        )
+        if applied and validated and _slice_has_review_ready_evidence(
+            orch_q=orch_q,
+            root_ticket=rid,
+            slice_id=hinted,
+        ):
+            return hinted
+    return _select_latest_ready_slice_for_closure(orch_q=orch_q, root_ticket=rid)
 
 
 def _select_latest_ready_slice_for_closure(
@@ -10204,6 +14099,16 @@ def _summary_has_blocked_with_root_cause_signal(text: str) -> bool:
     if not blob:
         return False
     return ("blocked_with_root_cause" in blob) or ("blocked with root cause" in blob)
+
+
+def _summary_has_verified_improvement_signal(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    compact = re.sub(r"\s+", " ", blob)
+    if re.search(r"^(pass|status|decision)\s*:\s*verified[_ ]improvement\b", compact):
+        return True
+    return bool(re.search(r"\bpass\b.{0,80}\bverified[_ ]improvement\b", compact))
 
 
 def _trace_patch_info(trace: dict[str, Any] | None) -> dict[str, Any]:
@@ -10388,7 +14293,7 @@ def _collect_order_local_autonomy_funnel(
             continue
 
         if role_norm in controller_roles and state == "done":
-            if ("verified_improvement" in summary.lower()) or bool(trace.get("improvement_verified", False)):
+            if _summary_has_verified_improvement_signal(summary) or bool(trace.get("improvement_verified", False)):
                 if explicit_slice_id and explicit_slice_id in slices:
                     target = slices.get(explicit_slice_id) or bucket
                     target["controller_verified"] = True
@@ -10614,12 +14519,40 @@ def _response_signals_no_code_change(text: str) -> bool:
     signals = (
         "no code changes required",
         "no code changes are required",
+        "no code change required",
+        "no code change is required",
+        "no code change to apply",
+        "no concrete code change to apply",
         "no actionable code change",
         "already implemented",
         "already complete",
+        "already correct",
+        "already satisfies",
+        "already uses",
+        "already use",
+        "already matches",
         "slice complete",
         "slice is complete",
         "request is satisfied by existing implementation",
+    )
+    return any(token in blob for token in signals)
+
+
+def _task_text_signals_validation_only(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    signals = (
+        "verify-only",
+        "verify only",
+        "validation-only",
+        "validation only",
+        "review-only",
+        "review only",
+        "no code changes",
+        "no code change",
+        "capture line evidence",
+        "line evidence",
     )
     return any(token in blob for token in signals)
 
@@ -11069,14 +15002,15 @@ def _recent_ticket_role_activity(
 
 def _apply_autonomous_local_first_policy(
     *,
+    cfg: BotConfig | None,
     specs: list[TaskSpec],
     orch_q: OrchestratorQueue,
     root_ticket: str,
     now: float,
+    enforce_hard_local_only: bool = False,
 ) -> list[TaskSpec]:
-    if not specs:
-        return specs
-    if not _autonomous_local_first_enabled():
+    specs = list(specs or [])
+    if not enforce_hard_local_only and not _autonomous_local_first_enabled():
         return specs
 
     rid = str(root_ticket or "").strip() or "ticket"
@@ -11216,6 +15150,24 @@ def _apply_autonomous_local_first_policy(
     except Exception:
         root_job = None
     root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+    order_chat_id: int | None = None
+    if isinstance(order_row, dict):
+        try:
+            raw_chat_id = order_row.get("chat_id")
+            order_chat_id = int(raw_chat_id) if raw_chat_id is not None else None
+        except Exception:
+            order_chat_id = None
+    repo_record = _repo_record_for_order(
+        orch_q=orch_q,
+        order_id=rid,
+        chat_id=order_chat_id,
+    )
+    local_support_repo_id = str((repo_record or {}).get("repo_id") or "").strip().lower()
+    shared_local_worktree = _local_role_worktree_dir(
+        "implementer_local",
+        cfg=cfg if (cfg is not None and local_support_repo_id) else None,
+        repo_id=local_support_repo_id or None,
+    )
 
     local_roles = {"architect_local", "implementer_local", "reviewer_local"}
     kept_specs: list[TaskSpec] = []
@@ -11518,6 +15470,53 @@ def _apply_autonomous_local_first_policy(
             )
         ]
 
+    def _validation_only_review_specs(spec: TaskSpec) -> list[TaskSpec]:
+        raw_key = str(spec.key or "").strip().lower()
+        review_suffix = ""
+        if raw_key.startswith("local_impl_guard_"):
+            review_suffix = raw_key[len("local_impl_guard_") :].strip()
+        if not review_suffix:
+            review_suffix = _sanitize_slice_token(raw_key, fallback=str(max(1, int(now))))
+        review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        planner_text = str(spec.text or "").strip()
+        handoff_block = ""
+        if latest_arch_response:
+            handoff_block = (
+                "\n\nPRIMARY_ARCHITECT_HANDOFF:\n"
+                f"{latest_arch_response}"
+            )
+        return [
+            TaskSpec(
+                key=review_key,
+                role="reviewer_local",
+                text=(
+                    f"Validation-only redirect for ticket {rid}. The planner routed review work to implementer_local; treat it as reviewer_local work instead.\n"
+                    "ORIGINAL_PLANNER_REQUEST:\n"
+                    f"{planner_text or '(none)'}"
+                    f"{handoff_block}\n\n"
+                    "Rules:\n"
+                    "- Inspect the target files directly in the workspace.\n"
+                    "- If existing behavior is already correct and no code change is needed, return READY with exact file evidence and one validation command.\n"
+                    "- If code change is still required, return NEEDS_REWORK with exact files and the smallest implementer slice.\n"
+                    "- Do not emit a diff or rewrite block.\n"
+                    "- Do not ask for another architecture pass.\n"
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return READY/NEEDS_REWORK with exact file evidence and one validation command.",
+                    "If rework is needed, provide the smallest concrete implementer slice.",
+                ],
+                definition_of_done=[
+                    "Validation-only planner request is resolved as a review verdict or a concrete rework path.",
+                ],
+                eta_minutes=20,
+                sla_tier="high",
+            )
+        ]
+
     def _blocker_replan_specs() -> list[TaskSpec]:
         old_slice = _sanitize_slice_token(latest_impl_failed_slice_id, fallback="")
         blocker_suffix = str(max(1, int(now)))
@@ -11569,7 +15568,7 @@ def _apply_autonomous_local_first_policy(
         arch_payload = str(latest_arch_response or "").strip()
         if not blocker_payload and not arch_payload:
             return []
-        worktree = _local_role_worktree_dir("implementer_local")
+        worktree = shared_local_worktree
         if not worktree.is_dir():
             return []
         file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
@@ -11651,22 +15650,120 @@ def _apply_autonomous_local_first_policy(
                     "MANDATORY_FILE_SCOPE:\n"
                     f"{files_block}\n\n"
                     "Execution rules:\n"
+                    "- Use the controller-provided FILE excerpts as authoritative current file content.\n"
                     "- Edit only files in MANDATORY_FILE_SCOPE unless one adjacent test/config file is strictly required.\n"
-                    "- Produce one single fenced ```diff``` block with all hunks.\n"
-                    f"- Run validation command: {validation_cmd}\n"
+                    "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool inside Codex.\n"
+                    "- Return one single fenced ```diff``` block with all hunks or rewrite blocks when a full-file replacement is clearer.\n"
+                    f"- After the code block(s), add EXPECTED_VALIDATION: {validation_cmd}\n"
                     "- If requirements are still missing, return BLOCKER with the exact missing field/value (no generic blocker).\n"
                 ),
-                mode_hint="rw",
+                mode_hint="ro",
                 priority=1,
                 depends_on=[],
                 requires_approval=False,
                 acceptance_criteria=[
-                    "Apply a concrete unblock patch in the named files with a real diff.",
-                    "Run one explicit validation command and report result.",
+                    "Return a concrete unblock patch in the named files with a real diff or rewrite block.",
+                    "Name one explicit validation command for the controller to run next.",
                     "If blocked, provide exact missing requirement/value tied to named files.",
                 ],
                 definition_of_done=[
-                    "A validated unblock patch is applied, or a concrete blocker is returned with exact missing requirement.",
+                    "A controller-applicable unblock patch is returned, or a concrete blocker is returned with exact missing requirement.",
+                ],
+                eta_minutes=45,
+                sla_tier="high",
+            )
+        ]
+
+    def _workspace_direct_implementer_specs(*, reason: str) -> list[TaskSpec]:
+        worktree = shared_local_worktree
+        if not worktree.is_dir():
+            return []
+        _exact_targets, workspace_candidates, inventory_lines = _workspace_inventory_and_candidates(
+            worktree_dir=worktree,
+            role="implementer_local",
+            context_texts=[
+                str(objective_snippet or ""),
+                str(latest_arch_response or ""),
+                str(latest_impl_failed_blocker or ""),
+                str(latest_impl_failed_summary or ""),
+            ],
+        )
+        ordered_candidates = [str(path or "").strip() for path in workspace_candidates if str(path or "").strip()]
+        if not ordered_candidates:
+            ordered_candidates = [str(path or "").strip() for path in inventory_lines if str(path or "").strip()]
+        existing_files: list[str] = []
+        seen_files: set[str] = set()
+        for rel_path in ordered_candidates:
+            if rel_path in seen_files:
+                continue
+            disk_path = (worktree / rel_path).resolve()
+            try:
+                inside = str(disk_path).startswith(str(worktree))
+            except Exception:
+                inside = False
+            if not inside or not disk_path.is_file():
+                continue
+            seen_files.add(rel_path)
+            existing_files.append(rel_path)
+            if len(existing_files) >= 4:
+                break
+        if not existing_files:
+            return []
+        non_doc_candidates = [p for p in existing_files if not str(p).lower().endswith(".md")]
+        candidate_files = non_doc_candidates[:3] if non_doc_candidates else existing_files[:2]
+        if not candidate_files:
+            return []
+        test_target = ""
+        for rel_path in candidate_files:
+            low = rel_path.lower()
+            if low.startswith("test") or "/test" in low or low.startswith("tests/"):
+                test_target = rel_path
+                break
+        validation_cmd = f"pytest -q {test_target}" if test_target else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        suffix_base = _sanitize_slice_token(latest_arch_job_id or latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
+        direct_suffix = _sanitize_slice_token(
+            f"{suffix_base}_ws_r{int(max(2, recent_non_actionable_arch_count + 1))}",
+            fallback=str(max(1, int(now))),
+        )
+        files_block = "\n".join(f"- {path}" for path in candidate_files)
+        inventory_block = "\n".join(f"- {path}" for path in inventory_lines[:8])
+        return [
+            TaskSpec(
+                key=f"local_impl_guard_{direct_suffix}",
+                role="implementer_local",
+                text=(
+                    f"Direct workspace-grounded implementation for ticket {rid}.\n"
+                    f"Reason: {reason}\n"
+                    f"Slice: {direct_suffix}\n"
+                    "This bypass is active because architect_local returned a non-actionable repo-access blocker despite controller-provided workspace snapshots.\n\n"
+                    "OBJECTIVE:\n"
+                    f"{objective_snippet or '(no objective snippet)'}\n\n"
+                    "LATEST_ARCHITECT_BLOCKER:\n"
+                    f"{latest_arch_response or latest_impl_failed_blocker or '(none)'}\n\n"
+                    "SNAPSHOT_CANDIDATES:\n"
+                    f"{inventory_block or '- (none)'}\n\n"
+                    "MANDATORY_FILE_SCOPE:\n"
+                    f"{files_block}\n\n"
+                    "Execution rules:\n"
+                    "- Use the controller-provided workspace FILE excerpts as authoritative current file content.\n"
+                    "- Edit only files in MANDATORY_FILE_SCOPE unless one adjacent test/config file is strictly required.\n"
+                    "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool inside Codex.\n"
+                    "- Return one single fenced ```diff``` block with all hunks or rewrite blocks when a full-file replacement is clearer.\n"
+                    f"- After the code block(s), add EXPECTED_VALIDATION: {validation_cmd}\n"
+                    "- Do not return another repo-access blocker when FILE excerpts or snapshot candidates are already present.\n"
+                    "- If still blocked, return the smallest concrete missing file/value tied to MANDATORY_FILE_SCOPE.\n"
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return a concrete bounded patch in the named files with a real diff or rewrite block.",
+                    "Name one explicit validation command for the controller to run next.",
+                    "If blocked, report the smallest concrete missing file/value tied to the named file scope.",
+                ],
+                definition_of_done=[
+                    "A controller-applicable workspace-grounded patch is returned, or a concrete blocker is returned without generic repo-access claims.",
                 ],
                 eta_minutes=45,
                 sla_tier="high",
@@ -11678,6 +15775,7 @@ def _apply_autonomous_local_first_policy(
         for spec in kept_specs
         if _coerce_orchestrator_role(str(spec.role or "")) in {"architect_local", "implementer_local", "reviewer_local"}
     }
+    planner_has_direct_execution = bool(planner_local_roles.intersection({"implementer_local", "reviewer_local"}))
     planner_arch_only = bool(planner_local_roles) and planner_local_roles.issubset({"architect_local"})
     recent_arch_done_count = 0
     for meta in _latest_done_meta("architect_local", limit=8):
@@ -11697,12 +15795,34 @@ def _apply_autonomous_local_first_policy(
         and latest_impl_done is None
     ):
         direct_specs = _direct_blocker_implementer_specs()
+        if (not direct_specs) and _response_signals_repo_access_blocker(latest_arch_response):
+            direct_specs = _workspace_direct_implementer_specs(reason="planner_arch_only_repo_access_blocker")
         if direct_specs:
             return direct_specs
 
     review_already_validated_no_change = bool(
         latest_review_done_summary and _response_signals_no_code_change(latest_review_done_summary)
     )
+    validation_only_impl_specs = [
+        spec
+        for spec in kept_specs
+        if _coerce_orchestrator_role(str(spec.role or "")) == "implementer_local"
+        and _task_text_signals_validation_only(str(spec.text or ""))
+    ]
+
+    if validation_only_impl_specs and not active_reviewer_open and not active_implementer_open:
+        if latest_impl_no_change_done is not None:
+            return _impl_no_change_review_specs()
+        return _validation_only_review_specs(validation_only_impl_specs[0])
+
+    if (
+        latest_impl_no_change_done is not None
+        and not active_reviewer_open
+        and not active_implementer_open
+        and planner_local_roles
+        and planner_local_roles.issubset({"architect_local", "implementer_local"})
+    ):
+        return _impl_no_change_review_specs()
 
     if not kept_specs:
         active_existing, queued_existing, waiting_existing = _ticket_active_backlog_counts(existing_children)
@@ -11721,16 +15841,6 @@ def _apply_autonomous_local_first_policy(
         )
         if has_active_guard_chain:
             return []
-        # Anti-loop breaker: if planner keeps yielding no actionable local specs while architect
-        # churn has already happened multiple times, force a direct implementer slice.
-        if (not active_arch_open) and (not active_implementer_open) and (not active_reviewer_open):
-            repeated_arch_churn = int(recent_arch_done_count) >= 2 and (
-                int(recent_non_actionable_arch_count) >= 1 or bool(latest_impl_failed_job_id)
-            )
-            if repeated_arch_churn:
-                direct_specs = _direct_blocker_implementer_specs()
-                if direct_specs:
-                    return direct_specs
         if latest_impl_done is not None and not active_reviewer_open:
             impl_key_raw = str(((latest_impl_done.get("labels") or {}) if isinstance(latest_impl_done.get("labels"), dict) else {}).get("key") or "").strip()
             review_suffix = ""
@@ -11763,7 +15873,18 @@ def _apply_autonomous_local_first_policy(
             ]
         if latest_impl_no_change_done is not None and not active_reviewer_open and not active_implementer_open:
             return _impl_no_change_review_specs()
-        shared_local_worktree = _local_role_worktree_dir("implementer_local")
+        # Anti-loop breaker: if planner keeps yielding no actionable local specs while architect
+        # churn has already happened multiple times, force a direct implementer slice.
+        if (not active_arch_open) and (not active_implementer_open) and (not active_reviewer_open):
+            repeated_arch_churn = int(recent_arch_done_count) >= 2 and (
+                int(recent_non_actionable_arch_count) >= 1 or bool(latest_impl_failed_job_id)
+            )
+            if repeated_arch_churn:
+                direct_specs = _direct_blocker_implementer_specs()
+                if (not direct_specs) and _response_signals_repo_access_blocker(latest_arch_response):
+                    direct_specs = _workspace_direct_implementer_specs(reason="repeated_architect_repo_access_blocker")
+                if direct_specs:
+                    return direct_specs
         invalid_arch_paths = _missing_handoff_files(text=latest_arch_response, worktree_dir=shared_local_worktree)
         if invalid_arch_paths and not active_arch_open and not active_implementer_open and not active_reviewer_open:
             invalid_suffix = latest_arch_job_id.split("-", 1)[0].strip() if latest_arch_job_id else str(max(1, int(now)))
@@ -11805,10 +15926,16 @@ def _apply_autonomous_local_first_policy(
         if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
             if int(recent_non_actionable_arch_count) >= 2:
                 direct_specs = _direct_blocker_implementer_specs()
+                if (not direct_specs) and _response_signals_repo_access_blocker(latest_arch_response):
+                    direct_specs = _workspace_direct_implementer_specs(reason="impl_replan_repo_access_blocker")
                 if direct_specs:
                     return direct_specs
             return _blocker_replan_specs()
         if latest_arch_response and not active_implementer_open and not active_reviewer_open:
+            if _response_signals_repo_access_blocker(latest_arch_response):
+                direct_specs = _workspace_direct_implementer_specs(reason="latest_architect_repo_access_blocker")
+                if direct_specs:
+                    return direct_specs
             arch_key_raw = latest_arch_key_raw
             impl_suffix = ""
             for prefix in ("local_arch_guard_", "local_arch_blocker_", "local_arch_ground_"):
@@ -11830,29 +15957,32 @@ def _apply_autonomous_local_first_policy(
                 TaskSpec(
                     key=impl_key,
                     role="implementer_local",
-                    text=(
-                        f"Implement exactly one bounded improvement directly in the assigned workspace for ticket {rid}.\n"
-                        "Treat the architect handoff below as authoritative unless it is internally inconsistent.\n\n"
-                        f"{retry_block}"
-                        "PRIMARY_ARCHITECT_HANDOFF:\n"
-                        f"{latest_arch_response}\n\n"
-                        "Rules:\n"
-                        "- Modify only the exact files named in the architect handoff unless one closely related test/config file is required.\n"
-                        "- If the handoff contains ARTIFACT_CONTRACT, implement/validate against that exact contract.\n"
-                        "- Produce one real diff and one targeted validation command.\n"
-                        "- If multiple files change, include all hunks inside one single fenced ```diff``` block.\n"
-                        "- If the handoff is still not actionable, stop immediately and return BLOCKER with the smallest concrete unblock path.\n"
-                    ),
-                    mode_hint="rw",
-                    priority=2,
-                    depends_on=[],
+                text=(
+                    f"Implement exactly one bounded improvement for ticket {rid} using only the delegated file scope.\n"
+                    "Treat the architect handoff below as authoritative unless it is internally inconsistent.\n\n"
+                    f"{retry_block}"
+                    "PRIMARY_ARCHITECT_HANDOFF:\n"
+                    f"{latest_arch_response}\n\n"
+                    "Rules:\n"
+                    "- Treat the workspace FILE excerpts as authoritative current content.\n"
+                    "- Modify only the exact files named in the architect handoff unless one closely related test/config file is required.\n"
+                    "- If the handoff contains ARTIFACT_CONTRACT, implement/validate against that exact contract.\n"
+                    "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool inside Codex.\n"
+                    "- Return the code change as one single fenced ```diff``` block or one/more fenced rewrite blocks.\n"
+                    "- After the code block(s), add EXPECTED_VALIDATION with one targeted command for the controller to run.\n"
+                    "- If multiple files change, include all resulting hunks inside one single fenced ```diff``` block.\n"
+                    "- If the handoff is still not actionable, stop immediately and return BLOCKER with the smallest concrete unblock path.\n"
+                ),
+                mode_hint="ro",
+                priority=2,
+                depends_on=[],
                     requires_approval=False,
                     acceptance_criteria=[
-                        "Apply one concrete improvement from the architect handoff with a real diff.",
-                        "Report exact files changed, one validation command, and the observed result.",
+                        "Return one concrete improvement from the architect handoff with a real diff or rewrite block.",
+                        "Report exact files changed and one expected validation command for the controller.",
                     ],
                     definition_of_done=[
-                        "Workspace contains one bounded improvement diff derived from the latest architect handoff, or a precise blocker tied to that handoff.",
+                        "Controller can apply one bounded improvement diff derived from the latest architect handoff, or receives a precise blocker tied to that handoff.",
                     ],
                     eta_minutes=60,
                     sla_tier="high",
@@ -11907,13 +16037,23 @@ def _apply_autonomous_local_first_policy(
     if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and review_already_validated_no_change:
         return []
     if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
-        planner_local_roles = {
-            _coerce_orchestrator_role(str(spec.role or ""))
-            for spec in kept_specs
-        }
-        if "reviewer_local" not in planner_local_roles and planner_local_roles.intersection({"architect_local", "implementer_local"}):
+        prefer_implementer_recovery = bool(
+            latest_impl_failed_job_id
+            or planner_has_direct_execution
+        )
+        if (
+            (not prefer_implementer_recovery)
+            and "reviewer_local" not in planner_local_roles
+            and planner_local_roles.intersection({"architect_local", "implementer_local"})
+        ):
             return _no_change_review_specs()
-    if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+    if (
+        impl_failure_requires_replan
+        and (not planner_has_direct_execution)
+        and not active_arch_open
+        and not active_implementer_open
+        and not active_reviewer_open
+    ):
         if int(recent_non_actionable_arch_count) >= 2:
             direct_specs = _direct_blocker_implementer_specs()
             if direct_specs:
@@ -11995,7 +16135,29 @@ def _sync_order_phase_from_runtime(
         return
     root_job = orch_q.get_job(rid)
     root_trace = dict((root_job.trace or {}) if root_job else {})
-    merge_required, _order_branch = _order_trace_requires_merge(root_trace)
+    try:
+        strategy_pending = bool(root_trace.get("ceo_strategy_approval_pending", False))
+        strategy_expires_at = float(root_trace.get("ceo_strategy_approval_expires_at", 0.0) or 0.0)
+    except Exception:
+        strategy_pending = False
+        strategy_expires_at = 0.0
+    if strategy_pending and (strategy_expires_at <= 0.0 or float(time.time()) < strategy_expires_at):
+        try:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ceo_approval_pending")
+        except Exception:
+            pass
+        return
+    _repo_record, repo_dir, default_branch = _repo_context_for_order(
+        cfg=None,
+        orch_q=orch_q,
+        order_id=rid,
+        chat_id=int(chat_id),
+    )
+    merge_required, _order_branch = _order_trace_requires_merge(
+        root_trace,
+        repo=(repo_dir if (repo_dir / ".git").exists() else None),
+        default_branch=default_branch,
+    )
     proactive_order = bool(_is_proactive_order_record(order))
     proactive_verified_no_change = False
     if proactive_order:
@@ -12015,6 +16177,7 @@ def _sync_order_phase_from_runtime(
                     merge_ready=True,
                     merge_ready_at=time.time(),
                     merge_reopened_for_policy_at=time.time(),
+                    **_merge_ready_trace_reset_payload(),
                     live_at=time.time(),
                 )
             except Exception:
@@ -12027,6 +16190,7 @@ def _sync_order_phase_from_runtime(
         return
 
     merged_to_main = bool(root_trace.get("merged_to_main", False))
+    deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     if not children:
@@ -12035,6 +16199,7 @@ def _sync_order_phase_from_runtime(
 
     proactive_evidence_ok = True
     proactive_funnel: dict[str, Any] | None = None
+    proactive_improvement_verified = False
     if proactive_order:
         proactive_funnel = _collect_order_local_autonomy_funnel(
             orch_q=orch_q,
@@ -12044,6 +16209,7 @@ def _sync_order_phase_from_runtime(
             orch_q=orch_q,
             root_ticket=rid,
         )
+        proactive_improvement_verified = bool(proactive_funnel.get("improvement_verified", False))
         try:
             orch_q.update_trace(
                 rid,
@@ -12055,7 +16221,7 @@ def _sync_order_phase_from_runtime(
                 proactive_mean_time_to_validated_improvement=proactive_funnel.get("mean_time_to_validated_improvement"),
                 proactive_loop_breaker_count=int(proactive_funnel.get("loop_breaker_count", 0) or 0),
                 proactive_quality_gate_status=str(proactive_funnel.get("quality_gate_status") or "planned"),
-                proactive_improvement_verified=bool(proactive_funnel.get("improvement_verified", False)),
+                proactive_improvement_verified=bool(proactive_improvement_verified),
                 proactive_improvement_checked_at=time.time(),
                 live_at=time.time(),
             )
@@ -12070,6 +16236,13 @@ def _sync_order_phase_from_runtime(
 
     latest_controller_terminal_summary = str(root_trace.get("result_summary") or "").strip()
     latest_controller_terminal_ts = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
+    any_controller_verified_improvement = bool(
+        _controller_verified_slice_for_closure(
+            orch_q=orch_q,
+            root_ticket=rid,
+            trace=root_trace,
+        )
+    ) and bool(root_trace.get("improvement_verified", False))
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
@@ -12077,6 +16250,12 @@ def _sync_order_phase_from_runtime(
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
         summary = str(trace.get("result_summary") or "").strip()
+        if bool(trace.get("improvement_verified", False)) and _controller_verified_slice_for_closure(
+            orch_q=orch_q,
+            root_ticket=rid,
+            trace=trace,
+        ):
+            any_controller_verified_improvement = True
         if not summary:
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
@@ -12084,15 +16263,24 @@ def _sync_order_phase_from_runtime(
             latest_controller_terminal_ts = ts
             latest_controller_terminal_summary = summary
 
+    proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
+
     if proactive_order and proactive_verified_no_change and not any_live:
         try:
-            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
-            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            if merge_required:
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            else:
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
             orch_q.update_trace(
                 rid,
                 proactive_no_change_validated=True,
                 proactive_no_change_validated_at=time.time(),
                 proactive_no_change_resolution="reviewer_validated_existing_implementation",
+                merge_ready=bool(merge_required),
+                merge_ready_at=(time.time() if merge_required else None),
+                **(_merge_ready_trace_reset_payload() if merge_required else {}),
                 live_at=time.time(),
             )
             orch_q.append_audit_event(
@@ -12102,6 +16290,37 @@ def _sync_order_phase_from_runtime(
                     "order_id": rid,
                     "chat_id": int(chat_id),
                     "reason": "reviewer_validated_existing_implementation",
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    if proactive_order and proactive_improvement_verified and not any_live:
+        try:
+            if merge_required:
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            else:
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            orch_q.update_trace(
+                rid,
+                proactive_improvement_verified=True,
+                proactive_improvement_closed=True,
+                proactive_improvement_closed_at=time.time(),
+                merge_ready=bool(merge_required),
+                merge_ready_at=(time.time() if merge_required else None),
+                **(_merge_ready_trace_reset_payload() if merge_required else {}),
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.proactive_verified_improvement_closed",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "chat_id": int(chat_id),
+                    "reason": "verified_improvement",
                 },
             )
         except Exception:
@@ -12151,6 +16370,10 @@ def _sync_order_phase_from_runtime(
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
         return
     if wrapup_done:
+        if merged_to_main and deploy_failed:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            return
         if proactive_order and (not merged_to_main) and (not proactive_evidence_ok):
             try:
                 orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
@@ -12179,6 +16402,10 @@ def _sync_order_phase_from_runtime(
     # If there are no active/blocked jobs, close only when all children reached terminal states.
     terminal_ok = all(s in ("done", "cancelled") for s in states)
     if terminal_ok:
+        if merged_to_main and deploy_failed:
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            return
         if proactive_order and (not merged_to_main) and (not proactive_evidence_ok):
             try:
                 orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
@@ -12339,12 +16566,22 @@ def _collapse_redundant_orders_tick(*, cfg: BotConfig, orch_q: OrchestratorQueue
 
             root_job = orch_q.get_job(oid)
             root_trace = dict((root_job.trace or {}) if root_job else {})
-            _needs_merge, superseded_branch = _order_trace_requires_merge(root_trace)
+            _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+            )
+            _needs_merge, superseded_branch = _order_trace_requires_merge(
+                root_trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
             branch_retired_ok = True
             branch_retired_result = "no_branch"
             if superseded_branch:
                 branch_retired_ok, branch_retired_result = _retire_order_branch_without_merge(
-                    repo=cfg.codex_workdir,
+                    repo=repo_dir,
                     order_branch=superseded_branch,
                 )
 
@@ -12380,6 +16617,147 @@ def _collapse_redundant_orders_tick(*, cfg: BotConfig, orch_q: OrchestratorQueue
             except Exception:
                 continue
     return collapsed
+
+
+def _collapse_duplicate_proactive_repo_orders_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    now: float,
+) -> int:
+    """
+    Keep at most one active proactive order per repo.
+
+    Grounded intent: two active proactive orders against the same repo will compete for
+    the same branch/merge surface and create noisy conflict loops. When this happens,
+    keep the strongest active order and pause the others instead of letting them race.
+    """
+    try:
+        rows = orch_q.list_orders_global(status="active", limit=300)
+    except Exception:
+        return 0
+    if len(rows) < 2:
+        return 0
+
+    non_terminal = {"queued", "waiting_deps", "blocked_approval", "blocked", "running"}
+    groups: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        if not _is_proactive_order_record(row):
+            continue
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        repo_id = _repo_id_from_order_record(row)
+        if not repo_id:
+            continue
+        groups.setdefault((chat_id, repo_id), []).append(row)
+
+    if not groups:
+        return 0
+
+    try:
+        max_pauses = max(1, min(24, int(os.environ.get("BOT_PROACTIVE_REPO_DEDUPE_MAX_PER_TICK", "6"))))
+    except Exception:
+        max_pauses = 6
+
+    paused = 0
+    for (chat_id, repo_id), siblings in groups.items():
+        if paused >= max_pauses:
+            break
+        if len(siblings) < 2:
+            continue
+
+        scored: list[tuple[tuple[int, int, int, float], dict[str, Any], list[Task], dict[str, Any]]] = []
+        for row in siblings:
+            oid = str(row.get("order_id") or "").strip()
+            if not oid:
+                continue
+            children = orch_q.jobs_by_parent(parent_job_id=oid, limit=600)
+            running_n = 0
+            active_n = 0
+            blocked_n = 0
+            for child in children:
+                st = str(child.state or "").strip().lower()
+                if st == "running":
+                    running_n += 1
+                if st in non_terminal:
+                    active_n += 1
+                if st in ("blocked", "blocked_approval"):
+                    blocked_n += 1
+            try:
+                updated_at = float(row.get("updated_at") or 0.0)
+            except Exception:
+                updated_at = 0.0
+            root_job = orch_q.get_job(oid)
+            root_trace = dict((root_job.trace or {}) if root_job else {})
+            merge_ready = 1 if bool(root_trace.get("merge_ready", False)) else 0
+            score = (running_n, active_n, merge_ready, updated_at - (blocked_n * 60.0))
+            scored.append((score, row, children, root_trace))
+
+        if len(scored) < 2:
+            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        keep_row = scored[0][1]
+        keep_id = str(keep_row.get("order_id") or "").strip()
+        if not keep_id:
+            continue
+
+        for _score, row, children, _root_trace in scored[1:]:
+            if paused >= max_pauses:
+                break
+            oid = str(row.get("order_id") or "").strip()
+            if not oid or oid == keep_id:
+                continue
+            cancelled_children = 0
+            for child in children:
+                st = str(child.state or "").strip().lower()
+                if st not in non_terminal:
+                    continue
+                try:
+                    ok = orch_q.update_state(
+                        child.job_id,
+                        "cancelled",
+                        blocked_reason="repo_active_order_conflict",
+                        result_summary=f"Auto-cancelled: repo {repo_id} already owned by proactive order {keep_id}.",
+                        result_next_action=f"Resume later under primary repo order {keep_id}.",
+                    )
+                    if ok:
+                        cancelled_children += 1
+                except Exception:
+                    continue
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="paused")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="paused")
+                orch_q.update_trace(
+                    oid,
+                    pause_reason="repo_active_order_conflict",
+                    repo_conflict_primary=keep_id,
+                    repo_conflict_repo_id=repo_id,
+                    repo_conflict_paused_at=float(now),
+                    cancelled_children=int(cancelled_children),
+                    live_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.proactive_repo_duplicate_paused",
+                    actor="jarvis",
+                    details={
+                        "order_id": oid,
+                        "primary_order_id": keep_id,
+                        "chat_id": int(chat_id),
+                        "repo_id": repo_id,
+                        "cancelled_children": int(cancelled_children),
+                    },
+                )
+                paused += 1
+            except Exception:
+                continue
+    return paused
 
 
 def _queued_job_dedupe_key(task: Task) -> str:
@@ -12680,7 +17058,52 @@ def _stalled_replan_tick(
         if escalated_at > 0 and (now - escalated_at) < replan_cooldown_s:
             continue
 
-        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+        order_row = _order_row_for_root_ticket(
+            orch_q=orch_q,
+            root_ticket=root_ticket,
+            chat_id=int(getattr(item, "chat_id", 0) or 0),
+        )
+        proactive_order = _is_proactive_order_record(order_row)
+        stalled_role = _coerce_orchestrator_role(str(item.role or ""))
+        if proactive_order and stalled_role not in _SKYNET_LOCAL_ONLY_ALLOWED_ROLE_NAMES:
+            try:
+                orch_q.update_state(
+                    item.job_id,
+                    "cancelled",
+                    blocked_reason="skynet_local_only_policy",
+                    result_summary=(
+                        "Auto-cancelled stalled legacy job: proactive Skynet orders may only use "
+                        "architect_local, implementer_local, and reviewer_local."
+                    ),
+                    result_next_action="Re-plan this proactive order with local specialists only.",
+                )
+            except Exception:
+                pass
+            try:
+                chat_for_order = int(getattr(item, "chat_id", 0) or 0)
+            except Exception:
+                chat_for_order = 0
+            if chat_for_order > 0:
+                try:
+                    orch_q.set_order_phase(root_ticket, chat_id=chat_for_order, phase="planning")
+                except Exception:
+                    pass
+            try:
+                orch_q.update_trace(
+                    root_ticket,
+                    stalled_legacy_non_local_cancelled_at=float(now),
+                    stalled_legacy_non_local_job_id=str(item.job_id or ""),
+                    stalled_legacy_non_local_role=str(stalled_role or ""),
+                    stalled_escalated_at=0.0,
+                    autopilot_last_enqueued_at=0.0,
+                    final_sweep_last_at=0.0,
+                    live_at=now,
+                )
+            except Exception:
+                pass
+            continue
+
+        controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
         profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
@@ -13095,7 +17518,7 @@ def _jarvis_final_sweep_tick(
         if last_sweep_at > 0 and (float(now) - last_sweep_at) < float(cooldown_s):
             continue
 
-        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=order_id)
+        controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=order_id)
         profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
@@ -13762,7 +18185,52 @@ def _sla_overdue_tick(
         ):
             continue
 
-        controller_role = _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
+        order_row = _order_row_for_root_ticket(
+            orch_q=orch_q,
+            root_ticket=root_ticket,
+            chat_id=int(getattr(item, "chat_id", 0) or 0),
+        )
+        proactive_order = _is_proactive_order_record(order_row)
+        overdue_role = _coerce_orchestrator_role(str(item.role or ""))
+        if proactive_order and overdue_role not in _SKYNET_LOCAL_ONLY_ALLOWED_ROLE_NAMES:
+            try:
+                orch_q.update_state(
+                    item.job_id,
+                    "cancelled",
+                    blocked_reason="skynet_local_only_policy",
+                    result_summary=(
+                        "Auto-cancelled overdue legacy job: proactive Skynet orders may only use "
+                        "architect_local, implementer_local, and reviewer_local."
+                    ),
+                    result_next_action="Re-plan this proactive order with local specialists only.",
+                )
+            except Exception:
+                pass
+            try:
+                chat_for_order = int(getattr(item, "chat_id", 0) or 0)
+            except Exception:
+                chat_for_order = 0
+            if chat_for_order > 0:
+                try:
+                    orch_q.set_order_phase(root_ticket, chat_id=chat_for_order, phase="planning")
+                except Exception:
+                    pass
+            try:
+                orch_q.update_trace(
+                    root_ticket,
+                    sla_legacy_non_local_cancelled_at=float(now),
+                    sla_legacy_non_local_job_id=str(item.job_id or ""),
+                    sla_legacy_non_local_role=str(overdue_role or ""),
+                    sla_escalated_at=0.0,
+                    autopilot_last_enqueued_at=0.0,
+                    final_sweep_last_at=0.0,
+                    live_at=now,
+                )
+            except Exception:
+                pass
+            continue
+
+        controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
         profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
@@ -14053,6 +18521,12 @@ def _ticket_card_text(orch_q: OrchestratorQueue, *, ticket_id: str) -> str:
         lines.append(f"Order status: {str(order.get('status') or 'active')}")
         order_phase = str(order.get("phase") or "").strip().lower() or "planning"
         lines.append(f"Order phase: {order_phase}")
+        deploy_status = str((head.trace or {}).get("deploy_status") or "").strip().lower()
+        deploy_summary = str((head.trace or {}).get("deploy_summary") or "").strip()
+        if deploy_status:
+            lines.append(f"Deploy: {deploy_status}")
+            if deploy_summary:
+                lines.append(deploy_summary[:220] + ("..." if len(deploy_summary) > 220 else ""))
         if order_phase == "ready_for_merge":
             if _jarvis_auto_approve_merge_enabled():
                 lines.append("Action: Jarvis auto-merge enabled (you will receive final result)")
@@ -14453,6 +18927,20 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         if not role:
             return "Uso: /resume <role>", None
         return _orch_marker("resume", role), None
+
+    if text == "/factory":
+        return _orch_marker("factory"), None
+
+    if text.startswith("/factory "):
+        payload = text[len("/factory ") :].strip()
+        return _orch_marker("factory", payload), None
+
+    if text == "/proposal":
+        return _orch_marker("proposal"), None
+
+    if text.startswith("/proposal "):
+        payload = text[len("/proposal ") :].strip()
+        return _orch_marker("proposal", payload), None
 
     if text.startswith("/approve "):
         job_id = _orch_job_id(text[len("/approve ") :])
@@ -15532,6 +20020,30 @@ def _extract_last_agent_message_from_jsonl(text: str) -> str:
     return last
 
 
+def _jsonl_stream_has_terminal_completion(text: str) -> bool:
+    """
+    Detect whether `codex exec --json` already emitted a terminal completion event.
+
+    Grounded use: sometimes the CLI finishes the response payload but lingers while
+    tearing down the websocket transport. When that happens we can safely stop
+    waiting once the JSONL stream is complete and no new bytes arrive.
+    """
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        t = str(obj.get("type") or "").strip().lower()
+        if t in ("response.completed", "assistant.completed", "turn.completed"):
+            return True
+    return False
+
+
 def _skill_installer_scripts_dir() -> Path:
     # skill-installer is a system skill that ships with this deployment.
     return _skills_root_dir() / ".system" / "skill-installer" / "scripts"
@@ -15994,7 +20506,11 @@ def _submit_orchestrator_task(
                 title_guess = _order_title_from_text(task.input_text, fallback=f"Order {order_id[:8]}")
                 if not order_branch:
                     order_branch = _order_branch_name(order_id, title_guess)
-                ok_branch, branch_msg = _git_ensure_branch_from_main(cfg.codex_workdir, str(order_branch))
+                ok_branch, branch_msg = _git_ensure_branch_from_main(
+                    cfg.codex_workdir,
+                    str(order_branch),
+                    default_branch=_git_default_branch(cfg.codex_workdir),
+                )
                 if not ok_branch:
                     raise RuntimeError(f"Cannot prepare order branch {order_branch}: {branch_msg}")
                 ttrace = dict(task.trace or {})
@@ -16074,6 +20590,19 @@ def _orchestrator_run_codex(
     started = time.time()
     role = _coerce_orchestrator_role(task.role)
     profile = _orchestrator_profile(profiles, role)
+    repo_record = _repo_record_for_task(task, orch_q)
+    repo_id = str((repo_record or {}).get("repo_id") or "").strip().lower()
+    repo_path = str((repo_record or {}).get("path") or "").strip()
+    repo_base_dir: Path | None = None
+    if repo_path:
+        try:
+            repo_base_dir = Path(repo_path).expanduser().resolve()
+        except Exception:
+            repo_base_dir = Path(repo_path).expanduser()
+    repo_default_branch = str((repo_record or {}).get("default_branch") or "").strip()
+    if not repo_default_branch and repo_base_dir is not None and (repo_base_dir / ".git").exists():
+        repo_default_branch = _git_default_branch(repo_base_dir)
+    repo_default_branch = repo_default_branch or "main"
 
     mode = _coerce_orchestrator_mode(task.mode_hint)
     timeout_seconds = cfg.codex_timeout_seconds
@@ -16196,10 +20725,11 @@ def _orchestrator_run_codex(
 
     # Worktree isolation (best-effort). If configured incorrectly, fail safe (no writes) by falling back.
     order_branch = _resolve_order_branch_from_task(task, orch_q)
-    eff_cfg = cfg
+    eff_cfg = dataclasses.replace(cfg, codex_workdir=repo_base_dir) if repo_base_dir is not None else cfg
     worktree_dir: Path | None = None
     leased_slot: int | None = None
-    lease_enabled = orch_q is not None and (cfg.codex_workdir / ".git").exists()
+    lease_base_repo = repo_base_dir if repo_base_dir is not None else cfg.codex_workdir
+    lease_enabled = orch_q is not None and (lease_base_repo / ".git").exists()
     try:
         slots = max(1, int(profile.get("max_parallel_jobs") or 1))
     except Exception:
@@ -16217,14 +20747,16 @@ def _orchestrator_run_codex(
                     "next_action": "retry",
                     "structured_digest": {"role": role, "workspace": "unavailable"},
                 }
-            ensure_worktree_pool(base_repo=cfg.codex_workdir, root=cfg.worktree_root, role=role, slots=slots)
-            worktree_dir = (cfg.worktree_root / role / f"slot{leased_slot}").resolve()
+            worktree_root = _repo_worktree_root(cfg, repo_id=repo_id or _factory_repo_id(lease_base_repo)) if repo_base_dir is not None else cfg.worktree_root
+            ensure_worktree_pool(base_repo=lease_base_repo, root=worktree_root, role=role, slots=slots)
+            worktree_dir = (worktree_root / role / f"slot{leased_slot}").resolve()
             prepare_clean_workspace(worktree_dir)
             if order_branch:
                 ok_sync, sync_msg = _sync_worktree_to_order_branch(
-                    base_repo=cfg.codex_workdir,
+                    base_repo=lease_base_repo,
                     worktree_dir=worktree_dir,
                     order_branch=order_branch,
+                    default_branch=repo_default_branch,
                 )
                 if not ok_sync:
                     raise RuntimeError(f"order branch sync failed: {sync_msg}")
@@ -16429,7 +20961,13 @@ def _orchestrator_run_codex(
     if codex_overrides:
         eff_cfg = dataclasses.replace(eff_cfg, **codex_overrides)
 
-    prompt = build_agent_prompt(task, profile=profile)
+    prompt = _build_local_specialist_user_prompt(
+        task=task,
+        role_profile=profile,
+        role=role,
+        mode=mode,
+        worktree_dir=(eff_cfg.codex_workdir if isinstance(eff_cfg.codex_workdir, Path) else Path(eff_cfg.codex_workdir)),
+    )
     try:
         # Safe logging: lengths only (never log prompt contents).
         LOG.debug(
@@ -16443,24 +20981,47 @@ def _orchestrator_run_codex(
         pass
 
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
-    runner = CodexRunner(eff_cfg, chat_id=task.chat_id)
+    enforce_read_only_runner = _role_requires_enforced_read_only(role)
+    runner = CodexRunner(
+        eff_cfg,
+        chat_id=task.chat_id,
+        allow_bypass=True,
+        forced_mode=("ro" if enforce_read_only_runner else None),
+    )
     proc: CodexRunner.Running
     used_thread_id: str | None = None
     started_new_thread = False
+    persist_started_thread = False
+    threaded_session_enabled = _orchestrator_threaded_session_enabled(profile, role=role)
     try:
         if cfg.orchestrator_sessions_enabled and orch_q is not None:
-            tid = orch_q.get_agent_thread(chat_id=task.chat_id, role=role) or ""
-            if tid:
-                used_thread_id = tid
-                proc = runner.start_threaded_resume(
-                    thread_id=tid,
-                    prompt=prompt,
-                    mode_hint=mode,
-                    image_paths=image_paths or None,
-                    model_override=task.model or None,
-                    effort_override=task.effort or None,
-                )
+            if threaded_session_enabled:
+                tid = orch_q.get_agent_thread(chat_id=task.chat_id, role=role) or ""
+                if tid:
+                    used_thread_id = tid
+                    proc = runner.start_threaded_resume(
+                        thread_id=tid,
+                        prompt=prompt,
+                        mode_hint=mode,
+                        image_paths=image_paths or None,
+                        model_override=task.model or None,
+                        effort_override=task.effort or None,
+                    )
+                else:
+                    started_new_thread = True
+                    persist_started_thread = True
+                    proc = runner.start_threaded_new(
+                        prompt=prompt,
+                        mode_hint=mode,
+                        image_paths=image_paths or None,
+                        model_override=task.model or None,
+                        effort_override=task.effort or None,
+                    )
             else:
+                try:
+                    orch_q.clear_agent_thread(chat_id=task.chat_id, role=role)
+                except Exception:
+                    LOG.exception("Failed to clear stale orchestrator thread. job=%s role=%s", task.job_id, role)
                 started_new_thread = True
                 proc = runner.start_threaded_new(
                     prompt=prompt,
@@ -16493,6 +21054,9 @@ def _orchestrator_run_codex(
     timed_out = False
     canceled = False
     last_live_update = 0.0
+    completed_stream_terminated = False
+    completed_stream_since: float | None = None
+    completed_stream_size = -1
     try:
         try:
             if orch_q is not None:
@@ -16551,6 +21115,23 @@ def _orchestrator_run_codex(
                         )
                     except Exception:
                         pass
+                    try:
+                        stdout_size = int(proc.stdout_path.stat().st_size)
+                    except Exception:
+                        stdout_size = -1
+                    if _jsonl_stream_has_terminal_completion(stdout_tail):
+                        if stdout_size != completed_stream_size:
+                            completed_stream_size = stdout_size
+                            completed_stream_since = now
+                        elif completed_stream_since is None:
+                            completed_stream_since = now
+                        elif (now - completed_stream_since) >= 5.0:
+                            _terminate_process(proc.proc)
+                            completed_stream_terminated = True
+                            break
+                    else:
+                        completed_stream_since = None
+                        completed_stream_size = stdout_size
                     last_live_update = now
             time.sleep(0.25)
 
@@ -16604,6 +21185,8 @@ def _orchestrator_run_codex(
             }
 
         code = int(proc.proc.returncode) if proc.proc.returncode is not None else 1
+        if completed_stream_terminated:
+            code = 0
 
         body = ""
         if proc.last_msg_path is not None:
@@ -16626,7 +21209,7 @@ def _orchestrator_run_codex(
             body = "(no output)"
 
         # If we started a new session, extract and persist the thread id.
-        if started_new_thread and orch_q is not None:
+        if started_new_thread and persist_started_thread and orch_q is not None:
             try:
                 tid = _extract_thread_id_from_jsonl_file(proc.stdout_path)
                 if tid:
@@ -16703,12 +21286,78 @@ def _orchestrator_run_codex(
             "visual_evidence_count": int(len(visual_artifacts)),
             "visual_evidence": visual_artifacts[:8],
         }
+        agent_payload = _extract_structured_result_payload(body)
+        if isinstance(agent_payload, dict):
+            for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason"):
+                if key in agent_payload:
+                    structured[key] = agent_payload.get(key)
         if order_branch:
             structured["order_branch"] = str(order_branch)
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
         if used_thread_id:
             structured["thread_id"] = used_thread_id
+
+        if role == "implementer_local" and worktree_dir is not None:
+            patch_artifacts, patch_info, patch_error = _finalize_codex_implementer_change(
+                task=task,
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=worktree_dir,
+            )
+            for artifact_path in patch_artifacts:
+                if artifact_path not in artifacts_text:
+                    artifacts_text.append(artifact_path)
+            if patch_info:
+                structured["patch_applied"] = bool(patch_info)
+                structured["patch_info"] = patch_info
+            if patch_error:
+                return {
+                    "status": "error",
+                    "summary": patch_error,
+                    "artifacts": artifacts_text,
+                    "logs": logs or body,
+                    "next_action": None,
+                    "structured_digest": structured,
+                }
+
+        if worktree_dir is not None and _role_disallows_repo_writes(role):
+            status_text = _git_status_porcelain(worktree_dir)
+            changed_paths = _git_changed_paths_from_porcelain(status_text)
+            if changed_paths:
+                violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
+                violation_lines = [
+                    f"role={role}",
+                    "reason=controller_write_policy_violation",
+                    "Only local implementer execution may land repository changes in the Skynet factory lane.",
+                    "",
+                    "git status --porcelain:",
+                    status_text,
+                ]
+                if changed_paths:
+                    violation_lines.extend(["", "changed_paths:"])
+                    violation_lines.extend(f"- {path}" for path in changed_paths[:40])
+                violation_artifact.write_text("\n".join(violation_lines).rstrip() + "\n", encoding="utf-8", errors="replace")
+                violation_artifact_str = str(violation_artifact)
+                if violation_artifact_str not in artifacts_text:
+                    artifacts_text.append(violation_artifact_str)
+                structured["write_policy_violation"] = {
+                    "role": role,
+                    "reason": "controller_write_policy_violation",
+                    "changed_paths": changed_paths[:20],
+                    "status_artifact": violation_artifact_str,
+                }
+                return {
+                    "status": "blocked",
+                    "summary": (
+                        f"Write policy violation: {role} modified repository files directly. "
+                        "Skynet factory work must delegate code changes to local specialists instead of editing in the controller lane."
+                    ),
+                    "artifacts": artifacts_text,
+                    "logs": logs or body,
+                    "next_action": "delegate_local_subtask",
+                    "structured_digest": structured,
+                }
 
         # Quality gate: frontend work cannot complete without visual evidence.
         if code == 0 and role == "frontend" and len(visual_artifacts) < 2:
@@ -16742,7 +21391,7 @@ def _orchestrator_run_codex(
                 "structured_digest": structured,
             }
 
-        if code == 0 and worktree_dir is not None and order_branch and str(task.request_type or "").strip().lower() in (
+        if code == 0 and _role_allows_branch_sync(role) and worktree_dir is not None and order_branch and str(task.request_type or "").strip().lower() in (
             "task",
             "maintenance",
             "review",
@@ -16773,12 +21422,19 @@ def _orchestrator_run_codex(
                     }
 
         if code == 0:
+            next_action_value = None
+            if isinstance(agent_payload, dict):
+                raw_next_action = agent_payload.get("next_action")
+                if isinstance(raw_next_action, str):
+                    next_action_value = raw_next_action.strip() or None
+                elif isinstance(raw_next_action, dict):
+                    next_action_value = str(raw_next_action.get("type") or "").strip() or None
             return {
                 "status": "ok",
                 "summary": body,
                 "artifacts": artifacts_text,
                 "logs": logs,
-                "next_action": None,
+                "next_action": next_action_value,
                 "structured_digest": structured,
             }
         return {
@@ -17582,6 +22238,55 @@ class _OrchestratorExecutor:
         role = _coerce_orchestrator_role(task.role)
         profile = _orchestrator_profile(self._profiles, role)
         if _orchestrator_role_prefers_local_ollama(role, profile):
+            repo_record = _repo_record_for_task(task, self._orch_q)
+            repo_id = str((repo_record or {}).get("repo_id") or "").strip().lower()
+            repo_path = str((repo_record or {}).get("path") or "").strip()
+            ollama_ok, ollama_detail = _ollama_status()
+            if not ollama_ok:
+                fallback_task = task.with_updates(model=_MODEL_AGENT_EXEC)
+                try:
+                    if self._orch_q is not None:
+                        self._orch_q.update_trace(
+                            task.job_id,
+                            model_route_backend="codex",
+                            model_route_fallback=True,
+                            model_route_reason=ollama_detail,
+                            live_at=time.time(),
+                        )
+                        self._orch_q.append_audit_event(
+                            event_type="factory.model_fallback",
+                            actor="router",
+                            details={
+                                "job_id": task.job_id,
+                                "role": role,
+                                "repo_id": (repo_id or None),
+                                "repo_path": (repo_path or None),
+                                "reason": ollama_detail,
+                            },
+                        )
+                        if repo_id:
+                            self._orch_q.upsert_agent_runtime_state(
+                                repo_id=repo_id,
+                                role=role,
+                                chat_id=int(task.chat_id),
+                                lane=_FACTORY_ROLE_LANES.get(role, "subagent"),
+                                heartbeat_at=time.time(),
+                                last_job_id=task.job_id,
+                                metadata={
+                                    "repo_path": repo_path,
+                                    "model_fallback": True,
+                                    "model_fallback_reason": ollama_detail,
+                                },
+                            )
+                except Exception:
+                    pass
+                return _orchestrator_run_codex(
+                    self._cfg,
+                    fallback_task,
+                    stop_event=self._stop_event,
+                    orch_q=self._orch_q,
+                    profiles=self._profiles,
+                )
             return _orchestrator_run_local_ollama(
                 self._cfg,
                 task,
@@ -17677,9 +22382,40 @@ def orchestrator_worker_loop(
             started = time.time()
             root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
             role_norm_task = _coerce_orchestrator_role(task.role)
+            repo_record = _repo_record_for_task(task, orch_q)
+            repo_id = str((repo_record or {}).get("repo_id") or "").strip().lower()
+            repo_path = str((repo_record or {}).get("path") or "").strip()
             source_message_id = _trace_source_message_id(task, root_ticket)
             agent_run_id = str(uuid.uuid4())
             orch_q.update_state(task.job_id, "running")
+            if repo_id:
+                try:
+                    controller_role = _controller_role_for_task(task, orch_q)
+                    orch_q.upsert_agent_runtime_state(
+                        repo_id=repo_id,
+                        role=role_norm_task,
+                        chat_id=int(task.chat_id),
+                        lane=_FACTORY_ROLE_LANES.get(role_norm_task, "factory"),
+                        heartbeat_at=started,
+                        last_job_id=task.job_id,
+                        last_run_at=started,
+                        metadata={
+                            "repo_path": repo_path,
+                            "current_state": "running",
+                            "root_ticket": root_ticket,
+                            "controller_role": controller_role,
+                        },
+                    )
+                    orch_q.append_agent_mailbox(
+                        repo_id=repo_id,
+                        from_agent_key=(f"{repo_id}:{controller_role}" if controller_role != role_norm_task else f"{repo_id}:factory"),
+                        to_agent_key=f"{repo_id}:{role_norm_task}",
+                        kind="spawn",
+                        correlation_id=root_ticket,
+                        payload={"job_id": task.job_id, "state": "running", "root_ticket": root_ticket},
+                    )
+                except Exception:
+                    pass
             if role_norm_task in _LOCAL_OLLAMA_ROLE_NAMES:
                 try:
                     orch_q.update_trace(
@@ -17758,9 +22494,17 @@ def orchestrator_worker_loop(
                 elif bool(task.requires_approval):
                     orch_state = "blocked_approval"
 
-            structured_digest: Any = getattr(result, "structured_digest", None)
-            if structured_digest is None and isinstance(result, dict):
-                structured_digest = result.get("structured_digest")
+            structured_digest: Any = _result_structured_digest(result)
+            ceo_strategy_proposal = _extract_factory_ceo_strategy_proposal(
+                structured_digest=structured_digest,
+                summary=summary,
+                order_id=root_ticket,
+                repo_id=str(((task.trace or {}) if isinstance(task.trace, dict) else {}).get("repo_id") or ""),
+                repo_path=str(((task.trace or {}) if isinstance(task.trace, dict) else {}).get("repo_path") or ""),
+            )
+            if ceo_strategy_proposal is not None:
+                orch_state = "blocked_approval"
+                next_action = str(ceo_strategy_proposal.get("next_action_type") or "ceo_approval_needed").strip() or "ceo_approval_needed"
 
             duration_s = max(0.0, float(time.time() - started))
             result_meta: dict[str, Any] = {
@@ -17770,6 +22514,8 @@ def orchestrator_worker_loop(
                 "result_next_action": next_action,
                 "result_duration_s": duration_s,
             }
+            if isinstance(structured_digest, (dict, list)):
+                result_meta["structured_digest"] = structured_digest
             if isinstance(structured_digest, dict):
                 tid = structured_digest.get("thread_id")
                 if isinstance(tid, str) and tid.strip():
@@ -17781,9 +22527,12 @@ def orchestrator_worker_loop(
                 except Exception:
                     pass
             if orch_state == "blocked_approval":
-                result_meta["blocked_reason"] = "requires_approval"
+                result_meta["blocked_reason"] = ("ceo_strategy_approval" if ceo_strategy_proposal is not None else "requires_approval")
             elif blocker_summary and role_norm_task == "implementer_local":
                 result_meta["blocked_reason"] = "implementer_blocker"
+            if ceo_strategy_proposal is not None:
+                result_meta["ceo_strategy_approval_pending"] = True
+                result_meta["ceo_strategy_proposal"] = ceo_strategy_proposal
             if role_norm_task in _LOCAL_OLLAMA_ROLE_NAMES:
                 slice_id = _task_slice_id(task, root_ticket=root_ticket)
                 attempt_n = _task_attempt_n(task)
@@ -17908,24 +22657,33 @@ def orchestrator_worker_loop(
                     ),
                 )
             elif _is_controller_role(role_norm_task):
-                verified = bool(
+                requested_verified = bool(
                     orch_state == "done"
                     and (
-                        ("verified_improvement" in str(summary or "").lower())
+                        _summary_has_verified_improvement_signal(summary)
                         or bool(((task.trace or {}) if isinstance(task.trace, dict) else {}).get("improvement_verified", False))
                     )
                 )
+                verified_slice_id = ""
+                if requested_verified:
+                    verified_slice_id = _controller_verified_slice_for_closure(
+                        orch_q=orch_q,
+                        root_ticket=root_ticket,
+                        trace=((task.trace or {}) if isinstance(task.trace, dict) else {}),
+                    )
+                verified = bool(requested_verified and verified_slice_id)
+                if requested_verified and not verified:
+                    orch_state = "failed"
+                    next_action = next_action or "delegate"
+                    summary = (
+                        f"{summary}\n\nController verification gate rejected: VERIFIED_IMPROVEMENT "
+                        "requires prior implementer_local applied+validated evidence plus reviewer_local READY evidence."
+                    ).strip()
+                    result_meta["result_summary"] = summary
+                    result_meta["controller_verification_gate"] = "missing_local_evidence"
                 result_meta["improvement_verified"] = bool(verified)
                 if verified:
-                    slice_id = _sanitize_slice_token(
-                        str((((task.trace or {}) if isinstance(task.trace, dict) else {}).get("slice_id") or "")),
-                        fallback="",
-                    )
-                    if not slice_id:
-                        slice_id = _select_latest_ready_slice_for_closure(
-                            orch_q=orch_q,
-                            root_ticket=root_ticket,
-                        )
+                    slice_id = verified_slice_id
                     if slice_id:
                         result_meta["slice_id"] = slice_id
                         result_meta["attempt_n"] = int(_task_attempt_n(task))
@@ -17999,6 +22757,47 @@ def orchestrator_worker_loop(
                     result_meta["loop_breaker_pending"] = True
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            if ceo_strategy_proposal is not None:
+                try:
+                    _register_factory_ceo_strategy_proposal(
+                        cfg=cfg,
+                        api=api,
+                        orch_q=orch_q,
+                        task=task,
+                        summary=summary,
+                        structured_digest=structured_digest,
+                    )
+                except Exception:
+                    LOG.exception("Failed to register CEO strategic proposal. job=%s", task.job_id)
+            if repo_id:
+                try:
+                    orch_q.upsert_agent_runtime_state(
+                        repo_id=repo_id,
+                        role=role_norm_task,
+                        chat_id=int(task.chat_id),
+                        lane=_FACTORY_ROLE_LANES.get(role_norm_task, "factory"),
+                        heartbeat_at=time.time(),
+                        last_result_status=orch_state,
+                        last_result_summary=summary,
+                        last_job_id=task.job_id,
+                        last_run_at=time.time(),
+                        metadata={
+                            "repo_path": repo_path,
+                            "current_state": orch_state,
+                            "root_ticket": root_ticket,
+                            "result_next_action": next_action,
+                        },
+                    )
+                    orch_q.append_agent_mailbox(
+                        repo_id=repo_id,
+                        from_agent_key=f"{repo_id}:{role_norm_task}",
+                        to_agent_key=f"{repo_id}:{_controller_role_for_task(task, orch_q)}",
+                        kind="reply",
+                        correlation_id=root_ticket,
+                        payload={"job_id": task.job_id, "state": orch_state, "next_action": next_action},
+                    )
+                except Exception:
+                    pass
             try:
                 role_norm_after = _coerce_orchestrator_role(str(task.role or ""))
                 root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
@@ -18042,7 +22841,7 @@ def orchestrator_worker_loop(
                         latest_local_reviewer_ready=bool(_summary_has_ready_signal(summary)),
                     )
                 elif orch_state == "done" and _is_controller_role(role_norm_after):
-                    if "verified_improvement" in str(summary or "").lower():
+                    if _summary_has_verified_improvement_signal(summary) or bool(result_meta.get("improvement_verified", False)):
                         orch_q.update_trace(
                             root_ticket,
                             proactive_improvement_verified=True,
@@ -18124,6 +22923,7 @@ def orchestrator_worker_loop(
                             merge_ready_announced=True,
                             order_branch=(live_order_branch or None),
                             merged_to_main=False,
+                            **_merge_ready_trace_reset_payload(),
                         )
                     except Exception:
                         pass
@@ -18238,7 +23038,8 @@ def orchestrator_worker_loop(
                         if str((c.labels or {}).get("key") or "").strip()
                     }
 
-                    specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
+                    strategic_proposal_requested = _factory_ceo_strategy_next_action(structured_digest) is not None
+                    specs = [] if strategic_proposal_requested else parse_orchestrator_subtasks(structured_digest)
                     current_plan_revision = 0
                     try:
                         current_plan_revision = int((task.trace or {}).get("plan_revision", 0) or 0)
@@ -18247,9 +23048,11 @@ def orchestrator_worker_loop(
                     next_plan_revision = current_plan_revision
                     proactive_lane = bool(task.trace.get("proactive_lane", False))
                     job_kind = str((task.labels or {}).get("kind") or "").strip().lower()
+                    merge_conflict_resolution = bool(task.trace.get("merge_conflict_resolution", False)) or job_kind == "merge_conflict_replan"
                     autonomous_non_manual = bool(
                         task.is_autonomous
                         or proactive_lane
+                        or merge_conflict_resolution
                         or job_kind in ("autopilot", "stalled_replan", "sla_replan")
                     )
                     order_is_proactive = False
@@ -18260,7 +23063,22 @@ def orchestrator_worker_loop(
                         except Exception:
                             order_is_proactive = False
 
-                    enforce_local_only = bool(proactive_lane) or bool(order_is_proactive)
+                    enforce_local_only = bool(proactive_lane) or bool(order_is_proactive) or bool(merge_conflict_resolution)
+                    if autonomous_non_manual and enforce_local_only and specs:
+                        specs, dropped_local_only_roles = _filter_specs_to_skynet_local_executors(specs)
+                        if dropped_local_only_roles:
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.local_only_specs_pruned",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "dropped_roles": list(dropped_local_only_roles),
+                                        "reason": "skynet_factory_local_only",
+                                    },
+                                )
+                            except Exception:
+                                pass
                     existing_local_inflight = bool(
                         autonomous_non_manual
                         and enforce_local_only
@@ -18318,7 +23136,7 @@ def orchestrator_worker_loop(
                             now=time.time(),
                         )
                     )
-                    if (not specs) and autonomous_non_manual and proactive_cli_promotion:
+                    if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
                         objective_snippet = str(task.input_text or "").strip()
                         if len(objective_snippet) > 240:
                             objective_snippet = objective_snippet[:240] + "..."
@@ -18389,7 +23207,7 @@ def orchestrator_worker_loop(
                             )
                         except Exception:
                             pass
-                    elif (not specs) and autonomous_non_manual and enforce_local_only:
+                    elif (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and enforce_local_only:
                         try:
                             live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
                         except Exception:
@@ -18411,40 +23229,82 @@ def orchestrator_worker_loop(
                             objective_snippet = str(task.input_text or "").strip()
                             if len(objective_snippet) > 240:
                                 objective_snippet = objective_snippet[:240] + "..."
-                            seed_key_base = f"proactive_local_seed_r{int(current_plan_revision) + 1}"
-                            seed_key = seed_key_base
-                            suffix = 1
-                            while seed_key in existing_keys:
-                                suffix += 1
-                                seed_key = f"{seed_key_base}_{suffix}"
-                            seed_specs = [
-                                TaskSpec(
-                                    key=seed_key,
-                                    role="backend",
-                                    text=(
-                                        f"Proactive local cycle for ticket {root_ticket}: derive concrete local improvements from objective and deliver evidence-ready actions. "
-                                        f"Objective snapshot: {objective_snippet}"
-                                    ),
-                                    mode_hint="ro",
-                                    priority=2,
-                                    depends_on=[],
-                                    requires_approval=False,
-                                    acceptance_criteria=[
-                                        "Define at least one concrete, testable improvement.",
-                                        "Produce verifiable evidence path for reviewer validation.",
-                                    ],
-                                    definition_of_done=[
-                                        "Improvement plan is actionable and ready for local execution/review.",
-                                    ],
-                                    eta_minutes=45,
-                                    sla_tier="high",
-                                )
-                            ]
+                            if merge_conflict_resolution:
+                                seed_key_base = f"merge_conflict_local_seed_r{int(current_plan_revision) + 1}"
+                                seed_key = seed_key_base
+                                suffix = 1
+                                while seed_key in existing_keys:
+                                    suffix += 1
+                                    seed_key = f"{seed_key_base}_{suffix}"
+                                merge_branch = str(task.trace.get("order_branch") or order_branch_for_root or "").strip()
+                                merge_error = str(task.trace.get("merge_error") or "").strip()
+                                merge_base_ref = str(task.trace.get("merge_resolution_base_ref") or "origin/main").strip() or "origin/main"
+                                merge_target_ref = str(task.trace.get("merge_resolution_target_ref") or f"origin/{merge_branch}").strip()
+                                seed_specs = [
+                                    TaskSpec(
+                                        key=seed_key,
+                                        role="architect_local",
+                                        text=(
+                                            f"Merge-conflict planning for ticket {root_ticket}.\n"
+                                            f"Canonical branch: {merge_branch or '(unknown)'}\n"
+                                            f"Base ref: {merge_base_ref}\n"
+                                            f"Target ref: {merge_target_ref or '(unknown)'}\n"
+                                            f"Observed merge error: {merge_error or '(none)'}\n\n"
+                                            "Return one bounded local reconciliation plan that resolves the concrete conflicts without dropping approved scope.\n"
+                                            f"Objective snapshot: {objective_snippet}"
+                                        ),
+                                        mode_hint="ro",
+                                        priority=1,
+                                        depends_on=[],
+                                        requires_approval=False,
+                                        acceptance_criteria=[
+                                            "Name the concrete conflicting files or the smallest verified file scope to inspect next.",
+                                            "Produce one actionable handoff for implementer_local with exact files and one validation command.",
+                                        ],
+                                        definition_of_done=[
+                                            "Skynet has one bounded merge-conflict resolution slice ready for local execution/review.",
+                                        ],
+                                        eta_minutes=30,
+                                        sla_tier="high",
+                                    )
+                                ]
+                            else:
+                                seed_key_base = f"proactive_local_seed_r{int(current_plan_revision) + 1}"
+                                seed_key = seed_key_base
+                                suffix = 1
+                                while seed_key in existing_keys:
+                                    suffix += 1
+                                    seed_key = f"{seed_key_base}_{suffix}"
+                                seed_specs = [
+                                    TaskSpec(
+                                        key=seed_key,
+                                        role="architect_local",
+                                        text=(
+                                            f"Proactive local cycle for ticket {root_ticket}: derive one bounded local implementation slice from the objective and hand it off for implementer/reviewer execution. "
+                                            f"Objective snapshot: {objective_snippet}"
+                                        ),
+                                        mode_hint="ro",
+                                        priority=2,
+                                        depends_on=[],
+                                        requires_approval=False,
+                                        acceptance_criteria=[
+                                            "Produce one bounded implementer-ready slice with exact files and one validation command.",
+                                            "Keep the slice small enough for implementer_local and reviewer_local to close in one cycle.",
+                                        ],
+                                        definition_of_done=[
+                                            "Skynet has one actionable local slice ready for implementer_local and reviewer_local.",
+                                        ],
+                                        eta_minutes=45,
+                                        sla_tier="high",
+                                    )
+                                ]
                             specs = _apply_autonomous_local_first_policy(
+                                cfg=cfg,
                                 specs=seed_specs,
                                 orch_q=orch_q,
                                 root_ticket=root_ticket,
                                 now=time.time(),
+                                enforce_hard_local_only=bool(enforce_local_only),
                             )
                             try:
                                 orch_q.append_audit_event(
@@ -18499,10 +23359,12 @@ def orchestrator_worker_loop(
                             elif enforce_local_only:
                                 # Proactive lane policy: execution and retries stay local-only.
                                 specs = _apply_autonomous_local_first_policy(
+                                    cfg=cfg,
                                     specs=specs,
                                     orch_q=orch_q,
                                     root_ticket=root_ticket,
                                     now=now_ts,
+                                    enforce_hard_local_only=True,
                                 )
 
                             specs = _dedupe_specs_by_signature(
@@ -18655,7 +23517,7 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
 
-                        if (not specs) and autonomous_non_manual and proactive_cli_promotion:
+                        if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
                             objective_snippet = str(task.input_text or "").strip()
                             if len(objective_snippet) > 240:
                                 objective_snippet = objective_snippet[:240] + "..."
@@ -18727,7 +23589,7 @@ def orchestrator_worker_loop(
                                 )
                             except Exception:
                                 pass
-                        elif (not specs) and autonomous_non_manual and enforce_local_only:
+                        elif (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and enforce_local_only:
                             try:
                                 live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
                             except Exception:
@@ -18749,40 +23611,82 @@ def orchestrator_worker_loop(
                                 objective_snippet = str(task.input_text or "").strip()
                                 if len(objective_snippet) > 240:
                                     objective_snippet = objective_snippet[:240] + "..."
-                                reseed_key_base = f"proactive_local_reseed_r{int(current_plan_revision) + 1}"
-                                reseed_key = reseed_key_base
-                                reseed_suffix = 1
-                                while reseed_key in existing_keys:
-                                    reseed_suffix += 1
-                                    reseed_key = f"{reseed_key_base}_{reseed_suffix}"
-                                reseed_specs = [
-                                    TaskSpec(
-                                        key=reseed_key,
-                                        role="backend",
-                                        text=(
-                                            f"Proactive local reseed for ticket {root_ticket}: previous plan produced no runnable subtasks; derive a new local approach with concrete, evidence-oriented actions. "
-                                            f"Objective snapshot: {objective_snippet}"
-                                        ),
-                                        mode_hint="ro",
-                                        priority=2,
-                                        depends_on=[],
-                                        requires_approval=False,
-                                        acceptance_criteria=[
-                                            "Define at least one new concrete, testable approach.",
-                                            "Produce verifiable evidence path for reviewer validation.",
-                                        ],
-                                        definition_of_done=[
-                                            "New local approach is actionable and avoids prior empty-plan outcome.",
-                                        ],
-                                        eta_minutes=45,
-                                        sla_tier="high",
-                                    )
-                                ]
+                                if merge_conflict_resolution:
+                                    reseed_key_base = f"merge_conflict_local_reseed_r{int(current_plan_revision) + 1}"
+                                    reseed_key = reseed_key_base
+                                    reseed_suffix = 1
+                                    while reseed_key in existing_keys:
+                                        reseed_suffix += 1
+                                        reseed_key = f"{reseed_key_base}_{reseed_suffix}"
+                                    merge_branch = str(task.trace.get("order_branch") or order_branch_for_root or "").strip()
+                                    merge_error = str(task.trace.get("merge_error") or "").strip()
+                                    merge_base_ref = str(task.trace.get("merge_resolution_base_ref") or "origin/main").strip() or "origin/main"
+                                    merge_target_ref = str(task.trace.get("merge_resolution_target_ref") or f"origin/{merge_branch}").strip()
+                                    reseed_specs = [
+                                        TaskSpec(
+                                            key=reseed_key,
+                                            role="architect_local",
+                                            text=(
+                                                f"Merge-conflict replan for ticket {root_ticket}: the previous resolution wave produced no runnable subtasks.\n"
+                                                f"Canonical branch: {merge_branch or '(unknown)'}\n"
+                                                f"Base ref: {merge_base_ref}\n"
+                                                f"Target ref: {merge_target_ref or '(unknown)'}\n"
+                                                f"Observed merge error: {merge_error or '(none)'}\n\n"
+                                                "Return one fresh bounded conflict-resolution slice with exact files, smallest safe edit, and one validation command.\n"
+                                                f"Objective snapshot: {objective_snippet}"
+                                            ),
+                                            mode_hint="ro",
+                                            priority=1,
+                                            depends_on=[],
+                                            requires_approval=False,
+                                            acceptance_criteria=[
+                                                "Return a new conflict-resolution slice, not a generic retry.",
+                                                "Name the exact files to reconcile and the validation command that proves merge readiness.",
+                                            ],
+                                            definition_of_done=[
+                                                "Skynet has a fresh local conflict-resolution slice ready for execution.",
+                                            ],
+                                            eta_minutes=30,
+                                            sla_tier="high",
+                                        )
+                                    ]
+                                else:
+                                    reseed_key_base = f"proactive_local_reseed_r{int(current_plan_revision) + 1}"
+                                    reseed_key = reseed_key_base
+                                    reseed_suffix = 1
+                                    while reseed_key in existing_keys:
+                                        reseed_suffix += 1
+                                        reseed_key = f"{reseed_key_base}_{reseed_suffix}"
+                                    reseed_specs = [
+                                        TaskSpec(
+                                            key=reseed_key,
+                                            role="architect_local",
+                                            text=(
+                                                f"Proactive local reseed for ticket {root_ticket}: previous plan produced no runnable subtasks; derive one fresh bounded local slice with concrete, evidence-oriented actions. "
+                                                f"Objective snapshot: {objective_snippet}"
+                                            ),
+                                            mode_hint="ro",
+                                            priority=2,
+                                            depends_on=[],
+                                            requires_approval=False,
+                                            acceptance_criteria=[
+                                                "Produce one new bounded implementer-ready slice with exact files and one validation command.",
+                                                "Avoid generic retries and keep the slice ready for reviewer_local validation.",
+                                            ],
+                                            definition_of_done=[
+                                                "New local slice is actionable and avoids the previous empty-plan outcome.",
+                                            ],
+                                            eta_minutes=45,
+                                            sla_tier="high",
+                                        )
+                                    ]
                                 specs = _apply_autonomous_local_first_policy(
+                                    cfg=cfg,
                                     specs=reseed_specs,
                                     orch_q=orch_q,
                                     root_ticket=root_ticket,
                                     now=time.time(),
+                                    enforce_hard_local_only=bool(enforce_local_only),
                                 )
                                 try:
                                     orch_q.append_audit_event(
@@ -18898,7 +23802,9 @@ def orchestrator_worker_loop(
                             effort = _orchestrator_effort_for_profile(child_profile, cfg)
                             mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
                             if child_role == "implementer_local" and mode_hint == "ro":
-                                mode_hint = "rw"
+                                exec_backend = str(child_profile.get("execution_backend") or "").strip().lower()
+                                if exec_backend in {"local_ollama", "ollama"}:
+                                    mode_hint = "rw"
                             requires_approval = bool(
                                 spec.requires_approval
                                 or bool(child_profile.get("approval_required", False))
@@ -18953,6 +23859,14 @@ def orchestrator_worker_loop(
                                 trace["order_branch"] = str(order_branch_for_root)
                             if enforce_local_only:
                                 trace["execution_policy"] = "local_only"
+                            if merge_conflict_resolution:
+                                trace["merge_conflict_resolution"] = True
+                                merge_base_ref = str(task.trace.get("merge_resolution_base_ref") or "origin/main").strip()
+                                merge_target_ref = str(task.trace.get("merge_resolution_target_ref") or "").strip()
+                                if merge_base_ref:
+                                    trace["merge_resolution_base_ref"] = merge_base_ref
+                                if merge_target_ref:
+                                    trace["merge_resolution_target_ref"] = merge_target_ref
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
@@ -20777,6 +25691,24 @@ def poll_loop(
                             )
                         continue
 
+                if (
+                    orchestrator_queue is not None
+                    and cfg.orchestrator_enabled
+                    and incoming is not None
+                    and (incoming.text or "").strip()
+                ):
+                    try:
+                        if _maybe_handle_factory_ceo_strategy_message(
+                            cfg=cfg,
+                            api=api,
+                            orch_q=orchestrator_queue,
+                            profiles=orchestrator_profiles,
+                            incoming=incoming,
+                        ):
+                            continue
+                    except Exception:
+                        LOG.exception("Failed to handle CEO strategic proposal message")
+
                 if cfg.strict_proxy:
                     # Forward almost everything to Codex thread directly, but keep a few local commands.
                     raw = incoming_text.strip()
@@ -20810,6 +25742,7 @@ def poll_loop(
                         "/snapshot",
                         "/approve",
                         "/approve_merge",
+                        "/proposal",
                         "/rollback",
                         "/emergency_stop",
                         "/emergency_resume",
@@ -20817,6 +25750,7 @@ def poll_loop(
                         "/pause_autonomia",
                         "/resume_autonomy",
                         "/resume_autonomia",
+                        "/factory",
                         "/pause",
                         "/resume",
                         "/ticket",
@@ -20854,13 +25788,16 @@ def poll_loop(
                         "/daily",
                         "/approve ",
                         "/approve_merge ",
+                        "/proposal ",
                         "/rollback ",
                         "/pause_autonomy",
                         "/pause_autonomia",
                         "/resume_autonomy",
                         "/resume_autonomia",
+                        "/factory",
                         "/pause ",
                         "/resume ",
+                        "/factory ",
                         "/cancel ",
                         "/purge ",
                     )
@@ -21952,6 +26889,8 @@ def main() -> None:
         _migrate_state_schema(cfg)
     except Exception:
         LOG.exception("State migration failed; continuing with existing state")
+    for issue in _sync_github_pat_git_credentials():
+        LOG.warning("GIT AUTH: %s", issue)
 
     if cfg.codex_dangerous_bypass_sandbox and cfg.breakglass_start_reason:
         try:
@@ -21999,6 +26938,10 @@ def main() -> None:
             recovered = orchestrator_queue.recover_stale_running()
             if recovered:
                 LOG.info("Recovered %d stale orchestrator jobs to queued state.", recovered)
+            try:
+                _factory_sync_repo_registry(cfg=cfg, orch_q=orchestrator_queue, now=time.time(), force=True)
+            except Exception:
+                LOG.exception("Factory repo registry bootstrap failed")
         except Exception:
             LOG.exception("Failed to initialize orchestrator storage/queue; disabling orchestrator for this session.")
             orchestrator_queue = None
@@ -22032,7 +26975,12 @@ def main() -> None:
                 interval_s = 1.0
 
             try:
-                svc = StatusService(orch_q=orchestrator_queue, role_profiles=orchestrator_profiles, cache_ttl_seconds=ttl_s)
+                svc = StatusService(
+                    orch_q=orchestrator_queue,
+                    role_profiles=orchestrator_profiles,
+                    cache_ttl_seconds=ttl_s,
+                    factory_snapshot_fn=(lambda snapshot_chat_id: _factory_status_snapshot(cfg=cfg, orch_q=orchestrator_queue, chat_id=snapshot_chat_id)),
+                )
                 auth_token = os.environ.get("BOT_STATUS_HTTP_TOKEN", "").strip()
                 allowed_origins = _parse_allowed_origins_env(os.environ.get("BOT_STATUS_HTTP_ALLOWED_ORIGINS", ""))
                 if not auth_token:
@@ -22146,6 +27094,14 @@ def main() -> None:
                 except Exception:
                     LOG.exception("Redundant orders collapse tick failed")
                 try:
+                    _collapse_duplicate_proactive_repo_orders_tick(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Duplicate proactive repo collapse tick failed")
+                try:
                     _drain_backlog_tick(
                         orch_q=orchestrator_queue,
                         now=time.time(),
@@ -22209,6 +27165,41 @@ def main() -> None:
                 except Exception:
                     LOG.exception("Jarvis final sweep tick failed")
                 try:
+                    now_tick = time.time()
+                    repos_now = _factory_sync_repo_registry(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        now=now_tick,
+                        force=False,
+                    )
+                    _factory_touch_runtime_agents(
+                        cfg=cfg,
+                        orch_q=orchestrator_queue,
+                        chat_id=(int(notify_chat_id) if notify_chat_id is not None else None),
+                        now=now_tick,
+                        repos=repos_now,
+                    )
+                except Exception:
+                    LOG.exception("Factory heartbeat tick failed")
+                try:
+                    _cancel_non_local_children_for_skynet_factory_orders_tick(
+                        orch_q=orchestrator_queue,
+                        now=time.time(),
+                        chat_id=(int(notify_chat_id) if notify_chat_id is not None else None),
+                    )
+                except Exception:
+                    LOG.exception("Skynet local-only scrub tick failed")
+                try:
+                    _factory_ceo_strategy_timeout_tick(
+                        cfg=cfg,
+                        api=api,
+                        orch_q=orchestrator_queue,
+                        profiles=orchestrator_profiles,
+                        now=time.time(),
+                    )
+                except Exception:
+                    LOG.exception("Factory CEO strategy timeout tick failed")
+                try:
                     _auto_merge_ready_orders_tick(
                         cfg=cfg,
                         api=api,
@@ -22229,6 +27220,16 @@ def main() -> None:
                         )
                     except Exception:
                         LOG.exception("Proactive lane tick failed")
+                    try:
+                        _active_order_watchdog_tick(
+                            cfg=cfg,
+                            orch_q=orchestrator_queue,
+                            profiles=orchestrator_profiles,
+                            chat_id=int(notify_chat_id),
+                            now=time.time(),
+                        )
+                    except Exception:
+                        LOG.exception("Active-order watchdog tick failed")
 
                 if notify_chat_id is None:
                     return
