@@ -228,6 +228,16 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(first, "retriable")
         self.assertEqual(second, "terminal")
 
+    def test_failure_class_no_valid_patches_is_terminal_immediately(self) -> None:
+        msg = 'patch rejected by git apply --check: error: No valid patches in input (allow with "--allow-empty")'
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "terminal")
+
     def test_failure_class_blocker_text_is_blocked(self) -> None:
         msg = "BLOCKER: missing requirement for evidence artifact path"
         klass = bot._classify_local_slice_failure(

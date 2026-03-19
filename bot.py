@@ -10304,6 +10304,8 @@ def _classify_local_slice_failure(
         "patch apply failed",
     )
     if any(tok in blob for tok in patch_invalid_markers):
+        if "no valid patches in input" in blob:
+            return "terminal"
         return "terminal" if int(attempt_n) >= 2 else "retriable"
 
     return "retriable"
