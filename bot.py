@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import textwrap
 import time
 import http.client
 import ssl
@@ -2502,12 +2503,12 @@ def _git_default_branch(repo: Path) -> str:
 
 def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
     roots = _factory_repo_roots()
-    skip_prefixes: list[Path] = []
+    all_skip_prefixes: list[Path] = []
     for candidate in (cfg.worktree_root, cfg.artifacts_root, Path(__file__).resolve().parent / "data"):
         try:
-            skip_prefixes.append(candidate.expanduser().resolve())
+            all_skip_prefixes.append(candidate.expanduser().resolve())
         except Exception:
-            skip_prefixes.append(candidate.expanduser())
+            all_skip_prefixes.append(candidate.expanduser())
 
     discovered: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -2520,6 +2521,9 @@ def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
     for root in roots:
         if not root.exists():
             continue
+        # Respect explicitly configured scan roots even if they live under internal
+        # worktree/artifact prefixes used for broader default scans.
+        skip_prefixes = [prefix for prefix in all_skip_prefixes if not _path_is_relative_to(root, prefix)]
         for dirpath, dirnames, _filenames in os.walk(root):
             current = Path(dirpath)
             try:
@@ -4362,8 +4366,12 @@ def _ollama_chat(
 
 def _extract_first_diff_block(text: str) -> str:
     raw = str(text or "")
-    fenced_blocks = re.findall(r"```diff\s*\n(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
-    normalized_blocks = [str(block or "").strip() for block in fenced_blocks if str(block or "").strip()]
+    fenced_blocks = re.findall(r"```(?:diff|patch)\s*\n(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL)
+    normalized_blocks = [
+        textwrap.dedent(str(block or "")).strip()
+        for block in fenced_blocks
+        if textwrap.dedent(str(block or "")).strip()
+    ]
     if normalized_blocks:
         return "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
     plain = re.search(r"(^diff --git .*?$.*)", raw, flags=re.MULTILINE | re.DOTALL)
@@ -4425,6 +4433,117 @@ def _result_structured_digest(result: Any) -> Any:
     if structured is None and isinstance(result, dict):
         structured = result.get("structured_digest")
     return structured
+
+
+def _structured_subtask_rows(payload: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    stack: list[Any] = [payload]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        subtasks = current.get("subtasks")
+        if isinstance(subtasks, list):
+            for item in subtasks:
+                if isinstance(item, dict):
+                    out.append(item)
+                    stack.append(item)
+        next_action = current.get("next_action")
+        if isinstance(next_action, dict):
+            stack.append(next_action)
+    return out
+
+
+def _controller_result_signature(
+    *,
+    summary: str,
+    next_action: str | None,
+    structured_digest: Any,
+) -> str:
+    normalized_summary = re.sub(r"\s+", " ", str(summary or "").strip().lower())[:1200]
+    subtasks_payload: list[dict[str, str]] = []
+    for row in _structured_subtask_rows(structured_digest):
+        role = _coerce_orchestrator_role(str(row.get("role") or ""))
+        key = str(row.get("key") or "").strip().lower()
+        text = re.sub(r"\s+", " ", str(row.get("text") or "").strip().lower())[:240]
+        if not role and not key and not text:
+            continue
+        subtasks_payload.append(
+            {
+                "role": role,
+                "key": key,
+                "text": text,
+            }
+        )
+    payload = {
+        "summary": normalized_summary,
+        "next_action": str(next_action or "").strip().lower(),
+        "subtasks": subtasks_payload,
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if not blob.strip():
+        return ""
+    return hashlib.sha1(blob.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _controller_result_indicates_progress(
+    *,
+    summary: str,
+    structured_digest: Any,
+    improvement_verified: bool,
+) -> bool:
+    if bool(improvement_verified):
+        return True
+    if _summary_has_verified_improvement_signal(summary):
+        return True
+    if _summary_has_ready_signal(summary):
+        return True
+    for row in _structured_subtask_rows(structured_digest):
+        role = _coerce_orchestrator_role(str(row.get("role") or ""))
+        if role in {"architect_local", "implementer_local", "reviewer_local"}:
+            return True
+    return False
+
+
+def _autopilot_no_progress_backoff_seconds(streak: int) -> float:
+    try:
+        base = float(os.environ.get("BOT_AUTOPILOT_NO_PROGRESS_COOLDOWN_SECONDS", "900").strip() or "900")
+    except Exception:
+        base = 900.0
+    try:
+        cap = float(os.environ.get("BOT_AUTOPILOT_NO_PROGRESS_COOLDOWN_MAX_SECONDS", "3600").strip() or "3600")
+    except Exception:
+        cap = 3600.0
+    base = max(300.0, base)
+    cap = max(base, cap)
+    exponent = max(0, int(streak) - 2)
+    return min(cap, base * float(2 ** exponent))
+
+
+def _extract_codex_token_usage(text: str) -> dict[str, int]:
+    blob = str(text or "")
+    if not blob.strip():
+        return {}
+    patterns = (
+        re.compile(r"tokens\s+in\s*=\s*(\d+)\s+out\s*=\s*(\d+)", re.IGNORECASE),
+        re.compile(r"input_tokens\s*=\s*(\d+)\s+output_tokens\s*=\s*(\d+)", re.IGNORECASE),
+        re.compile(r"prompt_tokens\s*=\s*(\d+)\s+completion_tokens\s*=\s*(\d+)", re.IGNORECASE),
+    )
+    for pattern in patterns:
+        match = pattern.search(blob)
+        if not match:
+            continue
+        try:
+            input_tokens = int(match.group(1))
+            output_tokens = int(match.group(2))
+        except Exception:
+            continue
+        return {
+            "input_tokens": int(input_tokens),
+            "output_tokens": int(output_tokens),
+            "total_tokens": int(max(0, input_tokens) + max(0, output_tokens)),
+        }
+    return {}
 
 
 def _extract_changed_files_from_patch_text(text: str) -> list[str]:
@@ -12580,6 +12699,12 @@ def _enqueue_order_autopilot_task(
         last_enqueued_at = float(root_trace.get("autopilot_last_enqueued_at", 0.0) or 0.0)
     except Exception:
         last_enqueued_at = 0.0
+    try:
+        backoff_until = float(root_trace.get("autopilot_no_progress_backoff_until", 0.0) or 0.0)
+    except Exception:
+        backoff_until = 0.0
+    if backoff_until > float(now):
+        return False
     if last_enqueued_at > 0 and latest_activity > (last_enqueued_at + 5.0):
         last_enqueued_at = 0.0
     if last_enqueued_at > 0 and float(cooldown_seconds) > 0 and (float(now) - last_enqueued_at) < float(cooldown_seconds):
@@ -14195,9 +14320,14 @@ def _classify_local_slice_failure(
         "cannot safely implement",
         "handoff is still not actionable",
         "provide the exact file path",
+        "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
+        "please provide the full function body for `_classify_local_slice_failure`",
     )
     if any(tok in blob for tok in blocker_markers):
         return "blocked"
+
+    if "patch rejected by git apply --check" in blob and "no valid patches in input" in blob:
+        return "terminal"
 
     patch_invalid_markers = (
         "patch rejected by git apply --check",
@@ -15189,6 +15319,12 @@ def _apply_autonomous_local_first_policy(
             break
         if latest_impl_no_change_done is None and _trace_local_no_change(trace):
             latest_impl_no_change_done = meta
+    latest_impl_done_ts = 0.0
+    if latest_impl_done is not None:
+        try:
+            latest_impl_done_ts = float(latest_impl_done.get("updated_at") or latest_impl_done.get("created_at") or 0.0)
+        except Exception:
+            latest_impl_done_ts = 0.0
     latest_impl_failed_summary = ""
     latest_impl_failed_job_id = ""
     latest_impl_failed_slice_id = ""
@@ -15276,6 +15412,7 @@ def _apply_autonomous_local_first_policy(
         )
     )
     latest_review_done_summary = ""
+    latest_review_done_ts = 0.0
     for meta in _latest_done_meta("reviewer_local", limit=12):
         trace = dict(meta.get("trace") or {}) if isinstance(meta.get("trace"), dict) else {}
         summary = str(trace.get("result_summary") or "").strip()
@@ -15287,7 +15424,11 @@ def _apply_autonomous_local_first_policy(
             summary = str(text or "").strip()
         if summary:
             latest_review_done_summary = summary[:4000]
+            latest_review_done_ts = float(ts)
             break
+    review_already_validated_no_change = bool(
+        latest_review_done_summary and _response_signals_no_code_change(latest_review_done_summary)
+    )
     arch_rows = _latest_done_meta("architect_local", limit=12)
     latest_arch_done: dict[str, Any] | None = None
     latest_arch_response = ""
@@ -15385,6 +15526,11 @@ def _apply_autonomous_local_first_policy(
         _coerce_orchestrator_role(str(child.role or "")) == "reviewer_local"
         and str(child.state or "").strip().lower() in active_states
         for child in existing_children
+    )
+    latest_downstream_local_ts = max(
+        float(latest_impl_done_ts or 0.0),
+        float(latest_impl_failed_ts or 0.0),
+        float(latest_review_done_ts or 0.0),
     )
 
     def _no_change_review_specs() -> list[TaskSpec]:
@@ -15513,6 +15659,62 @@ def _apply_autonomous_local_first_policy(
                     "Validation-only planner request is resolved as a review verdict or a concrete rework path.",
                 ],
                 eta_minutes=20,
+                sla_tier="high",
+            )
+        ]
+
+    def _latest_arch_implementer_specs() -> list[TaskSpec]:
+        if not latest_arch_response or active_implementer_open or active_reviewer_open:
+            return []
+        arch_key_raw_local = latest_arch_key_raw
+        impl_suffix = ""
+        for prefix in ("local_arch_guard_", "local_arch_blocker_", "local_arch_ground_"):
+            if arch_key_raw_local.startswith(prefix):
+                impl_suffix = arch_key_raw_local[len(prefix) :].strip()
+                break
+        if not impl_suffix and latest_arch_job_id:
+            impl_suffix = latest_arch_job_id.split("-", 1)[0].strip()
+        retry_block = ""
+        if latest_impl_failed_summary:
+            retry_block = (
+                "PREVIOUS_IMPLEMENTER_FAILURE:\n"
+                f"job_id={latest_impl_failed_job_id or '(unknown)'}\n"
+                f"{latest_impl_failed_summary}\n\n"
+                "Correct the failure above. Emit one single fenced ```diff``` block containing every file hunk needed for this slice.\n\n"
+            )
+        impl_key = f"local_impl_guard_{impl_suffix or max(1, int(now))}"
+        return [
+            TaskSpec(
+                key=impl_key,
+                role="implementer_local",
+                text=(
+                    f"Implement exactly one bounded improvement for ticket {rid} using only the delegated file scope.\n"
+                    "Treat the architect handoff below as authoritative unless it is internally inconsistent.\n\n"
+                    f"{retry_block}"
+                    "PRIMARY_ARCHITECT_HANDOFF:\n"
+                    f"{latest_arch_response}\n\n"
+                    "Rules:\n"
+                    "- Treat the workspace FILE excerpts as authoritative current content.\n"
+                    "- Modify only the exact files named in the architect handoff unless one closely related test/config file is required.\n"
+                    "- If the handoff contains ARTIFACT_CONTRACT, implement/validate against that exact contract.\n"
+                    "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool inside Codex.\n"
+                    "- Return the code change as one single fenced ```diff``` block or one/more fenced rewrite blocks.\n"
+                    "- After the code block(s), add EXPECTED_VALIDATION with one targeted command for the controller to run.\n"
+                    "- If multiple files change, include all resulting hunks inside one single fenced ```diff``` block.\n"
+                    "- If the handoff is still not actionable, stop immediately and return BLOCKER with the smallest concrete unblock path.\n"
+                ),
+                mode_hint="ro",
+                priority=2,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return one concrete improvement from the architect handoff with a real diff or rewrite block.",
+                    "Report exact files changed and one expected validation command for the controller.",
+                ],
+                definition_of_done=[
+                    "Controller can apply one bounded improvement diff derived from the latest architect handoff, or receives a precise blocker tied to that handoff.",
+                ],
+                eta_minutes=60,
                 sla_tier="high",
             )
         ]
@@ -15783,6 +15985,22 @@ def _apply_autonomous_local_first_policy(
         if ts <= 0 or (float(now) - ts) > 3600.0:
             continue
         recent_arch_done_count += 1
+    if (
+        planner_arch_only
+        and latest_arch_actionable
+        and not active_arch_open
+        and not active_implementer_open
+        and not active_reviewer_open
+        and latest_arch_ts > 0.0
+        and latest_arch_ts >= (latest_downstream_local_ts + 5.0)
+    ):
+        if _response_signals_no_code_change(latest_arch_response):
+            if review_already_validated_no_change:
+                return []
+            return _no_change_review_specs()
+        direct_from_arch = _latest_arch_implementer_specs()
+        if direct_from_arch:
+            return direct_from_arch
     # Break architect-only churn early: if we already have a recent architect pass but planner keeps
     # outputting only architect tasks for the same blocked episode, force one direct implementer attempt.
     if (
@@ -15800,9 +16018,6 @@ def _apply_autonomous_local_first_policy(
         if direct_specs:
             return direct_specs
 
-    review_already_validated_no_change = bool(
-        latest_review_done_summary and _response_signals_no_code_change(latest_review_done_summary)
-    )
     validation_only_impl_specs = [
         spec
         for spec in kept_specs
@@ -15936,58 +16151,9 @@ def _apply_autonomous_local_first_policy(
                 direct_specs = _workspace_direct_implementer_specs(reason="latest_architect_repo_access_blocker")
                 if direct_specs:
                     return direct_specs
-            arch_key_raw = latest_arch_key_raw
-            impl_suffix = ""
-            for prefix in ("local_arch_guard_", "local_arch_blocker_", "local_arch_ground_"):
-                if arch_key_raw.startswith(prefix):
-                    impl_suffix = arch_key_raw[len(prefix) :].strip()
-                    break
-            if not impl_suffix and latest_arch_job_id:
-                impl_suffix = latest_arch_job_id.split("-", 1)[0].strip()
-            retry_block = ""
-            if latest_impl_failed_summary:
-                retry_block = (
-                    "PREVIOUS_IMPLEMENTER_FAILURE:\n"
-                    f"job_id={latest_impl_failed_job_id or '(unknown)'}\n"
-                    f"{latest_impl_failed_summary}\n\n"
-                    "Correct the failure above. Emit one single fenced ```diff``` block containing every file hunk needed for this slice.\n\n"
-                )
-            impl_key = f"local_impl_guard_{impl_suffix or max(1, int(now))}"
-            return [
-                TaskSpec(
-                    key=impl_key,
-                    role="implementer_local",
-                text=(
-                    f"Implement exactly one bounded improvement for ticket {rid} using only the delegated file scope.\n"
-                    "Treat the architect handoff below as authoritative unless it is internally inconsistent.\n\n"
-                    f"{retry_block}"
-                    "PRIMARY_ARCHITECT_HANDOFF:\n"
-                    f"{latest_arch_response}\n\n"
-                    "Rules:\n"
-                    "- Treat the workspace FILE excerpts as authoritative current content.\n"
-                    "- Modify only the exact files named in the architect handoff unless one closely related test/config file is required.\n"
-                    "- If the handoff contains ARTIFACT_CONTRACT, implement/validate against that exact contract.\n"
-                    "- Do not use exec_command, apply_patch, shell tools, or any filesystem-writing tool inside Codex.\n"
-                    "- Return the code change as one single fenced ```diff``` block or one/more fenced rewrite blocks.\n"
-                    "- After the code block(s), add EXPECTED_VALIDATION with one targeted command for the controller to run.\n"
-                    "- If multiple files change, include all resulting hunks inside one single fenced ```diff``` block.\n"
-                    "- If the handoff is still not actionable, stop immediately and return BLOCKER with the smallest concrete unblock path.\n"
-                ),
-                mode_hint="ro",
-                priority=2,
-                depends_on=[],
-                    requires_approval=False,
-                    acceptance_criteria=[
-                        "Return one concrete improvement from the architect handoff with a real diff or rewrite block.",
-                        "Report exact files changed and one expected validation command for the controller.",
-                    ],
-                    definition_of_done=[
-                        "Controller can apply one bounded improvement diff derived from the latest architect handoff, or receives a precise blocker tied to that handoff.",
-                    ],
-                    eta_minutes=60,
-                    sla_tier="high",
-                )
-            ]
+            direct_from_arch = _latest_arch_implementer_specs()
+            if direct_from_arch:
+                return direct_from_arch
         # Guardrail: autonomous lane must remain local-first.
         # If Jarvis proposes only non-local roles, synthesize a bounded local fallback chain.
         stamp = max(1, int(now))
@@ -21189,6 +21355,7 @@ def _orchestrator_run_codex(
             code = 0
 
         body = ""
+        stdout_text = ""
         if proc.last_msg_path is not None:
             body = _read_text_file(proc.last_msg_path).strip()
         if not body:
@@ -21219,6 +21386,17 @@ def _orchestrator_run_codex(
                 LOG.exception("Failed to extract/persist orchestrator thread_id. job=%s role=%s", task.job_id, role)
 
         logs = _tail_file_text(proc.stderr_path, max_chars=6000)
+        token_usage = _extract_codex_token_usage(
+            "\n".join(
+                part
+                for part in (
+                    stdout_text,
+                    _tail_file_text(proc.stdout_path, max_chars=120000) if not stdout_text else "",
+                    logs,
+                )
+                if str(part or "").strip()
+            )
+        )
 
         artifacts: list[Path] = []
         # Screenshot output is outside workdir; include explicitly.
@@ -21286,6 +21464,8 @@ def _orchestrator_run_codex(
             "visual_evidence_count": int(len(visual_artifacts)),
             "visual_evidence": visual_artifacts[:8],
         }
+        if token_usage:
+            structured["token_usage"] = token_usage
         agent_payload = _extract_structured_result_payload(body)
         if isinstance(agent_payload, dict):
             for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason"):
@@ -22526,6 +22706,18 @@ def orchestrator_worker_loop(
                         result_meta["result_workspace_slot"] = int(slot)
                 except Exception:
                     pass
+                token_usage = structured_digest.get("token_usage")
+                if isinstance(token_usage, dict):
+                    cleaned_usage: dict[str, int] = {}
+                    for key in ("input_tokens", "output_tokens", "total_tokens"):
+                        try:
+                            value = int(token_usage.get(key))
+                        except Exception:
+                            continue
+                        if value >= 0:
+                            cleaned_usage[key] = int(value)
+                    if cleaned_usage:
+                        result_meta["token_usage"] = cleaned_usage
             if orch_state == "blocked_approval":
                 result_meta["blocked_reason"] = ("ceo_strategy_approval" if ceo_strategy_proposal is not None else "requires_approval")
             elif blocker_summary and role_norm_task == "implementer_local":
@@ -22757,6 +22949,68 @@ def orchestrator_worker_loop(
                     result_meta["loop_breaker_pending"] = True
 
             orch_q.update_state(task.job_id, orch_state, **result_meta)
+            try:
+                root_ticket_for_autopilot = (task.parent_job_id or task.job_id or "").strip() or task.job_id
+                task_trace_obj = dict((task.trace or {}) if isinstance(task.trace, dict) else {})
+                autonomous_controller = bool(
+                    root_ticket_for_autopilot
+                    and _is_controller_role(role_norm_task)
+                    and (
+                        bool(task.is_autonomous)
+                        or bool(task_trace_obj.get("autopilot", False))
+                        or bool(task_trace_obj.get("proactive_lane", False))
+                    )
+                )
+                if autonomous_controller:
+                    root_job_after = orch_q.get_job(root_ticket_for_autopilot)
+                    root_trace_after = dict((root_job_after.trace or {}) if root_job_after and isinstance(root_job_after.trace, dict) else {})
+                    last_signature = str(root_trace_after.get("autopilot_last_result_signature") or "").strip()
+                    try:
+                        last_streak = int(root_trace_after.get("autopilot_no_progress_streak") or 0)
+                    except Exception:
+                        last_streak = 0
+                    improvement_verified = bool(result_meta.get("improvement_verified", False))
+                    progress_signal = _controller_result_indicates_progress(
+                        summary=summary,
+                        structured_digest=structured_digest,
+                        improvement_verified=improvement_verified,
+                    )
+                    if ceo_strategy_proposal is not None:
+                        progress_signal = True
+                    signature = _controller_result_signature(
+                        summary=summary,
+                        next_action=next_action,
+                        structured_digest=structured_digest,
+                    )
+                    meaningful_improvement = bool(
+                        improvement_verified
+                        or _order_has_meaningful_improvement(
+                            orch_q=orch_q,
+                            root_ticket=root_ticket_for_autopilot,
+                        )
+                    )
+                    repeated_signature = bool(signature and last_signature and signature == last_signature)
+                    no_progress_streak = 0
+                    if meaningful_improvement:
+                        no_progress_streak = 0
+                    elif progress_signal and (not repeated_signature):
+                        no_progress_streak = 0
+                    else:
+                        no_progress_streak = max(0, int(last_streak)) + 1
+                    backoff_until = 0.0
+                    if no_progress_streak >= 2:
+                        backoff_until = time.time() + _autopilot_no_progress_backoff_seconds(no_progress_streak)
+                    update_payload: dict[str, Any] = {
+                        "autopilot_last_result_signature": (signature or None),
+                        "autopilot_no_progress_streak": int(no_progress_streak),
+                        "autopilot_no_progress_backoff_until": float(backoff_until),
+                        "autopilot_last_result_at": time.time(),
+                    }
+                    if progress_signal or meaningful_improvement:
+                        update_payload["autopilot_last_progress_at"] = time.time()
+                    orch_q.update_trace(root_ticket_for_autopilot, **update_payload)
+            except Exception:
+                pass
             if ceo_strategy_proposal is not None:
                 try:
                     _register_factory_ceo_strategy_proposal(

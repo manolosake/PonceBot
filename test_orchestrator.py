@@ -3870,3 +3870,60 @@ class TestFactoryCeoStrategyApproval(unittest.TestCase):
                 cooldown_seconds=0.0,
             )
             self.assertFalse(created)
+
+    def test_autopilot_skip_when_no_progress_backoff_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _cfg(Path(td) / "state.json", workdir=Path(td))
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+
+            order_id = "11111111-1111-1111-1111-111111111111"
+            now = _time.time()
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: codexbot Reliability + Delivery",
+                body="Ship one bounded improvement. [repo:codexbot-6fb8d5b9]",
+                status="active",
+                priority=2,
+                phase="planning",
+                project_id="codexbot-6fb8d5b9",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="AUTONOMOUS PROACTIVE SPRINT",
+                    request_type="maintenance",
+                    priority=1,
+                    model="gpt-5.2-codex",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    is_autonomous=True,
+                    trace={
+                        "allow_delegation": True,
+                        "proactive_lane": True,
+                        "repo_id": "codexbot-6fb8d5b9",
+                        "autopilot_no_progress_backoff_until": float(now + 600.0),
+                    },
+                    job_id=order_id,
+                )
+            )
+
+            order_row = q.get_order(order_id, chat_id=1)
+            assert order_row is not None
+            created = bot._enqueue_order_autopilot_task(
+                cfg=cfg,
+                orch_q=q,
+                profiles=self._profiles(),
+                order_row=order_row,
+                chat_id=1,
+                now=now,
+                reason="proactive_autopilot",
+                min_idle_seconds=0.0,
+                cooldown_seconds=0.0,
+            )
+            self.assertFalse(created)
