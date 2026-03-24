@@ -12885,6 +12885,7 @@ def _enqueue_reviewer_local_rework_if_due(
         return False
 
     latest_impl = None
+    latest_impl_ts = 0.0
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
         if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "implementer_local":
             continue
@@ -12896,7 +12897,10 @@ def _enqueue_reviewer_local_rework_if_due(
         trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
         if _trace_has_validated_slice_evidence(trace):
             latest_impl = child
+            latest_impl_ts = ts
             break
+    if latest_impl_ts > (latest_review_ts + 5.0):
+        return False
 
     review_labels = dict((getattr(latest_review, "labels", {}) or {}) if isinstance(getattr(latest_review, "labels", {}), dict) else {})
     review_key_raw = str(review_labels.get("key") or "").strip().lower()
@@ -16475,6 +16479,8 @@ def _apply_autonomous_local_first_policy(
         if latest_review_done is None or not latest_review_done_summary:
             return []
         if not _text_has_no_go_signal(latest_review_done_summary):
+            return []
+        if latest_impl_done_ts > (latest_review_done_ts + 5.0):
             return []
         if active_implementer_open or active_reviewer_open:
             return []
