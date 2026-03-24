@@ -15681,7 +15681,9 @@ def _order_has_verified_no_change_resolution(
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
-        if role_norm != "reviewer_local" or state != "done":
+        if role_norm != "reviewer_local":
+            continue
+        if state != "done" and not _task_has_salvageable_local_success(child):
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
         if ts <= 0 or (now_ts - ts) > 3600.0:

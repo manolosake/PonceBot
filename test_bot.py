@@ -376,6 +376,31 @@ class TestStateHandling(unittest.TestCase):
             "slice1",
         )
 
+    def test_order_has_verified_no_change_resolution_accepts_salvageable_failed_reviewer(self) -> None:
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. No code change is required and the implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600) -> list[object]:
+                return [reviewer]
+
+        self.assertTrue(
+            bot._order_has_verified_no_change_resolution(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                now=30.0,
+            )
+        )
+
     def test_collect_order_local_autonomy_funnel_counts_no_change_slice_as_closed(self) -> None:
         impl = SimpleNamespace(
             role="implementer_local",
