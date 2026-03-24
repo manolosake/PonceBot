@@ -464,35 +464,33 @@ class StatusService:
             and blocked_approval_total == 0
             and blocked_total == 0
         )
-        if no_open_jobs:
-            workers_out = []
+        if not no_open_jobs:
+            for role in roles:
+                n = int(max_parallel.get(role) or 1)
+                running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
+                queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
 
-        for role in roles:
-            n = int(max_parallel.get(role) or 1)
-            running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
-            queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
+                # Sort queued by the scheduler's intended order (priority asc, created_at asc).
+                queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
 
-            # Sort queued by the scheduler's intended order (priority asc, created_at asc).
-            queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
+                workers, occupied = _assign_running_to_workers(role, running, n)
 
-            workers, occupied = _assign_running_to_workers(role, running, n)
+                # Fill next tasks into idle workers.
+                q_idx = 0
+                for i in range(1, n + 1):
+                    if workers[i - 1]["current"] is not None:
+                        continue
+                    if q_idx < len(queued_sorted):
+                        workers[i - 1]["next"] = _task_to_status(queued_sorted[q_idx])
+                        q_idx += 1
 
-            # Fill next tasks into idle workers.
-            q_idx = 0
-            for i in range(1, n + 1):
-                if workers[i - 1]["current"] is not None:
-                    continue
-                if q_idx < len(queued_sorted):
-                    workers[i - 1]["next"] = _task_to_status(queued_sorted[q_idx])
-                    q_idx += 1
+                for t in running + queued:
+                    try:
+                        newest_updated_at = max(newest_updated_at, float(t.updated_at))
+                    except Exception:
+                        pass
 
-            for t in running + queued:
-                try:
-                    newest_updated_at = max(newest_updated_at, float(t.updated_at))
-                except Exception:
-                    pass
-
-            workers_out.extend(workers)
+                workers_out.extend(workers)
 
         staleness_seconds = max(0.0, float(now - newest_updated_at)) if newest_updated_at > 0 else None
         alerts = self._build_alerts(
