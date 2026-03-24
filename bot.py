@@ -13793,8 +13793,6 @@ def _task_requests_local_controller_recovery(
     trace = dict((getattr(task, "trace", {}) or {}))
     payload = structured_digest if isinstance(structured_digest, dict) else trace.get("structured_digest")
     specs = _controller_local_recovery_specs(payload)
-    if not specs:
-        return False
 
     action_hints: set[str] = set()
     if next_action is not None:
@@ -13815,7 +13813,11 @@ def _task_requests_local_controller_recovery(
     elif "write policy violation" in str(trace.get("result_summary") or "").strip().lower():
         write_policy_violation = True
 
-    return bool((action_hints & _CONTROLLER_LOCAL_RECOVERY_ACTIONS) or write_policy_violation)
+    if write_policy_violation:
+        return True
+    if not specs:
+        return False
+    return bool(action_hints & _CONTROLLER_LOCAL_RECOVERY_ACTIONS)
 
 
 def _task_counts_as_order_phase_blocker(task: Task) -> bool:

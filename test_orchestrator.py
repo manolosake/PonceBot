@@ -3994,6 +3994,28 @@ class TestSkynetLocalRecovery(unittest.TestCase):
                 )
             )
 
+    def test_blocked_controller_write_policy_violation_without_subtasks_still_requests_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, _q, order_id, repo_dir = self._seed_factory_order(td)
+            task = self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir)
+            trace = dict((task.trace or {}))
+            trace["structured_digest"] = {
+                "write_policy_violation": {
+                    "role": "skynet",
+                    "reason": "controller_write_policy_violation",
+                    "changed_paths": ["test_status_http.py"],
+                }
+            }
+            task = task.with_updates(trace=trace)
+            self.assertTrue(
+                bot._task_requests_local_controller_recovery(
+                    task,
+                    orch_state="blocked",
+                    next_action="delegate_local_subtask",
+                    structured_digest=trace["structured_digest"],
+                )
+            )
+
     def test_sync_order_phase_ignores_recoverable_blocked_controller_job(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)
