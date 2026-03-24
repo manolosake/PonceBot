@@ -12833,6 +12833,227 @@ def _proactive_lane_tick(
     return created
 
 
+
+def _enqueue_reviewer_local_rework_if_due(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_row: dict[str, Any],
+    chat_id: int,
+    now: float,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid:
+        return False
+    if not _is_proactive_order_record(order_row):
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=oid, limit=400)
+    except Exception:
+        return False
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(
+        _is_local_support_role_name(_coerce_orchestrator_role(str(getattr(child, "role", "") or "")))
+        and str(getattr(child, "state", "") or "").strip().lower() in active_states
+        for child in children
+    ):
+        return False
+
+    latest_review = None
+    latest_review_summary = ""
+    latest_review_ts = 0.0
+    for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
+        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "reviewer_local":
+            continue
+        if str(getattr(child, "state", "") or "").strip().lower() != "done":
+            continue
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        summary = _task_local_specialist_response(child, max_chars=5000)
+        if not summary:
+            trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
+            summary = str(trace.get("result_summary") or "").strip()
+        if not summary or not _text_has_no_go_signal(summary):
+            continue
+        latest_review = child
+        latest_review_summary = summary[:5000]
+        latest_review_ts = ts
+        break
+    if latest_review is None or not latest_review_summary:
+        return False
+
+    latest_impl = None
+    for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
+        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "implementer_local":
+            continue
+        if str(getattr(child, "state", "") or "").strip().lower() != "done":
+            continue
+        ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
+        if ts <= 0 or (float(now) - ts) > 3600.0:
+            continue
+        trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
+        if _trace_has_validated_slice_evidence(trace):
+            latest_impl = child
+            break
+
+    review_labels = dict((getattr(latest_review, "labels", {}) or {}) if isinstance(getattr(latest_review, "labels", {}), dict) else {})
+    review_key_raw = str(review_labels.get("key") or "").strip().lower()
+    review_suffix = ""
+    if review_key_raw.startswith("local_review_guard_"):
+        review_suffix = review_key_raw[len("local_review_guard_") :].strip()
+    if not review_suffix:
+        review_suffix = str(getattr(latest_review, "job_id", "") or "").split("-", 1)[0].strip()
+    used_keys = {
+        str(((getattr(child, "labels", {}) or {}) if isinstance(getattr(child, "labels", {}), dict) else {}).get("key") or "").strip()
+        for child in children
+        if str(((getattr(child, "labels", {}) or {}) if isinstance(getattr(child, "labels", {}), dict) else {}).get("key") or "").strip()
+    }
+    base_suffix = review_suffix or str(max(1, int(now)))
+    impl_key = f"local_impl_guard_{base_suffix}_r2"
+    retry_n = 2
+    while impl_key in used_keys:
+        retry_n += 1
+        impl_key = f"local_impl_guard_{base_suffix}_r{retry_n}"
+
+    impl_trace = dict((getattr(latest_impl, "trace", {}) or {}) if latest_impl and isinstance(getattr(latest_impl, "trace", {}), dict) else {})
+    impl_summary = _task_local_specialist_response(latest_impl, max_chars=7000) if latest_impl is not None else ""
+    if (not impl_summary) and impl_trace:
+        impl_summary = str(impl_trace.get("result_summary") or "").strip()
+    impl_artifacts_dir = str(getattr(latest_impl, "artifacts_dir", "") or "").strip() if latest_impl is not None else ""
+    patch_info = _trace_patch_info(impl_trace) if impl_trace else {}
+    changed_files = [str(item).strip() for item in (patch_info.get("changed_files") or []) if str(item).strip()]
+    match = re.search(r"EXPECTED_VALIDATION:\s*`([^`]+)`", latest_review_summary, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"EXPECTED_VALIDATION:\s*`([^`]+)`", impl_summary or "", flags=re.IGNORECASE)
+    validation_cmd = str(match.group(1) or "").strip() if match else ""
+    if not validation_cmd:
+        if len(changed_files) == 1 and changed_files[0].endswith('.py'):
+            validation_cmd = f"python3 -m py_compile {shlex.quote(changed_files[0])}"
+        elif changed_files and all(path.endswith('.py') for path in changed_files[:4]):
+            validation_cmd = "python3 -m py_compile " + " ".join(shlex.quote(path) for path in changed_files[:4])
+        else:
+            validation_cmd = "git diff --stat"
+
+    evidence_block = ""
+    if impl_summary:
+        evidence_block += "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n" + impl_summary
+    if changed_files:
+        evidence_block += "\n\nMANDATORY_FILE_SCOPE:\n- " + "\n- ".join(changed_files[:12])
+    if impl_artifacts_dir:
+        evidence_block += "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n" + impl_artifacts_dir
+
+    spec = TaskSpec(
+        key=impl_key,
+        role="implementer_local",
+        text=(
+            f"Reviewer-directed rework for ticket {oid}.\n"
+            f"Reviewer job: {str(getattr(latest_review, "job_id", "") or "").strip() or "(unknown)"}\n"
+            "Correct the exact reviewer blockers below without widening scope."
+            f"{evidence_block}\n\n"
+            "LATEST_REVIEWER_FINDINGS:\n"
+            f"{latest_review_summary}\n\n"
+            "Rules:\n"
+            "- Fix exactly the reviewer blockers before anything else.\n"
+            "- If MANDATORY_FILE_SCOPE is present, edit only those files unless one adjacent test/config file is strictly required.\n"
+            "- Do not ask for another architecture pass.\n"
+            "- Return one single fenced ```diff``` block or explicit rewrite block(s).\n"
+            f"- After the code block(s), add EXPECTED_VALIDATION: `{validation_cmd}`.\n"
+            "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
+        ),
+        mode_hint="ro",
+        priority=1,
+        depends_on=[],
+        requires_approval=False,
+        acceptance_criteria=[
+            "Address the reviewer_local blocking issue directly without widening scope.",
+            "Return one bounded patch plus a targeted validation command.",
+        ],
+        definition_of_done=[
+            "A corrected implementer slice is ready for reviewer_local re-check.",
+        ],
+        eta_minutes=40,
+        sla_tier="high",
+    )
+
+    child_profile = _orchestrator_profile(profiles, "implementer_local")
+    model = _orchestrator_model_for_profile(cfg, child_profile)
+    effort = _orchestrator_effort_for_profile(child_profile, cfg)
+    mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+    requires_approval = False
+    child_id = str(uuid.uuid4())
+    contract_text = _compose_subtask_instruction(spec, root_ticket=oid)
+    trace: dict[str, str | int | float | bool | list[str]] = {
+        "source": "scheduler",
+        "delegated_by": str(getattr(latest_review, "job_id", "") or "").strip() or oid,
+        "delegated_key": spec.key,
+        "requested_role": "implementer_local",
+        "profile_name": str(child_profile.get("name") or "implementer_local"),
+        "profile_role": "implementer_local",
+        "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
+        "acceptance_criteria": list(spec.acceptance_criteria or []),
+        "definition_of_done": list(spec.definition_of_done or []),
+        "eta_minutes": int(spec.eta_minutes or 0),
+        "sla_tier": str(spec.sla_tier or "normal"),
+        "slice_id": _slice_id_from_local_key(str(spec.key or ""), fallback=f"{oid[:8]}_slice"),
+        "slice_status": "planned",
+        "quality_gate_status": "planned",
+        "failure_class": "retriable",
+        "attempt_n": int(retry_n),
+        "improvement_verified": False,
+        "execution_policy": "local_only",
+    }
+    order_branch = _resolve_order_branch(orch_q=orch_q, root_ticket=oid)
+    if order_branch:
+        trace["order_branch"] = str(order_branch)
+    child = Task.new(
+        source="telegram",
+        role="implementer_local",
+        input_text=contract_text,
+        request_type="task",
+        priority=int(spec.priority),
+        model=model,
+        effort=effort,
+        mode_hint=mode_hint,
+        requires_approval=requires_approval,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id=oid,
+        owner="scheduler",
+        depends_on=[],
+        ttl_seconds=int(_ttl_seconds_from_spec(spec)),
+        max_retries=1,
+        labels={"ticket": oid, "kind": "subtask", "key": spec.key},
+        artifacts_dir=str((cfg.artifacts_root / child_id).resolve()),
+        trace=trace,
+        job_id=child_id,
+    )
+    orch_q.submit_task(child)
+    try:
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="executing")
+        orch_q.update_trace(
+            oid,
+            local_rework_seeded_at=float(now),
+            local_rework_seeded_job_id=child_id,
+            local_rework_seeded_from_review=str(getattr(latest_review, 'job_id', '') or '').strip() or None,
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.local_rework_seeded",
+            actor="scheduler",
+            details={
+                "order_id": oid,
+                "job_id": child_id,
+                "from_review_job_id": str(getattr(latest_review, 'job_id', '') or '').strip() or None,
+                "validation_cmd": validation_cmd,
+            },
+        )
+    except Exception:
+        pass
+    return True
+
 def _enqueue_order_autopilot_task(
     *,
     cfg: BotConfig,
@@ -12914,6 +13135,16 @@ def _enqueue_order_autopilot_task(
         last_enqueued_at = 0.0
     if last_enqueued_at > 0 and float(cooldown_seconds) > 0 and (float(now) - last_enqueued_at) < float(cooldown_seconds):
         return False
+
+    if _enqueue_reviewer_local_rework_if_due(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        order_row=order_row,
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return True
 
     is_proactive = _is_proactive_order_record(order_row)
     controller_role = "skynet" if is_proactive else "jarvis"
