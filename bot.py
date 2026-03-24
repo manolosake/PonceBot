@@ -13545,6 +13545,90 @@ def _has_open_local_support_work(tasks: list[Task]) -> bool:
     return False
 
 
+_CONTROLLER_LOCAL_RECOVERY_ACTIONS = frozenset(
+    {
+        "delegate_local_subtask",
+        "delegate_now",
+        "delegate",
+        "replan",
+    }
+)
+
+
+def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
+    if not isinstance(structured_digest, dict):
+        return []
+    specs = parse_orchestrator_subtasks(structured_digest)
+    if not specs:
+        return []
+    filtered, _dropped_roles = _filter_specs_to_skynet_local_executors(specs)
+    return list(filtered)
+
+
+def _task_requests_local_controller_recovery(
+    task: Task,
+    *,
+    orch_state: str | None = None,
+    next_action: str | None = None,
+    structured_digest: Any = None,
+) -> bool:
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if not _is_controller_role(role_norm):
+        return False
+    state_norm = str(orch_state or getattr(task, "state", "") or "").strip().lower()
+    if state_norm not in {"blocked", "blocked_approval"}:
+        return False
+
+    labels = dict((getattr(task, "labels", {}) or {}))
+    kind = str(labels.get("kind") or "").strip().lower()
+    if not str(getattr(task, "parent_job_id", "") or "").strip() and kind not in {
+        "autopilot",
+        "final_sweep",
+        "delivery_replan",
+        "blocked_replan",
+        "stalled_replan",
+        "sla_replan",
+        "merge_conflict_replan",
+    }:
+        return False
+
+    trace = dict((getattr(task, "trace", {}) or {}))
+    payload = structured_digest if isinstance(structured_digest, dict) else trace.get("structured_digest")
+    specs = _controller_local_recovery_specs(payload)
+    if not specs:
+        return False
+
+    action_hints: set[str] = set()
+    if next_action is not None:
+        action_hints.add(str(next_action or "").strip().lower())
+    stored_next_action = str(trace.get("result_next_action") or "").strip().lower()
+    if stored_next_action:
+        action_hints.add(stored_next_action)
+    if isinstance(payload, dict):
+        next_action_obj = payload.get("next_action")
+        if isinstance(next_action_obj, dict):
+            action_hints.add(str(next_action_obj.get("type") or "").strip().lower())
+
+    write_policy_violation = False
+    if isinstance(payload, dict) and isinstance(payload.get("write_policy_violation"), dict):
+        write_policy_violation = True
+    elif isinstance(trace.get("write_policy_violation"), dict):
+        write_policy_violation = True
+    elif "write policy violation" in str(trace.get("result_summary") or "").strip().lower():
+        write_policy_violation = True
+
+    return bool((action_hints & _CONTROLLER_LOCAL_RECOVERY_ACTIONS) or write_policy_violation)
+
+
+def _task_counts_as_order_phase_blocker(task: Task) -> bool:
+    state_norm = str(getattr(task, "state", "") or "").strip().lower()
+    if state_norm not in {"blocked", "blocked_approval", "failed"}:
+        return False
+    if state_norm in {"blocked", "blocked_approval"} and _task_requests_local_controller_recovery(task):
+        return False
+    return True
+
+
 def _extract_objective_tokens(text: str) -> set[str]:
     raw = str(text or "").lower()
     toks = re.findall(r"[a-z0-9_]{4,}", raw)
@@ -16359,7 +16443,8 @@ def _sync_order_phase_from_runtime(
     deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
-    if not children:
+    phase_children = [child for child in children if not _task_requests_local_controller_recovery(child)]
+    if not phase_children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
 
@@ -16394,8 +16479,8 @@ def _sync_order_phase_from_runtime(
         except Exception:
             pass
 
-    states = [str(c.state or "").strip().lower() for c in children]
-    wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
+    states = [str(c.state or "").strip().lower() for c in phase_children]
+    wrapups = [c for c in phase_children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
     wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
     wrapup_active = any(str(w.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for w in wrapups)
     any_live = any(s in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for s in states)
@@ -16409,7 +16494,7 @@ def _sync_order_phase_from_runtime(
             trace=root_trace,
         )
     ) and bool(root_trace.get("improvement_verified", False))
-    for child in children:
+    for child in phase_children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
         if not _is_controller_role(role_norm) or state != "done":
@@ -16523,7 +16608,7 @@ def _sync_order_phase_from_runtime(
             pass
         return
 
-    if any(s in ("blocked", "blocked_approval", "failed") for s in states):
+    if any(_task_counts_as_order_phase_blocker(child) for child in phase_children):
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
         return
     if any(s == "running" for s in states):
@@ -18086,6 +18171,45 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
             continue
         if cleaned >= max_jobs:
             break
+        if _task_requests_local_controller_recovery(task, orch_state=st):
+            prior_summary = str(((task.trace or {}) if isinstance(task.trace, dict) else {}).get("result_summary") or "").strip()
+            recovery_summary = "Auto-cancelled stale blocked controller job so the factory can replan through local specialists."
+            if prior_summary:
+                recovery_summary = (
+                    recovery_summary
+                    + "\nPrevious blocked summary (for context only): "
+                    + prior_summary[:320]
+                )
+            try:
+                orch_q.update_state(
+                    task.job_id,
+                    "cancelled",
+                    result_summary=recovery_summary,
+                    result_next_action="replan_local_recovery",
+                    failure_class="retriable",
+                    stale_controller_local_recovery=True,
+                    stale_controller_local_recovery_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="task.controller_local_recovery_cancelled",
+                    actor="scheduler",
+                    details={
+                        "job_id": task.job_id,
+                        "state": st,
+                        "role": str(task.role or ""),
+                        "stale_after_seconds": float(stale_after_s),
+                    },
+                )
+                if int(getattr(task, "chat_id", 0) or 0) > 0:
+                    _sync_order_phase_from_runtime(
+                        orch_q=orch_q,
+                        root_ticket=(str(task.parent_job_id or "").strip() or str(task.job_id or "").strip()),
+                        chat_id=int(task.chat_id),
+                    )
+                cleaned += 1
+                continue
+            except Exception:
+                pass
         try:
             orch_q.update_state(
                 task.job_id,
@@ -23274,8 +23398,17 @@ def orchestrator_worker_loop(
                 is_controller = _is_controller_role(controller_actor)
                 is_query = (task.request_type or "task") == "query"
                 is_top_level_manual = (not task.is_autonomous) and (not task.parent_job_id) and ((task.request_type or "task") == "task")
+                controller_local_recovery = bool(
+                    is_controller
+                    and _task_requests_local_controller_recovery(
+                        task,
+                        orch_state=orch_state,
+                        next_action=next_action,
+                        structured_digest=structured_digest,
+                    )
+                )
 
-                if orch_state == "done" and is_controller and (not is_query) and (is_top_level_manual or allow_delegation):
+                if (orch_state == "done" or controller_local_recovery) and is_controller and (not is_query) and (is_top_level_manual or allow_delegation or controller_local_recovery):
                     root_ticket = (task.parent_job_id or task.job_id or "").strip() or task.job_id
                     order_branch_for_root = _resolve_order_branch_from_task(task, orch_q)
                     existing = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=400)
@@ -24205,6 +24338,44 @@ def orchestrator_worker_loop(
                                     )
                             except Exception:
                                 pass
+                            if controller_local_recovery and str(task.parent_job_id or "").strip() and str(task.job_id or "").strip() != str(root_ticket):
+                                prior_summary = str(summary or "").strip()
+                                recovery_summary = (
+                                    "Auto-cancelled blocked controller meta-job after delegating recovery to local specialists."
+                                )
+                                if prior_summary:
+                                    recovery_summary = (
+                                        recovery_summary
+                                        + "\nPrevious blocked summary (for context only): "
+                                        + prior_summary[:320]
+                                    )
+                                try:
+                                    orch_q.update_state(
+                                        task.job_id,
+                                        "cancelled",
+                                        result_summary=recovery_summary,
+                                        result_next_action="delegated_local_recovery",
+                                        failure_class="retriable",
+                                        delegated_local_recovery=True,
+                                        delegated_local_recovery_at=time.time(),
+                                        delegated_local_recovery_children=[str(child.job_id) for child in children[:12]],
+                                    )
+                                    orch_q.append_audit_event(
+                                        event_type="task.controller_local_recovery_delegated",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "job_id": str(task.job_id),
+                                            "delegated_children": int(len(children)),
+                                        },
+                                    )
+                                    _sync_order_phase_from_runtime(
+                                        orch_q=orch_q,
+                                        root_ticket=root_ticket,
+                                        chat_id=int(task.chat_id),
+                                    )
+                                except Exception:
+                                    pass
 
                     # Wrap-up is only scheduled for manual top-level tickets (avoid autopilot spam).
                     if is_top_level_manual:

@@ -3871,6 +3871,189 @@ class TestFactoryCeoStrategyApproval(unittest.TestCase):
             )
             self.assertFalse(created)
 
+
+class TestSkynetLocalRecovery(unittest.TestCase):
+    def _profiles(self) -> dict[str, dict[str, object]]:
+        return {
+            "skynet": {
+                "name": "Skynet",
+                "model": "gpt-5.2-codex",
+                "effort": "medium",
+                "mode_hint": "ro",
+                "max_runtime_seconds": 1200,
+            }
+        }
+
+    def _seed_factory_order(self, td: str) -> tuple[bot.BotConfig, OrchestratorQueue, str, Path]:
+        root = Path(td)
+        cfg = _cfg(root / "state.json", workdir=root)
+        storage = SQLiteTaskStorage(root / "jobs.sqlite")
+        q = OrchestratorQueue(storage=storage, role_profiles=None)
+        repo_dir = root / "repo"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        order_id = "99999999-1111-1111-1111-111111111111"
+        q.upsert_order(
+            order_id=order_id,
+            chat_id=1,
+            title="Proactive Sprint: codexbot Reliability + Delivery",
+            body="Ship one bounded improvement. [repo:codexbot-6fb8d5b9]",
+            status="active",
+            priority=2,
+            phase="review",
+            project_id="codexbot-6fb8d5b9",
+        )
+        q.submit_task(
+            Task.new(
+                source="telegram",
+                role="skynet",
+                input_text="AUTONOMOUS PROACTIVE SPRINT",
+                request_type="maintenance",
+                priority=1,
+                model="gpt-5.2-codex",
+                effort="medium",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="done",
+                is_autonomous=True,
+                trace={
+                    "allow_delegation": True,
+                    "proactive_lane": True,
+                    "repo_id": "codexbot-6fb8d5b9",
+                    "repo_path": str(repo_dir),
+                    "factory_order": True,
+                },
+                job_id=order_id,
+            )
+        )
+        return cfg, q, order_id, repo_dir
+
+    def _blocked_final_sweep_task(self, *, order_id: str, repo_dir: Path, state: str = "blocked") -> Task:
+        return Task.new(
+            source="telegram",
+            role="skynet",
+            input_text="FINAL SWEEP",
+            request_type="maintenance",
+            priority=1,
+            model="gpt-5.2-codex",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=1.0,
+            chat_id=1,
+            state=state,
+            is_autonomous=True,
+            parent_job_id=order_id,
+            labels={"ticket": order_id, "kind": "final_sweep"},
+            trace={
+                "allow_delegation": True,
+                "proactive_lane": True,
+                "repo_id": "codexbot-6fb8d5b9",
+                "repo_path": str(repo_dir),
+                "result_next_action": "delegate_local_subtask",
+                "result_summary": (
+                    "Write policy violation: skynet modified repository files directly. "
+                    "Skynet factory work must delegate code changes to local specialists instead of editing in the controller lane."
+                ),
+                "structured_digest": {
+                    "write_policy_violation": {
+                        "role": "skynet",
+                        "reason": "controller_write_policy_violation",
+                        "changed_paths": ["bot.py"],
+                    },
+                    "next_action": {
+                        "type": "delegate_now",
+                        "subtasks": [
+                            {
+                                "key": "local_arch_guard_1773946787",
+                                "role": "architect_local",
+                                "text": "Plan one bounded recovery slice for codexbot.",
+                                "acceptance_criteria": ["Name exact files and one validation command."],
+                                "definition_of_done": ["Architect handoff is actionable for implementer_local."],
+                            }
+                        ],
+                    },
+                },
+            },
+            job_id="aaaa1111-bbbb-cccc-dddd-eeeeffff0000",
+        )
+
+    def test_blocked_controller_write_policy_violation_requests_local_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, _q, order_id, repo_dir = self._seed_factory_order(td)
+            task = self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir)
+            trace = dict((task.trace or {}))
+            structured = trace.get("structured_digest")
+            self.assertTrue(
+                bot._task_requests_local_controller_recovery(
+                    task,
+                    orch_state="blocked",
+                    next_action="delegate_local_subtask",
+                    structured_digest=structured,
+                )
+            )
+
+    def test_sync_order_phase_ignores_recoverable_blocked_controller_job(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)
+            q.submit_task(self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir))
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="architect_local",
+                    input_text="Plan a bounded local slice.",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2-codex",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="queued",
+                    is_autonomous=True,
+                    parent_job_id=order_id,
+                    labels={"ticket": order_id, "kind": "subtask", "key": "local_arch_guard_1773946787"},
+                    trace={"slice_id": "1773946787", "slice_status": "planned"},
+                    job_id="bbbb1111-bbbb-cccc-dddd-eeeeffff0000",
+                )
+            )
+
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("phase") or ""), "delegated")
+
+    def test_stale_blocked_controller_job_is_cancelled_for_local_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)
+            blocked = self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir)
+            q.submit_task(blocked)
+            stale_ts = float(_time.time() - 7200.0)
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ?, stalled_since = ? WHERE job_id = ?",
+                    (stale_ts, stale_ts, stale_ts, blocked.job_id),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_HYGIENE_STALE_BLOCKED_SECONDS": "60"}, clear=False):
+                cleaned = bot._cleanup_stale_blocked_jobs(orch_q=q, now=_time.time())
+
+            self.assertEqual(cleaned, 1)
+            refreshed = q.get_job(blocked.job_id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "cancelled")
+            self.assertTrue(bool((refreshed.trace or {}).get("stale_controller_local_recovery", False)))
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("phase") or ""), "review")
+
     def test_autopilot_skip_when_no_progress_backoff_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = _cfg(Path(td) / "state.json", workdir=Path(td))

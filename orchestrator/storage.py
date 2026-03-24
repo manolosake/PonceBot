@@ -2933,7 +2933,7 @@ class SQLiteTaskStorage:
             rows = conn.execute(
                 """
                 SELECT * FROM jobs
-                WHERE state IN ('waiting_deps', 'blocked_approval')
+                WHERE state IN ('waiting_deps', 'blocked_approval', 'blocked')
                   AND stalled_since IS NOT NULL
                   AND stalled_since <= ?
                 ORDER BY stalled_since ASC
