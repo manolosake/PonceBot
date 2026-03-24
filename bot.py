@@ -13008,7 +13008,13 @@ def _enqueue_reviewer_local_rework_if_due(
         "improvement_verified": False,
         "execution_policy": "local_only",
     }
-    order_branch = _resolve_order_branch(orch_q=orch_q, root_ticket=oid)
+    order_branch = ""
+    try:
+        root_job = orch_q.get_job(oid)
+        root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+        order_branch = str(root_trace.get("order_branch") or "").strip()
+    except Exception:
+        order_branch = ""
     if order_branch:
         trace["order_branch"] = str(order_branch)
     child = Task.new(
