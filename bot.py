@@ -15414,6 +15414,8 @@ def _response_signals_no_code_change(text: str) -> bool:
         "no code change to apply",
         "no concrete code change to apply",
         "no actionable code change",
+        "no additional code change required",
+        "no additional code change is required",
         "already implemented",
         "already complete",
         "already correct",

@@ -298,6 +298,9 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("reviewed_ready", bot._LOCAL_SLICE_ALLOWED_TRANSITIONS["planned"])
 
 
+    def test_response_signals_no_code_change_accepts_additional_change_wording(self) -> None:
+        self.assertTrue(bot._response_signals_no_code_change("READY. No additional code change is required."))
+
     def test_task_counts_as_order_phase_blocker_ignores_salvageable_failed_reviewer(self) -> None:
         task = SimpleNamespace(
             role="reviewer_local",
