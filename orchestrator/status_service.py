@@ -395,10 +395,12 @@ class StatusService:
 
         workers_out: list[dict[str, Any]] = []
         # Scope counts: when chat_id is provided, only count jobs for that chat.
+        counts_ok = True
         try:
             role_health = self.orch_q.get_role_health(chat_id=chat_id)
         except Exception:
             role_health = {}
+            counts_ok = False
         try:
             queued_total = int(self.orch_q.get_queued_count(chat_id=chat_id))
             waiting_deps_total = int(self.orch_q.get_waiting_deps_count(chat_id=chat_id))
@@ -409,12 +411,14 @@ class StatusService:
             waiting_deps_total = 0
             blocked_approval_total = 0
             running_total = 0
+            counts_ok = False
         blocked_total = 0
         try:
             for rec in (role_health or {}).values():
                 blocked_total += int((rec or {}).get("blocked", 0) or 0)
         except Exception:
             blocked_total = 0
+            counts_ok = False
 
         blocked_requires_approval: list[dict[str, Any]] = []
         try:
@@ -464,7 +468,7 @@ class StatusService:
             and blocked_approval_total == 0
             and blocked_total == 0
         )
-        if not no_open_jobs:
+        if counts_ok and not no_open_jobs:
             for role in roles:
                 n = int(max_parallel.get(role) or 1)
                 running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
