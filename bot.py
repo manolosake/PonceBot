@@ -16317,8 +16317,10 @@ def _apply_autonomous_local_first_policy(
                     f"Validate implementer_local no-change claim for ticket {rid}.\n"
                     f"Implementer job: {impl_job_id or '(unknown)'}\n"
                     "Inspect the target files directly in the workspace.\n"
-                    "- If no code change is truly required and behavior is already correct, return READY with exact file evidence + one validation command.\n"
-                    "- If code change is required, return NEEDS_REWORK with exact files and the smallest implementer slice.\n"
+                    "Evaluate whether any additional code change is required beyond the current branch/workspace state for this slice.\n"
+                    "Do not reject only because the branch already contains earlier valid code changes.\n"
+                    "- If no additional code change is truly required and behavior is already correct, return READY with exact file evidence + one validation command.\n"
+                    "- If an additional code change is required, return NEEDS_REWORK with exact files and the smallest implementer slice.\n"
                     "- Do not request another architecture pass."
                 ),
                 mode_hint="ro",
