@@ -955,6 +955,149 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertIn("tools/proactive_health_report.py", specs[0].text)
             self.assertIn("EXPECTED_VALIDATION", specs[0].text)
 
+    def test_autonomous_local_first_synthesizes_implementer_rework_from_reviewer_no_go(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1" / "orchestrator"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "runbooks.py").write_text("def to_task(runbook, chat_id):\n    return None\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                impl_trace = {
+                    "result_summary": (
+                        "Bounded runbook patch prepared.\n"
+                        "EXPECTED_VALIDATION: `python3 -m unittest -q test_orchestrator`"
+                    ),
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {
+                        "changed_files": ["orchestrator/runbooks.py"],
+                        "validation_ok": True,
+                    },
+                }
+                review_trace = {
+                    "result_summary": (
+                        "Verdict: NEEDS_REWORK. Blocking issue: `Task.new(...)` does not accept `ticket`. "
+                        "Remove the invalid kwarg and keep the slice bounded."
+                    )
+                }
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 90.0, 89.0, ?, ?, ?)",
+                    (
+                        "impl-job-1",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-1"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(impl_trace),
+                    ),
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 100.0, 99.0, ?, ?, ?)",
+                    (
+                        "review-job-1",
+                        "ticket-1",
+                        "reviewer_local",
+                        str(repo_root / "artifacts" / "review-job-1"),
+                        json.dumps({"key": "local_review_guard_slice1"}),
+                        json.dumps(review_trace),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve proactive local delegation. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=120.0,
+                    )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "implementer_local")
+            self.assertIn("LATEST_REVIEWER_FINDINGS", specs[0].text)
+            self.assertIn("`Task.new(...)` does not accept `ticket`", specs[0].text)
+            self.assertIn("orchestrator/runbooks.py", specs[0].text)
+            self.assertIn("python3 -m unittest -q test_orchestrator", specs[0].text)
+
     def test_dedupe_specs_by_signature_allows_retry_after_recent_failed_local_guard(self) -> None:
         spec = bot.TaskSpec(
             key="local_impl_guard_retry_new",

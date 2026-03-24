@@ -15885,6 +15885,7 @@ def _apply_autonomous_local_first_policy(
             or int(latest_impl_failed_attempt_n) >= 2
         )
     )
+    latest_review_done: dict[str, Any] | None = None
     latest_review_done_summary = ""
     latest_review_done_ts = 0.0
     for meta in _latest_done_meta("reviewer_local", limit=12):
@@ -15897,6 +15898,7 @@ def _apply_autonomous_local_first_policy(
             text = _row_local_response(meta, max_chars=4000)
             summary = str(text or "").strip()
         if summary:
+            latest_review_done = meta
             latest_review_done_summary = summary[:4000]
             latest_review_done_ts = float(ts)
             break
@@ -16221,6 +16223,119 @@ def _apply_autonomous_local_first_policy(
                 sla_tier="high",
             )
         ]
+
+    def _extract_expected_validation_command(*, text: str, fallback_changed_files: list[str] | None = None) -> str:
+        blob = str(text or "")
+        match = re.search(r"EXPECTED_VALIDATION:\s*`([^`]+)`", blob, flags=re.IGNORECASE)
+        if not match:
+            match = re.search(r"EXPECTED_VALIDATION:\s*(.+)", blob, flags=re.IGNORECASE)
+        if match:
+            cmd = str(match.group(1) or "").strip().strip("`")
+            if cmd:
+                return cmd[:240]
+        changed_files = [str(item).strip() for item in (fallback_changed_files or []) if str(item).strip()]
+        if len(changed_files) == 1 and changed_files[0].endswith('.py'):
+            return f"python3 -m py_compile {shlex.quote(changed_files[0])}"
+        if changed_files and all(path.endswith('.py') for path in changed_files[:4]):
+            return "python3 -m py_compile " + " ".join(shlex.quote(path) for path in changed_files[:4])
+        return "git diff --stat"
+
+    def _latest_review_rework_impl_specs() -> list[TaskSpec]:
+        if latest_review_done is None or not latest_review_done_summary:
+            return []
+        if not _text_has_no_go_signal(latest_review_done_summary):
+            return []
+        if active_implementer_open or active_reviewer_open:
+            return []
+        review_job_id = str(latest_review_done.get("job_id") or "").strip()
+        review_labels = (
+            (latest_review_done.get("labels") or {})
+            if isinstance(latest_review_done.get("labels"), dict)
+            else {}
+        )
+        review_key_raw = str(review_labels.get("key") or "").strip().lower()
+        review_suffix = ""
+        if review_key_raw.startswith("local_review_guard_"):
+            review_suffix = review_key_raw[len("local_review_guard_") :].strip()
+        if not review_suffix and review_job_id:
+            review_suffix = review_job_id.split("-", 1)[0].strip()
+        used_keys = {
+            str((getattr(child, "labels", {}) or {}).get("key") or "").strip()
+            for child in existing_children
+            if str((getattr(child, "labels", {}) or {}).get("key") or "").strip()
+        }
+        base_suffix = review_suffix or str(max(1, int(now)))
+        impl_key = f"local_impl_guard_{base_suffix}_r2"
+        attempt_idx = 2
+        while impl_key in used_keys:
+            attempt_idx += 1
+            impl_key = f"local_impl_guard_{base_suffix}_r{attempt_idx}"
+        impl_trace = dict(latest_impl_done.get("trace") or {}) if isinstance(latest_impl_done, dict) and isinstance(latest_impl_done.get("trace"), dict) else {}
+        impl_summary = _row_local_response(latest_impl_done, max_chars=7000) if latest_impl_done is not None else ""
+        if (not impl_summary) and impl_trace:
+            impl_summary = str(impl_trace.get("result_summary") or "").strip()
+        impl_artifacts_dir = str(latest_impl_done.get("artifacts_dir") or "").strip() if latest_impl_done is not None else ""
+        impl_patch_info = _trace_patch_info(impl_trace) if impl_trace else {}
+        impl_changed_files = [
+            str(item).strip()
+            for item in (impl_patch_info.get("changed_files") or [])
+            if str(item).strip()
+        ]
+        validation_cmd = _extract_expected_validation_command(
+            text=latest_review_done_summary,
+            fallback_changed_files=impl_changed_files,
+        )
+        evidence_block = ""
+        if impl_summary:
+            evidence_block += (
+                "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n"
+                f"{impl_summary}"
+            )
+        if impl_changed_files:
+            evidence_block += (
+                "\n\nMANDATORY_FILE_SCOPE:\n- "
+                + "\n- ".join(impl_changed_files[:12])
+            )
+        if impl_artifacts_dir:
+            evidence_block += (
+                "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n"
+                f"{impl_artifacts_dir}"
+            )
+        return [
+            TaskSpec(
+                key=impl_key,
+                role="implementer_local",
+                text=(
+                    f"Reviewer-directed rework for ticket {rid}.\n"
+                    f"Reviewer job: {review_job_id or '(unknown)'}\n"
+                    "Correct the exact reviewer blockers below without widening scope."
+                    f"{evidence_block}\n\n"
+                    "LATEST_REVIEWER_FINDINGS:\n"
+                    f"{latest_review_done_summary}\n\n"
+                    "Rules:\n"
+                    "- Fix exactly the reviewer blockers before anything else.\n"
+                    "- If MANDATORY_FILE_SCOPE is present, edit only those files unless one adjacent test/config file is strictly required.\n"
+                    "- Do not ask for another architecture pass.\n"
+                    "- Return one single fenced ```diff``` block or explicit rewrite block(s).\n"
+                    f"- After the code block(s), add EXPECTED_VALIDATION: `{validation_cmd}`.\n"
+                    "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Address the reviewer_local blocking issue directly without widening scope.",
+                    "Return one bounded patch plus a targeted validation command.",
+                ],
+                definition_of_done=[
+                    "A corrected implementer slice is ready for reviewer_local re-check.",
+                ],
+                eta_minutes=40,
+                sla_tier="high",
+            )
+        ]
+
 
     def _latest_arch_implementer_specs() -> list[TaskSpec]:
         if not latest_arch_response or active_implementer_open or active_reviewer_open:
@@ -16597,6 +16712,10 @@ def _apply_autonomous_local_first_policy(
         and planner_local_roles.issubset({"architect_local", "implementer_local"})
     ):
         return _impl_no_change_review_specs()
+
+    review_rework_specs = _latest_review_rework_impl_specs()
+    if review_rework_specs:
+        return review_rework_specs
 
     validated_impl_review_specs = _latest_validated_impl_review_specs()
     if validated_impl_review_specs:
