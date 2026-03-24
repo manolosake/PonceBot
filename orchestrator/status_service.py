@@ -4,10 +4,13 @@ from dataclasses import dataclass
 from typing import Any
 import hashlib
 import json
+import logging
 import time
 
 from .queue import OrchestratorQueue
 from .schemas.task import Task
+
+logger = logging.getLogger(__name__)
 
 
 def _max_parallel_by_role(role_profiles: dict[str, dict[str, Any]] | None) -> dict[str, int]:
@@ -96,13 +99,33 @@ def _task_to_status(t: Task) -> dict[str, Any]:
 
     result_next_action = str(tr.get("result_next_action") or "").strip() or None
 
+    waiting_dependencies = None
+    try:
+        raw_waiting = getattr(t, "waiting_dependencies", None)
+        if raw_waiting is None:
+            raw_waiting = (t.trace or {}).get("waiting_dependencies")
+        if raw_waiting is not None:
+            waiting_dependencies = int(raw_waiting)
+    except Exception:
+        waiting_dependencies = None
+
+    blockers_stale = False
+    effective_state = t.state
+    if t.state == "blocked_waiting_only" and waiting_dependencies == 0:
+        blockers_stale = True
+        effective_state = "ready"
+        logger.info(
+            "StatusService: auto-transition blocked_waiting_only job %s to ready (waiting_dependencies=0)",
+            t.job_id,
+        )
+
     approved = bool(tr.get("approved", False))
 
     return {
         "job_id": t.job_id,
         "job_id_short": t.job_id[:8],
         "role": t.role,
-        "state": t.state,
+        "state": effective_state,
         "priority": int(t.priority or 2),
         "request_type": t.request_type,
         "mode_hint": t.mode_hint,
@@ -124,6 +147,8 @@ def _task_to_status(t: Task) -> dict[str, Any]:
         "live_stderr_tail": stderr_tail,
         "result_summary": result_summary,
         "result_next_action": result_next_action,
+        "waiting_dependencies": waiting_dependencies,
+        "blockers_stale": blockers_stale,
     }
 
 def _assign_running_to_workers(
