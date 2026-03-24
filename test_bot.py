@@ -1463,6 +1463,69 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
             self.assertIn("_SKILL_SEGMENT_RE.fullmatch(s)", target.read_text(encoding="utf-8"))
 
+    def test_finalize_codex_implementer_change_applies_begin_patch_update(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "orchestrator" / "delegation.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            original = (
+                "def parse_orchestrator_subtasks(text):\n"
+                "    ticket_line = f\" Ticket: {ticket_id}.\" if ticket_id else \"\"\n"
+                "    text = (\n"
+                "        \"Provide a single, bounded implementer-ready slice for proactive idle watchdog reseed.\"\n"
+                "        \" Include exact file(s), one concrete change, validation command, and risks.\"\n"
+                "        f\"{ticket_line}\"\n"
+                "    )\n"
+                "    acceptance_criteria = [\"Return one implementer-ready slice with file-scoped change and validation.\"]\n"
+                "    return text, acceptance_criteria\n"
+            )
+            updated_snippet = "Match the ticket acceptance criteria"
+            target.write_text(original, encoding="utf-8")
+            subprocess.run(["git", "add", "orchestrator/delegation.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            body = (
+                "```diff\n"
+                "*** Begin Patch\n"
+                "*** Update File: orchestrator/delegation.py\n"
+                "@@\n"
+                "     text = (\n"
+                "         \"Provide a single, bounded implementer-ready slice for proactive idle watchdog reseed.\"\n"
+                "-        \" Include exact file(s), one concrete change, validation command, and risks.\"\n"
+                "+        \" Match the ticket acceptance criteria: include exact file(s), one concrete change,\"\n"
+                "+        \" a diff or rewrite block, validation command, and risks.\"\n"
+                "         f\"{ticket_line}\"\n"
+                "     )\n"
+                "@@\n"
+                "-    acceptance_criteria = [\"Return one implementer-ready slice with file-scoped change and validation.\"]\n"
+                "+    acceptance_criteria = [\n"
+                "+        \"Return one implementer-ready slice with file-scoped change, diff or rewrite, and validation.\",\n"
+                "+    ]\n"
+                "*** End Patch\n"
+                "```\n"
+            )
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertIn("orchestrator/delegation.py", patch_info.get("changed_files", []))
+            self.assertEqual(str(patch_info.get("apply_mode") or ""), "apply_patch")
+            self.assertTrue(bool(patch_info.get("validation_ok", False)))
+            self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
+            self.assertIn(updated_snippet, target.read_text(encoding="utf-8"))
+
     def test_finalize_codex_implementer_change_treats_already_fixed_blocker_as_no_change(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"

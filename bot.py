@@ -4381,6 +4381,21 @@ def _extract_first_diff_block(text: str) -> str:
     return ""
 
 
+def _extract_first_apply_patch_block(text: str) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    match = re.search(
+        r"(\*\*\* Begin Patch\r?\n.*?\r?\n\*\*\* End Patch\s*)",
+        raw,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return ""
+    patch = textwrap.dedent(str(match.group(1) or "")).strip()
+    return (patch + "\n") if patch else ""
+
+
 def _extract_structured_result_payload(text: str) -> dict[str, Any] | None:
     raw = str(text or "").strip()
     if not raw:
@@ -4569,7 +4584,57 @@ def _extract_changed_files_from_patch_text(text: str) -> list[str]:
             continue
         seen.add(candidate)
         found.append(candidate)
+    if found:
+        return found
+    for line in raw.splitlines():
+        candidate = ""
+        for prefix in ("*** Update File: ", "*** Add File: ", "*** Delete File: ", "*** Move to: "):
+            if line.startswith(prefix):
+                candidate = line[len(prefix) :].strip().lstrip("./")
+                break
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        found.append(candidate)
     return found
+
+
+def _apply_patch_line_content(line: str) -> str:
+    if not line:
+        return ""
+    return str(line[1:] if line[:1] in {" ", "+", "-"} else line)
+
+
+def _find_apply_patch_context(lines: list[str], needle: list[str], *, start: int) -> int:
+    if not needle:
+        return max(0, min(start, len(lines)))
+    normalized_lines = [str(line).rstrip("\n") for line in lines]
+    normalized_needle = [str(line).rstrip("\n") for line in needle]
+    upper = max(0, len(normalized_lines) - len(normalized_needle))
+    for idx in range(max(0, start), upper + 1):
+        if normalized_lines[idx : idx + len(normalized_needle)] == normalized_needle:
+            return idx
+    for idx in range(0, upper + 1):
+        if normalized_lines[idx : idx + len(normalized_needle)] == normalized_needle:
+            return idx
+    return -1
+
+
+def _apply_update_hunks_to_text(*, text: str, hunks: list[list[str]], rel_path: str) -> str:
+    lines = str(text or "").splitlines(keepends=True)
+    cursor = 0
+    for raw_hunk in hunks:
+        hunk_lines = [str(line or "") for line in (raw_hunk or []) if str(line or "") and str(line or "") != "*** End of File"]
+        if not hunk_lines:
+            continue
+        before = [_apply_patch_line_content(line) + "\n" for line in hunk_lines if line[:1] in {" ", "-"}]
+        after = [_apply_patch_line_content(line) + "\n" for line in hunk_lines if line[:1] in {" ", "+"}]
+        pos = _find_apply_patch_context(lines, before, start=cursor)
+        if pos < 0:
+            raise RuntimeError(f"implementer_local apply_patch hunk did not match current file: {rel_path}")
+        lines = lines[:pos] + after + lines[pos + len(before) :]
+        cursor = pos + len(after)
+    return "".join(lines)
 
 
 def _summarize_validation_failure(*, changed_files: list[str], validation_text: str, max_chars: int = 1200) -> str:
@@ -5687,6 +5752,130 @@ def _apply_local_implementer_rewrites(
     )
 
 
+def _apply_local_implementer_apply_patch(
+    *,
+    task: Any,
+    artifacts_dir: Path,
+    content: str,
+    worktree_dir: Path,
+) -> tuple[list[str], dict[str, Any]]:
+    patch_text = _extract_first_apply_patch_block(content)
+    if not patch_text.strip():
+        raise RuntimeError("implementer_local did not return an apply_patch block")
+    lines = patch_text.splitlines()
+    if not lines or lines[0].strip() != "*** Begin Patch":
+        raise RuntimeError("implementer_local apply_patch block is malformed")
+
+    patch_path = artifacts_dir / "local_ollama_patch.diff"
+    patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
+    artifacts: list[str] = [str(patch_path)]
+    resolved_worktree = worktree_dir.resolve()
+    allowed_targets = _task_file_targets(task=task, worktree_dir=worktree_dir)
+    allowed_parents = {str(Path(path).parent) for path in allowed_targets}
+
+    def _assert_allowed(rel_path: str) -> Path:
+        clean = str(rel_path or "").strip().lstrip("./")
+        disk_path = (resolved_worktree / clean).resolve()
+        try:
+            inside = str(disk_path).startswith(str(resolved_worktree))
+        except Exception:
+            inside = False
+        if not inside:
+            raise RuntimeError(f"implementer_local apply_patch path escapes worktree: {clean}")
+        if allowed_targets:
+            rel_parent = str(Path(clean).parent)
+            allowed_direct = clean in allowed_targets
+            allowed_adjacent = rel_parent in allowed_parents
+            if not allowed_direct and not allowed_adjacent:
+                raise RuntimeError(f"implementer_local apply_patch path is outside the delegated slice: {clean}")
+        return disk_path
+
+    changed_paths: list[str] = []
+    i = 1
+    while i < len(lines):
+        line = str(lines[i] or "")
+        if not line:
+            i += 1
+            continue
+        if line == "*** End Patch":
+            break
+        if line.startswith("*** Add File: "):
+            rel_path = line[len("*** Add File: ") :].strip().lstrip("./")
+            disk_path = _assert_allowed(rel_path)
+            i += 1
+            add_lines: list[str] = []
+            while i < len(lines):
+                current = str(lines[i] or "")
+                if current == "*** End Patch" or current.startswith("*** "):
+                    break
+                if not current.startswith("+"):
+                    raise RuntimeError(f"implementer_local apply_patch add-file line must start with '+': {rel_path}")
+                add_lines.append(current[1:])
+                i += 1
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_text("\n".join(add_lines) + ("\n" if add_lines else ""), encoding="utf-8", errors="replace")
+            changed_paths.append(rel_path)
+            continue
+        if line.startswith("*** Delete File: "):
+            rel_path = line[len("*** Delete File: ") :].strip().lstrip("./")
+            disk_path = _assert_allowed(rel_path)
+            if disk_path.exists():
+                disk_path.unlink()
+            changed_paths.append(rel_path)
+            i += 1
+            continue
+        if not line.startswith("*** Update File: "):
+            raise RuntimeError(f"implementer_local apply_patch block has unsupported directive: {line}")
+        rel_path = line[len("*** Update File: ") :].strip().lstrip("./")
+        disk_path = _assert_allowed(rel_path)
+        if not disk_path.exists():
+            raise RuntimeError(f"implementer_local apply_patch target not found: {rel_path}")
+        i += 1
+        move_to = ""
+        if i < len(lines) and str(lines[i] or "").startswith("*** Move to: "):
+            move_to = str(lines[i] or "")[len("*** Move to: ") :].strip().lstrip("./")
+            i += 1
+        hunks: list[list[str]] = []
+        current_hunk: list[str] = []
+        while i < len(lines):
+            current = str(lines[i] or "")
+            if current == "*** End Patch" or current.startswith("*** Update File: ") or current.startswith("*** Add File: ") or current.startswith("*** Delete File: "):
+                break
+            if current.startswith("@@"):
+                if current_hunk:
+                    hunks.append(current_hunk)
+                    current_hunk = []
+                i += 1
+                continue
+            if current == "*** End of File":
+                i += 1
+                continue
+            current_hunk.append(current)
+            i += 1
+        if current_hunk:
+            hunks.append(current_hunk)
+        original_text = disk_path.read_text(encoding="utf-8", errors="replace")
+        updated_text = _apply_update_hunks_to_text(text=original_text, hunks=hunks, rel_path=rel_path)
+        if move_to:
+            new_disk_path = _assert_allowed(move_to)
+            new_disk_path.parent.mkdir(parents=True, exist_ok=True)
+            new_disk_path.write_text(updated_text, encoding="utf-8", errors="replace")
+            if new_disk_path != disk_path and disk_path.exists():
+                disk_path.unlink()
+            changed_paths.extend([rel_path, move_to])
+        else:
+            disk_path.write_text(updated_text, encoding="utf-8", errors="replace")
+            changed_paths.append(rel_path)
+
+    return _finalize_local_implementer_change(
+        artifacts_dir=artifacts_dir,
+        worktree_dir=worktree_dir,
+        artifacts=artifacts,
+        apply_mode="apply_patch",
+        changed_files_hint=_extract_changed_files_from_patch_text(patch_text) or changed_paths,
+    )
+
+
 def _apply_local_implementer_patch(
     *,
     task: Any,
@@ -5695,7 +5884,16 @@ def _apply_local_implementer_patch(
     worktree_dir: Path,
 ) -> tuple[list[str], dict[str, Any]]:
     patch_text = _extract_first_diff_block(content)
+    if not patch_text.strip():
+        patch_text = _extract_first_apply_patch_block(content)
     rewrite_blocks = _extract_file_rewrite_blocks(content)
+    if patch_text.lstrip().startswith("*** Begin Patch"):
+        return _apply_local_implementer_apply_patch(
+            task=task,
+            artifacts_dir=artifacts_dir,
+            content=content,
+            worktree_dir=worktree_dir,
+        )
     repaired_patch_text, patch_repaired = _repair_unified_diff_text(patch_text)
     if repaired_patch_text.strip():
         patch_text = repaired_patch_text
