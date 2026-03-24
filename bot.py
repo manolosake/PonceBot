@@ -16421,6 +16421,12 @@ def _apply_autonomous_local_first_policy(
             for item in (impl_patch_info.get("changed_files") or [])
             if str(item).strip()
         ]
+        validation_excerpt = _read_local_artifact_excerpt(
+            job_id=impl_job_id,
+            artifacts_dir=impl_artifacts_dir,
+            names=("local_ollama_validation.txt",),
+            max_chars=1400,
+        )
         evidence_block = ""
         if impl_summary:
             evidence_block = (
@@ -16437,6 +16443,12 @@ def _apply_autonomous_local_first_policy(
                 "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n"
                 f"{impl_artifacts_dir}"
             )
+        if bool(impl_patch_info.get("validation_ok", False)) or validation_excerpt:
+            evidence_block += "\n\nCONTROLLER_VALIDATION:\n"
+            if bool(impl_patch_info.get("validation_ok", False)):
+                evidence_block += "validation_ok=true\n"
+            if validation_excerpt:
+                evidence_block += validation_excerpt
         return [
             TaskSpec(
                 key=review_key,
@@ -16446,7 +16458,9 @@ def _apply_autonomous_local_first_policy(
                     f"Review target job: {impl_job_id or '(unknown)'}\n"
                     f"Slice: {impl_slice_id or '(unspecified)'}\n"
                     f"{evidence_block}\n"
-                    "Use the latest diff/evidence only. Do not ask for another architecture pass.\n"
+                    "Inspect the touched files directly in the workspace when evidence excerpts are incomplete.\n"
+                    "Treat CONTROLLER_VALIDATION as already-executed controller evidence; do not ask implementer_local to run shell commands.\n"
+                    "Do not ask for another architecture pass.\n"
                     "If the patch is acceptable, return READY with exact file evidence and one validation command.\n"
                     "If the patch is weak or incomplete, return NEEDS_REWORK with exact fixes."
                 ),
