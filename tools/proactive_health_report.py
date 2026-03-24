@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 import json
+import os
 import re
 import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-DB = Path('/home/aponce/codexbot/data/jobs.sqlite')
-OUT_DIR = Path('/home/aponce/codexbot/data/artifacts/proactive_health')
+DEFAULT_DB = Path('/home/aponce/codexbot/data/jobs.sqlite')
+DEFAULT_OUT_DIR = Path('/home/aponce/codexbot/data/artifacts/proactive_health')
+DB = Path(os.environ.get('CODEXBOT_ORCH_DB', str(DEFAULT_DB)))
+OUT_DIR = Path(os.environ.get('CODEXBOT_PROACTIVE_HEALTH_OUT_DIR', str(DEFAULT_OUT_DIR)))
 ACTIVE_STATES = ('queued', 'running', 'waiting_deps', 'blocked', 'blocked_approval')
 LOCAL_ROLES = {'architect_local', 'implementer_local', 'reviewer_local'}
 CLI_ROLES = {'backend', 'frontend', 'qa', 'sre', 'security', 'research', 'product_ops', 'release_mgr'}
@@ -357,10 +360,45 @@ def fetch_rows(cur, query: str, params=()):
     return [dict(row) for row in rows]
 
 
+def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    report = {
+        'generated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+        'operational_status': 'CRITICAL',
+        'error': reason,
+        'db_path': str(DB),
+        'order_reports': [],
+        'anomalies': [],
+        'trend_flags': [],
+    }
+    payload = json.dumps(report, ensure_ascii=False, indent=2) + '\n'
+    markdown = '\n'.join(
+        [
+            '# Proactive Health Report',
+            f'- status=CRITICAL reason={reason}',
+            f'- db_path={DB}',
+            '',
+            '- order_reports: []',
+            '- anomalies: []',
+            '- trend_flags: []',
+        ]
+    ) + '\n'
+    latest_json = OUT_DIR / 'latest.json'
+    latest_md = OUT_DIR / 'latest.md'
+    stamped_json = OUT_DIR / f'report_{stamp}.json'
+    stamped_md = OUT_DIR / f'report_{stamp}.md'
+    for path, content in ((latest_json, payload), (latest_md, markdown), (stamped_json, payload), (stamped_md, markdown)):
+        path.write_text(content, encoding='utf-8')
+    return 2
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
     stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+
+    if not DB.exists():
+        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
