@@ -335,6 +335,22 @@ class TestStateHandling(unittest.TestCase):
         )
 
 
+    def test_controller_local_recovery_specs_synthesizes_local_patch_flow_from_write_policy(self) -> None:
+        specs = bot._controller_local_recovery_specs(
+            {
+                "summary": "Prepared a minimal reliability improvement in test_status_http.py.",
+                "order_branch": "feature/test-order",
+                "write_policy_violation": {
+                    "changed_paths": ["test_status_http.py"],
+                },
+            }
+        )
+        self.assertEqual([spec.role for spec in specs], ["implementer_local", "reviewer_local"])
+        self.assertIn("test_status_http.py", specs[0].text)
+        self.assertIn("python3 -m unittest -q test_status_http", specs[0].text)
+        self.assertEqual(specs[1].depends_on, [specs[0].key])
+
+
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
         return TestStateHandling()._cfg(state_file)

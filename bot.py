@@ -13764,10 +13764,96 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     if not isinstance(structured_digest, dict):
         return []
     specs = parse_orchestrator_subtasks(structured_digest)
-    if not specs:
+    if specs:
+        filtered, _dropped_roles = _filter_specs_to_skynet_local_executors(specs)
+        if filtered:
+            return list(filtered)
+
+    write_policy = structured_digest.get("write_policy_violation") if isinstance(structured_digest.get("write_policy_violation"), dict) else {}
+    changed_paths_raw = write_policy.get("changed_paths") if isinstance(write_policy, dict) else []
+    changed_paths = [str(p).strip() for p in (changed_paths_raw or []) if str(p).strip()]
+    if not changed_paths:
         return []
-    filtered, _dropped_roles = _filter_specs_to_skynet_local_executors(specs)
-    return list(filtered)
+
+    summary = str(structured_digest.get("summary") or "").strip()
+    order_branch = str(structured_digest.get("order_branch") or "").strip()
+    validation_cmd = "git diff --stat"
+    if len(changed_paths) == 1 and changed_paths[0].endswith(".py"):
+        name = Path(changed_paths[0]).name
+        if name.startswith("test_"):
+            mod = changed_paths[0][:-3].replace("/", ".")
+            validation_cmd = f"python3 -m unittest -q {mod}"
+        else:
+            validation_cmd = f"python3 -m py_compile {shlex.quote(changed_paths[0])}"
+    elif changed_paths and all(path.endswith(".py") for path in changed_paths[:4]):
+        validation_cmd = "python3 -m py_compile " + " ".join(shlex.quote(path) for path in changed_paths[:4])
+
+    digest = hashlib.sha1("\\n".join(changed_paths).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    impl_key = f"local_impl_recover_{digest}"
+    review_key = f"local_review_recover_{digest}"
+    file_list = "\\n".join(f"- `{path}`" for path in changed_paths[:8])
+    controller_intent = summary or (
+        "Recreate the bounded patch the controller prepared, but do it through implementer_local so the change stays inside local-only policy."
+    )
+    implementer_text = (
+        "Local recovery for a controller write-policy violation.\\n"
+        "The controller identified a bounded patch but cannot edit the repository directly.\\n"
+        f"Target files:\\n{file_list}\\n\\n"
+        f"Controller intent:\\n{controller_intent}\\n\\n"
+        "Rules:\\n"
+        "- Work only in the listed files.\\n"
+        "- Keep the patch bounded to the controller intent; do not expand scope.\\n"
+        f"- Run this validation command before finishing: `{validation_cmd}`.\\n"
+        "- Return the patch, changed files, and validation output/evidence.\\n"
+        + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
+    )
+    reviewer_text = (
+        "Independent local review for the controller-recovery slice.\\n"
+        f"Implementer key: {impl_key}\\n"
+        f"Expected validation command: `{validation_cmd}`\\n\\n"
+        "Rules:\\n"
+        "- Review only the newest implementer_local recovery slice for this ticket.\\n"
+        "- Require concrete validation evidence before READY.\\n"
+        "- Return READY or NEEDS_REWORK with one concrete next step.\\n"
+    )
+    return [
+        TaskSpec(
+            key=impl_key,
+            role="implementer_local",
+            text=implementer_text,
+            mode_hint="rw",
+            priority=1,
+            depends_on=[],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Patch stays inside the listed files only.",
+                "Validation command runs successfully with evidence in the summary/logs.",
+            ],
+            definition_of_done=[
+                "Bounded patch applied with changed files and validation evidence recorded.",
+            ],
+            eta_minutes=30,
+            sla_tier="high",
+        ),
+        TaskSpec(
+            key=review_key,
+            role="reviewer_local",
+            text=reviewer_text,
+            mode_hint="ro",
+            priority=1,
+            depends_on=[impl_key],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Review verdict references the implementer recovery slice only.",
+                "Validation evidence is checked before READY.",
+            ],
+            definition_of_done=[
+                "Reviewer returns READY or NEEDS_REWORK with explicit rationale.",
+            ],
+            eta_minutes=20,
+            sla_tier="high",
+        ),
+    ]
 
 
 def _task_requests_local_controller_recovery(
@@ -23900,6 +23986,8 @@ def orchestrator_worker_loop(
 
                     strategic_proposal_requested = _factory_ceo_strategy_next_action(structured_digest) is not None
                     specs = [] if strategic_proposal_requested else parse_orchestrator_subtasks(structured_digest)
+                    if controller_local_recovery and not specs:
+                        specs = _controller_local_recovery_specs(structured_digest)
                     current_plan_revision = 0
                     try:
                         current_plan_revision = int((task.trace or {}).get("plan_revision", 0) or 0)
