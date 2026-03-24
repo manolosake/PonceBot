@@ -2934,9 +2934,8 @@ class SQLiteTaskStorage:
                 """
                 SELECT * FROM jobs
                 WHERE state IN ('waiting_deps', 'blocked_approval', 'blocked')
-                  AND stalled_since IS NOT NULL
-                  AND stalled_since <= ?
-                ORDER BY stalled_since ASC
+                  AND COALESCE(stalled_since, updated_at, created_at) <= ?
+                ORDER BY COALESCE(stalled_since, updated_at, created_at) ASC
                 LIMIT ?
                 """,
                 (threshold, lim),

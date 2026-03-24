@@ -4097,6 +4097,29 @@ class TestSkynetLocalRecovery(unittest.TestCase):
             assert order is not None
             self.assertEqual(str(order.get("phase") or ""), "review")
 
+    def test_stale_blocked_controller_job_without_stalled_since_is_cancelled_for_local_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)
+            blocked = self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir)
+            q.submit_task(blocked)
+            stale_ts = float(_time.time() - 7200.0)
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ?, stalled_since = NULL WHERE job_id = ?",
+                    (stale_ts, stale_ts, blocked.job_id),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_HYGIENE_STALE_BLOCKED_SECONDS": "60"}, clear=False):
+                cleaned = bot._cleanup_stale_blocked_jobs(orch_q=q, now=_time.time())
+
+            self.assertEqual(cleaned, 1)
+            refreshed = q.get_job(blocked.job_id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "cancelled")
+            self.assertTrue(bool((refreshed.trace or {}).get("stale_controller_local_recovery", False)))
+
     def test_autopilot_skip_when_no_progress_backoff_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = _cfg(Path(td) / "state.json", workdir=Path(td))
