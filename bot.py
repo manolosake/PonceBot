@@ -16966,8 +16966,6 @@ def _apply_autonomous_local_first_policy(
         latest_impl_no_change_done is not None
         and not active_reviewer_open
         and not active_implementer_open
-        and planner_local_roles
-        and planner_local_roles.issubset({"architect_local", "implementer_local"})
     ):
         return _impl_no_change_review_specs()
 
