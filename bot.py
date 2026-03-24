@@ -18645,6 +18645,17 @@ def _jarvis_final_sweep_tick(
         if last_sweep_at > 0 and (float(now) - last_sweep_at) < float(cooldown_s):
             continue
 
+        if proactive_order and _enqueue_reviewer_local_rework_if_due(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_row=row,
+            chat_id=int(chat_id),
+            now=float(now),
+        ):
+            created += 1
+            continue
+
         controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=order_id)
         profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
