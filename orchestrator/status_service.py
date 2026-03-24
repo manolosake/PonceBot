@@ -115,8 +115,9 @@ def _task_to_status(t: Task) -> dict[str, Any]:
         blockers_stale = True
         effective_state = "ready"
         logger.info(
-            "StatusService: auto-transition blocked_waiting_only job %s to ready (waiting_dependencies=0)",
+            "StatusService: auto-transition blocked_waiting_only job %s to ready (waiting_dependencies=%s)",
             t.job_id,
+            waiting_dependencies,
         )
 
     approved = bool(tr.get("approved", False))
