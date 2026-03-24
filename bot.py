@@ -15977,6 +15977,32 @@ def _apply_autonomous_local_first_policy(
         if not review_suffix and impl_job_id:
             review_suffix = impl_job_id.split("-", 1)[0].strip()
         review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        impl_summary = _row_local_response(latest_impl_done, max_chars=7000)
+        if not impl_summary:
+            impl_summary = str(impl_trace.get("result_summary") or "").strip()
+        impl_artifacts_dir = str(latest_impl_done.get("artifacts_dir") or "").strip()
+        impl_patch_info = _trace_patch_info(impl_trace)
+        impl_changed_files = [
+            str(item).strip()
+            for item in (impl_patch_info.get("changed_files") or [])
+            if str(item).strip()
+        ]
+        evidence_block = ""
+        if impl_summary:
+            evidence_block = (
+                "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n"
+                f"{impl_summary}"
+            )
+        if impl_changed_files:
+            evidence_block += (
+                "\n\nIMPLEMENTER_CHANGED_FILES:\n- "
+                + "\n- ".join(impl_changed_files[:12])
+            )
+        if impl_artifacts_dir:
+            evidence_block += (
+                "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n"
+                f"{impl_artifacts_dir}"
+            )
         return [
             TaskSpec(
                 key=review_key,
@@ -15985,6 +16011,7 @@ def _apply_autonomous_local_first_policy(
                     f"Independent local review for ticket {rid}: review the newest validated implementer_local slice and issue READY/NEEDS_REWORK.\n"
                     f"Review target job: {impl_job_id or '(unknown)'}\n"
                     f"Slice: {impl_slice_id or '(unspecified)'}\n"
+                    f"{evidence_block}\n"
                     "Use the latest diff/evidence only. Do not ask for another architecture pass.\n"
                     "If the patch is acceptable, return READY with exact file evidence and one validation command.\n"
                     "If the patch is weak or incomplete, return NEEDS_REWORK with exact fixes."
@@ -16408,6 +16435,33 @@ def _apply_autonomous_local_first_policy(
             if impl_key_raw.startswith("local_impl_guard_"):
                 review_suffix = impl_key_raw[len("local_impl_guard_") :].strip()
             review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+            impl_trace = dict(latest_impl_done.get("trace") or {}) if isinstance(latest_impl_done.get("trace"), dict) else {}
+            impl_summary = _row_local_response(latest_impl_done, max_chars=7000)
+            if not impl_summary:
+                impl_summary = str(impl_trace.get("result_summary") or "").strip()
+            impl_artifacts_dir = str(latest_impl_done.get("artifacts_dir") or "").strip()
+            impl_patch_info = _trace_patch_info(impl_trace)
+            impl_changed_files = [
+                str(item).strip()
+                for item in (impl_patch_info.get("changed_files") or [])
+                if str(item).strip()
+            ]
+            evidence_block = ""
+            if impl_summary:
+                evidence_block = (
+                    "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n"
+                    f"{impl_summary}"
+                )
+            if impl_changed_files:
+                evidence_block += (
+                    "\n\nIMPLEMENTER_CHANGED_FILES:\n- "
+                    + "\n- ".join(impl_changed_files[:12])
+                )
+            if impl_artifacts_dir:
+                evidence_block += (
+                    "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n"
+                    f"{impl_artifacts_dir}"
+                )
             return [
                 TaskSpec(
                     key=review_key,
@@ -16415,6 +16469,7 @@ def _apply_autonomous_local_first_policy(
                     text=(
                         f"Independent local review for ticket {rid}: review the newest implementer_local diff/evidence only and issue READY/NEEDS_REWORK.\n"
                         f"Review target job: {latest_impl_done.get('job_id')}\n"
+                        f"{evidence_block}\n"
                         "Do not ask for another architecture pass. If diff/evidence is weak, return NEEDS_REWORK with exact fixes."
                     ),
                     mode_hint="ro",

@@ -1537,6 +1537,8 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(specs[0].role, "reviewer_local")
             self.assertIn("impl-job-validated", specs[0].text)
             self.assertIn("slice1", specs[0].text)
+            self.assertIn("Applied compatibility wrapper", specs[0].text)
+            self.assertIn("orchestrator/delegation.py", specs[0].text)
 
     def test_finalize_codex_implementer_change_applies_diff_when_workspace_is_clean(self) -> None:
         with tempfile.TemporaryDirectory() as td:
