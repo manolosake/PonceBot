@@ -3052,6 +3052,35 @@ def _session_key(chat_id: int) -> str:
     return str(int(chat_id))
 
 
+def _orchestrator_session_thread_id(
+    *,
+    orch_q: OrchestratorQueue | None,
+    chat_id: int | None,
+    role: str,
+    repo_id: str = "",
+) -> str:
+    if orch_q is None:
+        return ""
+    role_norm = _coerce_orchestrator_role(str(role or "")) or str(role or "").strip().lower()
+    rid = str(repo_id or "").strip().lower()
+    if rid:
+        try:
+            runtime_state = orch_q.get_agent_runtime_state(repo_id=rid, role=role_norm)
+        except Exception:
+            runtime_state = None
+        if isinstance(runtime_state, dict):
+            tid = str(runtime_state.get("session_thread_id") or "").strip()
+            if tid:
+                return tid
+        return ""
+    if chat_id is None:
+        return ""
+    try:
+        tid = orch_q.get_agent_thread(chat_id=int(chat_id), role=role_norm)
+    except Exception:
+        tid = None
+    return str(tid or "").strip()
+
 
 def _auth_is_session_active(cfg: "BotConfig", *, chat_id: int) -> tuple[bool, dict[str, Any]]:
     """
@@ -11911,11 +11940,6 @@ def _factory_touch_runtime_agents(
             continue
         for role in _FACTORY_RUNTIME_ROLES:
             thread_id = None
-            if chat_id is not None:
-                try:
-                    thread_id = orch_q.get_agent_thread(chat_id=int(chat_id), role=role)
-                except Exception:
-                    thread_id = None
             try:
                 orch_q.upsert_agent_runtime_state(
                     repo_id=repo_id,
@@ -22287,7 +22311,12 @@ def _orchestrator_run_codex(
     try:
         if cfg.orchestrator_sessions_enabled and orch_q is not None:
             if threaded_session_enabled:
-                tid = orch_q.get_agent_thread(chat_id=task.chat_id, role=role) or ""
+                tid = _orchestrator_session_thread_id(
+                    orch_q=orch_q,
+                    chat_id=int(task.chat_id),
+                    role=role,
+                    repo_id=repo_id,
+                )
                 if tid:
                     used_thread_id = tid
                     proc = runner.start_threaded_resume(
@@ -22507,7 +22536,17 @@ def _orchestrator_run_codex(
                 tid = _extract_thread_id_from_jsonl_file(proc.stdout_path)
                 if tid:
                     used_thread_id = tid
-                    orch_q.set_agent_thread(chat_id=task.chat_id, role=role, thread_id=tid)
+                    if repo_id:
+                        orch_q.upsert_agent_runtime_state(
+                            repo_id=repo_id,
+                            role=role,
+                            chat_id=int(task.chat_id),
+                            session_thread_id=tid,
+                            lane=_FACTORY_ROLE_LANES.get(role, "factory"),
+                            metadata={"repo_path": repo_path} if repo_path else None,
+                        )
+                    else:
+                        orch_q.set_agent_thread(chat_id=task.chat_id, role=role, thread_id=tid)
             except Exception:
                 LOG.exception("Failed to extract/persist orchestrator thread_id. job=%s role=%s", task.job_id, role)
 

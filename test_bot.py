@@ -301,6 +301,65 @@ class TestStateHandling(unittest.TestCase):
     def test_response_signals_no_code_change_accepts_additional_change_wording(self) -> None:
         self.assertTrue(bot._response_signals_no_code_change("READY. No additional code change is required."))
 
+    def test_orchestrator_session_thread_id_prefers_repo_runtime_state(self) -> None:
+        class _FakeQueue:
+            def get_agent_runtime_state(self, *, repo_id: str, role: str) -> dict[str, object] | None:
+                if repo_id == "repo-1" and role == "skynet":
+                    return {"session_thread_id": "repo-thread"}
+                return None
+
+            def get_agent_thread(self, *, chat_id: int, role: str) -> str | None:
+                return "global-thread"
+
+        self.assertEqual(
+            bot._orchestrator_session_thread_id(
+                orch_q=_FakeQueue(),
+                chat_id=1,
+                role="skynet",
+                repo_id="repo-1",
+            ),
+            "repo-thread",
+        )
+        self.assertEqual(
+            bot._orchestrator_session_thread_id(
+                orch_q=_FakeQueue(),
+                chat_id=1,
+                role="skynet",
+                repo_id="",
+            ),
+            "global-thread",
+        )
+
+    def test_factory_touch_runtime_agents_preserves_repo_session_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            storage = bot.SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = bot.OrchestratorQueue(storage=storage, role_profiles=None)
+            q.upsert_agent_runtime_state(
+                repo_id="repo-1",
+                role="skynet",
+                chat_id=1,
+                session_thread_id="repo-thread",
+                lane="factory",
+                metadata={"repo_path": "/tmp/repo-1"},
+            )
+            q.set_agent_thread(chat_id=1, role="skynet", thread_id="global-thread")
+            bot._factory_touch_runtime_agents(
+                cfg=self._cfg(td_path / "state.json"),
+                orch_q=q,
+                chat_id=1,
+                now=123.0,
+                repos=[{
+                    "repo_id": "repo-1",
+                    "path": "/tmp/repo-1",
+                    "default_branch": "main",
+                    "autonomy_enabled": True,
+                    "status": "active",
+                }],
+            )
+            runtime = q.get_agent_runtime_state(repo_id="repo-1", role="skynet")
+            self.assertEqual(str((runtime or {}).get("session_thread_id") or ""), "repo-thread")
+
     def test_task_counts_as_order_phase_blocker_ignores_salvageable_failed_reviewer(self) -> None:
         task = SimpleNamespace(
             role="reviewer_local",
