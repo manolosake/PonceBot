@@ -14670,7 +14670,7 @@ _LOCAL_SLICE_STATUS_ORDER = (
 )
 _LOCAL_SLICE_STATUS_TERMINAL = frozenset({"closed", "blocked", "failed_retriable", "failed_terminal"})
 _LOCAL_SLICE_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "planned": frozenset({"planned", "implementing", "blocked", "failed_retriable", "failed_terminal"}),
+    "planned": frozenset({"planned", "implementing", "reviewed_ready", "blocked", "failed_retriable", "failed_terminal"}),
     "implementing": frozenset({"planned", "implementing", "applied", "validated", "blocked", "failed_retriable", "failed_terminal"}),
     "applied": frozenset({"applied", "validated", "blocked", "failed_retriable", "failed_terminal"}),
     "validated": frozenset({"validated", "reviewed_ready", "closed", "blocked", "failed_retriable", "failed_terminal"}),
