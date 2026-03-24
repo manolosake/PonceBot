@@ -740,6 +740,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             repo_root = Path(td)
             data_dir = repo_root / "data"
             repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
             cfg = bot.BotConfig(
                 **{
                     **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
@@ -945,6 +946,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             repo_root = Path(td)
             data_dir = repo_root / "data"
             repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
             cfg = bot.BotConfig(
                 **{
                     **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
@@ -1407,6 +1409,134 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(len(specs), 1)
             self.assertEqual(specs[0].role, "reviewer_local")
             self.assertIn("Validate implementer_local no-change claim", specs[0].text)
+
+    def test_autonomous_local_first_prefers_reviewer_after_validated_implementer_even_if_planner_offers_architect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 90.0, 89.0, ?, ?, ?)",
+                    (
+                        "impl-job-validated",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-validated"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(
+                            {
+                                "result_summary": "Applied compatibility wrapper and validated it.",
+                                "slice_id": "slice1",
+                                "local_patch_info": {
+                                    "changed_files": ["orchestrator/delegation.py"],
+                                    "validation_ok": True,
+                                },
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[
+                        bot.TaskSpec(
+                            key="auto_architect_local_slice1",
+                            role="architect_local",
+                            text="Plan another small slice.",
+                            mode_hint="ro",
+                            priority=2,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return one plan."],
+                            definition_of_done=["Plan returned."],
+                            eta_minutes=10,
+                            sla_tier="normal",
+                        )
+                    ],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "reviewer_local")
+            self.assertIn("impl-job-validated", specs[0].text)
+            self.assertIn("slice1", specs[0].text)
 
     def test_finalize_codex_implementer_change_applies_diff_when_workspace_is_clean(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -4049,6 +4049,27 @@ class TestSkynetLocalRecovery(unittest.TestCase):
             assert order is not None
             self.assertEqual(str(order.get("phase") or ""), "delegated")
 
+    def test_final_sweep_ignores_recoverable_blocked_controller_job_when_no_other_work_is_live(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)
+            q.submit_task(self._blocked_final_sweep_task(order_id=order_id, repo_dir=repo_dir))
+
+            created = bot._jarvis_final_sweep_tick(
+                cfg=cfg_obj,
+                orch_q=q,
+                profiles=None,
+                now=_time.time(),
+            )
+
+            self.assertEqual(created, 0)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=20)
+            final_sweeps = [
+                child for child in children
+                if str((child.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+                and child.job_id != "aaaa1111-bbbb-cccc-dddd-eeeeffff0000"
+            ]
+            self.assertEqual(final_sweeps, [])
+
     def test_stale_blocked_controller_job_is_cancelled_for_local_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _cfg_obj, q, order_id, repo_dir = self._seed_factory_order(td)

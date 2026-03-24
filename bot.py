@@ -15947,6 +15947,64 @@ def _apply_autonomous_local_first_policy(
             )
         ]
 
+    def _latest_validated_impl_review_specs() -> list[TaskSpec]:
+        if latest_impl_done is None or active_implementer_open or active_reviewer_open:
+            return []
+        if latest_impl_done_ts > 0.0 and latest_impl_failed_ts > (latest_impl_done_ts + 5.0):
+            return []
+        impl_trace = dict(latest_impl_done.get("trace") or {}) if isinstance(latest_impl_done.get("trace"), dict) else {}
+        impl_job_id = str(latest_impl_done.get("job_id") or "").strip()
+        impl_key_raw = str(
+            (
+                (latest_impl_done.get("labels") or {})
+                if isinstance(latest_impl_done.get("labels"), dict)
+                else {}
+            ).get("key")
+            or ""
+        ).strip()
+        impl_slice_id = _sanitize_slice_token(str(impl_trace.get("slice_id") or ""), fallback="")
+        if impl_slice_id and _slice_has_review_ready_evidence(
+            orch_q=orch_q,
+            root_ticket=rid,
+            slice_id=impl_slice_id,
+        ):
+            return []
+        review_suffix = ""
+        if impl_key_raw.startswith("local_impl_guard_"):
+            review_suffix = impl_key_raw[len("local_impl_guard_") :].strip()
+        if not review_suffix and impl_slice_id:
+            review_suffix = impl_slice_id
+        if not review_suffix and impl_job_id:
+            review_suffix = impl_job_id.split("-", 1)[0].strip()
+        review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        return [
+            TaskSpec(
+                key=review_key,
+                role="reviewer_local",
+                text=(
+                    f"Independent local review for ticket {rid}: review the newest validated implementer_local slice and issue READY/NEEDS_REWORK.\n"
+                    f"Review target job: {impl_job_id or '(unknown)'}\n"
+                    f"Slice: {impl_slice_id or '(unspecified)'}\n"
+                    "Use the latest diff/evidence only. Do not ask for another architecture pass.\n"
+                    "If the patch is acceptable, return READY with exact file evidence and one validation command.\n"
+                    "If the patch is weak or incomplete, return NEEDS_REWORK with exact fixes."
+                ),
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Return READY/NEEDS_REWORK with concrete blocking issues.",
+                    "Reference the newest diff, validation command output, or artifact paths used for the verdict.",
+                ],
+                definition_of_done=[
+                    "Independent reviewer verdict delivered for the newest validated implementation slice.",
+                ],
+                eta_minutes=30,
+                sla_tier="high",
+            )
+        ]
+
     def _latest_arch_implementer_specs() -> list[TaskSpec]:
         if not latest_arch_response or active_implementer_open or active_reviewer_open:
             return []
@@ -16322,6 +16380,10 @@ def _apply_autonomous_local_first_policy(
         and planner_local_roles.issubset({"architect_local", "implementer_local"})
     ):
         return _impl_no_change_review_specs()
+
+    validated_impl_review_specs = _latest_validated_impl_review_specs()
+    if validated_impl_review_specs:
+        return validated_impl_review_specs
 
     if not kept_specs:
         active_existing, queued_existing, waiting_existing = _ticket_active_backlog_counts(existing_children)
@@ -17900,15 +17962,19 @@ def _jarvis_final_sweep_tick(
             kind = str((c.labels or {}).get("kind") or "").strip().lower()
             if kind not in meta_active_kinds and updated_at > latest_non_meta_child_activity:
                 latest_non_meta_child_activity = updated_at
+            recoverable_controller_blocked = st in ("blocked", "blocked_approval") and _task_requests_local_controller_recovery(
+                c,
+                orch_state=st,
+            )
             if st == "running":
                 running_n += 1
             elif st == "queued":
                 queued_n += 1
             elif st == "waiting_deps":
                 waiting_n += 1
-            elif st in ("blocked", "blocked_approval"):
+            elif st in ("blocked", "blocked_approval") and not recoverable_controller_blocked:
                 blocked_n += 1
-            elif st in terminal_states:
+            elif st in terminal_states or recoverable_controller_blocked:
                 terminal_n += 1
 
         phase = str(row.get("phase") or "").strip().lower()
@@ -22315,7 +22381,6 @@ def _maybe_enqueue_post_delivery_review(
         "product_ops",
         "sre",
         "release_mgr",
-        "implementer_local",
     ):
         return False
 
