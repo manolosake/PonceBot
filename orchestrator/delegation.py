@@ -144,6 +144,11 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
     return out
 
 
+def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
+    """Compatibility wrapper for callers expecting orchestrator naming."""
+    return _parse_orchestrator_subtasks(structured)
+
+
 def _extract_reseed_text(structured: dict[str, Any] | str | None) -> str:
     if structured is None:
         return ""
@@ -155,7 +160,7 @@ def _extract_reseed_text(structured: dict[str, Any] | str | None) -> str:
         return str(structured)
 
 
-def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
+def _parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
     parsed = parse_jarvis_subtasks(structured)
     if parsed:
         return parsed
