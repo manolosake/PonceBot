@@ -14735,6 +14735,35 @@ def _slice_has_applied_and_validated_evidence(
     return applied, validated
 
 
+def _slice_has_no_change_evidence(
+    *,
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    slice_id: str,
+) -> bool:
+    rid = str(root_ticket or "").strip()
+    token = _sanitize_slice_token(slice_id, fallback="")
+    if not rid or not token:
+        return False
+    try:
+        children = orch_q.jobs_by_parent(parent_job_id=rid, limit=700)
+    except Exception:
+        return False
+    for child in children:
+        if _coerce_orchestrator_role(str(child.role or "")) != "implementer_local":
+            continue
+        state = str(child.state or "").strip().lower()
+        if state != "done":
+            continue
+        child_slice = _task_slice_id(child, root_ticket=rid)
+        if child_slice != token:
+            continue
+        trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+        if _trace_local_no_change(trace):
+            return True
+    return False
+
+
 def _slice_has_review_ready_evidence(
     *,
     orch_q: OrchestratorQueue,
@@ -14753,7 +14782,7 @@ def _slice_has_review_ready_evidence(
         if _coerce_orchestrator_role(str(child.role or "")) != "reviewer_local":
             continue
         state = str(child.state or "").strip().lower()
-        if state != "done":
+        if state != "done" and not _task_has_salvageable_local_success(child):
             continue
         child_slice = _task_slice_id(child, root_ticket=rid)
         if child_slice != token:
@@ -14783,7 +14812,12 @@ def _controller_verified_slice_for_closure(
             root_ticket=rid,
             slice_id=hinted,
         )
-        if applied and validated and _slice_has_review_ready_evidence(
+        no_change = _slice_has_no_change_evidence(
+            orch_q=orch_q,
+            root_ticket=rid,
+            slice_id=hinted,
+        )
+        if ((applied and validated) or no_change) and _slice_has_review_ready_evidence(
             orch_q=orch_q,
             root_ticket=rid,
             slice_id=hinted,
@@ -14808,7 +14842,11 @@ def _select_latest_ready_slice_for_closure(
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
-        if role_norm not in {"implementer_local", "reviewer_local"} or state != "done":
+        if role_norm not in {"implementer_local", "reviewer_local"}:
+            continue
+        if role_norm == "implementer_local" and state != "done":
+            continue
+        if role_norm == "reviewer_local" and state != "done" and not _task_has_salvageable_local_success(child):
             continue
         slice_id = _task_slice_id(child, root_ticket=rid)
         if not slice_id:
@@ -14817,14 +14855,16 @@ def _select_latest_ready_slice_for_closure(
         bucket = latest_by_slice.setdefault(
             slice_id,
             {
-                "validated": False,
+                "implementer_ready": False,
                 "reviewed_ready": False,
                 "updated_at": 0.0,
             },
         )
         updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
-        if role_norm == "implementer_local" and _trace_has_validated_slice_evidence(trace):
-            bucket["validated"] = True
+        if role_norm == "implementer_local" and (
+            _trace_has_validated_slice_evidence(trace) or _trace_local_no_change(trace)
+        ):
+            bucket["implementer_ready"] = True
         if role_norm == "reviewer_local" and _summary_has_ready_signal(str(trace.get("result_summary") or "")):
             bucket["reviewed_ready"] = True
         if updated_at > float(bucket.get("updated_at", 0.0) or 0.0):
@@ -14832,7 +14872,7 @@ def _select_latest_ready_slice_for_closure(
     best_slice = ""
     best_ts = 0.0
     for slice_id, bucket in latest_by_slice.items():
-        if not (bool(bucket.get("validated")) and bool(bucket.get("reviewed_ready"))):
+        if not (bool(bucket.get("implementer_ready")) and bool(bucket.get("reviewed_ready"))):
             continue
         ts = float(bucket.get("updated_at", 0.0) or 0.0)
         if ts >= best_ts:
@@ -15132,13 +15172,14 @@ def _collect_order_local_autonomy_funnel(
             if state == "done":
                 if _trace_local_patch_applied(trace):
                     bucket["applied"] = True
-                if _trace_has_validated_slice_evidence(trace):
+                if _trace_has_validated_slice_evidence(trace) or _trace_local_no_change(trace):
                     bucket["validated"] = True
             continue
 
-        if role_norm == "reviewer_local" and state == "done":
-            if _summary_has_ready_signal(summary):
-                bucket["review_ready_candidate"] = True
+        if role_norm == "reviewer_local":
+            if state == "done" or _task_has_salvageable_local_success(child):
+                if _summary_has_ready_signal(summary):
+                    bucket["review_ready_candidate"] = True
             continue
 
         if role_norm in controller_roles and state == "done":
@@ -15151,7 +15192,7 @@ def _collect_order_local_autonomy_funnel(
                 else:
                     controller_verifications_no_slice.append(updated_ts if updated_ts > 0 else now_ts)
 
-    # Reviewer READY only counts when implementation evidence exists for that slice.
+    # Reviewer READY only counts when implementation evidence exists for that slice, including verified no-change.
     for bucket in slices.values():
         bucket["reviewed_ready"] = bool(bucket.get("review_ready_candidate") and bucket.get("validated"))
 
@@ -23882,12 +23923,17 @@ def orchestrator_worker_loop(
                         root_ticket=root_ticket,
                         slice_id=slice_id,
                     )
-                    if review_ready and not (applied_ev and validated_ev):
+                    no_change_ev = _slice_has_no_change_evidence(
+                        orch_q=orch_q,
+                        root_ticket=root_ticket,
+                        slice_id=slice_id,
+                    )
+                    if review_ready and not ((applied_ev and validated_ev) or no_change_ev):
                         review_ready = False
                         orch_state = "failed"
                         summary = (
-                            f"{summary}\n\nReviewer gate rejected: READY requires prior applied+validated "
-                            f"implementer evidence for slice_id={slice_id}."
+                            f"{summary}\n\nReviewer gate rejected: READY requires prior implementer evidence "
+                            f"(validated change or verified no-change) for slice_id={slice_id}."
                         ).strip()
                         result_meta["result_summary"] = summary
                     result_meta["review_ready"] = bool(review_ready)

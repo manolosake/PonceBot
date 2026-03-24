@@ -338,6 +338,132 @@ class TestStateHandling(unittest.TestCase):
             )
         )
 
+    def test_controller_verified_slice_for_closure_accepts_no_change_evidence(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. Existing implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 700) -> list[object]:
+                return [impl, reviewer]
+
+        self.assertEqual(
+            bot._controller_verified_slice_for_closure(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                trace={"slice_id": "slice1"},
+            ),
+            "slice1",
+        )
+
+    def test_collect_order_local_autonomy_funnel_counts_no_change_slice_as_closed(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. No additional code change is required.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+        controller = SimpleNamespace(
+            role="skynet",
+            state="done",
+            labels={},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "PASS: VERIFIED_IMPROVEMENT",
+                "improvement_verified": True,
+            },
+            updated_at=30.0,
+            created_at=29.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 800) -> list[object]:
+                return [impl, reviewer, controller]
+
+        funnel = bot._collect_order_local_autonomy_funnel(
+            orch_q=_FakeQueue(),
+            root_ticket="ticket-1",
+            now=40.0,
+        )
+        self.assertEqual(funnel["slices_validated"], 1)
+        self.assertEqual(funnel["slices_closed"], 1)
+        self.assertTrue(funnel["improvement_verified"])
+
+    def test_controller_verified_slice_for_closure_accepts_salvageable_failed_reviewer(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. Existing implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 700) -> list[object]:
+                return [impl, reviewer]
+
+        self.assertEqual(
+            bot._controller_verified_slice_for_closure(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                trace={"slice_id": "slice1"},
+            ),
+            "slice1",
+        )
+
 
     def test_controller_local_recovery_specs_synthesizes_local_patch_flow_from_write_policy(self) -> None:
         specs = bot._controller_local_recovery_specs(
