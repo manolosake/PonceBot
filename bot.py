@@ -20655,6 +20655,23 @@ def _jsonl_stream_has_terminal_completion(text: str) -> bool:
     return False
 
 
+def _should_salvage_local_codex_exit(
+    *,
+    role: str,
+    code: int,
+    body: str,
+    stdout_text: str,
+) -> bool:
+    role_norm = _coerce_orchestrator_role(str(role or ""))
+    if role_norm not in {"architect_local", "implementer_local", "reviewer_local"}:
+        return False
+    if int(code) == 0:
+        return False
+    if not str(body or "").strip():
+        return False
+    return _jsonl_stream_has_terminal_completion(str(stdout_text or ""))
+
+
 def _skill_installer_scripts_dir() -> Path:
     # skill-installer is a system skill that ships with this deployment.
     return _skills_root_dir() / ".system" / "skill-installer" / "scripts"
@@ -21831,6 +21848,13 @@ def _orchestrator_run_codex(
                 LOG.exception("Failed to extract/persist orchestrator thread_id. job=%s role=%s", task.job_id, role)
 
         logs = _tail_file_text(proc.stderr_path, max_chars=6000)
+        if _should_salvage_local_codex_exit(
+            role=role,
+            code=code,
+            body=body,
+            stdout_text=(stdout_text or _tail_file_text(proc.stdout_path, max_chars=120000)),
+        ):
+            code = 0
         token_usage = _extract_codex_token_usage(
             "\n".join(
                 part

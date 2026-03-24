@@ -253,6 +253,46 @@ class TestStateHandling(unittest.TestCase):
         self.assertTrue(bot._jsonl_stream_has_terminal_completion(payload))
         self.assertFalse(bot._jsonl_stream_has_terminal_completion(json.dumps({"type": "thread.started"})))
 
+    def test_should_salvage_local_codex_exit_only_for_local_roles_with_terminal_jsonl(self) -> None:
+        payload = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "abc"}),
+                json.dumps({"type": "response.completed", "text": "READY"}),
+            ]
+        )
+        self.assertTrue(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="READY",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="skynet",
+                code=1,
+                body="READY",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="READY",
+                stdout_text=json.dumps({"type": "thread.started"}),
+            )
+        )
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
