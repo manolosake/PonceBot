@@ -456,6 +456,16 @@ class StatusService:
                 }
             )
         newest_updated_at = 0.0
+        no_open_jobs = (
+            len(orders_out) == 0
+            and queued_total == 0
+            and running_total == 0
+            and waiting_deps_total == 0
+            and blocked_approval_total == 0
+            and blocked_total == 0
+        )
+        if no_open_jobs:
+            workers_out = []
 
         for role in roles:
             n = int(max_parallel.get(role) or 1)
