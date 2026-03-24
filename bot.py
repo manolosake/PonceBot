@@ -12962,8 +12962,9 @@ def _enqueue_reviewer_local_rework_if_due(
             "- Fix exactly the reviewer blockers before anything else.\n"
             "- If MANDATORY_FILE_SCOPE is present, edit only those files unless one adjacent test/config file is strictly required.\n"
             "- Do not ask for another architecture pass.\n"
-            "- Return one single fenced ```diff``` block or explicit rewrite block(s).\n"
+            "- If code changes are still required, return one single fenced ```diff``` block or explicit rewrite block(s).\n"
             f"- After the code block(s), add EXPECTED_VALIDATION: `{validation_cmd}`.\n"
+            "- If the reviewer is only missing validation/file evidence and the existing code is already correct, do not invent a diff. Say explicitly that no code change is required, provide exact file evidence, and add EXPECTED_VALIDATION.\n"
             "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
         ),
         mode_hint="ro",
