@@ -5554,13 +5554,18 @@ def _build_local_specialist_user_prompt(
         )
     if role == "implementer_local":
         architect_context = ""
-        arch_key_match = re.search(r"\blocal_arch_guard_[0-9]{6,}\b", str(user_prompt or ""), flags=re.IGNORECASE)
-        if arch_key_match:
-            architect_context = _local_specialist_response_for_key(
-                role="architect_local",
-                delegated_key=str(arch_key_match.group(0) or "").strip(),
-                max_chars=7000,
-            )
+        task_trace = getattr(task, "trace", {}) if isinstance(getattr(task, "trace", {}), dict) else {}
+        task_labels = getattr(task, "labels", {}) if isinstance(getattr(task, "labels", {}), dict) else {}
+        delegated_key = str(task_trace.get("delegated_key") or task_labels.get("key") or "").strip().lower()
+        is_controller_recovery_slice = delegated_key.startswith("local_impl_recover_")
+        if not is_controller_recovery_slice:
+            arch_key_match = re.search(r"\blocal_arch_guard_[0-9]{6,}\b", str(user_prompt or ""), flags=re.IGNORECASE)
+            if arch_key_match:
+                architect_context = _local_specialist_response_for_key(
+                    role="architect_local",
+                    delegated_key=str(arch_key_match.group(0) or "").strip(),
+                    max_chars=7000,
+                )
         root_ticket_hint = str(getattr(task, "parent_job_id", "") or "").strip()
         if not root_ticket_hint:
             ticket_match = re.search(
@@ -5570,7 +5575,7 @@ def _build_local_specialist_user_prompt(
             )
             if ticket_match:
                 root_ticket_hint = str(ticket_match.group(0) or "").strip()
-        if not architect_context:
+        if not architect_context and not is_controller_recovery_slice:
             architect_context = _latest_local_specialist_response(
                 root_ticket=root_ticket_hint,
                 role="architect_local",
@@ -8209,6 +8214,18 @@ def _orchestrator_threaded_session_enabled(profile: dict[str, Any], *, role: str
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _task_requires_fresh_threaded_session(task: Any, *, role: str = "") -> bool:
+    role_norm = _coerce_orchestrator_role(str(role or "")) or str(role or "").strip().lower()
+    if role_norm != "skynet":
+        return False
+    labels = getattr(task, "labels", {}) if isinstance(getattr(task, "labels", {}), dict) else {}
+    trace = getattr(task, "trace", {}) if isinstance(getattr(task, "trace", {}), dict) else {}
+    kind = str(labels.get("kind") or "").strip().lower()
+    if bool(getattr(task, "is_autonomous", False)) and kind in {"autopilot", "final_sweep"}:
+        return True
+    return bool(getattr(task, "is_autonomous", False) and trace.get("proactive_lane", False))
 
 
 def _orchestrator_task_from_job(
@@ -22308,9 +22325,10 @@ def _orchestrator_run_codex(
     started_new_thread = False
     persist_started_thread = False
     threaded_session_enabled = _orchestrator_threaded_session_enabled(profile, role=role)
+    force_fresh_thread = _task_requires_fresh_threaded_session(task, role=role)
     try:
         if cfg.orchestrator_sessions_enabled and orch_q is not None:
-            if threaded_session_enabled:
+            if threaded_session_enabled and not force_fresh_thread:
                 tid = _orchestrator_session_thread_id(
                     orch_q=orch_q,
                     chat_id=int(task.chat_id),
@@ -22337,6 +22355,16 @@ def _orchestrator_run_codex(
                         model_override=task.model or None,
                         effort_override=task.effort or None,
                     )
+            elif threaded_session_enabled and force_fresh_thread:
+                started_new_thread = True
+                persist_started_thread = True
+                proc = runner.start_threaded_new(
+                    prompt=prompt,
+                    mode_hint=mode,
+                    image_paths=image_paths or None,
+                    model_override=task.model or None,
+                    effort_override=task.effort or None,
+                )
             else:
                 try:
                     orch_q.clear_agent_thread(chat_id=task.chat_id, role=role)

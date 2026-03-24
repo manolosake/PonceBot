@@ -236,6 +236,16 @@ class TestStateHandling(unittest.TestCase):
         self.assertFalse(bot._orchestrator_threaded_session_enabled({"threaded_session": "off"}, role="reviewer_local"))
         self.assertTrue(bot._orchestrator_threaded_session_enabled({"threaded_session": "on"}, role="implementer_local"))
 
+    def test_task_requires_fresh_threaded_session_for_autonomous_skynet_controller_jobs(self) -> None:
+        autopilot = SimpleNamespace(role="skynet", is_autonomous=True, labels={"kind": "autopilot"}, trace={})
+        final_sweep = SimpleNamespace(role="skynet", is_autonomous=True, labels={"kind": "final_sweep"}, trace={})
+        proactive_trace = SimpleNamespace(role="skynet", is_autonomous=True, labels={}, trace={"proactive_lane": True})
+        architect = SimpleNamespace(role="architect_local", is_autonomous=True, labels={"kind": "autopilot"}, trace={})
+        self.assertTrue(bot._task_requires_fresh_threaded_session(autopilot, role="skynet"))
+        self.assertTrue(bot._task_requires_fresh_threaded_session(final_sweep, role="skynet"))
+        self.assertTrue(bot._task_requires_fresh_threaded_session(proactive_trace, role="skynet"))
+        self.assertFalse(bot._task_requires_fresh_threaded_session(architect, role="architect_local"))
+
     def test_only_controller_roles_are_forced_read_only(self) -> None:
         self.assertTrue(bot._role_requires_enforced_read_only("skynet"))
         self.assertTrue(bot._role_requires_enforced_read_only("jarvis"))
@@ -917,6 +927,41 @@ class TestPromptConstruction(unittest.TestCase):
             self.assertIn("Read-only workspace access is expected for this role", prompt)
             self.assertIn("The controller will apply your diff/rewrite", prompt)
             self.assertIn("EXPECTED_VALIDATION", prompt)
+
+    def test_build_local_specialist_user_prompt_for_recovery_implementer_does_not_mix_latest_architect_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={"delegated_key": "local_impl_recover_deadbeef"},
+                labels={"key": "local_impl_recover_deadbeef"},
+                input_text="Recover the bounded README.md change only.",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            with patch.object(bot, "_latest_local_specialist_response", return_value="FILES:\n- orchestrator/queue.py\nCHANGE:\n- unrelated architect handoff"):
+                prompt = bot._build_local_specialist_user_prompt(
+                    task=task,
+                    role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                    role="implementer_local",
+                    mode="ro",
+                    worktree_dir=repo,
+                )
+
+            self.assertNotIn("LATEST_ARCHITECT_LOCAL_OUTPUT", prompt)
+            self.assertNotIn("unrelated architect handoff", prompt)
+            self.assertIn("IMPLEMENTER_LOCAL_STRICT_OVERRIDE", prompt)
 
     def test_response_signals_repo_access_blocker_detects_known_patterns(self) -> None:
         self.assertTrue(bot._response_signals_repo_access_blocker("BLOCKER: sandbox exec denied; I can't access the repo filesystem"))
