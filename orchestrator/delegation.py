@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import re
 import json
 
 
@@ -143,6 +144,53 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
     return out
 
 
-# Backwards-compatible aliases; do not document.
-parse_orchestrator_subtasks = parse_jarvis_subtasks
+def _extract_reseed_text(structured: dict[str, Any] | str | None) -> str:
+    if structured is None:
+        return ""
+    if isinstance(structured, str):
+        return structured
+    try:
+        return json.dumps(structured)
+    except Exception:
+        return str(structured)
+
+
+def parse_orchestrator_subtasks(structured: dict[str, Any] | str | None) -> list[TaskSpec]:
+    parsed = parse_jarvis_subtasks(structured)
+    if parsed:
+        return parsed
+
+    raw_text = _extract_reseed_text(structured).lower()
+    if "proactive_idle_watchdog" not in raw_text and "proactive_local_reseed" not in raw_text:
+        return parsed
+
+    ticket_id = ""
+    try:
+        match = re.search(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", raw_text)
+        if match:
+            ticket_id = match.group(0)
+    except Exception:
+        ticket_id = ""
+
+    ticket_line = f" Ticket: {ticket_id}." if ticket_id else ""
+    text = (
+        "Provide a single, bounded implementer-ready slice for proactive idle watchdog reseed."
+        " Include exact file(s), one concrete change, validation command, and risks."
+        f"{ticket_line}"
+    )
+
+    return [
+        TaskSpec(
+            key="architect_local_reseed",
+            role="architect_local",
+            text=text,
+            mode_hint="ro",
+            priority=2,
+            acceptance_criteria=["Return one implementer-ready slice with file-scoped change and validation."],
+            definition_of_done=["Implementer can apply a single bounded change without extra planning."],
+        )
+    ]
+
+
+# Backwards-compatible alias; do not document.
 parse_ceo_subtasks = parse_jarvis_subtasks
