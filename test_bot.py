@@ -294,6 +294,47 @@ class TestStateHandling(unittest.TestCase):
         )
 
 
+    def test_task_counts_as_order_phase_blocker_ignores_salvageable_failed_reviewer(self) -> None:
+        task = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "result_summary": "READY.\n\nLooks good.",
+                "review_ready": True,
+                "structured_digest": {"summary": "READY: patch is safe to merge."},
+            },
+            updated_at=20.0,
+            created_at=10.0,
+        )
+        self.assertFalse(bot._task_counts_as_order_phase_blocker(task))
+
+    def test_task_counts_as_order_phase_blocker_ignores_failed_local_job_superseded_by_newer_done(self) -> None:
+        failed = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={"result_summary": "NEEDS_REWORK."},
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        newer_done = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={"result_summary": "READY."},
+            updated_at=20.0,
+            created_at=19.0,
+        )
+        latest = bot._latest_local_done_at_by_identity([failed, newer_done])
+        self.assertFalse(
+            bot._task_counts_as_order_phase_blocker(
+                failed,
+                latest_local_done_at_by_identity=latest,
+            )
+        )
+
+
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
         return TestStateHandling()._cfg(state_file)

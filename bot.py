@@ -1903,7 +1903,8 @@ class OpenAITTS:
                 conn.endheaders()
                 conn.send(body)
 
-                resp = conn.getresponse()
+                resp = conn.getresponse()
+
                 raw = resp.read()
                 if resp.status >= 400:
                     msg = raw.decode("utf-8", errors="replace")
@@ -3049,7 +3050,8 @@ def _auth_now() -> float:
 
 def _session_key(chat_id: int) -> str:
     return str(int(chat_id))
-
+
+
 
 def _auth_is_session_active(cfg: "BotConfig", *, chat_id: int) -> tuple[bool, dict[str, Any]]:
     """
@@ -3494,7 +3496,8 @@ def _model_choices_for_display() -> list[tuple[str, str, str, list[str]]]:
                         effs.append(eff)
         # De-dupe while preserving order.
         seen: set[str] = set()
-        effs2: list[str] = []
+        effs2: list[str] = []
+
         for e in effs:
             if e not in seen:
                 seen.add(e)
@@ -5066,7 +5069,8 @@ def _local_specialist_response_for_key(
     def _truncate(raw: str) -> str:
         text = str(raw or "").strip()
         if len(text) > max_chars:
-            text = text[:max_chars].rstrip()
+            text = text[:max_chars].rstrip()
+
         return text
 
     def _read_row_payload(row_obj: sqlite3.Row | tuple | None) -> str:
@@ -6063,7 +6067,8 @@ def _finalize_codex_implementer_change(
     return [], {}, existing_change_reason
 
 
-def _orchestrator_run_local_ollama(
+def _orchestrator_run_local_ollama(
+
 
     cfg: BotConfig,
     task: Task,
@@ -6729,7 +6734,8 @@ def _maybe_handle_ceo_query(
                     f"Jarvis: Telegram user_id={msg.user_id} chat_id={msg.chat_id} username={display_user}",
                 ]
             ),
-            reply_to_message_id=msg.message_id if msg.message_id else None,
+            reply_to_message_id=msg.message_id if msg.message_id else None,
+
         )
         return True
 
@@ -11004,7 +11010,8 @@ def _auto_merge_ready_orders_tick(
     now: float,
 ) -> int:
     """
-    Auto-approve + merge orders that reached ready_for_merge.
+    Auto-approve + merge orders that reached ready_for_merge.
+
     CEO sees final merge results without manual /approve_merge steps.
     """
     if not _jarvis_auto_approve_merge_enabled():
@@ -13820,15 +13827,111 @@ def _task_requests_local_controller_recovery(
     return bool(action_hints & _CONTROLLER_LOCAL_RECOVERY_ACTIONS)
 
 
-def _task_counts_as_order_phase_blocker(task: Task) -> bool:
+def _task_event_timestamp(task: Task) -> float:
+    try:
+        updated = float(getattr(task, "updated_at", 0.0) or 0.0)
+    except Exception:
+        updated = 0.0
+    try:
+        created = float(getattr(task, "created_at", 0.0) or 0.0)
+    except Exception:
+        created = 0.0
+    return max(updated, created, 0.0)
+
+
+def _local_terminal_identity(task: Task) -> str:
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"architect_local", "implementer_local", "reviewer_local"}:
+        return ""
+    labels = dict((getattr(task, "labels", {}) or {}))
+    key = str(labels.get("key") or "").strip()
+    if key:
+        return f"{role_norm}:key:{key}"
+    trace = dict((getattr(task, "trace", {}) or {}))
+    slice_id = str(trace.get("slice_id") or "").strip()
+    if slice_id:
+        return f"{role_norm}:slice:{slice_id}"
+    return ""
+
+
+def _task_has_salvageable_local_success(task: Task) -> bool:
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"architect_local", "implementer_local", "reviewer_local"}:
+        return False
+    trace = dict((getattr(task, "trace", {}) or {}))
+    summary = str(trace.get("result_summary") or "").strip()
+    structured = trace.get("structured_digest") if isinstance(trace.get("structured_digest"), dict) else {}
+    structured_summary = str(structured.get("summary") or "").strip() if isinstance(structured, dict) else ""
+    if role_norm == "reviewer_local":
+        return bool(
+            trace.get("review_ready", False)
+            or _summary_has_ready_signal(summary)
+            or _summary_has_ready_signal(structured_summary)
+        )
+    if role_norm == "implementer_local":
+        patch_info = trace.get("local_patch_info") if isinstance(trace.get("local_patch_info"), dict) else {}
+        if not patch_info and isinstance(structured, dict) and isinstance(structured.get("patch_info"), dict):
+            patch_info = structured.get("patch_info") or {}
+        changed_files = patch_info.get("changed_files") if isinstance(patch_info.get("changed_files"), list) else []
+        return bool(changed_files and patch_info.get("validation_ok", False))
+    if role_norm == "architect_local":
+        return bool(summary or structured_summary)
+    return False
+
+
+def _latest_local_done_at_by_identity(children: list[Task]) -> dict[str, float]:
+    latest: dict[str, float] = {}
+    for child in children:
+        if str(getattr(child, "state", "") or "").strip().lower() != "done":
+            continue
+        ident = _local_terminal_identity(child)
+        if not ident:
+            continue
+        ts = _task_event_timestamp(child)
+        prev = float(latest.get(ident, 0.0) or 0.0)
+        if ts > prev:
+            latest[ident] = ts
+    return latest
+
+
+def _task_is_superseded_local_terminal_failure(
+    task: Task,
+    *,
+    latest_local_done_at_by_identity: dict[str, float] | None = None,
+) -> bool:
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"architect_local", "implementer_local", "reviewer_local"}:
+        return False
+    state_norm = str(getattr(task, "state", "") or "").strip().lower()
+    if state_norm not in {"failed", "blocked", "blocked_approval"}:
+        return False
+    if _task_has_salvageable_local_success(task):
+        return True
+    if not latest_local_done_at_by_identity:
+        return False
+    ident = _local_terminal_identity(task)
+    if not ident:
+        return False
+    newer_done_at = float(latest_local_done_at_by_identity.get(ident, 0.0) or 0.0)
+    return newer_done_at > (_task_event_timestamp(task) + 1e-6)
+
+
+def _task_counts_as_order_phase_blocker(
+    task: Task,
+    *,
+    latest_local_done_at_by_identity: dict[str, float] | None = None,
+) -> bool:
     state_norm = str(getattr(task, "state", "") or "").strip().lower()
     if state_norm not in {"blocked", "blocked_approval", "failed"}:
         return False
     if state_norm in {"blocked", "blocked_approval"} and _task_requests_local_controller_recovery(task):
         return False
+    if _task_is_superseded_local_terminal_failure(
+        task,
+        latest_local_done_at_by_identity=latest_local_done_at_by_identity,
+    ):
+        return False
     return True
-
-
 def _extract_objective_tokens(text: str) -> set[str]:
     raw = str(text or "").lower()
     toks = re.findall(r"[a-z0-9_]{4,}", raw)
@@ -14027,7 +14130,8 @@ def _ticket_local_needs_cli_takeover(
     *,
     orch_q: OrchestratorQueue,
     root_ticket: str,
-    now: float | None = None,
+    now: float | None = None,
+
 ) -> bool:
     rid = str(root_ticket or "").strip()
     if not rid:
@@ -16761,6 +16865,15 @@ def _sync_order_phase_from_runtime(
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     phase_children = [child for child in children if not _task_requests_local_controller_recovery(child)]
+    latest_local_done_at_by_identity = _latest_local_done_at_by_identity(phase_children)
+    phase_children = [
+        child
+        for child in phase_children
+        if not _task_is_superseded_local_terminal_failure(
+            child,
+            latest_local_done_at_by_identity=latest_local_done_at_by_identity,
+        )
+    ]
     if not phase_children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
@@ -16925,7 +17038,13 @@ def _sync_order_phase_from_runtime(
             pass
         return
 
-    if any(_task_counts_as_order_phase_blocker(child) for child in phase_children):
+    if any(
+        _task_counts_as_order_phase_blocker(
+            child,
+            latest_local_done_at_by_identity=latest_local_done_at_by_identity,
+        )
+        for child in phase_children
+    ):
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
         return
     if any(s == "running" for s in states):
@@ -20553,7 +20672,8 @@ def _extract_thread_id_from_jsonl(text: str) -> str:
         except Exception:
             continue
         if not isinstance(obj, dict):
-            continue
+            continue
+
         t = obj.get("type")
         if t == "thread.started" and isinstance(obj.get("thread_id"), str):
             tid = obj["thread_id"].strip()
@@ -21088,7 +21208,8 @@ def _submit_orchestrator_task(
                         trace=ttrace,
                         priority=1,
                         request_type="task",
-                    )
+                    )
+
                 else:
                     intent_type = "order_project_new"
 
@@ -21178,7 +21299,8 @@ def _submit_orchestrator_task(
                 },
             )
 
-        return True, job_id
+        return True, job_id
+
     except Exception as e:
         LOG.exception("Failed to submit orchestrator task")
         raise RuntimeError(f"Failed to submit orchestrator task: {e}") from e
@@ -21287,7 +21409,8 @@ def _orchestrator_run_codex(
             }
         if not cfg.screenshot_enabled:
             return {
-                "status": "error",
+                "status": "error",
+
                 "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
                 "artifacts": [],
                 "logs": "",
@@ -21740,7 +21863,8 @@ def _orchestrator_run_codex(
                             live_stdout_tail=stdout_tail,
                             live_stderr_tail=stderr_tail,
                             live_at=now,
-                        )
+                        )
+
                     except Exception:
                         pass
                     try:
@@ -23259,7 +23383,11 @@ def orchestrator_worker_loop(
                         result_meta["quality_gate_status"] = failed_status
                         result_meta["failure_class"] = failure_class
                 elif role_norm_task == "reviewer_local":
-                    review_ready = bool(orch_state == "done" and _summary_has_ready_signal(summary))
+                    review_ready_signal = bool(_summary_has_ready_signal(summary))
+                    if orch_state == "failed" and review_ready_signal:
+                        orch_state = "done"
+                        result_meta["local_terminal_salvaged"] = True
+                    review_ready = bool(orch_state == "done" and review_ready_signal)
                     applied_ev, validated_ev = _slice_has_applied_and_validated_evidence(
                         orch_q=orch_q,
                         root_ticket=root_ticket,
@@ -23701,7 +23829,8 @@ def orchestrator_worker_loop(
                             reply_to_message_id=task.reply_to_message_id,
                             parent_job_id=root_ticket,
                             depends_on=[],
-                            labels={"ticket": root_ticket, "kind": "evidence", "for": task.job_id},
+                            labels={"ticket": root_ticket, "kind": "evidence", "for": task.job_id},
+
                             artifacts_dir=str((cfg.artifacts_root / shot_id).resolve()),
                             trace={
                                 "source": "telegram",
@@ -28018,7 +28147,8 @@ def main() -> None:
                             runbook_id=rb.runbook_id,
                             role=rb.role,
                             interval_seconds=rb.interval_seconds,
-                            prompt=_render_placeholders_text(rb.prompt, ceo_name=cfg.ceo_name),
+                            prompt=_render_placeholders_text(rb.prompt, ceo_name=cfg.ceo_name),
+
                             mode_hint=rb.mode_hint,
                             priority=rb.priority,
                             enabled=rb.enabled,
