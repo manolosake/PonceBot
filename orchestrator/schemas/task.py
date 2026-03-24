@@ -145,7 +145,7 @@ class Task:
             is_autonomous=kwargs.get("is_autonomous", self.is_autonomous),
             parent_job_id=kwargs.get("parent_job_id", self.parent_job_id),
             owner=kwargs.get("owner", self.owner),
-            ticket=kwargs.get("ticket", self.ticket),
+            ticket=kwargs.get("ticket", self.ticket),  # preserve ticket on updates
             depends_on=list(kwargs.get("depends_on", self.depends_on) or []),
             ttl_seconds=kwargs.get("ttl_seconds", self.ttl_seconds),
             retry_count=int(kwargs.get("retry_count", self.retry_count)),
