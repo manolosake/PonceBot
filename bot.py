@@ -11039,8 +11039,9 @@ def _auto_merge_ready_orders_tick(
     except Exception:
         orders = []
 
-    # Optional heal path for historical debt: some orders may be incorrectly marked done without merge evidence.
-    # Disabled by default to avoid reopening legacy orders and spamming repeated merge-conflict notifications.
+    # Heal recent done orders only when they still carry explicit merge intent; this fixes
+    # orders that were drained to done before auto-merge could actually run, without reopening
+    # unrelated historical debt by default.
     heal_done_orders = str(os.environ.get("BOT_JARVIS_AUTO_MERGE_HEAL_DONE_ORDERS", "0") or "").strip().lower() in ("1", "true", "yes", "on")
     try:
         heal_done_max_age_hours = float(os.environ.get("BOT_JARVIS_AUTO_MERGE_HEAL_DONE_MAX_AGE_HOURS", "6").strip() or "6")
@@ -11049,15 +11050,13 @@ def _auto_merge_ready_orders_tick(
     heal_done_max_age_s = max(300.0, min(168.0 * 3600.0, float(heal_done_max_age_hours) * 3600.0))
 
     done_orders: list[dict[str, Any]] = []
-    if heal_done_orders:
-        try:
-            done_orders = list(orch_q.list_orders_global(status="done", limit=240) or [])
-        except Exception:
-            done_orders = []
+    try:
+        done_orders = list(orch_q.list_orders_global(status="done", limit=240) or [])
+    except Exception:
+        done_orders = []
 
     known_ids = {str(it.get("order_id") or "").strip() for it in orders}
-    if heal_done_orders:
-        for row in done_orders:
+    for row in done_orders:
             oid = str(row.get("order_id") or "").strip()
             if not oid:
                 continue
@@ -11081,6 +11080,13 @@ def _auto_merge_ready_orders_tick(
                 continue
             if bool(trace.get("merge_auto_suspended", False)):
                 continue
+            if not heal_done_orders:
+                if not (
+                    bool(trace.get("merge_ready", False))
+                    or bool(trace.get("proactive_no_change_validated", False))
+                    or bool(trace.get("proactive_improvement_closed", False))
+                ):
+                    continue
 
             _repo_record, repo_dir, default_branch = _repo_context_for_order(
                 cfg=cfg,

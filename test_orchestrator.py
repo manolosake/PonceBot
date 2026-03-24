@@ -2730,6 +2730,94 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertIn("new_merge_ready_signal", str(trace.get("merge_auto_resume_reason") or ""))
             self.assertIsNone(trace.get("merge_auto_failed_at"))
 
+    def test_auto_merge_tick_heals_recent_done_merge_ready_order_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            repo_path = td_path / "repo"
+            repo_path.mkdir(parents=True, exist_ok=True)
+            (repo_path / ".git").mkdir(parents=True, exist_ok=True)
+
+            cfg = _cfg(td_path / "state.json", workdir=repo_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            q.upsert_repo(
+                repo_id="repo-secondary",
+                path=str(repo_path),
+                default_branch="main",
+                autonomy_enabled=True,
+                priority=1,
+                runtime_mode="ceo-bounded",
+                daily_budget=0.0,
+                status="active",
+                metadata={},
+            )
+
+            order_id = "ord-merge-heal-default-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Heal recent done merge-ready order",
+                body="[repo:repo-secondary]",
+                status="done",
+                priority=1,
+                intent_type="order_project_new",
+                project_id="proj-1",
+                phase="done",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={
+                        "order_branch": "feature/repo-secondary",
+                        "repo_id": "repo-secondary",
+                        "repo_path": str(repo_path),
+                        "merge_ready": True,
+                        "merge_ready_at": 1000.0,
+                        "proactive_no_change_validated": True,
+                    },
+                    job_id=order_id,
+                )
+            )
+
+            with patch.object(bot, "_jarvis_auto_approve_merge_enabled", return_value=True), patch.object(
+                bot,
+                "_sync_order_phase_from_runtime",
+                return_value=None,
+            ), patch.object(
+                bot,
+                "_order_trace_requires_merge",
+                return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_order_command_text",
+                return_value="Order ord-merge-heal-default-01 auto-merged by Jarvis to main",
+            ), patch.object(bot, "_send_chunked_text", return_value=None):
+                merged = bot._auto_merge_ready_orders_tick(
+                    cfg=cfg,
+                    api=object(),
+                    orch_q=q,
+                    now=1001.0,
+                )
+
+            self.assertEqual(merged, 1)
+            order = q.get_order(order_id, chat_id=1)
+            root = q.get_job(order_id)
+            assert order is not None and root is not None
+            self.assertEqual(str(order.get("status") or ""), "active")
+            self.assertEqual(str(order.get("phase") or ""), "ready_for_merge")
+            self.assertEqual(float((root.trace or {}).get("merge_reopened_for_auto_merge_at") or 0.0), 1001.0)
+
     def test_auto_merge_tick_requeues_stale_conflict_to_skynet_and_clears_ready(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
