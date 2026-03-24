@@ -16309,6 +16309,16 @@ def _apply_autonomous_local_first_policy(
         if not review_suffix and impl_job_id:
             review_suffix = impl_job_id.split("-", 1)[0].strip()
         review_key = f"local_review_guard_{review_suffix or max(1, int(now))}"
+        impl_trace = dict(latest_impl_no_change_done.get("trace") or {}) if isinstance(latest_impl_no_change_done.get("trace"), dict) else {}
+        impl_summary = _row_local_response(latest_impl_no_change_done, max_chars=6000)
+        if not impl_summary:
+            impl_summary = str(impl_trace.get("result_summary") or "").strip()
+        impl_artifacts_dir = str(latest_impl_no_change_done.get("artifacts_dir") or "").strip()
+        evidence_block = ""
+        if impl_summary:
+            evidence_block += "\n\nLATEST_NO_CHANGE_EVIDENCE:\n" + impl_summary
+        if impl_artifacts_dir:
+            evidence_block += "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n" + impl_artifacts_dir
         return [
             TaskSpec(
                 key=review_key,
@@ -16316,9 +16326,11 @@ def _apply_autonomous_local_first_policy(
                 text=(
                     f"Validate implementer_local no-change claim for ticket {rid}.\n"
                     f"Implementer job: {impl_job_id or '(unknown)'}\n"
+                    f"{evidence_block}\n"
                     "Inspect the target files directly in the workspace.\n"
                     "Evaluate whether any additional code change is required beyond the current branch/workspace state for this slice.\n"
                     "Do not reject only because the branch already contains earlier valid code changes.\n"
+                    "Use LATEST_NO_CHANGE_EVIDENCE as the primary claim to verify, then inspect the current files to confirm or reject it.\n"
                     "- If no additional code change is truly required and behavior is already correct, return READY with exact file evidence + one validation command.\n"
                     "- If an additional code change is required, return NEEDS_REWORK with exact files and the smallest implementer slice.\n"
                     "- Do not request another architecture pass."
