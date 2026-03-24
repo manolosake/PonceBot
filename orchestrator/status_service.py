@@ -111,7 +111,7 @@ def _task_to_status(t: Task) -> dict[str, Any]:
 
     blockers_stale = False
     effective_state = t.state
-    if t.state == "blocked_waiting_only" and waiting_dependencies == 0:
+    if t.state == "blocked_waiting_only" and waiting_dependencies is not None and waiting_dependencies <= 0:
         blockers_stale = True
         effective_state = "ready"
         logger.info(
