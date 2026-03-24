@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 import json
+import os
 import re
 import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-DB = Path('/home/aponce/codexbot/data/jobs.sqlite')
-STATE_FILE = Path('/home/aponce/codexbot/state.json')
-OUT_DIR = Path('/home/aponce/codexbot/data/artifacts/proactive_health')
+DEFAULT_DB = Path('/home/aponce/codexbot/data/jobs.sqlite')
+DEFAULT_STATE_FILE = Path('/home/aponce/codexbot/state.json')
+DEFAULT_OUT_DIR = Path('/home/aponce/codexbot/data/artifacts/proactive_health')
+DB = Path(os.environ.get('CODEXBOT_ORCH_DB', str(DEFAULT_DB)))
+STATE_FILE = Path(os.environ.get('CODEXBOT_STATE_FILE', str(DEFAULT_STATE_FILE)))
+OUT_DIR = Path(os.environ.get('CODEXBOT_PROACTIVE_HEALTH_OUT_DIR', str(DEFAULT_OUT_DIR)))
 ACTIVE_STATES = ('queued', 'running', 'waiting_deps', 'blocked', 'blocked_approval')
 LOCAL_ROLES = {'architect_local', 'implementer_local', 'reviewer_local'}
 CLI_ROLES = {'backend', 'frontend', 'qa', 'sre', 'security', 'research', 'product_ops', 'release_mgr'}
@@ -365,6 +369,36 @@ def fetch_rows(cur, query: str, params=()):
     return [dict(row) for row in rows]
 
 
+def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    report = {
+        'generated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
+        'operational_status': 'CRITICAL',
+        'error': reason,
+        'db_path': str(DB),
+        'state_file': str(STATE_FILE),
+        'order_reports': [],
+        'anomalies': [],
+        'trend_flags': [],
+    }
+    payload = json.dumps(report, ensure_ascii=False, indent=2) + '\n'
+    markdown = '\n'.join(
+        [
+            '# Proactive Health Report',
+            f'- status=CRITICAL reason={reason}',
+            f'- db_path={DB}',
+            f'- state_file={STATE_FILE}',
+        ]
+    ) + '\n'
+    latest_json = OUT_DIR / 'latest.json'
+    latest_md = OUT_DIR / 'latest.md'
+    stamped_json = OUT_DIR / f'report_{stamp}.json'
+    stamped_md = OUT_DIR / f'report_{stamp}.md'
+    for path, content in ((latest_json, payload), (latest_md, markdown), (stamped_json, payload), (stamped_md, markdown)):
+        path.write_text(content, encoding='utf-8')
+    return 2
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -377,6 +411,9 @@ def main() -> int:
         soft_pause_until = 0.0
     factory_soft_pause_active = bool((not factory_hard_stop) and soft_pause_until > now)
     factory_pause_reason = str(state.get('factory_pause_reason') or state.get('proactive_lane_paused_reason') or '').strip()
+
+    if not DB.exists():
+        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
