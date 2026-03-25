@@ -5392,6 +5392,92 @@ def _response_signals_repo_access_blocker(text: str) -> bool:
     return any(sig in raw for sig in signals)
 
 
+def _focused_workspace_symbol_excerpt(
+    *,
+    raw: str,
+    rel_path: str,
+    context_texts: list[str] | tuple[str, ...],
+    max_snippets: int = 3,
+    context_lines: int = 18,
+    max_chars: int = 14000,
+) -> str:
+    raw_text = str(raw or "")
+    if not raw_text:
+        return ""
+    tokens: list[str] = []
+    seen_tokens: set[str] = set()
+    stop_tokens = {
+        "files",
+        "change",
+        "validation",
+        "risk",
+        "expected_validation",
+        "latest_architect_local_output",
+        "implementer_local_strict_override",
+        "real_worktree_dir",
+        "workspace",
+        "controller",
+        "implementer_local",
+        "architect_local",
+        "reviewer_local",
+    }
+    context_blob = "\n".join(str(item or "") for item in (context_texts or []))
+    for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", context_blob):
+        token = str(match.group(0) or "").strip()
+        if not token:
+            continue
+        norm = token.lower()
+        if norm in stop_tokens or norm in seen_tokens:
+            continue
+        if "_" not in token and token.lower() == token:
+            continue
+        seen_tokens.add(norm)
+        tokens.append(token)
+        if len(tokens) >= 12:
+            break
+    if not tokens:
+        return ""
+
+    lines = raw_text.splitlines()
+    lower_lines = [line.lower() for line in lines]
+    snippets: list[str] = []
+    covered: list[tuple[int, int]] = []
+    total_chars = 0
+    for token in tokens:
+        token_norm = token.lower()
+        hit_index = -1
+        for idx, line in enumerate(lower_lines):
+            if token_norm in line:
+                hit_index = idx
+                break
+        if hit_index < 0:
+            continue
+        start = max(0, hit_index - context_lines)
+        end = min(len(lines), hit_index + context_lines + 1)
+        overlap = False
+        for seen_start, seen_end in covered:
+            if not (end <= seen_start or start >= seen_end):
+                overlap = True
+                break
+        if overlap:
+            continue
+        snippet_body = "\n".join(lines[start:end]).rstrip()
+        if not snippet_body:
+            continue
+        snippet = (
+            f"# [FOCUSED_EXACT_TARGET_CONTEXT {rel_path}:{start + 1}-{end} symbol={token}]\n"
+            + snippet_body
+        )
+        if snippets and total_chars + len(snippet) > max_chars:
+            break
+        snippets.append(snippet)
+        covered.append((start, end))
+        total_chars += len(snippet) + 2
+        if len(snippets) >= max_snippets:
+            break
+    return "\n\n".join(snippets).strip()
+
+
 def _augment_local_specialist_prompt_with_workspace_context(
     *,
     task: Any,
@@ -5491,13 +5577,29 @@ def _augment_local_specialist_prompt_with_workspace_context(
         lines = raw.splitlines()
         if role == "implementer_local" and rel_path in exact_targets:
             # For exact targets, prefer full-file context when feasible to avoid patch-hunk drift.
-            # Truncated exact-target context has caused repeated `git apply --check` failures.
+            # When the file is too large, include symbol-focused context instead of only the file prefix so
+            # exact late-file anchors like `_ORCHESTRATOR_ROLES` remain visible to the implementer.
             if len(lines) <= 1200 and len(raw) <= 48000:
                 excerpt = raw.rstrip()
             else:
-                excerpt = raw[:48000].rstrip()
-                if len(raw) > len(excerpt):
-                    excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+                focused_excerpt = _focused_workspace_symbol_excerpt(
+                    raw=raw,
+                    rel_path=rel_path,
+                    context_texts=[
+                        str(user_prompt or ""),
+                        str(getattr(task, "input_text", "") or ""),
+                        json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
+                    ],
+                    max_snippets=3,
+                    context_lines=18,
+                    max_chars=14000,
+                )
+                if focused_excerpt:
+                    excerpt = focused_excerpt
+                else:
+                    excerpt = raw[:48000].rstrip()
+                    if len(raw) > len(excerpt):
+                        excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
         else:
             excerpt = "\n".join(lines[:excerpt_lines_cap])
             if len(excerpt) > excerpt_chars_cap:

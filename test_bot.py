@@ -928,6 +928,43 @@ class TestPromptConstruction(unittest.TestCase):
             self.assertIn("The controller will apply your diff/rewrite", prompt)
             self.assertIn("EXPECTED_VALIDATION", prompt)
 
+    def test_build_local_specialist_user_prompt_for_large_exact_target_includes_focused_symbol_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            body = "".join(f"pad_{i} = 0\n" for i in range(7000)) + "\n_ORCHESTRATOR_ROLES = (\n    'jarvis',\n    'skynet',\n)\n"
+            (repo / "bot.py").write_text(body, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text="Implement exactly one bounded improvement in bot.py",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            architect_handoff = (
+                "FILES:\n- bot.py\n\nCHANGE:\n- Update `_ORCHESTRATOR_ROLES` to include `architect_local`, `implementer_local`, and `reviewer_local`.\n\nVALIDATION:\n- python3 -m py_compile bot.py\n\nRISK:\n- low\n"
+            )
+            with patch.object(bot, "_latest_local_specialist_response", return_value=architect_handoff):
+                prompt = bot._build_local_specialist_user_prompt(
+                    task=task,
+                    role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                    role="implementer_local",
+                    mode="ro",
+                    worktree_dir=repo,
+                )
+
+            self.assertIn("_ORCHESTRATOR_ROLES = (", prompt)
+            self.assertIn("FOCUSED_EXACT_TARGET_CONTEXT bot.py", prompt)
+
     def test_build_local_specialist_user_prompt_for_recovery_implementer_does_not_mix_latest_architect_context(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
