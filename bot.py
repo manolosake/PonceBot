@@ -121,6 +121,8 @@ def _skill_segment_ok(name: str) -> bool:
     """
     if not isinstance(name, str):
         return False
+    if not name or not name.strip():
+        return False
     s = name.strip()
     if not s or s in (".", ".."):
         return False
