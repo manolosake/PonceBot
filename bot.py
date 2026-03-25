@@ -5489,14 +5489,15 @@ def _augment_local_specialist_prompt_with_workspace_context(
         return user_prompt
 
     file_hint_re = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|js|ts|tsx|json|ya?ml|sh|md)\b")
+    context_texts = [
+        str(user_prompt or ""),
+        str(getattr(task, "input_text", "") or ""),
+        json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
+    ]
     exact_targets, candidate_paths, inventory_lines = _workspace_inventory_and_candidates(
         worktree_dir=worktree_dir,
         role=role,
-        context_texts=[
-            str(user_prompt or ""),
-            str(getattr(task, "input_text", "") or ""),
-            json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
-        ],
+        context_texts=context_texts,
     )
     if role == "implementer_local" and candidate_paths:
         inventory_lines = []
@@ -5575,31 +5576,35 @@ def _augment_local_specialist_prompt_with_workspace_context(
         except Exception:
             continue
         lines = raw.splitlines()
-        if role == "implementer_local" and rel_path in exact_targets:
-            # For exact targets, prefer full-file context when feasible to avoid patch-hunk drift.
-            # When the file is too large, include symbol-focused context instead of only the file prefix so
-            # exact late-file anchors like `_ORCHESTRATOR_ROLES` remain visible to the implementer.
-            if len(lines) <= 1200 and len(raw) <= 48000:
-                excerpt = raw.rstrip()
-            else:
+        if rel_path in exact_targets:
+            focused_excerpt = ""
+            if len(lines) > excerpt_lines_cap or len(raw) > excerpt_chars_cap:
                 focused_excerpt = _focused_workspace_symbol_excerpt(
                     raw=raw,
                     rel_path=rel_path,
-                    context_texts=[
-                        str(user_prompt or ""),
-                        str(getattr(task, "input_text", "") or ""),
-                        json.dumps(getattr(task, "trace", {}) or {}, ensure_ascii=False),
-                    ],
+                    context_texts=context_texts,
                     max_snippets=3,
-                    context_lines=18,
-                    max_chars=14000,
+                    context_lines=18 if role == "implementer_local" else 12,
+                    max_chars=14000 if role == "implementer_local" else 6000,
                 )
-                if focused_excerpt:
+            if role == "implementer_local":
+                # For exact targets, prefer full-file context when feasible to avoid patch-hunk drift.
+                # When the file is too large, include symbol-focused context instead of only the file prefix so
+                # exact late-file anchors like `_ORCHESTRATOR_ROLES` remain visible to the implementer.
+                if len(lines) <= 1200 and len(raw) <= 48000:
+                    excerpt = raw.rstrip()
+                elif focused_excerpt:
                     excerpt = focused_excerpt
                 else:
                     excerpt = raw[:48000].rstrip()
                     if len(raw) > len(excerpt):
                         excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+            elif focused_excerpt:
+                excerpt = focused_excerpt
+            else:
+                excerpt = "\n".join(lines[:excerpt_lines_cap])
+                if len(excerpt) > excerpt_chars_cap:
+                    excerpt = excerpt[:excerpt_chars_cap].rstrip()
         else:
             excerpt = "\n".join(lines[:excerpt_lines_cap])
             if len(excerpt) > excerpt_chars_cap:
