@@ -927,6 +927,7 @@ class TestPromptConstruction(unittest.TestCase):
             self.assertIn("Read-only workspace access is expected for this role", prompt)
             self.assertIn("The controller will apply your diff/rewrite", prompt)
             self.assertIn("EXPECTED_VALIDATION", prompt)
+            self.assertIn("NO CODE CHANGE REQUIRED", prompt)
 
     def test_build_local_specialist_user_prompt_for_architect_large_exact_target_includes_focused_symbol_excerpt(self) -> None:
         with tempfile.TemporaryDirectory() as td:

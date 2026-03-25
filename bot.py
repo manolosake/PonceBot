@@ -5737,6 +5737,7 @@ def _build_local_specialist_user_prompt(
             + "- Prefer rewrite blocks when a single small file is shown in full below; prefer diff when changing multiple existing files.\n"
             + "- After the diff or rewrite block(s), append short evidence notes plus EXPECTED_VALIDATION describing the command the controller should run next.\n"
             + "- Do not claim you executed validation commands unless that output was already provided in the prompt.\n"
+            + "- If the provided FILE excerpt already satisfies the requested slice, return `NO CODE CHANGE REQUIRED:` with exact file evidence and EXPECTED_VALIDATION instead of a blocker.\n"
             + "- If still blocked, return `BLOCKER:` with exact files or exact missing values to inspect next.\n"
         )
         return _augment_local_implementer_prompt_with_workspace_context(
