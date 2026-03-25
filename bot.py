@@ -13115,6 +13115,120 @@ def _enqueue_reviewer_local_rework_if_due(
         pass
     return True
 
+def _enqueue_proactive_local_architect_reseed(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_row: dict[str, Any],
+    root_trace: dict[str, Any],
+    existing_children: list[Task],
+    chat_id: int,
+    now: float,
+    reason: str,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid:
+        return False
+    objective_snippet = str(order_row.get("body") or "").strip()
+    if len(objective_snippet) > 240:
+        objective_snippet = objective_snippet[:240] + "..."
+    existing_keys: set[str] = set()
+    for child in existing_children or []:
+        labels = dict((getattr(child, "labels", {}) or {}))
+        key = str(labels.get("key") or "").strip()
+        if key:
+            existing_keys.add(key)
+    revive_key_base = f"local_arch_revive_{int(now)}"
+    revive_key = revive_key_base
+    suffix = 1
+    while revive_key in existing_keys:
+        suffix += 1
+        revive_key = f"{revive_key_base}_{suffix}"
+    child_id = str(uuid.uuid4())
+    child_profile = _orchestrator_profile(profiles, "architect_local")
+    model = _orchestrator_model_for_profile(cfg, child_profile)
+    effort = _orchestrator_effort_for_profile(child_profile, cfg)
+    root_prefix = _sanitize_slice_token(str(oid or "")[:8], fallback="slice")
+    slice_id = _slice_id_from_local_key(revive_key, fallback=f"{root_prefix}_slice")
+    attempt_n = _next_slice_attempt_n(
+        root_ticket=oid,
+        slice_id=slice_id,
+        existing_tasks=list(existing_children or []),
+    )
+    trace: dict[str, Any] = {
+        "source": "scheduler",
+        "delegated_by": oid,
+        "delegated_key": revive_key,
+        "requested_role": "architect_local",
+        "profile_name": str(child_profile.get("name") or "architect_local"),
+        "profile_role": "architect_local",
+        "execution_policy": "local_only",
+        "autopilot": True,
+        "autopilot_reason": str(reason or "").strip() or "forced_local_architect_reseed",
+        "slice_id": slice_id,
+        "slice_status": "planned",
+        "quality_gate_status": "planned",
+        "failure_class": "retriable",
+        "attempt_n": int(attempt_n),
+        "improvement_verified": False,
+    }
+    order_branch = str(root_trace.get("order_branch") or "").strip()
+    if order_branch:
+        trace["order_branch"] = order_branch
+    child = Task.new(
+        source="telegram",
+        role="architect_local",
+        input_text=(
+            f"Proactive local revive for ticket {oid}: the order is still active but has no runnable local tasks. "
+            "Return one fresh bounded implementer-ready slice with exact files and one validation command. "
+            f"Objective snapshot: {objective_snippet}"
+        ),
+        request_type="task",
+        priority=2,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id=oid,
+        owner="scheduler",
+        depends_on=[],
+        ttl_seconds=1800,
+        max_retries=0,
+        labels={"ticket": oid, "kind": "subtask", "key": revive_key, "order": oid},
+        artifacts_dir=str((cfg.artifacts_root / child_id).resolve()),
+        trace=trace,
+        job_id=child_id,
+    )
+    orch_q.submit_task(child)
+    try:
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
+        orch_q.update_trace(
+            oid,
+            local_only_revive_requested=False,
+            local_only_revive_requested_at=0.0,
+            local_only_revive_seeded_at=float(now),
+            local_only_revive_seeded_job_id=child_id,
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.local_only_reseeded",
+            actor="scheduler",
+            details={
+                "order_id": oid,
+                "job_id": child_id,
+                "role": "architect_local",
+                "reason": str(reason or "").strip() or "forced_local_architect_reseed",
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _enqueue_order_autopilot_task(
     *,
     cfg: BotConfig,
@@ -13154,6 +13268,20 @@ def _enqueue_order_autopilot_task(
 
     root_job = orch_q.get_job(oid)
     root_trace = dict((root_job.trace if root_job else {}) or {})
+    is_proactive = _is_proactive_order_record(order_row)
+    if is_proactive and bool(root_trace.get("local_only_revive_requested", False)) and not _has_open_local_support_work(children):
+        if _enqueue_proactive_local_architect_reseed(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            order_row=order_row,
+            root_trace=root_trace,
+            existing_children=children,
+            chat_id=int(chat_id),
+            now=float(now),
+            reason=str(reason or "").strip() or "forced_local_architect_reseed",
+        ):
+            return True
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     latest_activity = 0.0
     for index, candidate in enumerate([root_job, *children]):
@@ -13207,7 +13335,6 @@ def _enqueue_order_autopilot_task(
     ):
         return True
 
-    is_proactive = _is_proactive_order_record(order_row)
     controller_role = "skynet" if is_proactive else "jarvis"
     title = str(order_row.get("title") or "").strip()
     body = str(order_row.get("body") or "").strip()
