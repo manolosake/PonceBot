@@ -119,7 +119,9 @@ def _skill_segment_ok(name: str) -> bool:
     Only allow simple skill names like: imagegen, gh-fix-ci, notion-research-documentation.
     (No slashes, no '..', no weird whitespace.)
     """
-    s = (name or "").strip()
+    if not isinstance(name, str):
+        return False
+    s = name.strip()
     if not s or s in (".", ".."):
         return False
     if s != Path(s).name:
