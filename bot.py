@@ -5411,8 +5411,27 @@ def _focused_workspace_symbol_excerpt(
         "change",
         "validation",
         "risk",
+        "rules",
+        "ticket",
+        "key",
+        "role",
+        "request_type",
+        "mode_hint",
+        "artifacts_dir",
+        "target_files",
+        "controller_intent",
+        "primary_architect_handoff",
         "expected_validation",
+        "acceptance_criteria",
+        "definition_of_done",
+        "sla_tier",
+        "eta_minutes",
+        "execution_contract",
         "latest_architect_local_output",
+        "latest_implementer_evidence",
+        "latest_reviewer_findings",
+        "mandatory_file_scope",
+        "implementer_artifacts_dir",
         "implementer_local_strict_override",
         "real_worktree_dir",
         "workspace",
@@ -5422,19 +5441,27 @@ def _focused_workspace_symbol_excerpt(
         "reviewer_local",
     }
     context_blob = "\n".join(str(item or "") for item in (context_texts or []))
-    for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", context_blob):
-        token = str(match.group(0) or "").strip()
+
+    def _append_token(raw_token: str) -> bool:
+        token = str(raw_token or "").strip()
         if not token:
-            continue
+            return False
         norm = token.lower()
         if norm in stop_tokens or norm in seen_tokens:
-            continue
+            return False
         if "_" not in token and token.lower() == token:
-            continue
+            return False
         seen_tokens.add(norm)
         tokens.append(token)
-        if len(tokens) >= 12:
+        return len(tokens) >= 12
+
+    for match in re.finditer(r"`([A-Za-z_][A-Za-z0-9_]{3,})`", context_blob):
+        if _append_token(str(match.group(1) or "")):
             break
+    if len(tokens) < 12:
+        for match in re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", context_blob):
+            if _append_token(str(match.group(0) or "")):
+                break
     if not tokens:
         return ""
 
