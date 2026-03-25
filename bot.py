@@ -15557,7 +15557,7 @@ def _summary_has_validation_signal(text: str) -> bool:
 
 
 def _proactive_cli_promotion_enabled() -> bool:
-    raw = os.environ.get("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", "1")
+    raw = os.environ.get("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", "0")
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -15681,7 +15681,8 @@ def _order_has_meaningful_improvement(
     except Exception:
         return False
 
-    delivery_roles = {"backend", "frontend", "implementer_local", "sre", "product_ops", "security", "research", "release_mgr"}
+    # For proactive/local-only factory progress, count only the local implementer/reviewer lane.
+    delivery_roles = {"implementer_local"}
     delivery_ok = False
     validation_ok = False
     latest_delivery_ts = 0.0
@@ -15699,7 +15700,7 @@ def _order_has_meaningful_improvement(
         if role_norm in delivery_roles and (_trace_has_nontrivial_artifacts(trace) or _summary_has_progress_signal(summary)):
             delivery_ok = True
             latest_delivery_ts = max(latest_delivery_ts, updated_at)
-        if role_norm in {"qa", "reviewer_local"}:
+        if role_norm in {"reviewer_local"}:
             validation_blob = f"{result_status}\n{summary}"
             validation_verdict = _text_has_no_go_signal(validation_blob) or _summary_has_validation_signal(summary)
             validation_evidence = _trace_has_nontrivial_artifacts(trace) or len(summary) >= 80
@@ -18603,12 +18604,16 @@ def _jarvis_final_sweep_tick(
     are either discarded, closed explicitly, or replanned.
     """
     try:
-        # Avoid meta-loop thrash from very short sweep intervals.
-        cooldown_s = max(600.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "900").strip() or "900"))
+        # Avoid meta-loop thrash from very short sweep intervals, but honor test overrides.
+        cooldown_s = float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "900").strip() or "900")
+        if cooldown_s < 0:
+            cooldown_s = 0.0
     except Exception:
         cooldown_s = 900.0
     try:
-        idle_order_stale_s = max(120.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300"))
+        idle_order_stale_s = float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300")
+        if idle_order_stale_s < 0:
+            idle_order_stale_s = 0.0
     except Exception:
         idle_order_stale_s = 300.0
     try:
@@ -24599,17 +24604,8 @@ def orchestrator_worker_loop(
                                 )
                             except Exception:
                                 pass
-                    proactive_cli_promotion = bool(
-                        autonomous_non_manual
-                        and (proactive_lane or order_is_proactive)
-                        and (not enforce_local_only)
-                        and _proactive_cli_promotion_enabled()
-                        and _ticket_proactive_needs_cli_promotion(
-                            orch_q=orch_q,
-                            root_ticket=root_ticket,
-                            now=time.time(),
-                        )
-                    )
+                    # Hard guardrail: proactive Skynet factory work must stay local-only.
+                    proactive_cli_promotion = False
                     if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
                         objective_snippet = str(task.input_text or "").strip()
                         if len(objective_snippet) > 240:

@@ -3995,6 +3995,55 @@ class TestImplementerFailureSelection(unittest.TestCase):
         )
 
 
+class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
+    def test_proactive_cli_promotion_disabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)
+            self.assertFalse(bot._proactive_cli_promotion_enabled())
+
+    def test_order_meaningful_improvement_ignores_backend_qa_only(self) -> None:
+        root = SimpleNamespace(job_id="root", trace={}, created_at=0.0, updated_at=0.0)
+        children = [
+            SimpleNamespace(
+                role="backend",
+                state="done",
+                trace={"result_status": "done", "result_summary": "Implemented concrete improvement with evidence."},
+                labels={},
+                created_at=100.0,
+                updated_at=100.0,
+            ),
+            SimpleNamespace(
+                role="qa",
+                state="done",
+                trace={"result_status": "done", "result_summary": "PASS validation with evidence artifacts."},
+                labels={},
+                created_at=120.0,
+                updated_at=120.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return list(children) if parent_job_id == "root" else []
+
+        self.assertFalse(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
+    def test_order_meaningful_improvement_true_when_already_merged(self) -> None:
+        root = SimpleNamespace(job_id="root", trace={"merged_to_main": True}, created_at=0.0, updated_at=0.0)
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return []
+
+        self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
+
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
         out = bot._normalize_tts_speak_text("Jarvis: merge completed", backend="piper")
