@@ -4056,7 +4056,12 @@ def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> st
 def _order_branch_name(order_id: str, title: str) -> str:
     oid = str(order_id or "").strip()[:8] or "order"
     slug = _slug_token(title or f"order-{oid}", max_len=38)
-    return f"feature/order-{oid}-{slug}"
+    branch_prefix = f"feature/order-{oid}-"
+    max_total_len = 63
+    max_slug_len = max_total_len - len(branch_prefix)
+    if max_slug_len > 0 and len(slug) > max_slug_len:
+        slug = slug[:max_slug_len]
+    return f"{branch_prefix}{slug}"
 
 
 def _run_git(
