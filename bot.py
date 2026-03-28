@@ -3996,6 +3996,12 @@ def _coerce_orchestrator_mode(value: str) -> str:
 
 
 def _default_orchestrator_profile(role: str) -> dict[str, Any]:
+    normalized_role = (role or "").strip().lower()
+    allowed_tools = (
+        ["plan", "summarize", "review", "repo_read"]
+        if normalized_role.endswith("_local")
+        else []
+    )
     return {
         "name": role.title(),
         "role": role,
@@ -4003,7 +4009,7 @@ def _default_orchestrator_profile(role: str) -> dict[str, Any]:
         "model": "",
         "effort": "medium",
         "mode_hint": "ro",
-        "allowed_tools": [],
+        "allowed_tools": allowed_tools,
         "max_parallel_jobs": 1,
         "max_runtime_seconds": 900,
         "approval_required": False,
