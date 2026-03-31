@@ -4055,10 +4055,8 @@ def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> st
 
 def _order_branch_name(order_id: str, title: str) -> str:
     oid = str(order_id or "").strip()[:8] or "order"
-    slug = _slug_token(title or f"order-{oid}", max_len=38)
-    if not slug:
-        # Ensure we never end with a trailing hyphen in the branch name.
-        slug = f"order-{oid}"
+    # Ensure we never end with a trailing hyphen in the branch name.
+    slug = _slug_token(title or f"order-{oid}", max_len=38) or f"order-{oid}"
     return f"feature/order-{oid}-{slug}"
 
 
