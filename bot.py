@@ -3996,14 +3996,15 @@ def _coerce_orchestrator_mode(value: str) -> str:
 
 
 def _default_orchestrator_profile(role: str) -> dict[str, Any]:
+    mode_hint = "ro"
     return {
         "name": role.title(),
         "role": role,
         "system_prompt": "",
         "model": "",
         "effort": "medium",
-        "mode_hint": "ro",
-        "allowed_tools": ["repo_read"],
+        "mode_hint": mode_hint,
+        "allowed_tools": ["repo_read"] if mode_hint == "ro" else [],
         "max_parallel_jobs": 1,
         "max_runtime_seconds": 900,
         "approval_required": False,
