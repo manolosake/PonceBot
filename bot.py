@@ -4553,7 +4553,12 @@ def _parse_orchestrator_marker(text: str) -> tuple[str, str] | None:
         return None
     if ":" in body:
         kind, payload = body.split(":", 1)
-        return kind, payload.strip()
+        payload = payload.strip()
+        if not payload:
+            return None
+        if len(payload) > 8192:
+            payload = payload[:8192]
+        return kind, payload
     kind = body
     if kind.endswith("__"):
         kind = kind[:-2]
