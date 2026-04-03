@@ -4548,7 +4548,7 @@ def _parse_orchestrator_marker(text: str) -> tuple[str, str] | None:
     """
     if not text.startswith("__orch_"):
         return None
-    body = text[len("__orch_") :]
+    body = text[len("__orch_") :].strip()
     if not body:
         return None
     if ":" in body:
