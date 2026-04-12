@@ -9,10 +9,20 @@ OnFailure=codexbot-alert@%n
 [Service]
 Type=simple
 User=aponce
-WorkingDirectory=/home/aponce/codexbot
+WorkingDirectory=/home/aponce/codexbot/data/runtime_worktrees/main
 EnvironmentFile=/home/aponce/codexbot/codexbot.env
-ExecStartPre=/home/aponce/codexbot/run.sh --check-env
-ExecStart=/home/aponce/codexbot/run.sh
+Environment=ENV_FILE=/home/aponce/codexbot/codexbot.env
+Environment=CODEXBOT_PYTHON_BIN=/home/aponce/codexbot/.venv/bin/python
+Environment=BOT_STATE_FILE=/home/aponce/codexbot/state.json
+Environment=BOT_AUTH_USERS_FILE=/home/aponce/codexbot/users.json
+Environment=BOT_AUTH_PROFILES_FILE=/home/aponce/codexbot/profiles.json
+Environment=BOT_ORCHESTRATOR_DB_PATH=/home/aponce/codexbot/data/jobs.sqlite
+Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=/home/aponce/codexbot/orchestrator/agents.yaml
+Environment=BOT_RUNBOOKS_PATH=/home/aponce/codexbot/orchestrator/runbooks.yaml
+Environment=BOT_WORKTREE_ROOT=/home/aponce/codexbot/data/worktrees
+Environment=BOT_ARTIFACTS_ROOT=/home/aponce/codexbot/data/artifacts
+ExecStartPre=/home/aponce/codexbot/data/runtime_worktrees/main/run.sh --check-env
+ExecStart=/home/aponce/codexbot/data/runtime_worktrees/main/run.sh
 Restart=on-failure
 RestartSec=5
 

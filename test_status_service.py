@@ -171,3 +171,26 @@ class TestStatusService(unittest.TestCase):
             pending = list(snap.get("decisions_pending") or [])
             self.assertTrue(len(pending) >= 1)
             self.assertTrue(any(str(x.get("next_action") or "").startswith("Aprobar evidencia") for x in pending))
+
+    def test_snapshot_merges_factory_callback_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+
+            svc = StatusService(
+                orch_q=q,
+                role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}},
+                cache_ttl_seconds=0,
+                factory_snapshot_fn=lambda chat_id: {
+                    "factory": {"status": "active", "mode": "ceo-bounded"},
+                    "repos": [{"repo_id": "repo-a", "path": "/tmp/repo-a", "status": "active"}],
+                    "heartbeats": [{"agent_key": "repo-a:skynet", "stale": False}],
+                    "models": {"local_ollama": {"healthy": True}},
+                    "alerts": [{"kind": "factory_test", "severity": "warning", "summary": "factory callback merged"}],
+                },
+            )
+            snap = svc.snapshot(chat_id=1)
+            self.assertEqual((snap.get("factory") or {}).get("status"), "active")
+            self.assertEqual(len(list(snap.get("repos") or [])), 1)
+            self.assertEqual(len(list(snap.get("heartbeats") or [])), 1)
+            self.assertTrue(any(str(item.get("kind") or "") == "factory_test" for item in list(snap.get("alerts") or [])))
