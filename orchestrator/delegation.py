@@ -2,21 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-import hashlib
 import json
-import re
 
 
 _ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local")
 _ALLOWED_MODES = ("ro", "rw", "full")
 _ALLOWED_SLA = ("normal", "high", "urgent")
-
-
-def _synth_task_key(*, role: str, text: str) -> str:
-    role_token = re.sub(r"[^a-z0-9_]+", "_", str(role or "task").strip().lower()).strip("_") or "task"
-    normalized = " ".join(str(text or "").strip().lower().split())
-    digest = hashlib.sha1(f"{role_token}\n{normalized}".encode("utf-8", errors="ignore")).hexdigest()[:10]
-    return f"auto_{role_token}_{digest}"
 
 
 @dataclass(frozen=True)
@@ -76,10 +67,6 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
         return []
     items = payload.get("subtasks")
     if not isinstance(items, list):
-        next_action = payload.get("next_action")
-        if isinstance(next_action, dict):
-            items = next_action.get("subtasks")
-    if not isinstance(items, list):
         return []
 
     out: list[TaskSpec] = []
@@ -88,15 +75,13 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
             continue
         key = str(raw.get("key") or "").strip()
         role = str(raw.get("role") or "").strip().lower()
-        text = str(raw.get("text") or raw.get("task") or "").strip()
-        if not text:
+        text = str(raw.get("text") or "").strip()
+        if not key or not text:
             continue
         if role in ("ceo", "orchestrator"):
             role = "jarvis"
         if role not in _ALLOWED_ROLES:
             continue
-        if not key:
-            key = _synth_task_key(role=role, text=text)
 
         # mode_hint is optional. If omitted, we let the runner apply role profile defaults.
         if "mode_hint" in raw:

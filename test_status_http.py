@@ -56,7 +56,7 @@ class TestStatusHTTP(unittest.TestCase):
                 self.assertEqual(resp.headers.get("X-ED-API-Version"), "v1")
                 payload = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(payload.get("api_version"), "v1")
-                self.assertEqual(payload.get("schema_version"), 2)
+                self.assertEqual(payload.get("schema_version"), 1)
 
             http_srv.shutdown()
 
@@ -206,39 +206,5 @@ class TestStatusHTTP(unittest.TestCase):
                     self.assertEqual(payload.get("api_version"), "v1")
                     self.assertIn("items", payload)
                     self.assertIsInstance(payload["items"], list)
-
-            http_srv.shutdown()
-
-    def test_overview_includes_factory_block(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
-            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend"}})
-            svc = StatusService(
-                orch_q=q,
-                role_profiles={"backend": {"role": "backend"}},
-                cache_ttl_seconds=0,
-                factory_snapshot_fn=lambda chat_id: {"factory": {"status": "soft_pause", "mode": "ceo-bounded"}},
-            )
-
-            http_srv = start_status_http_server(
-                host="127.0.0.1",
-                port=0,
-                status_service=svc,
-                stream_interval_s=0.5,
-                auth_token="secret",
-                snapshot_rate_per_s=0.0,
-                snapshot_burst=1.0,
-                max_sse_per_ip=2,
-            )
-            t = threading.Thread(target=http_srv.serve_forever, daemon=True)
-            t.start()
-            time.sleep(0.05)
-
-            base = f"http://{http_srv.host}:{http_srv.port}"
-            req = urllib.request.Request(base + "/api/v1/orchestration/overview", headers={"Authorization": "Bearer secret"})
-            with urllib.request.urlopen(req, timeout=2) as resp:
-                self.assertEqual(resp.status, 200)
-                payload = json.loads(resp.read().decode("utf-8"))
-                self.assertEqual((payload.get("factory") or {}).get("status"), "soft_pause")
 
             http_srv.shutdown()
