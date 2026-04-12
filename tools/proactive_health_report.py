@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_DB = Path('/home/aponce/codexbot/data/jobs.sqlite')
+DEFAULT_STATE_FILE = Path('/home/aponce/codexbot/state.json')
 DEFAULT_OUT_DIR = Path('/home/aponce/codexbot/data/artifacts/proactive_health')
 DB = Path(os.environ.get('CODEXBOT_ORCH_DB', str(DEFAULT_DB)))
+STATE_FILE = Path(os.environ.get('CODEXBOT_STATE_FILE', str(DEFAULT_STATE_FILE)))
 OUT_DIR = Path(os.environ.get('CODEXBOT_PROACTIVE_HEALTH_OUT_DIR', str(DEFAULT_OUT_DIR)))
 ACTIVE_STATES = ('queued', 'running', 'waiting_deps', 'blocked', 'blocked_approval')
 LOCAL_ROLES = {'architect_local', 'implementer_local', 'reviewer_local'}
@@ -44,6 +46,13 @@ def worst_status(*values: str) -> str:
 def load_json(raw: str):
     try:
         return json.loads(raw or '{}')
+    except Exception:
+        return {}
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
     except Exception:
         return {}
 
@@ -367,6 +376,7 @@ def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
         'operational_status': 'CRITICAL',
         'error': reason,
         'db_path': str(DB),
+        'state_file': str(STATE_FILE),
         'order_reports': [],
         'anomalies': [],
         'trend_flags': [],
@@ -377,10 +387,7 @@ def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
             '# Proactive Health Report',
             f'- status=CRITICAL reason={reason}',
             f'- db_path={DB}',
-            '',
-            '- order_reports: []',
-            '- anomalies: []',
-            '- trend_flags: []',
+            f'- state_file={STATE_FILE}',
         ]
     ) + '\n'
     latest_json = OUT_DIR / 'latest.json'
@@ -396,6 +403,14 @@ def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
     stamp = datetime.now(UTC).strftime('%Y%m%d_%H%M%S')
+    state = load_state()
+    factory_hard_stop = bool(state.get('factory_hard_stop', False) or state.get('proactive_lane_manual_pause', False))
+    try:
+        soft_pause_until = float(state.get('factory_soft_pause_until') or 0.0)
+    except Exception:
+        soft_pause_until = 0.0
+    factory_soft_pause_active = bool((not factory_hard_stop) and soft_pause_until > now)
+    factory_pause_reason = str(state.get('factory_pause_reason') or state.get('proactive_lane_paused_reason') or '').strip()
 
     if not DB.exists():
         return _write_error_report(now=now, stamp=stamp, reason='db_missing')
@@ -404,8 +419,16 @@ def main() -> int:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
 
-    order_rows = fetch_rows(cur, 'SELECT * FROM ceo_orders WHERE status = ? ORDER BY updated_at DESC', ('active',))
+    order_rows = fetch_rows(cur, "SELECT * FROM ceo_orders WHERE status IN ('active','paused') ORDER BY updated_at DESC")
     proactive_orders = [row for row in order_rows if is_proactive(row.get('title', ''), row.get('body', ''))]
+    try:
+        repo_rows = fetch_rows(cur, 'SELECT * FROM repo_registry ORDER BY priority ASC, updated_at DESC')
+    except Exception:
+        repo_rows = []
+    try:
+        heartbeat_rows = fetch_rows(cur, 'SELECT * FROM agent_runtime_state ORDER BY updated_at DESC')
+    except Exception:
+        heartbeat_rows = []
 
     since = now - LOOKBACK_S
     order_reports = []
@@ -541,6 +564,15 @@ def main() -> int:
         "SELECT COUNT(*) AS n FROM jobs WHERE updated_at >= ? AND trace LIKE ?",
         (since, '%empty response from local ollama model%'),
     ).fetchone()['n']
+    enabled_repos = [row for row in repo_rows if str(row.get('status') or '').strip().lower() == 'active' and bool(int(row.get('autonomy_enabled') or 0))]
+    stale_heartbeats = 0
+    for hb in heartbeat_rows:
+        try:
+            heartbeat_at = float(hb.get('heartbeat_at') or 0.0)
+        except Exception:
+            heartbeat_at = 0.0
+        if heartbeat_at <= 0 or (now - heartbeat_at) >= STALE_LOCAL_S:
+            stale_heartbeats += 1
 
     def audit_count(event_type: str) -> int:
         return int(
@@ -572,13 +604,43 @@ def main() -> int:
         'proactive_cli_reseeded_24h': audit_count('delegation.proactive_cli_reseeded'),
         'stale_local_cancels_24h': audit_count('task.proactive_local_stale_cancelled'),
         'final_sweeps_24h': audit_count('order.final_sweep_enqueued'),
+        'factory_model_fallback_24h': audit_count('factory.model_fallback'),
+        'factory_repo_orders_24h': audit_count('factory.repo_order.created'),
+        'factory_enabled_repos': len(enabled_repos),
+        'factory_registered_repos': len(repo_rows),
+        'factory_stale_heartbeats': int(stale_heartbeats),
     }
 
     operational_status = 'OK'
-    if any(item['type'] in ('ready_with_open_work', 'ready_without_quality_gate') for item in anomalies):
+    if factory_hard_stop:
+        operational_status = 'CRITICAL'
+        anomalies.append({
+            'type': 'factory_hard_stop',
+            'reason': factory_pause_reason or 'unspecified',
+        })
+    elif factory_soft_pause_active:
+        operational_status = 'WARN'
+        anomalies.append({
+            'type': 'factory_soft_pause',
+            'reason': factory_pause_reason or 'unspecified',
+            'soft_pause_until': soft_pause_until,
+        })
+    elif any(item['type'] in ('ready_with_open_work', 'ready_without_quality_gate') for item in anomalies):
         operational_status = 'CRITICAL'
     elif anomalies:
         operational_status = 'WARN'
+    if metrics['factory_enabled_repos'] > 0 and not proactive_orders:
+        anomalies.append({
+            'type': 'factory_without_active_orders',
+            'enabled_repos': metrics['factory_enabled_repos'],
+        })
+        operational_status = worst_status(operational_status, 'WARN')
+    if metrics['factory_stale_heartbeats'] > 0:
+        anomalies.append({
+            'type': 'factory_stale_heartbeats',
+            'count': metrics['factory_stale_heartbeats'],
+        })
+        operational_status = worst_status(operational_status, 'WARN')
 
     trend_flags = []
     if metrics['empty_response_failures_24h'] >= 10:
@@ -596,6 +658,11 @@ def main() -> int:
             'type': 'high_final_sweeps',
             'count': metrics['final_sweeps_24h'],
         })
+    if metrics['factory_model_fallback_24h'] >= 5:
+        trend_flags.append({
+            'type': 'high_model_fallbacks',
+            'count': metrics['factory_model_fallback_24h'],
+        })
     trend_status = 'WARN' if trend_flags else 'OK'
     status = worst_status(operational_status, trend_status)
 
@@ -605,6 +672,15 @@ def main() -> int:
         'status': status,
         'operational_status': operational_status,
         'trend_status': trend_status,
+        'factory': {
+            'hard_stop': factory_hard_stop,
+            'soft_pause_active': factory_soft_pause_active,
+            'pause_reason': factory_pause_reason,
+            'soft_pause_until': soft_pause_until if factory_soft_pause_active else None,
+            'registered_repos': len(repo_rows),
+            'enabled_repos': len(enabled_repos),
+            'stale_heartbeats': int(stale_heartbeats),
+        },
         'metrics': metrics,
         'autonomy_funnel': {
             'slices_started': metrics['slices_started'],
@@ -630,6 +706,9 @@ def main() -> int:
         f'- Status: {status}',
         f'- Operational status: {operational_status}',
         f'- Trend status: {trend_status}',
+        f"- Factory state: {'hard_stop' if factory_hard_stop else ('soft_pause' if factory_soft_pause_active else 'active')}",
+        f"- Factory repos: registered={metrics['factory_registered_repos']} enabled={metrics['factory_enabled_repos']}",
+        f"- Factory stale heartbeats: {metrics['factory_stale_heartbeats']}",
         f"- Active proactive orders: {metrics['proactive_active_orders']}",
         f"- Autonomy funnel (24h): started={metrics['slices_started']} applied={metrics['slices_applied']} validated={metrics['slices_validated']} closed={metrics['slices_closed']}",
         f"- Implementer fail rate (24h): {metrics['implementer_fail_rate']:.2%}",
@@ -640,6 +719,7 @@ def main() -> int:
         f"- CLI seeds/reseeds (24h): {metrics['proactive_cli_seeded_24h']}/{metrics['proactive_cli_reseeded_24h']}",
         f"- Stale local cancels (24h): {metrics['stale_local_cancels_24h']}",
         f"- Final sweeps (24h): {metrics['final_sweeps_24h']}",
+        f"- Model fallbacks (24h): {metrics['factory_model_fallback_24h']}",
         '',
         '## Orders',
     ]

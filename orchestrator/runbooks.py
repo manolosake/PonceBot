@@ -67,16 +67,11 @@ def due(runbook: Runbook, *, last_run_at: float, now: float | None = None) -> bo
 
 
 def to_task(runbook: Runbook, *, chat_id: int) -> Task:
-    request_type = "maintenance"
-    ticket = None
-    if runbook.runbook_id == "proactive_local_seed_r1":
-        request_type = "proactive_local_seed_r1"
-        ticket = "e4b6a310-fe37-4344-a48f-38e6d7623eb1"
     return Task.new(
         source="telegram",
         role=runbook.role,
         input_text=runbook.prompt,
-        request_type=request_type,
+        request_type="maintenance",
         priority=int(runbook.priority),
         model="",
         effort="medium",
@@ -86,7 +81,6 @@ def to_task(runbook: Runbook, *, chat_id: int) -> Task:
         chat_id=int(chat_id),
         is_autonomous=True,
         owner="scheduler",
-        ticket=ticket,
         labels={"runbook": runbook.runbook_id},
         trace={"runbook_id": runbook.runbook_id},
     )

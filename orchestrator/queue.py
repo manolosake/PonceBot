@@ -260,6 +260,130 @@ class OrchestratorQueue:
     def list_projects(self, *, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         return self._storage.list_projects(status=status, limit=limit)
 
+    def upsert_repo(
+        self,
+        *,
+        repo_id: str,
+        path: str,
+        default_branch: str = "main",
+        autonomy_enabled: bool = True,
+        priority: int = 2,
+        runtime_mode: str = "ceo-bounded",
+        daily_budget: float = 0.0,
+        status: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._storage.upsert_repo(
+            repo_id=repo_id,
+            path=path,
+            default_branch=default_branch,
+            autonomy_enabled=autonomy_enabled,
+            priority=priority,
+            runtime_mode=runtime_mode,
+            daily_budget=daily_budget,
+            status=status,
+            metadata=metadata,
+        )
+
+    def get_repo(self, *, repo_id: str) -> dict[str, Any] | None:
+        return self._storage.get_repo(repo_id=repo_id)
+
+    def get_repo_by_path(self, *, path: str) -> dict[str, Any] | None:
+        return self._storage.get_repo_by_path(path=path)
+
+    def list_repos(
+        self,
+        *,
+        status: str | None = None,
+        autonomy_enabled: bool | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        return self._storage.list_repos(status=status, autonomy_enabled=autonomy_enabled, limit=limit)
+
+    def set_repo_autonomy(self, *, repo_id: str, enabled: bool) -> bool:
+        return self._storage.set_repo_autonomy(repo_id=repo_id, enabled=enabled)
+
+    def set_repo_status(self, *, repo_id: str, status: str) -> bool:
+        return self._storage.set_repo_status(repo_id=repo_id, status=status)
+
+    def upsert_agent_runtime_state(
+        self,
+        *,
+        repo_id: str,
+        role: str,
+        chat_id: int | None = None,
+        session_thread_id: str | None = None,
+        lane: str = "factory",
+        heartbeat_at: float | None = None,
+        last_result_status: str | None = None,
+        last_result_summary: str | None = None,
+        last_job_id: str | None = None,
+        last_run_at: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return self._storage.upsert_agent_runtime_state(
+            repo_id=repo_id,
+            role=role,
+            chat_id=chat_id,
+            session_thread_id=session_thread_id,
+            lane=lane,
+            heartbeat_at=heartbeat_at,
+            last_result_status=last_result_status,
+            last_result_summary=last_result_summary,
+            last_job_id=last_job_id,
+            last_run_at=last_run_at,
+            metadata=metadata,
+        )
+
+    def get_agent_runtime_state(self, *, repo_id: str, role: str) -> dict[str, Any] | None:
+        return self._storage.get_agent_runtime_state(repo_id=repo_id, role=role)
+
+    def list_agent_runtime_state(
+        self,
+        *,
+        repo_id: str | None = None,
+        role: str | None = None,
+        stale_before: float | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        return self._storage.list_agent_runtime_state(repo_id=repo_id, role=role, stale_before=stale_before, limit=limit)
+
+    def append_agent_mailbox(
+        self,
+        *,
+        to_agent_key: str,
+        kind: str,
+        repo_id: str | None = None,
+        from_agent_key: str | None = None,
+        correlation_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        status: str = "queued",
+        message_id: str | None = None,
+    ) -> str:
+        return self._storage.append_agent_mailbox(
+            to_agent_key=to_agent_key,
+            kind=kind,
+            repo_id=repo_id,
+            from_agent_key=from_agent_key,
+            correlation_id=correlation_id,
+            payload=payload,
+            status=status,
+            message_id=message_id,
+        )
+
+    def list_agent_mailbox(
+        self,
+        *,
+        to_agent_key: str | None = None,
+        repo_id: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        return self._storage.list_agent_mailbox(to_agent_key=to_agent_key, repo_id=repo_id, status=status, limit=limit)
+
+    def set_agent_mailbox_status(self, *, message_id: str, status: str) -> bool:
+        return self._storage.set_agent_mailbox_status(message_id=message_id, status=status)
+
     def hard_reset_bootstrap(self, *, reason: str = "hard_reset_bootstrap") -> dict[str, int]:
         return self._storage.hard_reset_bootstrap(reason=reason)
 
