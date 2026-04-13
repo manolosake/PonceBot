@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -127,6 +131,452 @@ class TestStateHandling(unittest.TestCase):
             self.assertFalse(bool(state.get("paused", False)))
             self.assertFalse(bool(state.get("manual_pause", False)))
 
+    def test_factory_soft_pause_auto_resumes_when_due(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._set_factory_pause(
+                cfg,
+                hard_stop=False,
+                reason="factory_soft_pause",
+                ttl_seconds=60,
+            )
+            state_before = bot._factory_state(cfg)
+            self.assertTrue(bool(state_before.get("soft_pause_active", False)))
+
+            def _m(st: dict[str, object]) -> None:
+                st["factory_soft_pause_until"] = 0.0
+
+            bot._update_state(cfg, _m)
+            resumed = bot._factory_auto_resume_if_due(cfg)
+            self.assertTrue(resumed)
+            state_after = bot._factory_state(cfg)
+            self.assertFalse(bool(state_after.get("paused", False)))
+
+    def test_discover_factory_repos_scans_git_dirs_under_configured_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo_a = root / "repo-a"
+            repo_b = root / "nested" / "repo-b"
+            (repo_a / ".git").mkdir(parents=True)
+            (repo_b / ".git").mkdir(parents=True)
+            (root / "node_modules" / "skip-me" / ".git").mkdir(parents=True)
+            cfg = self._cfg(root / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "codex_workdir": repo_a})
+
+            with patch.dict(os.environ, {"BOT_FACTORY_REPO_ROOTS": str(root)}):
+                repos = bot._discover_factory_repos(cfg)
+
+            repo_paths = {str(item.get("path") or "") for item in repos}
+            self.assertIn(str(repo_a.resolve()), repo_paths)
+            self.assertIn(str(repo_b.resolve()), repo_paths)
+            self.assertFalse(any("node_modules" in path for path in repo_paths))
+
+    def test_sync_github_pat_git_credentials_writes_store_and_global_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            home.mkdir(parents=True, exist_ok=True)
+
+            with patch.dict(os.environ, {"HOME": str(home), "GITHUB_TOKEN": "ghp_test_token_123"}, clear=False):
+                issues = bot._sync_github_pat_git_credentials()
+
+            self.assertEqual(issues, [])
+            cred_path = (home / ".config" / "omnicrew" / "git-credentials").resolve()
+            self.assertTrue(cred_path.exists())
+            cred_text = cred_path.read_text(encoding="utf-8")
+            self.assertIn("https://x-access-token:", cred_text)
+            self.assertIn("@github.com", cred_text)
+            self.assertEqual(cred_path.stat().st_mode & 0o777, 0o600)
+
+            git_env = {**dict(os.environ), "HOME": str(home)}
+            helper = subprocess.run(
+                ["git", "config", "--global", "--get", "credential.helper"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=git_env,
+            )
+            self.assertEqual(helper.stdout.strip(), f"store --file {cred_path}")
+
+            use_http_path = subprocess.run(
+                ["git", "config", "--global", "--get", "credential.useHttpPath"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=git_env,
+            )
+            self.assertEqual(use_http_path.stdout.strip().lower(), "false")
+
+            filled = subprocess.run(
+                ["git", "credential", "fill"],
+                input="protocol=https\nhost=github.com\npath=manolosake/PonceBot.git\n\n",
+                check=True,
+                capture_output=True,
+                text=True,
+                env=git_env,
+            )
+            self.assertIn("username=x-access-token", filled.stdout)
+            self.assertIn("password=ghp_test_token_123", filled.stdout)
+
+            rewrites = subprocess.run(
+                ["git", "config", "--global", "--get-all", "url.https://github.com/.insteadOf"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=git_env,
+            )
+            rewrite_values = {line.strip() for line in rewrites.stdout.splitlines() if line.strip()}
+            self.assertIn("ssh://git@github.com/", rewrite_values)
+            self.assertIn("git@github.com:", rewrite_values)
+
+    def test_orchestrator_threaded_session_enabled_defaults_true(self) -> None:
+        self.assertTrue(bot._orchestrator_threaded_session_enabled({}, role="architect_local"))
+
+    def test_orchestrator_threaded_session_enabled_respects_profile_override(self) -> None:
+        self.assertFalse(bot._orchestrator_threaded_session_enabled({"threaded_session": False}, role="architect_local"))
+        self.assertFalse(bot._orchestrator_threaded_session_enabled({"threaded_session": "off"}, role="reviewer_local"))
+        self.assertTrue(bot._orchestrator_threaded_session_enabled({"threaded_session": "on"}, role="implementer_local"))
+
+    def test_task_requires_fresh_threaded_session_for_autonomous_skynet_controller_jobs(self) -> None:
+        autopilot = SimpleNamespace(role="skynet", is_autonomous=True, labels={"kind": "autopilot"}, trace={})
+        final_sweep = SimpleNamespace(role="skynet", is_autonomous=True, labels={"kind": "final_sweep"}, trace={})
+        proactive_trace = SimpleNamespace(role="skynet", is_autonomous=True, labels={}, trace={"proactive_lane": True})
+        architect = SimpleNamespace(role="architect_local", is_autonomous=True, labels={"kind": "autopilot"}, trace={})
+        self.assertTrue(bot._task_requires_fresh_threaded_session(autopilot, role="skynet"))
+        self.assertTrue(bot._task_requires_fresh_threaded_session(final_sweep, role="skynet"))
+        self.assertTrue(bot._task_requires_fresh_threaded_session(proactive_trace, role="skynet"))
+        self.assertFalse(bot._task_requires_fresh_threaded_session(architect, role="architect_local"))
+
+    def test_only_controller_roles_are_forced_read_only(self) -> None:
+        self.assertTrue(bot._role_requires_enforced_read_only("skynet"))
+        self.assertTrue(bot._role_requires_enforced_read_only("jarvis"))
+        self.assertFalse(bot._role_requires_enforced_read_only("architect_local"))
+        self.assertFalse(bot._role_requires_enforced_read_only("implementer_local"))
+        self.assertFalse(bot._role_requires_enforced_read_only("reviewer_local"))
+
+    def test_jsonl_stream_has_terminal_completion_detects_response_completed(self) -> None:
+        payload = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "abc"}),
+                json.dumps({"type": "response.completed", "text": "done"}),
+            ]
+        )
+        self.assertTrue(bot._jsonl_stream_has_terminal_completion(payload))
+        self.assertFalse(bot._jsonl_stream_has_terminal_completion(json.dumps({"type": "thread.started"})))
+
+    def test_should_salvage_local_codex_exit_only_for_local_roles_with_terminal_jsonl(self) -> None:
+        payload = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "abc"}),
+                json.dumps({"type": "response.completed", "text": "READY"}),
+            ]
+        )
+        self.assertTrue(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="READY",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="skynet",
+                code=1,
+                body="READY",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="",
+                stdout_text=payload,
+            )
+        )
+        self.assertFalse(
+            bot._should_salvage_local_codex_exit(
+                role="reviewer_local",
+                code=1,
+                body="READY",
+                stdout_text=json.dumps({"type": "thread.started"}),
+            )
+        )
+
+
+    def test_local_slice_transitions_allow_planned_to_reviewer_ready(self) -> None:
+        self.assertIn("reviewed_ready", bot._LOCAL_SLICE_ALLOWED_TRANSITIONS["planned"])
+
+
+    def test_response_signals_no_code_change_accepts_additional_change_wording(self) -> None:
+        self.assertTrue(bot._response_signals_no_code_change("READY. No additional code change is required."))
+
+    def test_orchestrator_session_thread_id_prefers_repo_runtime_state(self) -> None:
+        class _FakeQueue:
+            def get_agent_runtime_state(self, *, repo_id: str, role: str) -> dict[str, object] | None:
+                if repo_id == "repo-1" and role == "skynet":
+                    return {"session_thread_id": "repo-thread"}
+                return None
+
+            def get_agent_thread(self, *, chat_id: int, role: str) -> str | None:
+                return "global-thread"
+
+        self.assertEqual(
+            bot._orchestrator_session_thread_id(
+                orch_q=_FakeQueue(),
+                chat_id=1,
+                role="skynet",
+                repo_id="repo-1",
+            ),
+            "repo-thread",
+        )
+        self.assertEqual(
+            bot._orchestrator_session_thread_id(
+                orch_q=_FakeQueue(),
+                chat_id=1,
+                role="skynet",
+                repo_id="",
+            ),
+            "global-thread",
+        )
+
+    def test_factory_touch_runtime_agents_preserves_repo_session_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            storage = bot.SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = bot.OrchestratorQueue(storage=storage, role_profiles=None)
+            q.upsert_agent_runtime_state(
+                repo_id="repo-1",
+                role="skynet",
+                chat_id=1,
+                session_thread_id="repo-thread",
+                lane="factory",
+                metadata={"repo_path": "/tmp/repo-1"},
+            )
+            q.set_agent_thread(chat_id=1, role="skynet", thread_id="global-thread")
+            bot._factory_touch_runtime_agents(
+                cfg=self._cfg(td_path / "state.json"),
+                orch_q=q,
+                chat_id=1,
+                now=123.0,
+                repos=[{
+                    "repo_id": "repo-1",
+                    "path": "/tmp/repo-1",
+                    "default_branch": "main",
+                    "autonomy_enabled": True,
+                    "status": "active",
+                }],
+            )
+            runtime = q.get_agent_runtime_state(repo_id="repo-1", role="skynet")
+            self.assertEqual(str((runtime or {}).get("session_thread_id") or ""), "repo-thread")
+
+    def test_task_counts_as_order_phase_blocker_ignores_salvageable_failed_reviewer(self) -> None:
+        task = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "result_summary": "READY.\n\nLooks good.",
+                "review_ready": True,
+                "structured_digest": {"summary": "READY: patch is safe to merge."},
+            },
+            updated_at=20.0,
+            created_at=10.0,
+        )
+        self.assertFalse(bot._task_counts_as_order_phase_blocker(task))
+
+    def test_task_counts_as_order_phase_blocker_ignores_failed_local_job_superseded_by_newer_done(self) -> None:
+        failed = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={"result_summary": "NEEDS_REWORK."},
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        newer_done = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={"result_summary": "READY."},
+            updated_at=20.0,
+            created_at=19.0,
+        )
+        latest = bot._latest_local_done_at_by_identity([failed, newer_done])
+        self.assertFalse(
+            bot._task_counts_as_order_phase_blocker(
+                failed,
+                latest_local_done_at_by_identity=latest,
+            )
+        )
+
+    def test_controller_verified_slice_for_closure_accepts_no_change_evidence(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. Existing implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 700) -> list[object]:
+                return [impl, reviewer]
+
+        self.assertEqual(
+            bot._controller_verified_slice_for_closure(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                trace={"slice_id": "slice1"},
+            ),
+            "slice1",
+        )
+
+    def test_order_has_verified_no_change_resolution_accepts_salvageable_failed_reviewer(self) -> None:
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. No code change is required and the implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600) -> list[object]:
+                return [reviewer]
+
+        self.assertTrue(
+            bot._order_has_verified_no_change_resolution(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                now=30.0,
+            )
+        )
+
+    def test_collect_order_local_autonomy_funnel_counts_no_change_slice_as_closed(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="done",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. No additional code change is required.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+        controller = SimpleNamespace(
+            role="skynet",
+            state="done",
+            labels={},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "PASS: VERIFIED_IMPROVEMENT",
+                "improvement_verified": True,
+            },
+            updated_at=30.0,
+            created_at=29.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 800) -> list[object]:
+                return [impl, reviewer, controller]
+
+        funnel = bot._collect_order_local_autonomy_funnel(
+            orch_q=_FakeQueue(),
+            root_ticket="ticket-1",
+            now=40.0,
+        )
+        self.assertEqual(funnel["slices_validated"], 1)
+        self.assertEqual(funnel["slices_closed"], 1)
+        self.assertTrue(funnel["improvement_verified"])
+
+    def test_controller_verified_slice_for_closure_accepts_salvageable_failed_reviewer(self) -> None:
+        impl = SimpleNamespace(
+            role="implementer_local",
+            state="done",
+            labels={"key": "local_impl_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "slice_no_code_change": True,
+                "local_patch_info": {"no_code_change_required": True},
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        reviewer = SimpleNamespace(
+            role="reviewer_local",
+            state="failed",
+            labels={"key": "local_review_guard_slice1"},
+            trace={
+                "slice_id": "slice1",
+                "result_summary": "READY. Existing implementation is correct.",
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 700) -> list[object]:
+                return [impl, reviewer]
+
+        self.assertEqual(
+            bot._controller_verified_slice_for_closure(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                trace={"slice_id": "slice1"},
+            ),
+            "slice1",
+        )
+
+
+    def test_controller_local_recovery_specs_synthesizes_local_patch_flow_from_write_policy(self) -> None:
+        specs = bot._controller_local_recovery_specs(
+            {
+                "summary": "Prepared a minimal reliability improvement in test_status_http.py.",
+                "order_branch": "feature/test-order",
+                "write_policy_violation": {
+                    "changed_paths": ["test_status_http.py"],
+                },
+            }
+        )
+        self.assertEqual([spec.role for spec in specs], ["implementer_local", "reviewer_local"])
+        self.assertIn("test_status_http.py", specs[0].text)
+        self.assertIn("python3 -m unittest -q test_status_http", specs[0].text)
+        self.assertEqual(specs[1].depends_on, [specs[0].key])
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
@@ -194,6 +644,14 @@ class TestParseJob(unittest.TestCase):
             msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/approve_merge abc12345")
             resp, job = bot._parse_job(cfg, msg)
             self.assertEqual(resp, "__orch_approve_merge:abc12345")
+            self.assertIsNone(job)
+
+    def test_proposal_returns_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(update_id=1, chat_id=1, user_id=2, message_id=10, username="u", text="/proposal approve abc12345")
+            resp, job = bot._parse_job(cfg, msg)
+            self.assertEqual(resp, "__orch_proposal:approve abc12345")
             self.assertIsNone(job)
 
     def test_rollback_returns_marker(self) -> None:
@@ -360,6 +818,1842 @@ class TestPromptConstruction(unittest.TestCase):
         name, msg = bot._parse_employee_forward(raw)
         self.assertEqual(name, "Juan Perez")
         self.assertEqual(msg, "Primer: linea\nSegunda: linea\nFin")
+
+    def test_architect_prompt_uses_controller_workspace_snapshot_as_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            (repo / "orchestrator").mkdir(parents=True, exist_ok=True)
+            (repo / "tools").mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("print('hi')\n", encoding="utf-8")
+            (repo / "orchestrator" / "agents.yaml").write_text("roles: []\n", encoding="utf-8")
+            (repo / "tools" / "proactive_health_report.py").write_text("print('ok')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py", "orchestrator/agents.yaml", "tools/proactive_health_report.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(input_text="codexbot reliability delivery", trace={})
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="LOCAL_WORKSPACE_RULES:\n- base\n",
+                worktree_dir=repo,
+                role="architect_local",
+            )
+
+            self.assertIn("authoritative snapshots", prompt)
+            self.assertIn("Workspace inventory", prompt)
+            self.assertIn("orchestrator/agents.yaml", prompt)
+
+    def test_build_agent_prompt_marks_allowed_tools_as_advisory(self) -> None:
+        task = SimpleNamespace(
+            role="architect_local",
+            request_type="maintenance",
+            mode_hint="ro",
+            artifacts_dir="/tmp/artifacts",
+            trace={},
+            input_text="do work",
+            parent_job_id="",
+            is_autonomous=True,
+        )
+        prompt = bot.build_agent_prompt(task, profile={"allowed_tools": ["plan", "repo_read"]})
+        self.assertIn("ALLOWED_TOOLS: plan, repo_read (advisory focus; controller-provided repo context remains allowed)", prompt)
+
+    def test_build_local_specialist_user_prompt_adds_workspace_snapshot_for_codex_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            (repo / "orchestrator").mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("print('hi')\n", encoding="utf-8")
+            (repo / "orchestrator" / "agents.yaml").write_text("roles: []\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py", "orchestrator/agents.yaml"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="architect_local",
+                request_type="maintenance",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text="codexbot reliability delivery",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            prompt = bot._build_local_specialist_user_prompt(
+                task=task,
+                role_profile={"allowed_tools": ["plan", "repo_read"]},
+                role="architect_local",
+                mode="ro",
+                worktree_dir=repo,
+            )
+
+            self.assertIn("LOCAL_WORKSPACE_RULES", prompt)
+            self.assertIn("Controller note: the Workspace inventory and FILE excerpts below are authoritative snapshots", prompt)
+            self.assertIn("Workspace inventory", prompt)
+
+    def test_build_local_specialist_user_prompt_for_implementer_uses_controller_apply_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("print('hi')\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text="Implement exactly one bounded improvement in bot.py",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            prompt = bot._build_local_specialist_user_prompt(
+                task=task,
+                role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                role="implementer_local",
+                mode="ro",
+                worktree_dir=repo,
+            )
+
+            self.assertIn("IMPLEMENTER_LOCAL_STRICT_OVERRIDE", prompt)
+            self.assertIn("Do not use exec_command, apply_patch, shell tools", prompt)
+            self.assertIn("Read-only workspace access is expected for this role", prompt)
+            self.assertIn("The controller will apply your diff/rewrite", prompt)
+            self.assertIn("EXPECTED_VALIDATION", prompt)
+            self.assertIn("NO CODE CHANGE REQUIRED", prompt)
+
+    def test_build_local_specialist_user_prompt_for_architect_large_exact_target_includes_focused_symbol_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            body = "".join(f"pad_{i} = 0\n" for i in range(7000)) + "\n_ORCHESTRATOR_ROLES = (\n    'jarvis',\n    'skynet',\n)\n"
+            (repo / "bot.py").write_text(body, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="architect_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text=(
+                    "FILES:\n- bot.py\n\nCHANGE:\n- Update `_ORCHESTRATOR_ROLES` to include `architect_local`, `implementer_local`, and `reviewer_local`.\n\nVALIDATION:\n- python3 -m py_compile bot.py\n\nRISK:\n- low\n"
+                ),
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            prompt = bot._build_local_specialist_user_prompt(
+                task=task,
+                role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                role="architect_local",
+                mode="ro",
+                worktree_dir=repo,
+            )
+
+            self.assertIn("_ORCHESTRATOR_ROLES = (", prompt)
+            self.assertIn("FOCUSED_EXACT_TARGET_CONTEXT bot.py", prompt)
+
+    def test_build_local_specialist_user_prompt_for_large_exact_target_includes_focused_symbol_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            body = "".join(f"pad_{i} = 0\n" for i in range(7000)) + "\n_ORCHESTRATOR_ROLES = (\n    'jarvis',\n    'skynet',\n)\n"
+            (repo / "bot.py").write_text(body, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text="Implement exactly one bounded improvement in bot.py",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            architect_handoff = (
+                "FILES:\n- bot.py\n\nCHANGE:\n- Update `_ORCHESTRATOR_ROLES` to include `architect_local`, `implementer_local`, and `reviewer_local`.\n\nVALIDATION:\n- python3 -m py_compile bot.py\n\nRISK:\n- low\n"
+            )
+            with patch.object(bot, "_latest_local_specialist_response", return_value=architect_handoff):
+                prompt = bot._build_local_specialist_user_prompt(
+                    task=task,
+                    role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                    role="implementer_local",
+                    mode="ro",
+                    worktree_dir=repo,
+                )
+
+            self.assertIn("_ORCHESTRATOR_ROLES = (", prompt)
+            self.assertIn("FOCUSED_EXACT_TARGET_CONTEXT bot.py", prompt)
+
+    def test_build_local_specialist_user_prompt_for_recovery_implementer_does_not_mix_latest_architect_context(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("hello\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={"delegated_key": "local_impl_recover_deadbeef"},
+                labels={"key": "local_impl_recover_deadbeef"},
+                input_text="Recover the bounded README.md change only.",
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            with patch.object(bot, "_latest_local_specialist_response", return_value="FILES:\n- orchestrator/queue.py\nCHANGE:\n- unrelated architect handoff"):
+                prompt = bot._build_local_specialist_user_prompt(
+                    task=task,
+                    role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                    role="implementer_local",
+                    mode="ro",
+                    worktree_dir=repo,
+                )
+
+            self.assertNotIn("LATEST_ARCHITECT_LOCAL_OUTPUT", prompt)
+            self.assertNotIn("unrelated architect handoff", prompt)
+            self.assertIn("IMPLEMENTER_LOCAL_STRICT_OVERRIDE", prompt)
+
+    def test_response_signals_repo_access_blocker_detects_known_patterns(self) -> None:
+        self.assertTrue(bot._response_signals_repo_access_blocker("BLOCKER: sandbox exec denied; I can't access the repo filesystem"))
+        self.assertTrue(bot._response_signals_repo_access_blocker("every command fails with bwrap: loopback: Failed RTM_NEWADDR"))
+        self.assertFalse(bot._response_signals_repo_access_blocker("FILES:\n- bot.py\nCHANGE:\n- tweak timeout"))
+
+
+class TestLocalSpecialistResponseHelpers(unittest.TestCase):
+    def test_parse_orchestrator_subtasks_accepts_next_action_nested_subtasks(self) -> None:
+        specs = bot.parse_orchestrator_subtasks(
+            {
+                "summary": "blocked for now",
+                "next_action": {
+                    "type": "LOCAL_REPLAN_REQUEST",
+                    "subtasks": [
+                        {
+                            "role": "architect_local",
+                            "task": "Define one bounded retry slice for bot.py",
+                            "mode_hint": "ro",
+                            "priority": 1,
+                            "acceptance_criteria": ["Return exact files and one validation command."],
+                            "definition_of_done": ["Actionable implementer handoff is ready."],
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].role, "architect_local")
+        self.assertTrue(specs[0].key.startswith("auto_architect_local_"))
+
+    def test_result_structured_digest_reads_dict_payload_for_delegation(self) -> None:
+        result = {
+            "status": "ok",
+            "summary": "done",
+            "structured_digest": {
+                "next_action": {
+                    "type": "LOCAL_REPLAN_REQUEST",
+                    "subtasks": [
+                        {
+                            "role": "reviewer_local",
+                            "task": "Validate bot.py and report PASS/NO-GO.",
+                        }
+                    ],
+                }
+            },
+        }
+
+        structured = bot._result_structured_digest(result)
+        specs = bot.parse_orchestrator_subtasks(structured)
+
+        self.assertIsInstance(structured, dict)
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].role, "reviewer_local")
+
+    def test_helpers_read_result_summary_from_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                trace = json.dumps(
+                    {
+                        "result_summary": (
+                            "FILES:\n"
+                            "- tools/proactive_health_report.py\n"
+                            "CHANGE:\n"
+                            "- tighten proactive signal parsing\n"
+                            "VALIDATION:\n"
+                            "- python3 -m py_compile tools/proactive_health_report.py\n"
+                            "RISK:\n"
+                            "- low"
+                        )
+                    }
+                )
+                labels = json.dumps({"key": "local_arch_guard_slice1"})
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 10.0, 9.0, ?, ?, ?)",
+                    (
+                        "job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "job-1"),
+                        labels,
+                        trace,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            globals_map = bot._latest_local_specialist_response.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                latest = bot._latest_local_specialist_response(
+                    root_ticket="ticket-1",
+                    role="architect_local",
+                    max_chars=4000,
+                )
+                by_key = bot._local_specialist_response_for_key(
+                    role="architect_local",
+                    delegated_key="local_arch_guard_slice1",
+                    max_chars=4000,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertIn("FILES:", latest)
+            self.assertIn("tools/proactive_health_report.py", latest)
+            self.assertEqual(latest, by_key)
+
+    def test_autonomous_local_first_synthesizes_implementer_from_architect_handoff_when_specs_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1" / "tools"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "proactive_health_report.py").write_text("def is_proactive(text):\n    return False\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                handoff = (
+                    "FILES:\n"
+                    "- tools/proactive_health_report.py\n"
+                    "CHANGE:\n"
+                    "- expand proactive title matching\n"
+                    "VALIDATION:\n"
+                    "- python3 -m py_compile tools/proactive_health_report.py\n"
+                    "RISK:\n"
+                    "- low"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 50.0, 49.0, ?, ?, ?)",
+                    (
+                        "arch-job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "arch-job-1"),
+                        json.dumps({"key": "local_arch_guard_slice1"}),
+                        json.dumps({"result_summary": handoff}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve proactive health report reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "implementer_local")
+            self.assertEqual(specs[0].mode_hint, "ro")
+            self.assertIn("PRIMARY_ARCHITECT_HANDOFF", specs[0].text)
+            self.assertIn("tools/proactive_health_report.py", specs[0].text)
+            self.assertIn("EXPECTED_VALIDATION", specs[0].text)
+
+    def test_autonomous_local_first_synthesizes_implementer_rework_from_reviewer_no_go(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1" / "orchestrator"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "runbooks.py").write_text("def to_task(runbook, chat_id):\n    return None\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                impl_trace = {
+                    "result_summary": (
+                        "Bounded runbook patch prepared.\n"
+                        "EXPECTED_VALIDATION: `python3 -m unittest -q test_orchestrator`"
+                    ),
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {
+                        "changed_files": ["orchestrator/runbooks.py"],
+                        "validation_ok": True,
+                    },
+                }
+                review_trace = {
+                    "result_summary": (
+                        "Verdict: NEEDS_REWORK. Blocking issue: `Task.new(...)` does not accept `ticket`. "
+                        "Remove the invalid kwarg and keep the slice bounded."
+                    )
+                }
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 90.0, 89.0, ?, ?, ?)",
+                    (
+                        "impl-job-1",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-1"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(impl_trace),
+                    ),
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 100.0, 99.0, ?, ?, ?)",
+                    (
+                        "review-job-1",
+                        "ticket-1",
+                        "reviewer_local",
+                        str(repo_root / "artifacts" / "review-job-1"),
+                        json.dumps({"key": "local_review_guard_slice1"}),
+                        json.dumps(review_trace),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve proactive local delegation. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=120.0,
+                    )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "implementer_local")
+            self.assertIn("LATEST_REVIEWER_FINDINGS", specs[0].text)
+            self.assertIn("`Task.new(...)` does not accept `ticket`", specs[0].text)
+            self.assertIn("orchestrator/runbooks.py", specs[0].text)
+            self.assertIn("python3 -m unittest -q test_orchestrator", specs[0].text)
+
+    def test_dedupe_specs_by_signature_allows_retry_after_recent_failed_local_guard(self) -> None:
+        spec = bot.TaskSpec(
+            key="local_impl_guard_retry_new",
+            role="implementer_local",
+            text="Implement one bounded retry slice in bot.py",
+            mode_hint="ro",
+            priority=1,
+            depends_on=[],
+            requires_approval=False,
+            acceptance_criteria=["Return one diff."],
+            definition_of_done=["Controller can apply retry patch."],
+            eta_minutes=30,
+            sla_tier="high",
+        )
+        failed = bot.Task.new(
+            job_id="failed-impl",
+            source="test",
+            role="implementer_local",
+            input_text="Older failed local guard slice",
+            request_type="task",
+            priority=1,
+            model="gpt-5.2-codex",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=0.0,
+            chat_id=1,
+            state="failed",
+            labels={"key": "local_impl_guard_retry_old"},
+            created_at=100.0,
+        ).with_updates(updated_at=120.0)
+
+        deduped = bot._dedupe_specs_by_signature(
+            specs=[spec],
+            existing_subtasks=[failed],
+            now=180.0,
+            recent_window_s=3600.0,
+        )
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].key, "local_impl_guard_retry_new")
+
+    def test_dedupe_specs_by_signature_keeps_recent_done_local_guard_suppressed(self) -> None:
+        spec = bot.TaskSpec(
+            key="local_impl_guard_retry_new",
+            role="implementer_local",
+            text="Implement one bounded retry slice in bot.py",
+            mode_hint="ro",
+            priority=1,
+            depends_on=[],
+            requires_approval=False,
+            acceptance_criteria=["Return one diff."],
+            definition_of_done=["Controller can apply retry patch."],
+            eta_minutes=30,
+            sla_tier="high",
+        )
+        done = bot.Task.new(
+            job_id="done-impl",
+            source="test",
+            role="implementer_local",
+            input_text="Older successful local guard slice",
+            request_type="task",
+            priority=1,
+            model="gpt-5.2-codex",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=0.0,
+            chat_id=1,
+            state="done",
+            labels={"key": "local_impl_guard_retry_old"},
+            created_at=100.0,
+        ).with_updates(updated_at=120.0)
+
+        deduped = bot._dedupe_specs_by_signature(
+            specs=[spec],
+            existing_subtasks=[done],
+            now=180.0,
+            recent_window_s=3600.0,
+        )
+
+        self.assertEqual(deduped, [])
+
+    def test_autonomous_local_first_keeps_direct_implementer_recovery_when_architect_claims_no_change(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                arch_summary = (
+                    "FILES:\n"
+                    "- bot.py\n"
+                    "CHANGE:\n"
+                    "- no concrete code change to apply because behavior is already correct\n"
+                    "VALIDATION:\n"
+                    "- python3 -m py_compile bot.py\n"
+                    "RISK:\n"
+                    "- low\n"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 50.0, 49.0, ?, ?, ?)",
+                    (
+                        "arch-job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "arch-job-1"),
+                        json.dumps({"key": "local_arch_guard_slice1"}),
+                        json.dumps({"result_summary": arch_summary}),
+                    ),
+                )
+                impl_summary = (
+                    "BLOCKER: workspace is read-only, so I can't modify `bot.py` or apply the required diff. "
+                    "Smallest next action: grant write permissions (RW) for `REAL_WORKTREE_DIR`."
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'failed', 60.0, 59.0, ?, ?, ?)",
+                    (
+                        "impl-job-1",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-1"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps({"result_summary": impl_summary, "slice_id": "slice1", "attempt_n": 1, "failure_class": "blocked"}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[
+                        bot.TaskSpec(
+                            key="local_impl_guard_slice1_retry",
+                            role="implementer_local",
+                            text="Direct unblock implementation for ticket ticket-1 in bot.py",
+                            mode_hint="ro",
+                            priority=1,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return a concrete diff."],
+                            definition_of_done=["Controller can apply the patch."],
+                            eta_minutes=30,
+                            sla_tier="high",
+                        )
+                    ],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "implementer_local")
+
+    def test_autonomous_local_first_redirects_validation_only_replan_to_reviewer_after_no_change(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                arch_summary = (
+                    "FILES:\n"
+                    "- bot.py\n"
+                    "CHANGE:\n"
+                    "- remove redundant anchors from _SKILL_SEGMENT_RE because fullmatch already enforces full-string validation\n"
+                    "VALIDATION:\n"
+                    "- python3 -m py_compile bot.py\n"
+                    "RISK:\n"
+                    "- low\n"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 50.0, 49.0, ?, ?, ?)",
+                    (
+                        "arch-job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "arch-job-1"),
+                        json.dumps({"key": "local_arch_guard_slice1"}),
+                        json.dumps({"result_summary": arch_summary}),
+                    ),
+                )
+                impl_trace = {
+                    "result_summary": "No code change required because the current implementation already matches the requested fix.",
+                    "slice_no_code_change": True,
+                    "local_patch_info": {"no_code_change_required": True},
+                }
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 60.0, 59.0, ?, ?, ?)",
+                    (
+                        "impl-job-1",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-1"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(impl_trace),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[
+                        bot.TaskSpec(
+                            key="auto_architect_local_slice1",
+                            role="architect_local",
+                            text="Define a minimal verification checklist for the current slice.",
+                            mode_hint="ro",
+                            priority=2,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return one checklist."],
+                            definition_of_done=["Checklist returned."],
+                            eta_minutes=5,
+                            sla_tier="normal",
+                        ),
+                        bot.TaskSpec(
+                            key="auto_implementer_local_slice1",
+                            role="implementer_local",
+                            text=(
+                                "Run verify-only slice: capture line evidence for _skill_segment_ok and execute one targeted parser test; no code changes.\n\n"
+                                "PRIMARY_ARCHITECT_HANDOFF:\n"
+                                f"{arch_summary}\n"
+                            ),
+                            mode_hint="ro",
+                            priority=2,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return evidence only."],
+                            definition_of_done=["Validation completed."],
+                            eta_minutes=10,
+                            sla_tier="normal",
+                        ),
+                    ],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "reviewer_local")
+            self.assertIn("Validate implementer_local no-change claim", specs[0].text)
+
+    def test_autonomous_local_first_prefers_reviewer_over_direct_retry_when_no_change_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                arch_summary = (
+                    "FILES:\n"
+                    "- bot.py\n"
+                    "CHANGE:\n"
+                    "- no concrete code change to apply because behavior is already correct\n"
+                    "VALIDATION:\n"
+                    "- python3 -m py_compile bot.py\n"
+                    "RISK:\n"
+                    "- low\n"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 40.0, 39.0, ?, ?, ?)",
+                    (
+                        "arch-job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "arch-job-1"),
+                        json.dumps({"key": "local_arch_guard_slice1"}),
+                        json.dumps({"result_summary": arch_summary}),
+                    ),
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 60.0, 59.0, ?, ?, ?)",
+                    (
+                        "impl-job-1",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-1"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(
+                            {
+                                "result_summary": "No code change required because the requested behavior is already present.",
+                                "slice_no_code_change": True,
+                                "local_patch_info": {"no_code_change_required": True},
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'failed', 70.0, 69.0, ?, ?, ?)",
+                    (
+                        "impl-job-2",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-2"),
+                        json.dumps({"key": "local_impl_guard_slice1_retry"}),
+                        json.dumps(
+                            {
+                                "result_summary": "BLOCKER: Missing FAILED_VALIDATION_OUTPUT content.",
+                                "slice_id": "slice1_retry",
+                                "attempt_n": 2,
+                                "failure_class": "blocked",
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "reviewer_local")
+            self.assertIn("Validate implementer_local no-change claim", specs[0].text)
+
+    def test_autonomous_local_first_prefers_reviewer_after_validated_implementer_even_if_planner_offers_architect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 90.0, 89.0, ?, ?, ?)",
+                    (
+                        "impl-job-validated",
+                        "ticket-1",
+                        "implementer_local",
+                        str(repo_root / "artifacts" / "impl-job-validated"),
+                        json.dumps({"key": "local_impl_guard_slice1"}),
+                        json.dumps(
+                            {
+                                "result_summary": "Applied compatibility wrapper and validated it.",
+                                "slice_id": "slice1",
+                                "local_patch_info": {
+                                    "changed_files": ["orchestrator/delegation.py"],
+                                    "validation_ok": True,
+                                },
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[
+                        bot.TaskSpec(
+                            key="auto_architect_local_slice1",
+                            role="architect_local",
+                            text="Plan another small slice.",
+                            mode_hint="ro",
+                            priority=2,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return one plan."],
+                            definition_of_done=["Plan returned."],
+                            eta_minutes=10,
+                            sla_tier="normal",
+                        )
+                    ],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "reviewer_local")
+            self.assertIn("impl-job-validated", specs[0].text)
+            self.assertIn("slice1", specs[0].text)
+            self.assertIn("Applied compatibility wrapper", specs[0].text)
+            self.assertIn("orchestrator/delegation.py", specs[0].text)
+
+    def test_finalize_codex_implementer_change_applies_diff_when_workspace_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "bot.py"
+            original = (
+                "from pathlib import Path\n\n"
+                "def _skill_segment_ok(name: str) -> bool:\n"
+                "    s = (name or '').strip()\n"
+                "    if not s or s in ('.', '..'):\n"
+                "        return False\n"
+                "    if s != Path(s).name:\n"
+                "        return False\n"
+                "    return bool(_SKILL_SEGMENT_RE.match(s))\n"
+            )
+            updated = original.replace("_SKILL_SEGMENT_RE.match(s)", "_SKILL_SEGMENT_RE.fullmatch(s)")
+            target.write_text(original, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target.write_text(updated, encoding="utf-8")
+            diff_text = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--unified=3"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            target.write_text(original, encoding="utf-8")
+
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            body = (
+                "Applied the strict skill segment validation.\n\n"
+                f"```diff\n{diff_text}```\n\n"
+                "Validation: python3 -m py_compile bot.py\n"
+            )
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertIn("bot.py", patch_info.get("changed_files", []))
+            self.assertTrue(bool(patch_info.get("validation_ok", False)))
+            self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
+            self.assertIn("_SKILL_SEGMENT_RE.fullmatch(s)", target.read_text(encoding="utf-8"))
+
+    def test_finalize_codex_implementer_change_applies_begin_patch_update(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "orchestrator" / "delegation.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            original = (
+                "def parse_orchestrator_subtasks(text):\n"
+                "    ticket_line = f\" Ticket: {ticket_id}.\" if ticket_id else \"\"\n"
+                "    text = (\n"
+                "        \"Provide a single, bounded implementer-ready slice for proactive idle watchdog reseed.\"\n"
+                "        \" Include exact file(s), one concrete change, validation command, and risks.\"\n"
+                "        f\"{ticket_line}\"\n"
+                "    )\n"
+                "    acceptance_criteria = [\"Return one implementer-ready slice with file-scoped change and validation.\"]\n"
+                "    return text, acceptance_criteria\n"
+            )
+            updated_snippet = "Match the ticket acceptance criteria"
+            target.write_text(original, encoding="utf-8")
+            subprocess.run(["git", "add", "orchestrator/delegation.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            body = (
+                "```diff\n"
+                "*** Begin Patch\n"
+                "*** Update File: orchestrator/delegation.py\n"
+                "@@\n"
+                "     text = (\n"
+                "         \"Provide a single, bounded implementer-ready slice for proactive idle watchdog reseed.\"\n"
+                "-        \" Include exact file(s), one concrete change, validation command, and risks.\"\n"
+                "+        \" Match the ticket acceptance criteria: include exact file(s), one concrete change,\"\n"
+                "+        \" a diff or rewrite block, validation command, and risks.\"\n"
+                "         f\"{ticket_line}\"\n"
+                "     )\n"
+                "@@\n"
+                "-    acceptance_criteria = [\"Return one implementer-ready slice with file-scoped change and validation.\"]\n"
+                "+    acceptance_criteria = [\n"
+                "+        \"Return one implementer-ready slice with file-scoped change, diff or rewrite, and validation.\",\n"
+                "+    ]\n"
+                "*** End Patch\n"
+                "```\n"
+            )
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertIn("orchestrator/delegation.py", patch_info.get("changed_files", []))
+            self.assertEqual(str(patch_info.get("apply_mode") or ""), "apply_patch")
+            self.assertTrue(bool(patch_info.get("validation_ok", False)))
+            self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
+            self.assertIn(updated_snippet, target.read_text(encoding="utf-8"))
+
+    def test_finalize_codex_implementer_change_treats_already_fixed_blocker_as_no_change(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            content = (
+                "BLOCKER: `bot.py` already uses `_SKILL_SEGMENT_RE.fullmatch(s)` in `_skill_segment_ok`, "
+                "so there is no concrete code change to apply for the requested fix."
+            )
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=content,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertTrue(bool(patch_info.get("no_code_change_required", False)))
+            self.assertTrue(any(path.endswith("codex_implementer_no_change.txt") for path in artifacts))
+
+    def test_orchestrator_run_codex_applies_implementer_diff_even_when_mode_is_ro(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "bot.py"
+            original = "VALUE = 1\n"
+            updated = "VALUE = 2\n"
+            target.write_text(original, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target.write_text(updated, encoding="utf-8")
+            diff_text = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--unified=3"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            target.write_text(original, encoding="utf-8")
+
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            cfg = bot.dataclasses.replace(
+                cfg,
+                codex_workdir=repo,
+                worktree_root=Path(td) / "worktrees",
+                artifacts_root=Path(td) / "artifacts_root",
+                orchestrator_sessions_enabled=False,
+                orchestrator_live_update_seconds=0,
+                codex_timeout_seconds=5,
+            )
+            cfg.artifacts_root.mkdir(parents=True, exist_ok=True)
+            cfg.worktree_root.mkdir(parents=True, exist_ok=True)
+
+            repo_id = "codexbot-12345678"
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.updated: list[tuple[str, dict[str, object]]] = []
+
+                def lease_workspace(self, *, role: str, job_id: str, slots: int = 1) -> int:
+                    return 1
+
+                def release_workspace(self, *, job_id: str) -> None:
+                    return None
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    self.updated.append((job_id, dict(kwargs)))
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+            task = bot.Task.new(
+                job_id="job-impl-ro",
+                source="test",
+                role="implementer_local",
+                input_text="Implement one bounded improvement using the provided handoff.",
+                request_type="task",
+                priority=1,
+                model="gpt-5.2-codex",
+                effort="medium",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                state="running",
+                artifacts_dir=str((cfg.artifacts_root / "job-impl-ro").resolve()),
+                trace={
+                    "repo_id": repo_id,
+                    "repo_path": str(repo),
+                    "repo_default_branch": "main",
+                },
+            )
+
+            class _FakeProc:
+                def __init__(self) -> None:
+                    self.pid = 12345
+                    self.returncode = 0
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            case = self
+
+            def _fake_start(self, *, argv: list[str], mode_hint: str):  # type: ignore[no-untyped-def]
+                case.assertEqual(mode_hint, "ro")
+                stdout_path = Path(td) / "codex_stdout.jsonl"
+                stderr_path = Path(td) / "codex_stderr.log"
+                last_msg_path = Path(td) / "codex_last.txt"
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("", encoding="utf-8")
+                last_msg_path.write_text(
+                    "Applied the bounded change.\n\n"
+                    f"```diff\n{diff_text}```\n\n"
+                    "EXPECTED_VALIDATION: python -m py_compile bot.py\n",
+                    encoding="utf-8",
+                )
+                return bot.CodexRunner.Running(
+                    proc=_FakeProc(),
+                    start_time=0.0,
+                    cmd=["codex", "exec"],
+                    last_msg_path=last_msg_path,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+
+            fake_queue = _FakeQueue()
+            profiles = {
+                "implementer_local": {
+                    "execution_backend": "codex",
+                    "model": "gpt-5.2-codex",
+                    "effort": "medium",
+                    "max_parallel_jobs": 1,
+                }
+            }
+
+            with patch.object(bot.CodexRunner, "start", _fake_start), patch.object(
+                bot, "_orchestrator_min_evidence_gate", return_value=(True, "", {})
+            ):
+                result = bot._orchestrator_run_codex(
+                    cfg,
+                    task,
+                    stop_event=threading.Event(),
+                    orch_q=fake_queue,
+                    profiles=profiles,
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertIn("patch_info", result["structured_digest"])
+            self.assertTrue(bool(result["structured_digest"]["patch_info"].get("validation_ok", False)))
+            worktree_target = bot._repo_worktree_root(cfg, repo_id=repo_id) / "implementer_local" / "slot1" / "bot.py"
+            self.assertTrue(worktree_target.is_file())
+            self.assertEqual(worktree_target.read_text(encoding="utf-8"), updated)
+
+    def test_orchestrator_run_codex_extracts_json_payload_from_body_into_structured_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            cfg = bot.dataclasses.replace(
+                cfg,
+                codex_workdir=repo,
+                worktree_root=Path(td) / "worktrees",
+                artifacts_root=Path(td) / "artifacts_root",
+                orchestrator_sessions_enabled=False,
+                orchestrator_live_update_seconds=0,
+                codex_timeout_seconds=5,
+            )
+            cfg.artifacts_root.mkdir(parents=True, exist_ok=True)
+            cfg.worktree_root.mkdir(parents=True, exist_ok=True)
+
+            class _FakeQueue:
+                def lease_workspace(self, *, role: str, job_id: str, slots: int = 1) -> int:
+                    return 1
+
+                def release_workspace(self, *, job_id: str) -> None:
+                    return None
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    return None
+
+            task = bot.Task.new(
+                job_id="job-skynet-json",
+                source="test",
+                role="skynet",
+                input_text="Drive one bounded proactive tick.",
+                request_type="maintenance",
+                priority=1,
+                model="gpt-5.3-codex",
+                effort="medium",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                state="running",
+                artifacts_dir=str((cfg.artifacts_root / "job-skynet-json").resolve()),
+            )
+
+            class _FakeProc:
+                def __init__(self) -> None:
+                    self.pid = 12345
+                    self.returncode = 0
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            def _fake_start(self, *, argv: list[str], mode_hint: str):  # type: ignore[no-untyped-def]
+                stdout_path = Path(td) / "codex_stdout.jsonl"
+                stderr_path = Path(td) / "codex_stderr.log"
+                last_msg_path = Path(td) / "codex_last.txt"
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("", encoding="utf-8")
+                last_msg_path.write_text(
+                    "Skynet tick complete.\n\n"
+                    "```json\n"
+                    "{\n"
+                    "  \"summary\": \"Blocked but recoverable.\",\n"
+                    "  \"next_action\": {\n"
+                    "    \"type\": \"LOCAL_REPLAN_REQUEST\",\n"
+                    "    \"subtasks\": [\n"
+                    "      {\n"
+                    "        \"key\": \"arch_replan_1\",\n"
+                    "        \"role\": \"architect_local\",\n"
+                    "        \"text\": \"Define one bounded retry slice for bot.py\",\n"
+                    "        \"mode_hint\": \"ro\",\n"
+                    "        \"priority\": 1,\n"
+                    "        \"acceptance_criteria\": [\"Return exact files and one validation command.\"],\n"
+                    "        \"definition_of_done\": [\"Actionable implementer handoff is ready.\"]\n"
+                    "      }\n"
+                    "    ]\n"
+                    "  }\n"
+                    "}\n"
+                    "```\n",
+                    encoding="utf-8",
+                )
+                return bot.CodexRunner.Running(
+                    proc=_FakeProc(),
+                    start_time=0.0,
+                    cmd=["codex", "exec"],
+                    last_msg_path=last_msg_path,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+
+            with patch.object(bot.CodexRunner, "start", _fake_start), patch.object(
+                bot, "_orchestrator_min_evidence_gate", return_value=(True, "", {})
+            ):
+                result = bot._orchestrator_run_codex(
+                    cfg,
+                    task,
+                    stop_event=threading.Event(),
+                    orch_q=_FakeQueue(),
+                    profiles={"skynet": {"execution_backend": "codex", "model": "gpt-5.3-codex", "effort": "medium"}},
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["next_action"], "LOCAL_REPLAN_REQUEST")
+            structured = result["structured_digest"]
+            self.assertIsInstance(structured.get("next_action"), dict)
+            specs = bot.parse_orchestrator_subtasks(structured)
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "architect_local")
+
+    def test_orchestrator_run_codex_blocks_controller_repo_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            cfg = bot.dataclasses.replace(
+                cfg,
+                codex_workdir=repo,
+                worktree_root=Path(td) / "worktrees",
+                artifacts_root=Path(td) / "artifacts_root",
+                orchestrator_sessions_enabled=False,
+                orchestrator_live_update_seconds=0,
+                codex_timeout_seconds=5,
+            )
+            cfg.artifacts_root.mkdir(parents=True, exist_ok=True)
+            cfg.worktree_root.mkdir(parents=True, exist_ok=True)
+
+            repo_id = "codexbot-12345678"
+
+            class _FakeQueue:
+                def lease_workspace(self, *, role: str, job_id: str, slots: int = 1) -> int:
+                    return 1
+
+                def release_workspace(self, *, job_id: str) -> None:
+                    return None
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    return None
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+            task = bot.Task.new(
+                job_id="job-skynet-write",
+                source="test",
+                role="skynet",
+                input_text="Drive one bounded proactive tick.",
+                request_type="maintenance",
+                priority=1,
+                model="gpt-5.4",
+                effort="high",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                state="running",
+                artifacts_dir=str((cfg.artifacts_root / "job-skynet-write").resolve()),
+                trace={
+                    "repo_id": repo_id,
+                    "repo_path": str(repo),
+                    "repo_default_branch": "main",
+                    "proactive_lane": True,
+                },
+            )
+
+            class _FakeProc:
+                def __init__(self) -> None:
+                    self.pid = 12345
+                    self.returncode = 0
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            def _fake_start(self, *, argv: list[str], mode_hint: str):  # type: ignore[no-untyped-def]
+                case_worktree = Path(self._cfg.codex_workdir)
+                (case_worktree / "bot.py").write_text("VALUE = 2\n", encoding="utf-8")
+                stdout_path = Path(td) / "codex_stdout.jsonl"
+                stderr_path = Path(td) / "codex_stderr.log"
+                last_msg_path = Path(td) / "codex_last.txt"
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("", encoding="utf-8")
+                last_msg_path.write_text("Applied a direct improvement in bot.py\n", encoding="utf-8")
+                return bot.CodexRunner.Running(
+                    proc=_FakeProc(),
+                    start_time=0.0,
+                    cmd=["codex", "exec"],
+                    last_msg_path=last_msg_path,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+
+            with patch.object(bot.CodexRunner, "start", _fake_start), patch.object(
+                bot, "_orchestrator_min_evidence_gate", return_value=(True, "", {})
+            ):
+                result = bot._orchestrator_run_codex(
+                    cfg,
+                    task,
+                    stop_event=threading.Event(),
+                    orch_q=_FakeQueue(),
+                    profiles={"skynet": {"execution_backend": "codex", "model": "gpt-5.4", "effort": "high"}},
+                )
+
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["next_action"], "delegate_local_subtask")
+            violation = result["structured_digest"].get("write_policy_violation")
+            self.assertIsInstance(violation, dict)
+            self.assertIn("bot.py", violation.get("changed_paths", []))
+            self.assertIn("Write policy violation", result["summary"])
 
 class _FakeTelegramAPI:
     def __init__(self) -> None:
@@ -940,6 +3234,18 @@ class TestDangerousBypassThreaded(unittest.TestCase):
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
             self.assertNotIn("--sandbox", cmd)
 
+    def test_threaded_new_can_force_read_only_without_bypass(self) -> None:
+        cfg = self._cfg()
+        runner = bot.CodexRunner(cfg, allow_bypass=False, forced_mode="ro")
+        with patch.object(bot.subprocess, "Popen") as popen, patch("bot._breakglass_is_active", return_value=(True, {"reason": "test"})):
+            popen.side_effect = FileNotFoundError("no codex in test")
+            with self.assertRaises(FileNotFoundError):
+                runner.start_threaded_new(prompt="hi", mode_hint="full")
+            cmd = popen.call_args.args[0]
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+            self.assertIn("--sandbox", cmd)
+            self.assertIn("read-only", cmd)
+
 
 class TestThreadedImages(unittest.TestCase):
     def test_threaded_new_includes_image_flags(self) -> None:
@@ -1123,6 +3429,24 @@ class TestHardeningControls(unittest.TestCase):
             with patch("bot.time.time", return_value=exp + 1.0):
                 self.assertFalse(bot._effective_bypass_sandbox(cfg, chat_id=1))
 
+    def test_effective_bypass_sandbox_auto_refreshes_startup_breakglass_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            cfg = bot.BotConfig(
+                **{
+                    **cfg.__dict__,
+                    "codex_dangerous_bypass_sandbox": True,
+                    "breakglass_ttl_seconds": 60,
+                    "breakglass_start_reason": "persistent_factory_runtime",
+                }
+            )
+
+            bot._set_access_mode(cfg, "full", chat_id=1)
+            self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
+            active, raw = bot._breakglass_is_active(cfg)
+            self.assertTrue(active)
+            self.assertEqual(str(raw.get("reason") or ""), "persistent_factory_runtime")
+
     def test_permissions_full_ack_reports_selected_mode_and_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
@@ -1277,6 +3601,19 @@ class TestHardeningControls(unittest.TestCase):
 
 
 class TestLocalSpecialistDelegation(unittest.TestCase):
+    def test_extract_codex_token_usage_parses_turn_summary(self) -> None:
+        usage = bot._extract_codex_token_usage(
+            "[out] [turn] completed tokens in=530686 out=7145\n"
+        )
+        self.assertEqual(
+            usage,
+            {
+                "input_tokens": 530686,
+                "output_tokens": 7145,
+                "total_tokens": 537831,
+            },
+        )
+
     def test_inject_local_specialists_skips_manual_ceo_work_by_default(self) -> None:
         specs = [
             bot.TaskSpec(
@@ -1413,6 +3750,235 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
         self.assertEqual(normalized.mode_hint, "ro")
         self.assertFalse(normalized.requires_approval)
 
+    def test_autonomous_local_first_hard_enforcement_keeps_only_local_roles_even_if_flag_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            cfg = TestStateHandling()._cfg(repo_root / "state.json")
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": "Ship one bounded improvement. [repo:codexbot-12345678]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "0"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[
+                            bot.TaskSpec(
+                                key="delivery_fix",
+                                role="backend",
+                                text="Implement one bounded reliability fix with concrete evidence.",
+                                mode_hint="rw",
+                                priority=1,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Ship one concrete fix."],
+                                definition_of_done=["Improvement is implemented."],
+                                eta_minutes=45,
+                                sla_tier="high",
+                            ),
+                            bot.TaskSpec(
+                                key="delivery_review",
+                                role="qa",
+                                text="Validate the change with PASS/FAIL evidence.",
+                                mode_hint="ro",
+                                priority=1,
+                                depends_on=["delivery_fix"],
+                                requires_approval=False,
+                                acceptance_criteria=["Return a verdict."],
+                                definition_of_done=["Validation is complete."],
+                                eta_minutes=30,
+                                sla_tier="high",
+                            ),
+                        ],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                        enforce_hard_local_only=True,
+                    )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            roles = [str(spec.role or "").strip().lower() for spec in specs]
+            self.assertGreaterEqual(len(roles), 1)
+            self.assertTrue(set(roles).issubset({"architect_local", "implementer_local", "reviewer_local"}))
+            self.assertNotIn("backend", roles)
+            self.assertNotIn("qa", roles)
+
+    def test_autonomous_local_first_reuses_fresh_architect_handoff_instead_of_replanning_architect(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            data_dir = repo_root / "data"
+            repo_id = "codexbot-12345678"
+            cfg = bot.BotConfig(
+                **{
+                    **TestStateHandling()._cfg(repo_root / "state.json").__dict__,
+                    "worktree_root": data_dir / "worktrees",
+                }
+            )
+            repo_worktree_root = bot._repo_worktree_root(cfg, repo_id=repo_id)
+            worktree_dir = repo_worktree_root / "implementer_local" / "slot1"
+            worktree_dir.mkdir(parents=True, exist_ok=True)
+            (worktree_dir / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            db_path = data_dir / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "create table jobs ("
+                    " job_id text primary key,"
+                    " parent_job_id text,"
+                    " role text,"
+                    " state text,"
+                    " updated_at real,"
+                    " created_at real,"
+                    " artifacts_dir text,"
+                    " labels text,"
+                    " trace text"
+                    ")"
+                )
+                arch_summary = (
+                    "FILES:\n"
+                    "- bot.py\n"
+                    "CHANGE:\n"
+                    "- tighten the retry guard in `_enqueue_order_autopilot_task`\n"
+                    "VALIDATION:\n"
+                    "- python3 -m py_compile bot.py\n"
+                    "RISK:\n"
+                    "- low\n"
+                )
+                conn.execute(
+                    "insert into jobs (job_id, parent_job_id, role, state, updated_at, created_at, artifacts_dir, labels, trace)"
+                    " values (?, ?, ?, 'done', 60.0, 59.0, ?, ?, ?)",
+                    (
+                        "arch-job-1",
+                        "ticket-1",
+                        "architect_local",
+                        str(repo_root / "artifacts" / "arch-job-1"),
+                        json.dumps({"key": "local_arch_guard_slice1"}),
+                        json.dumps({"result_summary": arch_summary}),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            class _FakeQueue:
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 2000) -> list[object]:
+                    return []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": 8355547734,
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": f"Improve reliability. [repo:{repo_id}]",
+                    }
+
+                def list_orders_global(self, status: str = "active", limit: int = 400) -> list[dict[str, object]]:
+                    return []
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo_root / "repo"),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+                def get_job(self, job_id: str) -> object | None:
+                    return SimpleNamespace(
+                        trace={},
+                        labels={},
+                        parent_job_id="",
+                        job_id=job_id,
+                        chat_id=8355547734,
+                    )
+
+            globals_map = bot._apply_autonomous_local_first_policy.__globals__
+            original_file = globals_map.get("__file__")
+            globals_map["__file__"] = str(repo_root / "bot.py")
+            try:
+                specs = bot._apply_autonomous_local_first_policy(
+                    cfg=cfg,
+                    specs=[
+                        bot.TaskSpec(
+                            key="auto_architect_local_slice1",
+                            role="architect_local",
+                            text="Plan the next minimal bounded slice.",
+                            mode_hint="ro",
+                            priority=2,
+                            depends_on=[],
+                            requires_approval=False,
+                            acceptance_criteria=["Return one plan."],
+                            definition_of_done=["Plan returned."],
+                            eta_minutes=10,
+                            sla_tier="normal",
+                        )
+                    ],
+                    orch_q=_FakeQueue(),
+                    root_ticket="ticket-1",
+                    now=100.0,
+                )
+            finally:
+                if original_file is not None:
+                    globals_map["__file__"] = original_file
+                else:
+                    globals_map.pop("__file__", None)
+
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(specs[0].role, "implementer_local")
+            self.assertIn("PRIMARY_ARCHITECT_HANDOFF", specs[0].text)
+            self.assertIn("bot.py", specs[0].text)
+
 
 class TestImplementerFailureSelection(unittest.TestCase):
     def test_implementer_failure_actionable_signal_detects_py_compile_syntax_error(self) -> None:
@@ -1502,39 +4068,53 @@ class TestImplementerFailureSelection(unittest.TestCase):
         )
 
 
-class TestDiffExtraction(unittest.TestCase):
-    def test_extract_first_diff_block_accepts_patch_fence(self) -> None:
-        text = (
-            "Plan:\n"
-            "```patch\n"
-            "diff --git a/foo.py b/foo.py\n"
-            "index 1111111..2222222 100644\n"
-            "--- a/foo.py\n"
-            "+++ b/foo.py\n"
-            "@@ -1,1 +1,1 @@\n"
-            "-old\n"
-            "+new\n"
-            "```\n"
-        )
-        out = bot._extract_first_diff_block(text)
-        self.assertIn("diff --git a/foo.py b/foo.py", out)
-        self.assertIn("+new", out)
+class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
+    def test_proactive_cli_promotion_disabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)
+            self.assertFalse(bot._proactive_cli_promotion_enabled())
 
-    def test_extract_first_diff_block_accepts_udiff_fence(self) -> None:
-        text = (
-            "```udiff\n"
-            "diff --git a/bar.txt b/bar.txt\n"
-            "index 1111111..2222222 100644\n"
-            "--- a/bar.txt\n"
-            "+++ b/bar.txt\n"
-            "@@ -1,1 +1,1 @@\n"
-            "-before\n"
-            "+after\n"
-            "```\n"
-        )
-        out = bot._extract_first_diff_block(text)
-        self.assertIn("diff --git a/bar.txt b/bar.txt", out)
-        self.assertIn("+after", out)
+    def test_order_meaningful_improvement_ignores_backend_qa_only(self) -> None:
+        root = SimpleNamespace(job_id="root", trace={}, created_at=0.0, updated_at=0.0)
+        children = [
+            SimpleNamespace(
+                role="backend",
+                state="done",
+                trace={"result_status": "done", "result_summary": "Implemented concrete improvement with evidence."},
+                labels={},
+                created_at=100.0,
+                updated_at=100.0,
+            ),
+            SimpleNamespace(
+                role="qa",
+                state="done",
+                trace={"result_status": "done", "result_summary": "PASS validation with evidence artifacts."},
+                labels={},
+                created_at=120.0,
+                updated_at=120.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return list(children) if parent_job_id == "root" else []
+
+        self.assertFalse(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
+    def test_order_meaningful_improvement_true_when_already_merged(self) -> None:
+        root = SimpleNamespace(job_id="root", trace={"merged_to_main": True}, created_at=0.0, updated_at=0.0)
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return []
+
+        self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
 
 
 class TestVoiceNormalization(unittest.TestCase):
