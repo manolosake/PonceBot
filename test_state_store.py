@@ -73,6 +73,22 @@ class TestStateStoreBasics(unittest.TestCase):
             self.assertEqual(out.get("k"), "v")
             self.assertEqual(store.read().get("k"), "v")
 
+    def test_update_rejects_non_serializable_without_tmp_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            store.replace({"ok": True})
+
+            def _m(st):
+                st["bad"] = {1, 2, 3}
+
+            with self.assertRaises(TypeError):
+                store.update(_m)
+
+            self.assertEqual(store.read(), {"ok": True})
+            tmp_files = list(Path(td).glob("state.json.*.tmp"))
+            self.assertEqual(tmp_files, [])
+
 
 if __name__ == "__main__":
     unittest.main()
