@@ -48,25 +48,17 @@
     - Do not take over CEO project delivery unless the system explicitly routes that work to you.
     - Plan the smallest highest-impact verified improvement that can be delivered now.
     - Keep WIP bounded, require evidence, and avoid work-for-work's-sake.
-    - If you identify a larger strategic move, a new capability, a drastic refactor, or a change that materially alters the product/architecture, do not execute it immediately.
-    - For those larger/drastic ideas, ask the CEO first by returning a JSON next_action of type `ceo_approval_needed` with proposal_title, proposal_summary, scope, risks, questions, and fallback_work.
-    - While waiting for CEO approval on a larger/drastic idea, do not delegate execution subtasks for that idea.
     - Use local specialists (architect_local, implementer_local, reviewer_local) as the primary executors for this autonomous lane.
-    - You are a controller, not an implementer: never modify repository files directly, never apply patches yourself, and never commit or push code changes.
-    - architect_local and reviewer_local are advisory/review lanes only; only implementer_local may land repository changes for this autonomous lane.
-    - implementer_local on Codex may run in read-only mode and return textual diff/rewrite only; the controller applies the patch and runs validation after the turn.
-    - Do not treat read-only mode by itself as a blocker for implementer_local when the controller already supplied FILE excerpts and delegated file scope.
 
     Review policy:
     - Review implementation results with explicit PASS/NO-GO language.
     - Require concrete evidence: diffs, commands, tests, logs, screenshots, artifacts, or residual-risk notes.
     - If work is blocked or low-signal, re-plan another bounded local path instead of broadening scope.
-    - If the latest implementer blocker only says read-only workspace / bwrap sandbox, assume the controller-applied diff flow is available and continue with a bounded local-only retry or a reviewer_local validation pass.
 
     Communication policy:
     - Keep output short, operational, and evidence-first.
     - Distinguish facts from assumptions explicitly.
-  model: gpt-5.2-codex
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -77,7 +69,6 @@
   max_parallel_jobs: 1
   max_runtime_seconds: 1200
   approval_required: false
-  threaded_session: false
 
 - role: frontend
   name: Frontend
@@ -211,9 +202,8 @@
 
 
 - role: architect_local
-  name: Architect Codex
-  execution_backend: codex
-  threaded_session: false
+  name: Architect Local (Ollama)
+  execution_backend: local_ollama
   system_prompt: |
     You are the local architecture specialist.
     Produce one crisp bounded implementation handoff with explicit tradeoffs and risk controls.
@@ -233,22 +223,24 @@
     RISK:
     - main residual risk
     If you cannot identify exact files, return `BLOCKER:` plus the most likely files to inspect next.
-  model: gpt-5.2-codex
-  effort: medium
+  model: qwen3.5:latest
+  effort: high
   mode_hint: ro
+  local_num_ctx: 8192
+  local_max_tokens: 600
+  local_keep_alive_s: 240
+  local_think: false
   allowed_tools:
     - plan
     - summarize
     - review
-    - repo_read
   max_parallel_jobs: 1
   max_runtime_seconds: 900
   approval_required: false
 
 - role: implementer_local
-  name: Implementer Codex
-  execution_backend: codex
-  threaded_session: false
+  name: Implementer Local (Ollama Qwen 3.5 27B)
+  execution_backend: local_ollama
   system_prompt: |
     You are the local implementation specialist.
     Follow the delegated plan from Jarvis/Skynet exactly; do not redefine scope on your own.
@@ -267,23 +259,25 @@
     After the diff, return concise evidence: changed files, validation intent, expected outcome, residual risks, and rollback notes.
     If you cannot identify at least one exact file to modify, stop early and return `BLOCKER:` with the exact blocker instead of exploring broadly.
     If blocked, state the exact blocker and the smallest next action needed to continue.
-  model: gpt-5.2-codex
-  effort: medium
+  model: qwen3.5:27b
+  effort: high
   mode_hint: rw
+  local_num_ctx: 8192
+  local_max_tokens: 2400
+  local_keep_alive_s: 300
+  local_think: false
   allowed_tools:
     - plan
     - tests
     - review
     - summarize
-    - repo_read
   max_parallel_jobs: 1
   max_runtime_seconds: 1800
   approval_required: false
 
 - role: reviewer_local
-  name: Reviewer Codex
-  execution_backend: codex
-  threaded_session: false
+  name: Reviewer Local (Ollama)
+  execution_backend: local_ollama
   system_prompt: |
     You are the independent local reviewer.
     Validate proposals for correctness, security, regressions, and maintainability.
@@ -291,13 +285,16 @@
     Reject low-signal analysis; require explicit evidence, missing artifacts, and precise next actions.
     Treat REAL_WORKTREE_DIR as the real repository root and ignore ARTIFACTS_DIR as an implementation target.
     Treat missing diff/worktree evidence as an immediate NO-GO for implementer_local output.
-  model: gpt-5.2-codex
-  effort: medium
+  model: qwen3.5:latest
+  effort: high
   mode_hint: ro
+  local_num_ctx: 4096
+  local_max_tokens: 384
+  local_keep_alive_s: 180
+  local_think: false
   allowed_tools:
     - review
     - summarize
-    - repo_read
   max_parallel_jobs: 1
   max_runtime_seconds: 900
   approval_required: false
