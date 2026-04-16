@@ -8,20 +8,10 @@ OnFailure=codexbot-alert-user@%n
 
 [Service]
 Type=simple
-WorkingDirectory=%h/codexbot/data/runtime_worktrees/main
+WorkingDirectory=%h/codexbot
 EnvironmentFile=%h/codexbot/codexbot.env
-Environment=ENV_FILE=%h/codexbot/codexbot.env
-Environment=CODEXBOT_PYTHON_BIN=%h/codexbot/.venv/bin/python
-Environment=BOT_STATE_FILE=%h/codexbot/state.json
-Environment=BOT_AUTH_USERS_FILE=%h/codexbot/users.json
-Environment=BOT_AUTH_PROFILES_FILE=%h/codexbot/profiles.json
-Environment=BOT_ORCHESTRATOR_DB_PATH=%h/codexbot/data/jobs.sqlite
-Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=%h/codexbot/orchestrator/agents.yaml
-Environment=BOT_RUNBOOKS_PATH=%h/codexbot/orchestrator/runbooks.yaml
-Environment=BOT_WORKTREE_ROOT=%h/codexbot/data/worktrees
-Environment=BOT_ARTIFACTS_ROOT=%h/codexbot/data/artifacts
-ExecStartPre=%h/codexbot/data/runtime_worktrees/main/run.sh --check-env
-ExecStart=%h/codexbot/data/runtime_worktrees/main/run.sh
+ExecStartPre=%h/codexbot/run.sh --check-env
+ExecStart=%h/codexbot/run.sh
 Restart=on-failure
 RestartSec=5
 
