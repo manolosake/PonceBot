@@ -35,7 +35,7 @@ def build_agent_prompt(task: Task, *, profile: dict[str, Any] | None = None) -> 
     if project_path:
         header_lines.append(f"PROJECT_PATH: {project_path}")
     if tools_csv:
-        header_lines.append(f"ALLOWED_TOOLS: {tools_csv}")
+        header_lines.append(f"ALLOWED_TOOLS: {tools_csv} (advisory focus; controller-provided repo context remains allowed)")
     if system_prompt:
         header_lines.append("")
         header_lines.append("ROLE_SYSTEM_PROMPT:")
