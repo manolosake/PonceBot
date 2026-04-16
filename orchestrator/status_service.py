@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 import hashlib
 import json
 import time
@@ -184,7 +184,6 @@ class StatusService:
     orch_q: OrchestratorQueue
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
-    factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
 
     def _build_alerts(
         self,
@@ -396,10 +395,12 @@ class StatusService:
 
         workers_out: list[dict[str, Any]] = []
         # Scope counts: when chat_id is provided, only count jobs for that chat.
+        counts_ok = True
         try:
             role_health = self.orch_q.get_role_health(chat_id=chat_id)
         except Exception:
             role_health = {}
+            counts_ok = False
         try:
             queued_total = int(self.orch_q.get_queued_count(chat_id=chat_id))
             waiting_deps_total = int(self.orch_q.get_waiting_deps_count(chat_id=chat_id))
@@ -410,12 +411,14 @@ class StatusService:
             waiting_deps_total = 0
             blocked_approval_total = 0
             running_total = 0
+            counts_ok = False
         blocked_total = 0
         try:
             for rec in (role_health or {}).values():
                 blocked_total += int((rec or {}).get("blocked", 0) or 0)
         except Exception:
             blocked_total = 0
+            counts_ok = False
 
         blocked_requires_approval: list[dict[str, Any]] = []
         try:
@@ -457,33 +460,41 @@ class StatusService:
                 }
             )
         newest_updated_at = 0.0
+        no_open_jobs = (
+            len(orders_out) == 0
+            and queued_total == 0
+            and running_total == 0
+            and waiting_deps_total == 0
+            and blocked_approval_total == 0
+            and blocked_total == 0
+        )
+        if counts_ok and not no_open_jobs:
+            for role in roles:
+                n = int(max_parallel.get(role) or 1)
+                running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
+                queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
 
-        for role in roles:
-            n = int(max_parallel.get(role) or 1)
-            running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
-            queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
+                # Sort queued by the scheduler's intended order (priority asc, created_at asc).
+                queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
 
-            # Sort queued by the scheduler's intended order (priority asc, created_at asc).
-            queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
+                workers, occupied = _assign_running_to_workers(role, running, n)
 
-            workers, occupied = _assign_running_to_workers(role, running, n)
+                # Fill next tasks into idle workers.
+                q_idx = 0
+                for i in range(1, n + 1):
+                    if workers[i - 1]["current"] is not None:
+                        continue
+                    if q_idx < len(queued_sorted):
+                        workers[i - 1]["next"] = _task_to_status(queued_sorted[q_idx])
+                        q_idx += 1
 
-            # Fill next tasks into idle workers.
-            q_idx = 0
-            for i in range(1, n + 1):
-                if workers[i - 1]["current"] is not None:
-                    continue
-                if q_idx < len(queued_sorted):
-                    workers[i - 1]["next"] = _task_to_status(queued_sorted[q_idx])
-                    q_idx += 1
+                for t in running + queued:
+                    try:
+                        newest_updated_at = max(newest_updated_at, float(t.updated_at))
+                    except Exception:
+                        pass
 
-            for t in running + queued:
-                try:
-                    newest_updated_at = max(newest_updated_at, float(t.updated_at))
-                except Exception:
-                    pass
-
-            workers_out.extend(workers)
+                workers_out.extend(workers)
 
         staleness_seconds = max(0.0, float(now - newest_updated_at)) if newest_updated_at > 0 else None
         alerts = self._build_alerts(
@@ -509,18 +520,9 @@ class StatusService:
             "staleness_seconds": staleness_seconds,
         }
 
-        factory_extra: dict[str, Any] = {}
-        if self.factory_snapshot_fn is not None:
-            try:
-                maybe_extra = self.factory_snapshot_fn(chat_id)
-                if isinstance(maybe_extra, dict):
-                    factory_extra = maybe_extra
-            except Exception:
-                factory_extra = {}
-
         payload: dict[str, Any] = {
             "api_version": "v1",
-            "schema_version": 2,
+            "schema_version": 1,
             "generated_at": float(now),
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
@@ -541,15 +543,6 @@ class StatusService:
             "source_newest_updated_at": (float(newest_updated_at) if newest_updated_at > 0 else None),
             "staleness_seconds": staleness_seconds,
         }
-        for key in ("factory", "repos", "heartbeats", "lanes", "models", "slo", "mailbox"):
-            if key in factory_extra:
-                payload[key] = factory_extra.get(key)
-        extra_alerts = factory_extra.get("alerts") if isinstance(factory_extra.get("alerts"), list) else []
-        if extra_alerts:
-            payload["alerts"] = [*(payload.get("alerts") or []), *extra_alerts]
-        extra_risks = factory_extra.get("risks") if isinstance(factory_extra.get("risks"), list) else []
-        if extra_risks:
-            payload["risks"] = [*(payload.get("risks") or []), *extra_risks]
 
         # Add a stable hash for SSE clients.
         try:

@@ -35,6 +35,7 @@ class Task:
     is_autonomous: bool = False
     parent_job_id: str | None = None
     owner: str | None = None
+    ticket: str | None = None
     depends_on: list[str] = field(default_factory=list)
     ttl_seconds: int | None = None
     retry_count: int = 0
@@ -69,6 +70,7 @@ class Task:
         is_autonomous: bool = False,
         parent_job_id: str | None = None,
         owner: str | None = None,
+        ticket: str | None = None,
         depends_on: list[str] | None = None,
         ttl_seconds: int | None = None,
         retry_count: int = 0,
@@ -106,6 +108,7 @@ class Task:
             is_autonomous=bool(is_autonomous),
             parent_job_id=parent_job_id,
             owner=owner if (owner is None or str(owner).strip()) else None,
+            ticket=(str(ticket).strip() if isinstance(ticket, str) and str(ticket).strip() else None),
             depends_on=[str(p).strip() for p in (depends_on or []) if str(p).strip()],
             ttl_seconds=int(ttl_seconds) if ttl_seconds is not None else None,
             retry_count=max(0, int(retry_count)),
@@ -142,6 +145,7 @@ class Task:
             is_autonomous=kwargs.get("is_autonomous", self.is_autonomous),
             parent_job_id=kwargs.get("parent_job_id", self.parent_job_id),
             owner=kwargs.get("owner", self.owner),
+            ticket=kwargs.get("ticket", self.ticket),  # preserve ticket on updates
             depends_on=list(kwargs.get("depends_on", self.depends_on) or []),
             ttl_seconds=kwargs.get("ttl_seconds", self.ttl_seconds),
             retry_count=int(kwargs.get("retry_count", self.retry_count)),
