@@ -8,6 +8,7 @@ import json
 _ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local")
 _ALLOWED_MODES = ("ro", "rw", "full")
 _ALLOWED_SLA = ("normal", "high", "urgent")
+_ISOLATED_BLOCKER_KEYS = {"07625372"}
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,55 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
                 definition_of_done=dod,
                 eta_minutes=eta_minutes,
                 sla_tier=sla_tier,
+            )
+        )
+    return _partition_approval_dependent_specs(out)
+
+
+def _partition_approval_dependent_specs(specs: list[TaskSpec]) -> list[TaskSpec]:
+    """Keep approval blockers isolated so runnable work can still queue/execute.
+
+    Rules:
+    - Isolated blocker keys are always approval-dependent.
+    - Non-approval specs cannot depend on approval-dependent specs.
+    """
+    if not specs:
+        return []
+
+    approval_keys: set[str] = set(_ISOLATED_BLOCKER_KEYS)
+    for spec in specs:
+        if bool(spec.requires_approval) or str(spec.mode_hint or "").strip().lower() == "full":
+            approval_keys.add(str(spec.key))
+    for spec in specs:
+        if str(spec.key) in _ISOLATED_BLOCKER_KEYS:
+            approval_keys.add(str(spec.key))
+
+    out: list[TaskSpec] = []
+    for spec in specs:
+        key = str(spec.key)
+        is_approval_spec = (
+            bool(spec.requires_approval)
+            or str(spec.mode_hint or "").strip().lower() == "full"
+            or key in _ISOLATED_BLOCKER_KEYS
+        )
+
+        deps = [str(x).strip() for x in (spec.depends_on or []) if str(x).strip()]
+        if not is_approval_spec:
+            deps = [dep for dep in deps if dep not in approval_keys]
+
+        out.append(
+            TaskSpec(
+                key=key,
+                role=spec.role,
+                text=spec.text,
+                mode_hint=spec.mode_hint,
+                priority=spec.priority,
+                depends_on=deps,
+                requires_approval=is_approval_spec,
+                acceptance_criteria=list(spec.acceptance_criteria or []),
+                definition_of_done=list(spec.definition_of_done or []),
+                eta_minutes=spec.eta_minutes,
+                sla_tier=spec.sla_tier,
             )
         )
     return out
