@@ -4003,7 +4003,7 @@ def _default_orchestrator_profile(role: str) -> dict[str, Any]:
         "model": "",
         "effort": "medium",
         "mode_hint": "ro",
-        "allowed_tools": ["repo_read"],
+        "allowed_tools": [],
         "max_parallel_jobs": 1,
         "max_runtime_seconds": 900,
         "approval_required": False,
@@ -4056,9 +4056,6 @@ def _order_title_from_text(text: str, *, fallback: str = "Untitled order") -> st
 def _order_branch_name(order_id: str, title: str) -> str:
     oid = str(order_id or "").strip()[:8] or "order"
     slug = _slug_token(title or f"order-{oid}", max_len=38)
-    slug = slug.strip("-")
-    if not slug:
-        slug = f"order-{oid}"
     return f"feature/order-{oid}-{slug}"
 
 
@@ -4548,17 +4545,12 @@ def _parse_orchestrator_marker(text: str) -> tuple[str, str] | None:
     """
     if not text.startswith("__orch_"):
         return None
-    body = text[len("__orch_") :].strip()
+    body = text[len("__orch_") :]
     if not body:
         return None
     if ":" in body:
         kind, payload = body.split(":", 1)
-        payload = payload.strip()
-        if not payload:
-            return None
-        if len(payload) > 8192:
-            payload = payload[:8192]
-        return kind, payload
+        return kind, payload.strip()
     kind = body
     if kind.endswith("__"):
         kind = kind[:-2]
