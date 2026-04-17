@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
-import os
 import tempfile
 import threading
 from pathlib import Path
@@ -66,7 +65,6 @@ class StateStore:
 
     def _write_unlocked(self, data: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        serialized = json.dumps(data, indent=2, sort_keys=True) + "\n"
         tmp_f = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -76,19 +74,11 @@ class StateStore:
             delete=False,
         )
         try:
-            tmp_f.write(serialized)
+            tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
             tmp_f.flush()
-            os.fsync(tmp_f.fileno())
         finally:
             tmp_f.close()
         Path(tmp_f.name).replace(self._path)
-        dir_fd = None
-        try:
-            dir_fd = os.open(str(self._path.parent), os.O_DIRECTORY)
-            os.fsync(dir_fd)
-        finally:
-            if dir_fd is not None:
-                os.close(dir_fd)
 
     def read(self) -> dict[str, Any]:
         with self._mu:
