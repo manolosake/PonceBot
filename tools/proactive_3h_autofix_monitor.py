@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -21,10 +22,13 @@ def _ts() -> str:
 def _log(msg: str, *, path: Path, **fields: Any) -> None:
     payload = {"ts": _ts(), "msg": msg, **fields}
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(payload, ensure_ascii=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line, flush=True)
+    line = json.dumps(payload, ensure_ascii=True) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+    print(line.rstrip("\n"), flush=True)
 
 
 def _load_env_file(path: Path) -> None:
