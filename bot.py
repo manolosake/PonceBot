@@ -7417,7 +7417,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/pause":
         return "Uso: /pause <role>", None
 
-    if text == "/pause_autonomy":
+    if text in ("/pause_autonomy", "/pause-autonomy"):
         return _orch_marker("pause_autonomy"), None
 
     if text.startswith("/pause "):
@@ -7435,7 +7435,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/resume":
         return "Uso: /resume <role>", None
 
-    if text == "/resume_autonomy":
+    if text in ("/resume_autonomy", "/resume-autonomy"):
         return _orch_marker("resume_autonomy"), None
 
     if text.startswith("/resume "):

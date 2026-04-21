@@ -92,6 +92,9 @@ class TestOrchestratorCommands(unittest.TestCase):
             msg_pause_autonomy = bot.IncomingMessage(21, 1, 2, 31, "u", "/pause_autonomy")
             resp_pause_autonomy, _ = bot._parse_job(cfg, msg_pause_autonomy)
             self.assertEqual(resp_pause_autonomy, "__orch_pause_autonomy__")
+            msg_pause_autonomy_dash = bot.IncomingMessage(211, 1, 2, 311, "u", "/pause-autonomy")
+            resp_pause_autonomy_dash, _ = bot._parse_job(cfg, msg_pause_autonomy_dash)
+            self.assertEqual(resp_pause_autonomy_dash, "__orch_pause_autonomy__")
 
             msg_resume = bot.IncomingMessage(3, 1, 2, 12, "u", "/resume backend")
             resp_resume, _ = bot._parse_job(cfg, msg_resume)
@@ -100,6 +103,9 @@ class TestOrchestratorCommands(unittest.TestCase):
             msg_resume_autonomy = bot.IncomingMessage(22, 1, 2, 32, "u", "/resume_autonomy")
             resp_resume_autonomy, _ = bot._parse_job(cfg, msg_resume_autonomy)
             self.assertEqual(resp_resume_autonomy, "__orch_resume_autonomy__")
+            msg_resume_autonomy_dash = bot.IncomingMessage(221, 1, 2, 321, "u", "/resume-autonomy")
+            resp_resume_autonomy_dash, _ = bot._parse_job(cfg, msg_resume_autonomy_dash)
+            self.assertEqual(resp_resume_autonomy_dash, "__orch_resume_autonomy__")
 
             msg_cancel = bot.IncomingMessage(4, 1, 2, 13, "u", "/cancel 8f9c")
             resp_cancel, _ = bot._parse_job(cfg, msg_cancel)
