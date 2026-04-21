@@ -349,10 +349,21 @@ class TestProactive3hAutofixMonitorSweep(unittest.TestCase):
 
             conn = sqlite3.connect(str(db_path))
             row = conn.execute("SELECT state, blocked_reason FROM jobs WHERE job_id='blocked-1'").fetchone()
+            followup = conn.execute(
+                "SELECT role, state, source FROM jobs WHERE parent_job_id=? AND job_id<>'blocked-1' ORDER BY created_at DESC LIMIT 1",
+                (order_id,),
+            ).fetchone()
+            order = conn.execute("SELECT status FROM ceo_orders WHERE order_id=?", (order_id,)).fetchone()
             conn.close()
             self.assertIsNotNone(row)
             self.assertEqual(str(row[0]), "cancelled")
             self.assertEqual(str(row[1]), "autofix_stale_blocked_only")
+            self.assertIsNotNone(followup)
+            self.assertEqual(str(followup[0]), "architect_local")
+            self.assertEqual(str(followup[1]), "queued")
+            self.assertEqual(str(followup[2]), "autopilot")
+            self.assertIsNotNone(order)
+            self.assertEqual(str(order[0]), "active")
 
 
 if __name__ == "__main__":

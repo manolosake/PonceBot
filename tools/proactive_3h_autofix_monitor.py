@@ -108,6 +108,25 @@ def _terminal_children_count(conn: sqlite3.Connection, *, order_id: str) -> int:
     return int((row["c"] if row is not None else 0) or 0)
 
 
+def _recent_cancelled_blocked_cleanup_count(conn: sqlite3.Connection, *, order_id: str, seconds: float = 1800.0) -> int:
+    since = float(time.time()) - float(seconds)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM jobs
+            WHERE parent_job_id=?
+              AND state='cancelled'
+              AND blocked_reason='autofix_stale_blocked_only'
+              AND updated_at>=?
+            """,
+            (order_id, since),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return int((row["c"] if row is not None else 0) or 0)
+
+
 def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
     now = float(time.time())
     cur = conn.execute(
@@ -361,7 +380,20 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                         _log("autopilot_reseed", path=log_path, order_id=order_id, created=int(created))
                     else:
                         terminal_count = _terminal_children_count(conn, order_id=order_id)
-                        if terminal_count > 0 and _close_order_done(conn, order_id=order_id):
+                        recent_blocked_cleanup = _recent_cancelled_blocked_cleanup_count(conn, order_id=order_id)
+                        if recent_blocked_cleanup > 0:
+                            followup_job_id = _enqueue_fallback_followup(conn, order_id=order_id, chat_id=chat_id)
+                            conn.commit()
+                            actions += 1
+                            refreshed_open = _open_children(conn, order_id=order_id)
+                            _log(
+                                "enqueued_post_blocked_cleanup_followup",
+                                path=log_path,
+                                order_id=order_id,
+                                job_id=followup_job_id,
+                                cleaned_blocked=recent_blocked_cleanup,
+                            )
+                        elif terminal_count > 0 and _close_order_done(conn, order_id=order_id):
                             conn.commit()
                             actions += 1
                             _log(
