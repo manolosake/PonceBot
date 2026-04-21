@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import math
 import os
 import queue
 import re
@@ -1010,6 +1011,19 @@ def _parse_int_set(value: str | None) -> set[int]:
             continue
         out.add(int(part))
     return out
+
+
+def _parse_finite_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = float(str(raw).strip())
+    except Exception:
+        return default
+    if not math.isfinite(val):
+        return default
+    return val
 
 
 def _chunk_text(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
@@ -4547,7 +4561,17 @@ def _controller_result_indicates_progress(
         return True
     for row in _structured_subtask_rows(structured_digest):
         role = _coerce_orchestrator_role(str(row.get("role") or ""))
-        if role in {"architect_local", "implementer_local", "reviewer_local"}:
+        if role in {
+            "architect_local",
+            "implementer_local",
+            "reviewer_local",
+            "backend",
+            "frontend",
+            "qa",
+            "sre",
+            "security",
+            "release_mgr",
+        }:
             return True
     return False
 
@@ -5623,9 +5647,17 @@ def _augment_local_specialist_prompt_with_workspace_context(
                 elif focused_excerpt:
                     excerpt = focused_excerpt
                 else:
-                    excerpt = raw[:48000].rstrip()
-                    if len(raw) > len(excerpt):
-                        excerpt += "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+                    if len(raw) <= 48000:
+                        excerpt = raw.rstrip()
+                    else:
+                        head = raw[:24000].rstrip()
+                        tail = raw[-24000:].lstrip()
+                        excerpt = (
+                            head
+                            + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
+                            + "# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]\n"
+                            + tail
+                        )
             elif focused_excerpt:
                 excerpt = focused_excerpt
             else:
@@ -10695,7 +10727,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "Rules:\n"
             "- You may now execute this larger approved plan.\n"
             "- If scope drifts materially beyond the approved plan, ask the CEO again before proceeding.\n"
-            "- Use only architect_local, implementer_local, reviewer_local.\n"
+            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
+            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
             "- Keep evidence explicit and close work in bounded slices.\n"
         )
     elif decision_norm in ("reject", "timeout"):
@@ -10715,7 +10748,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "- Do NOT execute the larger/drastic proposal now.\n"
             "- Continue with simpler bounded work like the normal factory lane.\n"
             "- Stay inside the current registered repo and keep changes incremental.\n"
-            "- Use only architect_local, implementer_local, reviewer_local.\n"
+            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
+            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
         )
     else:
         input_text = (
@@ -10728,7 +10762,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "- Do NOT execute the larger/drastic change yet.\n"
             "- Replan from the CEO feedback.\n"
             "- Either produce a revised CEO approval proposal or downgrade to bounded work if possible.\n"
-            "- Use only architect_local, implementer_local, reviewer_local.\n"
+            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
+            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
         )
 
     trace: dict[str, Any] = {
@@ -12712,8 +12747,9 @@ def _spawn_proactive_order(
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
-        "- When delegating implementer_local, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.",
-        "- If local-only work becomes repetitive, empty, or low-signal, re-plan one bounded local-only path with clearer evidence requirements.",
+        "- Default to one bounded Codex delivery slice plus one validation slice; do not spray parallel tasks.",
+        "- When delegating implementation, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.",
+        "- If work becomes repetitive, empty, or low-signal, slow down and re-plan one narrower evidence-first path instead of spawning more tasks.",
         "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.",
         "- If fully validated, publish a concise PASS summary and the next highest-impact opportunity.",
     ]
@@ -13506,9 +13542,9 @@ def _enqueue_order_autopilot_task(
             "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
             "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
             "- If the best next move is a larger strategic idea, a new capability, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
-            "- Delegate only local specialist executors: architect_local, implementer_local, reviewer_local.\n"
-            "- Do not seed backend/qa/sre Codex CLI delivery roles for proactive work.\n"
-            "- If a local cycle stalls or returns low-signal output, re-plan another local-only path instead of promoting to CLI.\n"
+            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors for proactive work.\n"
+            "- Keep local specialists as optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- If a cycle stalls or returns low-signal output, slow down and re-plan a narrower Codex slice with stronger evidence requirements.\n"
             "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
             "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
             "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
@@ -13955,6 +13991,13 @@ def _local_specialists_enforced() -> bool:
 def _ceo_local_injection_enabled() -> bool:
     # CEO/manual orders stay Codex CLI-first by default. Local lanes are an experimental opt-in override.
     raw = os.environ.get("BOT_CEO_INJECT_LOCAL_SPECIALISTS", "0")
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _skynet_factory_local_only_enabled() -> bool:
+    # Proactive work defaults to Codex delivery roles. The old local-only factory
+    # mode remains available as an explicit opt-in escape hatch.
+    raw = os.environ.get("BOT_SKYNET_FACTORY_LOCAL_ONLY", "0")
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -14844,6 +14887,8 @@ _SKYNET_LOCAL_ONLY_ALLOWED_ROLE_NAMES = frozenset({"skynet", *_SKYNET_LOCAL_EXEC
 def _filter_specs_to_skynet_local_executors(
     specs: list[TaskSpec],
 ) -> tuple[list[TaskSpec], list[str]]:
+    if not _skynet_factory_local_only_enabled():
+        return list(specs or []), []
     kept: list[TaskSpec] = []
     dropped_roles: list[str] = []
     for spec in specs or []:
@@ -14869,6 +14914,8 @@ def _cancel_non_local_children_for_skynet_factory_orders_tick(
     an active proactive order, cancel those non-local children so the next scheduler tick
     can re-plan inside the allowed trio.
     """
+    if not _skynet_factory_local_only_enabled():
+        return 0
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
     except Exception:
@@ -15026,8 +15073,6 @@ def _slice_has_applied_and_validated_evidence(
     applied = False
     validated = False
     for child in children:
-        if _coerce_orchestrator_role(str(child.role or "")) != "implementer_local":
-            continue
         state = str(child.state or "").strip().lower()
         if state != "done":
             continue
@@ -15035,9 +15080,9 @@ def _slice_has_applied_and_validated_evidence(
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
-        if _trace_local_patch_applied(trace):
+        if _task_has_skynet_delivery_evidence(child, trace=trace):
             applied = True
-        if _trace_has_validated_slice_evidence(trace):
+        if _task_has_skynet_delivery_validation_evidence(child, trace=trace):
             validated = True
         if applied and validated:
             return True, True
@@ -15059,8 +15104,6 @@ def _slice_has_no_change_evidence(
     except Exception:
         return False
     for child in children:
-        if _coerce_orchestrator_role(str(child.role or "")) != "implementer_local":
-            continue
         state = str(child.state or "").strip().lower()
         if state != "done":
             continue
@@ -15068,7 +15111,7 @@ def _slice_has_no_change_evidence(
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
-        if _trace_local_no_change(trace):
+        if _task_has_skynet_no_change_evidence(child, trace=trace):
             return True
     return False
 
@@ -15088,16 +15131,20 @@ def _slice_has_review_ready_evidence(
     except Exception:
         return False
     for child in children:
-        if _coerce_orchestrator_role(str(child.role or "")) != "reviewer_local":
+        role_norm = _coerce_orchestrator_role(str(child.role or ""))
+        if role_norm not in {"reviewer_local", "qa", "release_mgr"}:
             continue
         state = str(child.state or "").strip().lower()
-        if state != "done" and not _task_has_salvageable_local_success(child):
+        if role_norm == "reviewer_local":
+            if state != "done" and not _task_has_salvageable_local_success(child):
+                continue
+        elif state != "done":
             continue
         child_slice = _task_slice_id(child, root_ticket=rid)
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
-        if _summary_has_ready_signal(str(trace.get("result_summary") or "")):
+        if _task_has_skynet_review_ready_evidence(child, trace=trace):
             return True
     return False
 
@@ -15126,11 +15173,12 @@ def _controller_verified_slice_for_closure(
             root_ticket=rid,
             slice_id=hinted,
         )
-        if ((applied and validated) or no_change) and _slice_has_review_ready_evidence(
+        review_ready = _slice_has_review_ready_evidence(
             orch_q=orch_q,
             root_ticket=rid,
             slice_id=hinted,
-        ):
+        )
+        if review_ready and ((applied and validated) or applied or no_change):
             return hinted
     return _select_latest_ready_slice_for_closure(orch_q=orch_q, root_ticket=rid)
 
@@ -15151,11 +15199,12 @@ def _select_latest_ready_slice_for_closure(
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
-        if role_norm not in {"implementer_local", "reviewer_local"}:
+        if role_norm not in {"implementer_local", "backend", "frontend", "sre", "security", "reviewer_local", "qa", "release_mgr"}:
             continue
-        if role_norm == "implementer_local" and state != "done":
-            continue
-        if role_norm == "reviewer_local" and state != "done" and not _task_has_salvageable_local_success(child):
+        if role_norm == "reviewer_local":
+            if state != "done" and not _task_has_salvageable_local_success(child):
+                continue
+        elif state != "done":
             continue
         slice_id = _task_slice_id(child, root_ticket=rid)
         if not slice_id:
@@ -15164,24 +15213,24 @@ def _select_latest_ready_slice_for_closure(
         bucket = latest_by_slice.setdefault(
             slice_id,
             {
-                "implementer_ready": False,
+                "delivery_ready": False,
                 "reviewed_ready": False,
                 "updated_at": 0.0,
             },
         )
         updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
-        if role_norm == "implementer_local" and (
-            _trace_has_validated_slice_evidence(trace) or _trace_local_no_change(trace)
+        if role_norm in {"implementer_local", "backend", "frontend", "sre", "security"} and (
+            _task_has_skynet_delivery_evidence(child, trace=trace) or _task_has_skynet_no_change_evidence(child, trace=trace)
         ):
-            bucket["implementer_ready"] = True
-        if role_norm == "reviewer_local" and _summary_has_ready_signal(str(trace.get("result_summary") or "")):
+            bucket["delivery_ready"] = True
+        if role_norm in {"reviewer_local", "qa", "release_mgr"} and _task_has_skynet_review_ready_evidence(child, trace=trace):
             bucket["reviewed_ready"] = True
         if updated_at > float(bucket.get("updated_at", 0.0) or 0.0):
             bucket["updated_at"] = updated_at
     best_slice = ""
     best_ts = 0.0
     for slice_id, bucket in latest_by_slice.items():
-        if not (bool(bucket.get("implementer_ready")) and bool(bucket.get("reviewed_ready"))):
+        if not (bool(bucket.get("delivery_ready")) and bool(bucket.get("reviewed_ready"))):
             continue
         ts = float(bucket.get("updated_at", 0.0) or 0.0)
         if ts >= best_ts:
@@ -15235,6 +15284,17 @@ def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
     m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground)_(.+)$", key_norm)
     if m:
         return _sanitize_slice_token(m.group(1), fallback=fallback)
+    for suffix in (
+        "_qa",
+        "_review",
+        "_reviewer",
+        "_release",
+        "_release_mgr",
+        "_validate",
+        "_validation",
+    ):
+        if key_norm.endswith(suffix) and len(key_norm) > len(suffix):
+            return _sanitize_slice_token(key_norm[: -len(suffix)], fallback=fallback)
     return _sanitize_slice_token(key_norm, fallback=fallback)
 
 
@@ -15347,6 +15407,76 @@ def _trace_has_validated_slice_evidence(trace: dict[str, Any] | None) -> bool:
     return bool(_trace_local_patch_applied(trace) and _trace_local_patch_validated(trace))
 
 
+def _task_has_skynet_delivery_evidence(task: Task | None, *, trace: dict[str, Any] | None = None) -> bool:
+    if task is None:
+        return False
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"implementer_local", "backend", "frontend", "sre", "security"}:
+        return False
+    trace_obj = trace if isinstance(trace, dict) else {}
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    if _trace_local_no_change(trace_obj) or _response_signals_no_code_change(summary):
+        return False
+    if _trace_local_patch_applied(trace_obj):
+        return True
+    return bool(_trace_has_nontrivial_artifacts(trace_obj) or _summary_has_progress_signal(summary))
+
+
+def _task_has_skynet_delivery_validation_evidence(
+    task: Task | None,
+    *,
+    trace: dict[str, Any] | None = None,
+) -> bool:
+    if task is None:
+        return False
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"implementer_local", "backend", "frontend", "sre", "security"}:
+        return False
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if _trace_has_validated_slice_evidence(trace_obj):
+        return True
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    if _text_has_no_go_signal(summary):
+        return False
+    return bool(
+        _summary_has_validation_signal(summary)
+        and (_trace_has_nontrivial_artifacts(trace_obj) or len(summary) >= 80)
+    )
+
+
+def _task_has_skynet_no_change_evidence(task: Task | None, *, trace: dict[str, Any] | None = None) -> bool:
+    if task is None:
+        return False
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"implementer_local", "backend", "frontend", "sre", "security"}:
+        return False
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if _trace_local_no_change(trace_obj):
+        return True
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    return bool(_response_signals_no_code_change(summary))
+
+
+def _task_has_skynet_review_ready_evidence(task: Task | None, *, trace: dict[str, Any] | None = None) -> bool:
+    if task is None:
+        return False
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"reviewer_local", "qa", "release_mgr"}:
+        return False
+    trace_obj = trace if isinstance(trace, dict) else {}
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    if role_norm == "reviewer_local":
+        return bool(trace_obj.get("review_ready", False) or _summary_has_ready_signal(summary))
+    if _text_has_no_go_signal(summary):
+        return False
+    if bool(trace_obj.get("review_ready", False)) or _summary_has_ready_signal(summary):
+        return True
+    return bool(
+        _summary_has_validation_signal(summary)
+        and (_trace_has_nontrivial_artifacts(trace_obj) or len(summary) >= 80)
+    )
+
+
 def _classify_local_slice_failure(
     *,
     role_norm: str,
@@ -15448,11 +15578,11 @@ def _collect_order_local_autonomy_funnel(
         explicit_slice_id = _sanitize_slice_token(str(trace.get("slice_id") or ""), fallback="")
         if bool(trace.get("loop_breaker_triggered", False)):
             loop_breaker_count += 1
-        if role_norm == "implementer_local":
+        if role_norm in {"implementer_local", "backend", "frontend", "sre", "security"}:
             implementer_attempts += 1
             if state in ("failed", "cancelled", "blocked", "blocked_approval"):
                 implementer_failures += 1
-        if role_norm not in {"architect_local", "implementer_local", "reviewer_local"} and role_norm not in controller_roles:
+        if role_norm not in {"architect_local", "implementer_local", "reviewer_local", "backend", "frontend", "qa", "sre", "security", "release_mgr"} and role_norm not in controller_roles:
             continue
         slice_id = _task_slice_id(child, root_ticket=rid)
         if not slice_id:
@@ -15476,19 +15606,22 @@ def _collect_order_local_autonomy_funnel(
         if state in ("failed", "cancelled", "blocked", "blocked_approval"):
             bucket["has_failed"] = True
 
-        if role_norm == "implementer_local":
+        if role_norm in {"implementer_local", "backend", "frontend", "sre", "security"}:
             bucket["started"] = True
             if state == "done":
-                if _trace_local_patch_applied(trace):
+                if _task_has_skynet_delivery_evidence(child, trace=trace) or _task_has_skynet_no_change_evidence(child, trace=trace):
                     bucket["applied"] = True
-                if _trace_has_validated_slice_evidence(trace) or _trace_local_no_change(trace):
+                if _task_has_skynet_delivery_validation_evidence(child, trace=trace) or _task_has_skynet_no_change_evidence(child, trace=trace):
                     bucket["validated"] = True
             continue
 
-        if role_norm == "reviewer_local":
-            if state == "done" or _task_has_salvageable_local_success(child):
-                if _summary_has_ready_signal(summary):
-                    bucket["review_ready_candidate"] = True
+        if role_norm in {"reviewer_local", "qa", "release_mgr"}:
+            if role_norm == "reviewer_local":
+                if state == "done" or _task_has_salvageable_local_success(child):
+                    if _task_has_skynet_review_ready_evidence(child, trace=trace):
+                        bucket["review_ready_candidate"] = True
+            elif state == "done" and _task_has_skynet_review_ready_evidence(child, trace=trace):
+                bucket["review_ready_candidate"] = True
             continue
 
         if role_norm in controller_roles and state == "done":
@@ -15943,7 +16076,8 @@ def _order_has_meaningful_improvement(
     except Exception:
         return False
 
-    # For proactive/local-only factory progress, count only the local implementer/reviewer lane.
+    # Prefer the proactive slice funnel. It now accepts both Codex delivery lanes and
+    # the legacy local trio, but still requires controller verification before closure.
     delivery_roles = {"implementer_local"}
     delivery_ok = False
     validation_ok = False
@@ -15993,15 +16127,22 @@ def _order_has_verified_no_change_resolution(
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
-        if role_norm != "reviewer_local":
+        if role_norm not in {"reviewer_local", "qa", "release_mgr"}:
             continue
-        if state != "done" and not _task_has_salvageable_local_success(child):
+        if role_norm == "reviewer_local":
+            if state != "done" and not _task_has_salvageable_local_success(child):
+                continue
+        elif state != "done":
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
         if ts <= 0 or (now_ts - ts) > 3600.0:
             continue
-        summary = _task_local_specialist_response(child, max_chars=5000)
-        if not summary:
+        if role_norm == "reviewer_local":
+            summary = _task_local_specialist_response(child, max_chars=5000)
+            if not summary:
+                trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
+                summary = str(trace.get("result_summary") or "").strip()
+        else:
             trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
             summary = str(trace.get("result_summary") or "").strip()
         if not summary:
@@ -16021,7 +16162,7 @@ def _order_has_verified_no_change_resolution(
         return False
     for child in children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
-        if role_norm not in {"architect_local", "implementer_local"}:
+        if role_norm not in {"architect_local", "implementer_local", "backend", "frontend", "sre", "security"}:
             continue
         st = str(child.state or "").strip().lower()
         if st in {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}:
@@ -19003,7 +19144,7 @@ def _jarvis_final_sweep_tick(
                 "- Verify if remaining blockers are still valid.\n"
                 "- Discard/cancel stale or superseded leftovers.\n"
                 "- Re-plan an executable path for unresolved blockers.\n"
-                "- Keep execution aligned with ticket policy; proactive tickets must stay local-only.\n"
+                "- Keep execution aligned with ticket policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
                 "- Keep iterating until this ticket has no blocked/waiting leftovers.\n"
             )
             extra_trace = {
@@ -19023,7 +19164,7 @@ def _jarvis_final_sweep_tick(
                 "Action required:\n"
                 "- Do not leave this order active with zero live jobs.\n"
                 "- Either close the order explicitly with evidence, or delegate the next highest-impact executable work now.\n"
-                "- Re-plan using the ticket execution policy; proactive tickets must stay local-only.\n"
+                "- Re-plan using the ticket execution policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
                 "- Require validation/evidence before any final wrap-up.\n"
             )
             extra_trace = {
@@ -19195,7 +19336,7 @@ def _running_watchdog_tick(
     try:
         local_silent_requeue_s = min(
             900.0,
-            max(120.0, float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", "240").strip() or "240")),
+            max(120.0, _parse_finite_float_env("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", 240.0)),
         )
     except Exception:
         local_silent_requeue_s = 240.0
@@ -19724,7 +19865,7 @@ def _sla_overdue_tick(
                 continue
             age_s = max(0.0, float(now - float(item.created_at or now)))
             overdue_by = age_s - float(ttl_s)
-            if overdue_by <= grace_s:
+            if overdue_by <= 0:
                 continue
             kind = str((item.labels or {}).get("kind") or "").strip().lower()
             if kind in ("autopilot", "stalled_replan", "sla_replan", "wrapup", "evidence"):
@@ -19806,6 +19947,8 @@ def _sla_overdue_tick(
                 )
             except Exception:
                 pass
+            continue
+        if overdue_by <= grace_s:
             continue
 
         controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=root_ticket)
@@ -24804,7 +24947,10 @@ def orchestrator_worker_loop(
                         except Exception:
                             order_is_proactive = False
 
-                    enforce_local_only = bool(proactive_lane) or bool(order_is_proactive) or bool(merge_conflict_resolution)
+                    enforce_local_only = bool(
+                        _skynet_factory_local_only_enabled()
+                        and (bool(proactive_lane) or bool(order_is_proactive) or bool(merge_conflict_resolution))
+                    )
                     if autonomous_non_manual and enforce_local_only and specs:
                         specs, dropped_local_only_roles = _filter_specs_to_skynet_local_executors(specs)
                         if dropped_local_only_roles:
@@ -24866,8 +25012,7 @@ def orchestrator_worker_loop(
                                 )
                             except Exception:
                                 pass
-                    # Hard guardrail: proactive Skynet factory work must stay local-only.
-                    proactive_cli_promotion = False
+                    proactive_cli_promotion = bool(autonomous_non_manual and (not enforce_local_only))
                     if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
                         objective_snippet = str(task.input_text or "").strip()
                         if len(objective_snippet) > 240:
@@ -25056,22 +25201,26 @@ def orchestrator_worker_loop(
                         specs = specs[:12]
                         # Key-based dedupe: allows multiple waves (autopilot) without duplicating keys.
                         specs = [s for s in specs if s.key not in existing_keys]
-                        specs = _inject_local_specialist_specs(
-                            specs=specs,
-                            root_ticket=root_ticket,
-                            existing_keys=existing_keys,
-                            request_type=str(task.request_type or "task"),
-                            is_top_level_manual=bool(is_top_level_manual),
-                            proactive_lane=proactive_lane,
-                            allow_delegation=bool(allow_delegation),
-                        )
+                        if not (autonomous_non_manual and not enforce_local_only):
+                            specs = _inject_local_specialist_specs(
+                                specs=specs,
+                                root_ticket=root_ticket,
+                                existing_keys=existing_keys,
+                                request_type=str(task.request_type or "task"),
+                                is_top_level_manual=bool(is_top_level_manual),
+                                proactive_lane=proactive_lane,
+                                allow_delegation=bool(allow_delegation),
+                            )
 
                         now_ts = time.time()
                         if specs and autonomous_non_manual:
                             # Policy:
-                            # - Proactive lane (no active CEO projects) stays local-only.
-                            # - CEO-driven projects may mix Codex CLI + local specialists.
-                            enforce_local_only = bool(proactive_lane) or bool(order_is_proactive)
+                            # - Proactive lane defaults to Codex-first execution.
+                            # - Legacy local-only enforcement remains available via env override.
+                            enforce_local_only = bool(
+                                _skynet_factory_local_only_enabled()
+                                and (bool(proactive_lane) or bool(order_is_proactive))
+                            )
                             if proactive_cli_promotion:
                                 specs = _apply_ceo_cli_first_policy(
                                     specs=specs,
@@ -25089,7 +25238,7 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
                             elif enforce_local_only:
-                                # Proactive lane policy: execution and retries stay local-only.
+                                # Legacy proactive policy: execution and retries stay local-only.
                                 specs = _apply_autonomous_local_first_policy(
                                     cfg=cfg,
                                     specs=specs,
@@ -25165,7 +25314,7 @@ def orchestrator_worker_loop(
                                 specs = specs[:ticket_slots]
 
                         if specs:
-                            max_keep = 4 if autonomous_non_manual else 6
+                            max_keep = 2 if (autonomous_non_manual and not enforce_local_only) else (4 if autonomous_non_manual else 6)
                             specs_before_objective = len(specs)
                             specs, objective_dropped = _objective_filter_specs(
                                 specs=specs,
@@ -25439,12 +25588,11 @@ def orchestrator_worker_loop(
                             # Quality gate:
                             # - Mandatory for manual CEO tickets (before wrap-up).
                             # - Also mandatory for autonomous/proactive lanes so improvements iterate with evidence.
-                            quality_gate_required = bool(is_top_level_manual)
-                            if (not quality_gate_required) and autonomous_non_manual:
-                                # Autonomous lane stays local-first by default; no automatic QA delegation.
-                                quality_gate_required = False
+                            quality_gate_required = bool(is_top_level_manual) or bool(
+                                autonomous_non_manual and (not enforce_local_only)
+                            )
                             if quality_gate_required:
-                                has_qa = any(str(s.role).strip().lower() == "qa" for s in specs)
+                                has_qa = any(str(s.role).strip().lower() in ("qa", "release_mgr", "reviewer_local") for s in specs)
                                 needs_qa = any(
                                     str(s.role).strip().lower()
                                     in ("frontend", "backend", "security", "research", "release_mgr", "product_ops", "sre", "architect_local", "implementer_local", "reviewer_local")
@@ -25453,6 +25601,18 @@ def orchestrator_worker_loop(
                                 if needs_qa and (not has_qa):
                                     dep_keys = [str(s.key).strip() for s in specs if str(s.key).strip()]
                                     qa_key_base = f"qa_gate_r{int(next_plan_revision)}"
+                                    if autonomous_non_manual and (not enforce_local_only):
+                                        primary_delivery_key = next(
+                                            (
+                                                str(s.key).strip()
+                                                for s in specs
+                                                if str(s.role).strip().lower() in ("frontend", "backend", "security", "release_mgr", "product_ops", "sre")
+                                                and str(s.key).strip()
+                                            ),
+                                            "",
+                                        )
+                                        if primary_delivery_key:
+                                            qa_key_base = f"{primary_delivery_key}_qa"
                                     qa_key = qa_key_base
                                     suffix = 1
                                     while qa_key in existing_keys or any(str(s.key).strip() == qa_key for s in specs):

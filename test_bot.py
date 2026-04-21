@@ -1001,6 +1001,42 @@ class TestPromptConstruction(unittest.TestCase):
             self.assertIn("_ORCHESTRATOR_ROLES = (", prompt)
             self.assertIn("FOCUSED_EXACT_TARGET_CONTEXT bot.py", prompt)
 
+    def test_build_local_specialist_user_prompt_large_exact_target_truncation_includes_tail_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            body = "".join(f"pad_{i} = 0\n" for i in range(9000)) + "\n_ORCHESTRATOR_ROLES = (\n    'jarvis',\n    'skynet',\n)\n"
+            (repo / "bot.py").write_text(body, encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            task = SimpleNamespace(
+                role="implementer_local",
+                request_type="task",
+                mode_hint="ro",
+                artifacts_dir="/tmp/artifacts",
+                trace={},
+                input_text=(
+                    "FILES:\n- bot.py\n\nCHANGE:\n- Adjust startup logging.\n\nVALIDATION:\n- python3 -m py_compile bot.py\n"
+                ),
+                parent_job_id="759a2373-00a8-4fd1-8763-1ef40db8ed1d",
+                is_autonomous=True,
+            )
+            with patch.object(bot, "_latest_local_specialist_response", return_value=""):
+                prompt = bot._build_local_specialist_user_prompt(
+                    task=task,
+                    role_profile={"allowed_tools": ["repo_read"], "execution_backend": "codex"},
+                    role="implementer_local",
+                    mode="ro",
+                    worktree_dir=repo,
+                )
+
+            self.assertIn("_ORCHESTRATOR_ROLES = (", prompt)
+            self.assertIn("# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]", prompt)
+
     def test_build_local_specialist_user_prompt_for_recovery_implementer_does_not_mix_latest_architect_context(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
@@ -4069,6 +4105,11 @@ class TestImplementerFailureSelection(unittest.TestCase):
 
 
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
+    def test_skynet_factory_local_only_disabled_by_default(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BOT_SKYNET_FACTORY_LOCAL_ONLY", None)
+            self.assertFalse(bot._skynet_factory_local_only_enabled())
+
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)
@@ -4127,3 +4168,16 @@ class TestVoiceNormalization(unittest.TestCase):
         out = bot._normalize_tts_speak_text("rebase y merge en branch main", backend="piper")
         self.assertIn("rei beis", out.lower())
         self.assertIn("merch", out.lower())
+
+
+class TestRunningWatchdogEnvParsing(unittest.TestCase):
+    def test_watchdog_env_invalid_values_fall_back_to_default(self) -> None:
+        default = 240.0
+
+        for raw in ("nan", "inf", "-inf", "not-a-number"):
+            with self.subTest(raw=raw):
+                with patch.dict(os.environ, {"BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS": raw}, clear=True):
+                    self.assertEqual(
+                        bot._parse_finite_float_env("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", default),
+                        default,
+                    )

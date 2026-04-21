@@ -249,6 +249,17 @@ class TestDelegationParsing(unittest.TestCase):
         self.assertEqual(s.sla_tier, "high")
 
 
+class TestOrchestratorRoleNormalization(unittest.TestCase):
+    def test_known_roles_are_stable(self) -> None:
+        for role in bot._ORCHESTRATOR_ROLES:
+            self.assertEqual(bot._coerce_orchestrator_role(role), role)
+
+    def test_ceo_and_unknown_roles_normalize(self) -> None:
+        self.assertEqual(bot._coerce_orchestrator_role("ceo"), "jarvis")
+        self.assertEqual(bot._coerce_orchestrator_role("orchestrator"), "jarvis")
+        self.assertEqual(bot._coerce_orchestrator_role("unknown_role"), "backend")
+
+
 class TestOrchestratorEvidenceGate(unittest.TestCase):
     def test_backend_requires_meaningful_evidence(self) -> None:
         t = Task.new(
@@ -1423,6 +1434,126 @@ class TestOrchestratorStorage(unittest.TestCase):
             assert root is not None
             self.assertTrue(bool((root.trace or {}).get("proactive_improvement_closed", False)))
             self.assertTrue(bool((root.trace or {}).get("merge_ready", False)))
+
+    def test_sync_order_phase_marks_ready_for_merge_for_verified_proactive_backend_qa_improvement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-proactive-backend-qa-merge-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True, "order_branch": "feature/order-test"},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="implemented slice",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    labels={"ticket": order_id, "kind": "subtask", "key": "proactive_cli_seed_r1"},
+                    trace={
+                        "slice_id": "proactive_cli_seed_r1",
+                        "patch_info": {"changed_files": ["bot.py"], "validation_ok": True},
+                        "result_summary": "Implemented one bounded reliability improvement with tests and evidence.",
+                    },
+                    job_id="job-backend-verified-merge",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="qa",
+                    input_text="reviewed slice",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    labels={"ticket": order_id, "kind": "subtask", "key": "proactive_cli_seed_r1_qa"},
+                    trace={
+                        "review_ready": True,
+                        "result_summary": (
+                            "PASS validation with evidence artifacts, targeted regression coverage, "
+                            "and explicit residual risks for the proactive_cli_seed_r1 slice."
+                        ),
+                        "result_artifacts": ["qa/report.txt"],
+                    },
+                    job_id="job-qa-verified-merge",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="verified pass",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    trace={
+                        "slice_id": "proactive_cli_seed_r1",
+                        "result_summary": (
+                            "PASS: VERIFIED_IMPROVEMENT. "
+                            "Validated one bounded backend plus QA proactive improvement."
+                        ),
+                    },
+                    labels={"ticket": order_id, "kind": "autopilot"},
+                    job_id="job-skynet-backend-qa-verified-merge",
+                )
+            )
+
+            with patch.object(bot, "_order_trace_requires_merge", return_value=(True, "feature/order-test")):
+                bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("phase")), "ready_for_merge")
+            self.assertEqual(str(got.get("status")), "active")
 
     def test_set_order_phase_accepts_ready_for_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3496,11 +3627,12 @@ class TestBulkCancel(unittest.TestCase):
                 )
             )
 
-            cancelled = bot._cancel_non_local_children_for_skynet_factory_orders_tick(
-                orch_q=q,
-                now=1234.0,
-                chat_id=1,
-            )
+            with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+                cancelled = bot._cancel_non_local_children_for_skynet_factory_orders_tick(
+                    orch_q=q,
+                    now=1234.0,
+                    chat_id=1,
+                )
 
             self.assertEqual(cancelled, 2)
             backend_job = q.get_job("22222222-2222-2222-2222-222222222222")
@@ -3568,11 +3700,12 @@ class TestBulkCancel(unittest.TestCase):
                 )
             )
 
-            cancelled = bot._cancel_non_local_children_for_skynet_factory_orders_tick(
-                orch_q=q,
-                now=1234.0,
-                chat_id=1,
-            )
+            with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+                cancelled = bot._cancel_non_local_children_for_skynet_factory_orders_tick(
+                    orch_q=q,
+                    now=1234.0,
+                    chat_id=1,
+                )
 
             self.assertEqual(cancelled, 1)
             backend_job = q.get_job("bbbb2222-2222-2222-2222-222222222222")
