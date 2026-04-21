@@ -3282,6 +3282,18 @@ class TestDangerousBypassThreaded(unittest.TestCase):
             self.assertIn("--sandbox", cmd)
             self.assertIn("read-only", cmd)
 
+    def test_threaded_new_forced_read_only_ignores_global_bypass(self) -> None:
+        cfg = self._cfg()
+        runner = bot.CodexRunner(cfg, forced_mode="ro")
+        with patch.object(bot.subprocess, "Popen") as popen, patch("bot._breakglass_is_active", return_value=(True, {"reason": "test"})):
+            popen.side_effect = FileNotFoundError("no codex in test")
+            with self.assertRaises(FileNotFoundError):
+                runner.start_threaded_new(prompt="hi", mode_hint="full")
+            cmd = popen.call_args.args[0]
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+            self.assertIn("--sandbox", cmd)
+            self.assertIn("read-only", cmd)
+
 
 class TestThreadedImages(unittest.TestCase):
     def test_threaded_new_includes_image_flags(self) -> None:

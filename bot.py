@@ -3821,6 +3821,8 @@ class CodexRunner:
     def _bypass_sandbox(self) -> bool:
         if not self._allow_bypass:
             return False
+        if self._forced_mode == "ro":
+            return False
         return _effective_bypass_sandbox(self._cfg, chat_id=self._chat_id)
 
     def _effective_mode_hint(self, mode_hint: str) -> str:
