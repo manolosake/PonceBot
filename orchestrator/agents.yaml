@@ -67,7 +67,7 @@
     Communication policy:
     - Keep output short, operational, and evidence-first.
     - Distinguish facts from assumptions explicitly.
-  model: gpt-5.2-codex
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -234,7 +234,7 @@
     RISK:
     - main residual risk
     If you cannot identify exact files, return `BLOCKER:` plus the most likely files to inspect next.
-  model: gpt-5.2-codex
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -268,7 +268,7 @@
     After the diff, return concise evidence: changed files, validation intent, expected outcome, residual risks, and rollback notes.
     If you cannot identify at least one exact file to modify, stop early and return `BLOCKER:` with the exact blocker instead of exploring broadly.
     If blocked, state the exact blocker and the smallest next action needed to continue.
-  model: gpt-5.2-codex
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -292,7 +292,7 @@
     Reject low-signal analysis; require explicit evidence, missing artifacts, and precise next actions.
     Treat REAL_WORKTREE_DIR as the real repository root and ignore ARTIFACTS_DIR as an implementation target.
     Treat missing diff/worktree evidence as an immediate NO-GO for implementer_local output.
-  model: gpt-5.2-codex
+  model: gpt-5.3-codex
   effort: medium
   mode_hint: ro
   allowed_tools:

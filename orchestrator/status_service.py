@@ -179,6 +179,286 @@ def _assign_running_to_workers(
     return workers, occupied
 
 
+_DELIVERY_ROLES = {"backend", "frontend", "sre", "security", "implementer_local"}
+_VALIDATION_ROLES = {"qa", "release_mgr", "reviewer_local"}
+_CONTROLLER_ROLES = {"skynet"}
+
+
+def _count_task_states(tasks: list[Task]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for t in tasks:
+        state = str(t.state or "").strip().lower() or "unknown"
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def _latest_task(tasks: list[Task]) -> Task | None:
+    if not tasks:
+        return None
+    return max(tasks, key=lambda t: float(t.updated_at or 0.0))
+
+
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except Exception:
+        return None
+
+
+def _task_kind(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    labels = task.labels or {}
+    kind = str(labels.get("kind") or "").strip().lower()
+    return kind or None
+
+
+def _workflow_task_ref(task: Task | None) -> dict[str, Any] | None:
+    if task is None:
+        return None
+    return {
+        "job_id": task.job_id,
+        "job_id_short": task.job_id[:8],
+        "role": str(task.role or "").strip().lower(),
+        "state": str(task.state or "").strip().lower(),
+        "kind": _task_kind(task),
+        "updated_at": float(task.updated_at or 0.0),
+    }
+
+
+def _controller_failure_summary(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    trace = task.trace or {}
+    stdout_tail = str(trace.get("live_stdout_tail") or "").strip()
+    stderr_tail = str(trace.get("live_stderr_tail") or "").strip()
+    result_summary = str(trace.get("result_summary") or "").strip()
+    if "not supported when using Codex with a ChatGPT account" in stdout_tail:
+        return "Configured Codex model is unsupported for the current ChatGPT-backed account."
+    if result_summary:
+        return result_summary[:280]
+    if stderr_tail:
+        return stderr_tail[:280]
+    if stdout_tail:
+        return stdout_tail[:280]
+    return None
+
+
+def _derive_stage_status(
+    *,
+    running: bool,
+    failed: bool,
+    blocked: bool,
+    done: bool,
+    pending: bool,
+) -> str:
+    if running:
+        return "running"
+    if failed:
+        return "failed"
+    if blocked:
+        return "blocked"
+    if done:
+        return "done"
+    if pending:
+        return "pending"
+    return "pending"
+
+
+def _build_order_workflow(
+    *,
+    order_row: dict[str, Any],
+    root_task: Task | None,
+    children: list[Task],
+) -> dict[str, Any]:
+    root_trace = dict((root_task.trace or {}) if root_task is not None else {})
+    delivery_children = [t for t in children if str(t.role or "").strip().lower() in _DELIVERY_ROLES]
+    validation_children = [t for t in children if str(t.role or "").strip().lower() in _VALIDATION_ROLES]
+    controller_children = [t for t in children if str(t.role or "").strip().lower() in _CONTROLLER_ROLES]
+
+    delivery_counts = _count_task_states(delivery_children)
+    validation_counts = _count_task_states(validation_children)
+    controller_counts = _count_task_states(controller_children)
+
+    latest_delivery = _latest_task(delivery_children)
+    latest_validation = _latest_task(validation_children)
+    latest_controller = _latest_task(controller_children)
+
+    applied_count = _coerce_int(root_trace.get("proactive_slices_applied"))
+    validated_count = _coerce_int(root_trace.get("proactive_slices_validated"))
+    closed_count = _coerce_int(root_trace.get("proactive_slices_closed"))
+    quality_gate_status = str(root_trace.get("proactive_quality_gate_status") or "").strip().lower()
+    improvement_verified = bool(root_trace.get("proactive_improvement_verified", False))
+    merge_ready = bool(root_trace.get("merge_ready", False))
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+    deploy_status = str(root_trace.get("deploy_status") or "").strip().lower()
+    deploy_summary = str(root_trace.get("deploy_summary") or "").strip()
+    deployed_commit = str(root_trace.get("deployed_commit") or "").strip() or None
+
+    plan_status = _derive_stage_status(
+        running=bool(root_task is not None and str(root_task.state or "").strip().lower() == "running"),
+        failed=bool(root_task is not None and str(root_task.state or "").strip().lower() == "failed"),
+        blocked=bool(root_task is not None and str(root_task.state or "").strip().lower() in {"blocked", "blocked_approval", "waiting_deps"}),
+        done=bool(root_task is not None and str(root_task.state or "").strip().lower() in {"done", "cancelled"}),
+        pending=(root_task is None),
+    )
+
+    delivery_status = _derive_stage_status(
+        running=delivery_counts.get("running", 0) > 0,
+        failed=delivery_counts.get("failed", 0) > 0,
+        blocked=(delivery_counts.get("blocked", 0) + delivery_counts.get("blocked_approval", 0) + delivery_counts.get("waiting_deps", 0)) > 0,
+        done=(applied_count > 0) or (delivery_counts.get("done", 0) > 0),
+        pending=(len(delivery_children) == 0),
+    )
+
+    validation_status = _derive_stage_status(
+        running=validation_counts.get("running", 0) > 0,
+        failed=validation_counts.get("failed", 0) > 0,
+        blocked=(validation_counts.get("blocked", 0) + validation_counts.get("blocked_approval", 0) + validation_counts.get("waiting_deps", 0)) > 0,
+        done=(validated_count > 0) or (validation_counts.get("done", 0) > 0),
+        pending=(applied_count > 0) or (quality_gate_status == "applied") or (len(validation_children) == 0),
+    )
+
+    controller_done = bool(improvement_verified or closed_count > 0)
+    controller_summary = _controller_failure_summary(latest_controller)
+    controller_status = _derive_stage_status(
+        running=controller_counts.get("running", 0) > 0,
+        failed=controller_counts.get("failed", 0) > 0,
+        blocked=(controller_counts.get("blocked", 0) + controller_counts.get("blocked_approval", 0) + controller_counts.get("waiting_deps", 0)) > 0,
+        done=controller_done,
+        pending=(validated_count > 0) or (len(controller_children) == 0),
+    )
+
+    deploy_done = deploy_status in {"ok", "scheduled"}
+    deploy_failed = deploy_status == "failed"
+    deploy_status_label = _derive_stage_status(
+        running=bool(merged_to_main and deploy_status in {"queued", "running", "scheduled"}),
+        failed=deploy_failed,
+        blocked=False,
+        done=deploy_done,
+        pending=bool(controller_done or merge_ready or merged_to_main),
+    )
+
+    blockers: list[dict[str, Any]] = []
+    if delivery_status in {"failed", "blocked"}:
+        blockers.append(
+            {
+                "stage": "delivery",
+                "summary": str((latest_delivery.trace or {}).get("result_summary") or latest_delivery.blocked_reason or "Delivery work is blocked.")[:280]
+                if latest_delivery is not None
+                else "Delivery work is blocked.",
+                "job": _workflow_task_ref(latest_delivery),
+            }
+        )
+    if validation_status in {"failed", "blocked"}:
+        blockers.append(
+            {
+                "stage": "validation",
+                "summary": str((latest_validation.trace or {}).get("result_summary") or latest_validation.blocked_reason or "Validation did not pass.")[:280]
+                if latest_validation is not None
+                else "Validation did not pass.",
+                "job": _workflow_task_ref(latest_validation),
+            }
+        )
+    if controller_status in {"failed", "blocked"}:
+        blockers.append(
+            {
+                "stage": "skynet_review",
+                "summary": controller_summary or "Skynet review did not complete cleanly.",
+                "job": _workflow_task_ref(latest_controller),
+            }
+        )
+    if deploy_failed:
+        blockers.append(
+            {
+                "stage": "deploy",
+                "summary": deploy_summary[:280] if deploy_summary else "Deploy failed after merge.",
+                "job": None,
+            }
+        )
+
+    stages = [
+        {
+            "stage": "skynet_plan",
+            "label": "Skynet plan",
+            "status": plan_status,
+            "job": _workflow_task_ref(root_task),
+            "counts": {"children_total": len(children)},
+            "summary": str(root_trace.get("result_summary") or "").strip()[:280] or None,
+        },
+        {
+            "stage": "delivery",
+            "label": "Delivery",
+            "status": delivery_status,
+            "job": _workflow_task_ref(latest_delivery),
+            "counts": delivery_counts,
+            "summary": (
+                f"applied={applied_count} started={_coerce_int(root_trace.get('proactive_slices_started'))}"
+                if (applied_count > 0 or delivery_children)
+                else None
+            ),
+        },
+        {
+            "stage": "validation",
+            "label": "Validation",
+            "status": validation_status,
+            "job": _workflow_task_ref(latest_validation),
+            "counts": validation_counts,
+            "summary": (
+                f"validated={validated_count} quality_gate={quality_gate_status or 'n/a'}"
+                if (validated_count > 0 or quality_gate_status or validation_children)
+                else None
+            ),
+        },
+        {
+            "stage": "skynet_review",
+            "label": "Skynet review",
+            "status": controller_status,
+            "job": _workflow_task_ref(latest_controller),
+            "counts": controller_counts,
+            "summary": controller_summary,
+        },
+        {
+            "stage": "deploy",
+            "label": "Deploy",
+            "status": deploy_status_label,
+            "job": None,
+            "counts": {},
+            "summary": deploy_summary[:280] if deploy_summary else None,
+        },
+    ]
+
+    current_stage = "deploy"
+    for status_priority in ("running", "failed", "blocked", "pending"):
+        for stage in stages:
+            if str(stage.get("status") or "") == status_priority:
+                current_stage = str(stage.get("stage") or "deploy")
+                break
+        if current_stage != "deploy":
+            break
+
+    return {
+        "order_id": str(order_row.get("order_id") or ""),
+        "order_id_short": str(order_row.get("order_id") or "")[:8],
+        "phase": str(order_row.get("phase") or "planning"),
+        "current_stage": current_stage,
+        "merge_ready": merge_ready,
+        "merged_to_main": merged_to_main,
+        "deploy_status": deploy_status or None,
+        "deploy_summary": deploy_summary or None,
+        "deployed_commit": deployed_commit,
+        "stages": stages,
+        "blockers": blockers,
+    }
+
+
 @dataclass
 class StatusService:
     orch_q: OrchestratorQueue
@@ -368,14 +648,17 @@ class StatusService:
             orders = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=50)
 
         orders_out: list[dict[str, Any]] = []
+        workflows_out: list[dict[str, Any]] = []
         for o in orders:
             oid = str(o.get("order_id") or "").strip()
             if not oid:
                 continue
+            root_task = self.orch_q.get_job(oid)
             children = self.orch_q.jobs_by_parent(parent_job_id=oid, limit=200)
             counts: dict[str, int] = {}
             for c in children:
                 counts[c.state] = counts.get(c.state, 0) + 1
+            workflow = _build_order_workflow(order_row=o, root_task=root_task, children=children)
             orders_out.append(
                 {
                     "order_id": oid,
@@ -391,8 +674,10 @@ class StatusService:
                     "title": str(o.get("title") or ""),
                     "updated_at": float(o.get("updated_at") or 0.0),
                     "children_counts": counts,
+                    "workflow": workflow,
                 }
             )
+            workflows_out.append(workflow)
 
         workers_out: list[dict[str, Any]] = []
         # Scope counts: when chat_id is provided, only count jobs for that chat.
@@ -524,6 +809,7 @@ class StatusService:
             "generated_at": float(now),
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
+            "order_workflows": workflows_out,
             "projects": projects,
             "workers": workers_out,
             "queued_total": int(queued_total),

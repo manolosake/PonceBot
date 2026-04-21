@@ -1490,7 +1490,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             input_text="Older failed local guard slice",
             request_type="task",
             priority=1,
-            model="gpt-5.2-codex",
+            model="gpt-5.3-codex",
             effort="medium",
             mode_hint="ro",
             requires_approval=False,
@@ -1532,7 +1532,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             input_text="Older successful local guard slice",
             request_type="task",
             priority=1,
-            model="gpt-5.2-codex",
+            model="gpt-5.3-codex",
             effort="medium",
             mode_hint="ro",
             requires_approval=False,
@@ -2373,7 +2373,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
                 input_text="Implement one bounded improvement using the provided handoff.",
                 request_type="task",
                 priority=1,
-                model="gpt-5.2-codex",
+                model="gpt-5.3-codex",
                 effort="medium",
                 mode_hint="ro",
                 requires_approval=False,
@@ -2427,7 +2427,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             profiles = {
                 "implementer_local": {
                     "execution_backend": "codex",
-                    "model": "gpt-5.2-codex",
+                    "model": "gpt-5.3-codex",
                     "effort": "medium",
                     "max_parallel_jobs": 1,
                 }
