@@ -109,6 +109,71 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    tmp.write_text(content, encoding=encoding)
+    tmp.replace(path)
+
+
+def _acquire_artifact_lock(lock_path: Path) -> int:
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    os.write(fd, f"pid={os.getpid()} ts={_utc_iso()}\n".encode("utf-8"))
+    return fd
+
+
+def _release_artifact_lock(lock_path: Path, fd: int) -> None:
+    try:
+        os.close(fd)
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _manifest_entries(artifacts_dir: Path, *, exclude_names: set[str]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for p in sorted(artifacts_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.name in exclude_names:
+            continue
+        entries.append(
+            {
+                "name": p.name,
+                "size": int(p.stat().st_size),
+                "sha256": _sha256_file(p),
+            }
+        )
+    return entries
+
+
+def _manifest_mismatches(manifest: dict[str, Any], artifacts_dir: Path) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    for item in manifest.get("files", []):
+        name = str(item.get("name", ""))
+        p = artifacts_dir / name
+        if not p.exists() or (not p.is_file()):
+            mismatches.append({"name": name, "reason": "missing"})
+            continue
+        expected_size = int(item.get("size", -1))
+        expected_sha = str(item.get("sha256", ""))
+        actual_size = int(p.stat().st_size)
+        actual_sha = _sha256_file(p)
+        if expected_size != actual_size or expected_sha != actual_sha:
+            mismatches.append(
+                {
+                    "name": name,
+                    "reason": "hash_or_size_mismatch",
+                    "expected_size": expected_size,
+                    "actual_size": actual_size,
+                    "expected_sha256": expected_sha,
+                    "actual_sha256": actual_sha,
+                }
+            )
+    return mismatches
+
+
 def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_branch: str) -> str:
     requested = (explicit_head or order_branch or "").strip()
     if requested:
@@ -289,51 +354,64 @@ def main() -> int:
     artifacts_dir = Path(args.artifacts_dir).expanduser().resolve() if args.artifacts_dir else None
     if artifacts_dir:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        checklist_path = artifacts_dir / "RELEASE_CHECKLIST.json"
-        checklist_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        if pr_compare:
-            (artifacts_dir / "PR_URL.txt").write_text(pr_compare + "\n", encoding="utf-8")
-        if diffstat:
-            (artifacts_dir / "DIFFSTAT.txt").write_text(diffstat + "\n", encoding="utf-8")
-        changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=root)
-        (artifacts_dir / "CHANGED_FILES.txt").write_text((changed + "\n") if changed else "(none)\n", encoding="utf-8")
+        lock_path = artifacts_dir / ".finalize.lock"
+        lock_fd = _acquire_artifact_lock(lock_path)
+        try:
+            checklist_path = artifacts_dir / "RELEASE_CHECKLIST.json"
+            _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            if pr_compare:
+                _atomic_write_text(artifacts_dir / "PR_URL.txt", pr_compare + "\n")
+            if diffstat:
+                _atomic_write_text(artifacts_dir / "DIFFSTAT.txt", diffstat + "\n")
+            changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=root)
+            _atomic_write_text(artifacts_dir / "CHANGED_FILES.txt", (changed + "\n") if changed else "(none)\n")
 
-        required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt"]
-        present_non_empty = []
-        for p in required:
-            present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
-        pr_targets_head = bool(pr_compare and (f"...{head_branch}?" in pr_compare))
-        final_checks = {
-            "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
-            "pr_url_targets_head": bool(pr_targets_head),
-            "required_artifacts_non_empty": bool(all(present_non_empty)),
-        }
-        final_ok = bool(all(final_checks.values()))
-        payload["final_validation"] = {
-            "ok": final_ok,
-            "checks": final_checks,
-            "validated_at": _utc_iso(),
-        }
-        payload["ok"] = bool(final_ok)
-        checklist_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        (artifacts_dir / "FINAL_VALIDATION.json").write_text(
-            json.dumps(payload["final_validation"], ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        manifest = {
-            "generated_at": _utc_iso(),
-            "files": [],
-        }
-        for p in sorted(artifacts_dir.iterdir()):
-            if p.is_file():
-                manifest["files"].append(
-                    {
-                        "name": p.name,
-                        "size": int(p.stat().st_size),
-                        "sha256": _sha256_file(p),
-                    }
-                )
-        (artifacts_dir / "FINAL_MANIFEST.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt"]
+            present_non_empty = []
+            for p in required:
+                present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
+            pr_targets_head = bool(pr_compare and (f"...{head_branch}?" in pr_compare))
+            final_checks = {
+                "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
+                "pr_url_targets_head": bool(pr_targets_head),
+                "required_artifacts_non_empty": bool(all(present_non_empty)),
+            }
+            final_ok = bool(all(final_checks.values()))
+            payload["final_validation"] = {
+                "ok": final_ok,
+                "checks": final_checks,
+                "validated_at": _utc_iso(),
+            }
+            payload["ok"] = bool(final_ok)
+            computed_exit = 0 if bool(payload.get("ok")) else 2
+            _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            _atomic_write_text(
+                artifacts_dir / "FINAL_VALIDATION.json",
+                json.dumps(payload["final_validation"], ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(
+                artifacts_dir / "release_governance.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{computed_exit}\n")
+
+            # FINAL_MANIFEST must be generated after all other artifact outputs are finalized.
+            manifest = {
+                "generated_at": _utc_iso(),
+                "files": _manifest_entries(
+                    artifacts_dir,
+                    exclude_names={"FINAL_MANIFEST.json", lock_path.name},
+                ),
+            }
+            mismatches = _manifest_mismatches(manifest, artifacts_dir)
+            manifest["mismatch_count"] = len(mismatches)
+            manifest["mismatches"] = mismatches
+            _atomic_write_text(
+                artifacts_dir / "FINAL_MANIFEST.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            )
+        finally:
+            _release_artifact_lock(lock_path, lock_fd)
 
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return 0 if bool(payload.get("ok")) else 2
