@@ -6406,13 +6406,23 @@ def _jarvis_final_sweep_tick(
         if recent_sweep:
             continue
 
+        def _first_valid_ts(*vals: Any) -> float:
+            for v in vals:
+                try:
+                    f = float(v)
+                    if f > 0:
+                        return f
+                except Exception:
+                    continue
+            return float(now)
+
         root = orch_q.get_job(oid)
         order_updated = o.get("updated_at")
         order_created = o.get("created_at")
         if root is None:
-            root_like_ts = order_updated or order_created or now
+            root_like_ts = _first_valid_ts(order_updated, order_created, now)
         else:
-            root_like_ts = root.updated_at or root.created_at or order_updated or order_created or now
+            root_like_ts = _first_valid_ts(root.updated_at, root.created_at, order_updated, order_created, now)
         root_age_s = max(0.0, float(now) - float(root_like_ts))
         if root_age_s < stale_after_s:
             continue
