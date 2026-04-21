@@ -6586,6 +6586,77 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
     )
 
 
+def _implementer_failure_summary_has_actionable_signal(summary: str) -> bool:
+    s = str(summary or "")
+    if not s.strip():
+        return False
+    lower = s.lower()
+    if "failed_validation_output" not in lower:
+        return False
+    generic_blockers = [
+        "provides no specific failing test output",
+        "please provide failing test output",
+        "no concrete failure scenario",
+        "same generic request for more context",
+    ]
+    if any(token in lower for token in generic_blockers):
+        return False
+    actionable_tokens = [
+        "syntaxerror",
+        "traceback",
+        "assertionerror",
+        "nameerror",
+        "typeerror",
+        "valueerror",
+        "py_compile",
+        "failed tests",
+    ]
+    return any(token in lower for token in actionable_tokens)
+
+
+def _select_preferred_implementer_failure(
+    failures: list[tuple[str, str, str, int, str, float]],
+) -> tuple[str, str, str, int, str, float] | None:
+    if not failures:
+        return None
+    actionable_terminal = [
+        f for f in failures
+        if _implementer_failure_summary_has_actionable_signal(str(f[0])) and str(f[4]).strip().lower() == "terminal"
+    ]
+    if actionable_terminal:
+        actionable_terminal.sort(key=lambda x: float(x[5] or 0.0))
+        return actionable_terminal[0]
+    failures_sorted = sorted(failures, key=lambda x: float(x[5] or 0.0), reverse=True)
+    return failures_sorted[0]
+
+
+def _should_ignore_cancelled_local_failure(
+    *,
+    state_norm: str,
+    failure_class: str,
+    attempt_n: int,
+    summary: str,
+) -> bool:
+    if str(state_norm or "").strip().lower() != "cancelled":
+        return False
+    if str(failure_class or "").strip().lower() != "retriable":
+        return False
+    s = str(summary or "").strip().lower()
+    if not s:
+        return True
+    return s in {"cancelled", "canceled", "cancelled by user", "canceled by user"}
+
+
+def _extract_first_diff_block(text: str) -> str:
+    s = str(text or "")
+    fence_re = re.compile(r"```(?:patch|udiff)\\n(.*?)```", re.IGNORECASE | re.DOTALL)
+    for m in fence_re.finditer(s):
+        block = str(m.group(1) or "").strip()
+        if "diff --git " in block:
+            return block
+    return ""
+
+
 def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
     acceptance = [f"- {x}" for x in (spec.acceptance_criteria or []) if str(x).strip()]
     dod = [f"- {x}" for x in (spec.definition_of_done or []) if str(x).strip()]
