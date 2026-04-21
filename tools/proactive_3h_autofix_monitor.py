@@ -181,6 +181,14 @@ def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
     return int(cur.rowcount or 0) > 0
 
 
+def _set_order_phase_planning(conn: sqlite3.Connection, *, order_id: str) -> None:
+    now = float(time.time())
+    conn.execute(
+        "UPDATE ceo_orders SET phase='planning', updated_at=? WHERE order_id=? AND status='active'",
+        (now, order_id),
+    )
+
+
 def _enqueue_fallback_followup(conn: sqlite3.Connection, *, order_id: str, chat_id: int) -> str:
     now = float(time.time())
     job_id = str(uuid.uuid4())
@@ -476,6 +484,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                         recent_blocked_cleanup = _recent_cancelled_blocked_cleanup_count(conn, order_id=order_id)
                         if recent_blocked_cleanup > 0:
                             followup_job_id = _enqueue_fallback_followup(conn, order_id=order_id, chat_id=chat_id)
+                            _set_order_phase_planning(conn, order_id=order_id)
                             conn.commit()
                             actions += 1
                             refreshed_open = _open_children(conn, order_id=order_id)
@@ -497,6 +506,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                             )
                         else:
                             followup_job_id = _enqueue_fallback_followup(conn, order_id=order_id, chat_id=chat_id)
+                            _set_order_phase_planning(conn, order_id=order_id)
                             conn.commit()
                             actions += 1
                             refreshed_open = _open_children(conn, order_id=order_id)

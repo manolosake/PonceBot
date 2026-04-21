@@ -214,12 +214,15 @@ class TestProactive3hAutofixMonitorSweep(unittest.TestCase):
                 "SELECT parent_job_id, role, state, source FROM jobs WHERE parent_job_id=? ORDER BY created_at DESC LIMIT 1",
                 (order_id,),
             ).fetchone()
+            order = conn.execute("SELECT phase FROM ceo_orders WHERE order_id=?", (order_id,)).fetchone()
             conn.close()
             self.assertIsNotNone(row)
             self.assertEqual(str(row[0]), order_id)
             self.assertEqual(str(row[1]), "architect_local")
             self.assertEqual(str(row[2]), "queued")
             self.assertEqual(str(row[3]), "autopilot")
+            self.assertIsNotNone(order)
+            self.assertEqual(str(order[0]), "planning")
 
     def test_cancels_stale_blocked_only_job(self) -> None:
         with tempfile.TemporaryDirectory() as td:
