@@ -117,7 +117,7 @@ def _recent_cancelled_blocked_cleanup_count(conn: sqlite3.Connection, *, order_i
             FROM jobs
             WHERE parent_job_id=?
               AND state='cancelled'
-              AND blocked_reason='autofix_stale_blocked_only'
+              AND blocked_reason IN ('autofix_stale_blocked_only', 'autofix_superseded_blocker')
               AND updated_at>=?
             """,
             (order_id, since),
@@ -125,6 +125,30 @@ def _recent_cancelled_blocked_cleanup_count(conn: sqlite3.Connection, *, order_i
     except sqlite3.OperationalError:
         return 0
     return int((row["c"] if row is not None else 0) or 0)
+
+
+def _job_blocked_reason(conn: sqlite3.Connection, *, job_id: str) -> str:
+    try:
+        row = conn.execute("SELECT blocked_reason FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    return str((row["blocked_reason"] if row is not None else "") or "").strip()
+
+
+def _extract_waiting_job_id(blocked_reason: str) -> str:
+    txt = str(blocked_reason or "").strip()
+    for prefix in ("waiting_for_job:", "depends_on_job:", "blocked_on_job:"):
+        if txt.startswith(prefix):
+            return txt[len(prefix) :].strip()
+    return ""
+
+
+def _job_is_terminal(conn: sqlite3.Connection, *, job_id: str) -> bool:
+    row = conn.execute("SELECT state FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+    if row is None:
+        return False
+    state = str(row["state"] or "").strip().lower()
+    return state not in OPEN_STATES
 
 
 def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
@@ -349,12 +373,34 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                 # FINAL SWEEP: when only blocked jobs remain (and none are waiting_deps), clear stale blockers.
                 if blocked_only and (len(blocked_only) == len(open_jobs)) and (not waiting_dep):
                     for job in blocked_only:
+                        job_id = str(job["job_id"] or "")
+                        blocked_reason = _job_blocked_reason(conn, job_id=job_id)
+                        waiting_job_id = _extract_waiting_job_id(blocked_reason)
+                        if waiting_job_id and _job_is_terminal(conn, job_id=waiting_job_id):
+                            _update_job_state(
+                                conn,
+                                job_id=job_id,
+                                state="cancelled",
+                                blocked_reason="autofix_superseded_blocker",
+                                result_summary=f"Autofix monitor cancelled blocked job because dependency {waiting_job_id[:8]} is already terminal.",
+                                result_next_action="reseed_or_enqueue_followup",
+                            )
+                            actions += 1
+                            _log(
+                                "cancel_superseded_blocked_only",
+                                path=log_path,
+                                order_id=order_id,
+                                job_id=job_id,
+                                dependency_job_id=waiting_job_id,
+                            )
+                            continue
+
                         age_s = max(0.0, now - float(job["updated_at"] or job["created_at"] or now))
                         if age_s < STALE_BLOCKED_ONLY_AGE_S:
                             continue
                         _update_job_state(
                             conn,
-                            job_id=str(job["job_id"]),
+                            job_id=job_id,
                             state="cancelled",
                             blocked_reason="autofix_stale_blocked_only",
                             result_summary=f"Autofix monitor cancelled stale blocked-only job after {int(age_s)}s to unblock proactive lane.",
