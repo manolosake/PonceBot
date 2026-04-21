@@ -74,6 +74,9 @@ LOG = logging.getLogger("codexbot")
 
 _STATE_STORES_LOCK = threading.Lock()
 _STATE_STORES_BY_PATH: dict[str, StateStore] = {}
+_BREAKGLASS_WARN_LOCK = threading.Lock()
+_LAST_BREAKGLASS_ENABLED_WARN_SIG: tuple[Any, ...] | None = None
+_LAST_BREAKGLASS_DISABLED_WARN_SIG: tuple[Any, ...] | None = None
 
 
 TELEGRAM_MSG_LIMIT = 4096
@@ -591,6 +594,7 @@ def _activate_breakglass(
     user_id: int | None,
     source: str,
 ) -> float:
+    global _LAST_BREAKGLASS_ENABLED_WARN_SIG
     now = float(time.time())
     ttl = int(ttl_seconds)
     if ttl < 60:
@@ -623,14 +627,24 @@ def _activate_breakglass(
             "reason": safe_reason,
         },
     )
-    LOG.warning(
-        "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
+    warn_sig = (
         str(source or "telegram").strip() or "telegram",
         int(chat_id),
         int(user_id) if user_id is not None else "",
         int(ttl),
         safe_reason,
     )
+    with _BREAKGLASS_WARN_LOCK:
+        if _LAST_BREAKGLASS_ENABLED_WARN_SIG != warn_sig:
+            LOG.warning(
+                "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
+                warn_sig[0],
+                warn_sig[1],
+                warn_sig[2],
+                warn_sig[3],
+                warn_sig[4],
+            )
+            _LAST_BREAKGLASS_ENABLED_WARN_SIG = warn_sig
     return exp
 
 
@@ -642,6 +656,7 @@ def _deactivate_breakglass(
     user_id: int | None,
     source: str,
 ) -> None:
+    global _LAST_BREAKGLASS_DISABLED_WARN_SIG
     old = _get_breakglass_state(cfg)
 
     def _m(st: dict[str, Any]) -> None:
@@ -659,13 +674,22 @@ def _deactivate_breakglass(
             "previous": old,
         },
     )
-    LOG.warning(
-        "BREAKGLASS DISABLED source=%s chat_id=%s user_id=%s reason=%s",
+    warn_sig = (
         str(source or "telegram").strip() or "telegram",
         int(chat_id),
         int(user_id) if user_id is not None else "",
         str(reason or "manual_off").strip() or "manual_off",
     )
+    with _BREAKGLASS_WARN_LOCK:
+        if _LAST_BREAKGLASS_DISABLED_WARN_SIG != warn_sig:
+            LOG.warning(
+                "BREAKGLASS DISABLED source=%s chat_id=%s user_id=%s reason=%s",
+                warn_sig[0],
+                warn_sig[1],
+                warn_sig[2],
+                warn_sig[3],
+            )
+            _LAST_BREAKGLASS_DISABLED_WARN_SIG = warn_sig
 
 
 def _effective_bypass_sandbox(cfg: "BotConfig", *, chat_id: int | None = None) -> bool:

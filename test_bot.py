@@ -1182,6 +1182,52 @@ class TestHardeningControls(unittest.TestCase):
             self.assertIn("access_mode_selected: full", resp)
             self.assertIn("dangerous_bypass: inactive", resp)
 
+    def test_breakglass_enabled_warning_is_deduped_for_repeated_same_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._LAST_BREAKGLASS_ENABLED_WARN_SIG = None
+            with patch.object(bot.LOG, "warning") as warn:
+                bot._activate_breakglass(
+                    cfg,
+                    reason="same reason",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._activate_breakglass(
+                    cfg,
+                    reason="same reason",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+            self.assertEqual(warn.call_count, 1)
+
+    def test_breakglass_enabled_warning_is_emitted_when_payload_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._LAST_BREAKGLASS_ENABLED_WARN_SIG = None
+            with patch.object(bot.LOG, "warning") as warn:
+                bot._activate_breakglass(
+                    cfg,
+                    reason="reason-a",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._activate_breakglass(
+                    cfg,
+                    reason="reason-b",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+            self.assertEqual(warn.call_count, 2)
+
     def test_auth_touch_session_extends_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")
