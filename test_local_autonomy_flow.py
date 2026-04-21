@@ -408,7 +408,7 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(planned[0].role, "implementer_local")
         self.assertIn("LATEST_IMPLEMENTER_BLOCKER", planned[0].text)
         self.assertIn("- bot.py", planned[0].text)
-        self.assertIn("python -m py_compile bot.py", planned[0].text)
+        self.assertIn("python3 -m py_compile bot.py", planned[0].text)
 
     def test_structured_handoff_actionable_requires_sections(self) -> None:
         good = (

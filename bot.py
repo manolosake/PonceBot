@@ -7073,7 +7073,7 @@ def _apply_autonomous_local_first_policy(
         + summary
         + "\n\nGrounding files:\n"
         + "\n".join(f"- {p}" for p in files)
-        + "\n\nValidation:\n- python -m py_compile bot.py\n"
+        + "\n\nValidation:\n- python3 -m py_compile bot.py\n"
     )
     return [
         TaskSpec(
@@ -7215,7 +7215,7 @@ def _apply_autonomous_local_first_policy(
     files = sorted(set(re.findall(r"`([^`]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt))`", summary)))
     file_lines = [f"- {p}" for p in files] if files else ["- (no explicit file paths found)"]
     py_targets = [p for p in files if p.endswith(".py")]
-    validation_hint = "python -m py_compile " + " ".join(py_targets) if py_targets else "python -m py_compile <target_files.py>"
+    validation_hint = "python3 -m py_compile " + " ".join(py_targets) if py_targets else "python3 -m py_compile <target_files.py>"
     rewritten = TaskSpec(
         key="local_first_impl_followup",
         role="implementer_local",
