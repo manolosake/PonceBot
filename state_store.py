@@ -86,7 +86,17 @@ class StateStore:
             tmp_f.flush()
         finally:
             tmp_f.close()
-        Path(tmp_f.name).replace(self._path)
+        tmp_path = Path(tmp_f.name)
+        try:
+            tmp_path.replace(self._path)
+        except Exception:
+            # Best-effort cleanup for orphaned temp files while preserving
+            # the original replace exception for callers.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     def read(self) -> dict[str, Any]:
         with self._mu:

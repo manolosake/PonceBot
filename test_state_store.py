@@ -2,6 +2,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from state_store import StateStore
 
@@ -94,6 +95,19 @@ class TestStateStoreBasics(unittest.TestCase):
             data = store.read()
             self.assertEqual(data.get("outer", {}).get("a"), 1)
             self.assertEqual(data.get("outer", {}).get("2"), "two")
+
+    def test_replace_failure_cleans_orphan_tmp_and_reraises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            err = OSError("replace failed")
+
+            with mock.patch.object(Path, "replace", side_effect=err):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    store.replace({"k": "v"})
+
+            leftovers = list(Path(td).glob("state.json.*.tmp"))
+            self.assertEqual(leftovers, [])
 
 
 if __name__ == "__main__":
