@@ -73,6 +73,28 @@ class TestStateStoreBasics(unittest.TestCase):
             self.assertEqual(out.get("k"), "v")
             self.assertEqual(store.read().get("k"), "v")
 
+    def test_update_handles_mixed_key_types_without_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            store.replace({"alpha": 1})
+
+            def _m(st):
+                st[2] = "two"
+
+            out = store.update(_m)
+            self.assertEqual(out.get(2), "two")
+            self.assertEqual(store.read().get("2"), "two")
+
+    def test_replace_normalizes_nested_mixed_key_types(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            store.replace({"outer": {"a": 1, 2: "two"}})
+            data = store.read()
+            self.assertEqual(data.get("outer", {}).get("a"), 1)
+            self.assertEqual(data.get("outer", {}).get("2"), "two")
+
 
 if __name__ == "__main__":
     unittest.main()

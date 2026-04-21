@@ -64,6 +64,14 @@ class StateStore:
         return parsed if isinstance(parsed, dict) else {}
 
     def _write_unlocked(self, data: dict[str, Any]) -> None:
+        def _normalize_json_keys(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {str(k): _normalize_json_keys(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_normalize_json_keys(v) for v in value]
+            return value
+
+        safe_data = _normalize_json_keys(data)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_f = tempfile.NamedTemporaryFile(
             mode="w",
@@ -74,7 +82,7 @@ class StateStore:
             delete=False,
         )
         try:
-            tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+            tmp_f.write(json.dumps(safe_data, indent=2, sort_keys=True) + "\n")
             tmp_f.flush()
         finally:
             tmp_f.close()
