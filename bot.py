@@ -684,6 +684,52 @@ def _set_access_mode(cfg: "BotConfig", mode: str | None, *, chat_id: int | None 
     _update_state(cfg, _m)
 
 
+def _proactive_lane_state(cfg: "BotConfig") -> dict[str, Any]:
+    st = _get_state(cfg)
+    raw = st.get("proactive_lane")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _set_proactive_lane_pause(
+    cfg: "BotConfig",
+    *,
+    paused: bool,
+    reason: str,
+    manual: bool,
+) -> None:
+    now = float(time.time())
+
+    def _m(st: dict[str, Any]) -> None:
+        lane = st.get("proactive_lane")
+        lane_state = lane if isinstance(lane, dict) else {}
+        lane_state.update(
+            {
+                "paused": bool(paused),
+                "manual_pause": bool(manual),
+                "reason": str(reason or "").strip(),
+                "updated_at": now,
+            }
+        )
+        st["proactive_lane"] = lane_state
+
+    _update_state(cfg, _m)
+
+
+def _maybe_resume_proactive_lane_for_manual_ceo_request(cfg: "BotConfig") -> bool:
+    state = _proactive_lane_state(cfg)
+    if not bool(state.get("paused", False)):
+        return False
+    if bool(state.get("manual_pause", False)):
+        return False
+    _set_proactive_lane_pause(
+        cfg,
+        paused=False,
+        reason="auto_resume_manual_ceo_request",
+        manual=False,
+    )
+    return True
+
+
 def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
     bypass = _effective_bypass_sandbox(cfg, chat_id=chat_id)
@@ -5508,6 +5554,52 @@ def _send_orchestrator_marker_response(
             api.send_message(chat_id, f"Reanudado: {role}", reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind in ("pause_autonomy", "resume_autonomy"):
+        if not orch_q:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+        if not _can_manage_orchestrator(cfg, chat_id=chat_id):
+            api.send_message(
+                chat_id,
+                "No permitido: necesitas permisos de gestor para controlar la autonomia.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        if kind == "pause_autonomy":
+            canceled = 0
+            roots = orch_q.jobs_by_state(state="running", limit=500, chat_id=chat_id)
+            for task in roots:
+                if not bool(task.is_autonomous):
+                    continue
+                if orch_q.cancel(task.job_id):
+                    canceled += 1
+                for child in orch_q.jobs_by_parent(parent_job_id=task.job_id, limit=500):
+                    if str(child.state or "").strip().lower() in ("queued", "running", "waiting_deps", "blocked", "blocked_approval"):
+                        if orch_q.cancel(child.job_id):
+                            canceled += 1
+            _set_proactive_lane_pause(
+                cfg,
+                paused=True,
+                reason="manual_pause_command",
+                manual=True,
+            )
+            api.send_message(
+                chat_id,
+                f"Autonomia pausada. Tareas autonomas canceladas: {int(canceled)}.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+
+        _set_proactive_lane_pause(
+            cfg,
+            paused=False,
+            reason="manual_resume_command",
+            manual=False,
+        )
+        api.send_message(chat_id, "Autonomia reanudada.", reply_to_message_id=reply_to_message_id)
+        return True
+
     if kind in ("emergency_stop", "emergency_resume"):
         if not orch_q:
             api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
@@ -7325,6 +7417,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/pause":
         return "Uso: /pause <role>", None
 
+    if text == "/pause_autonomy":
+        return _orch_marker("pause_autonomy"), None
+
     if text.startswith("/pause "):
         role = _orch_job_id(text[len("/pause ") :]).lower()
         if not role:
@@ -7339,6 +7434,9 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/resume":
         return "Uso: /resume <role>", None
+
+    if text == "/resume_autonomy":
+        return _orch_marker("resume_autonomy"), None
 
     if text.startswith("/resume "):
         role = _orch_job_id(text[len("/resume ") :]).lower()
