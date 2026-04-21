@@ -6407,9 +6407,13 @@ def _jarvis_final_sweep_tick(
             continue
 
         root = orch_q.get_job(oid)
+        order_updated = o.get("updated_at")
+        order_created = o.get("created_at")
         if root is None:
-            continue
-        root_age_s = max(0.0, float(now) - float(root.updated_at or root.created_at or now))
+            root_like_ts = order_updated or order_created or now
+        else:
+            root_like_ts = root.updated_at or root.created_at or order_updated or order_created or now
+        root_age_s = max(0.0, float(now) - float(root_like_ts))
         if root_age_s < stale_after_s:
             continue
 
@@ -6422,7 +6426,7 @@ def _jarvis_final_sweep_tick(
                 continue
         child_idle_s = int(max(0.0, float(now) - last_child_ts)) if last_child_ts > 0 else int(root_age_s)
 
-        proactive_order = bool(_is_proactive_order_record(o)) or bool((root.trace or {}).get("proactive_lane", False))
+        proactive_order = bool(_is_proactive_order_record(o)) or bool((root.trace or {}).get("proactive_lane", False) if root is not None else False)
         if proactive_order and len(terminal_children) >= int(idle_terminal_close_threshold):
             try:
                 orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
