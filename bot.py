@@ -12844,10 +12844,10 @@ def _drain_pending_updates(cfg: BotConfig, api: TelegramAPI) -> int:
     for _ in range(20):
         try:
             updates = api.get_updates(offset=offset, timeout_seconds=0)
-        except Exception:
+        except Exception as e:
             # On boot, DNS/network can be temporarily unavailable. Draining is a convenience, not a requirement.
             # If we crash here, systemd may hit StartLimit* and leave the bot "off" until manually restarted.
-            LOG.exception("Failed to drain pending Telegram updates; continuing without drain")
+            LOG.warning("Failed to drain pending Telegram updates; continuing without drain (%s)", e)
             break
         if not updates:
             break

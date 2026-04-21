@@ -860,8 +860,11 @@ class TestDrainPendingUpdates(unittest.TestCase):
                 def get_updates(self, *, offset: int, timeout_seconds: int) -> list[dict]:
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with patch.object(bot.LOG, "warning") as warn_mock, patch.object(bot.LOG, "exception") as exc_mock:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 0)
+            warn_mock.assert_called_once()
+            exc_mock.assert_not_called()
 
     def test_drain_returns_partial_offset_on_midway_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -877,8 +880,11 @@ class TestDrainPendingUpdates(unittest.TestCase):
                         return [{"update_id": 41}, {"update_id": 42}]
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with patch.object(bot.LOG, "warning") as warn_mock, patch.object(bot.LOG, "exception") as exc_mock:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 43)
+            warn_mock.assert_called_once()
+            exc_mock.assert_not_called()
 
 
 class TestCodexConfigParsing(unittest.TestCase):
