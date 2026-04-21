@@ -310,7 +310,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
 
                 running_impl = [j for j in by_role.get("implementer_local", []) if str(j["state"] or "") == "running"]
                 running_arch = [j for j in by_role.get("architect_local", []) if str(j["state"] or "") == "running"]
-                blocked_only = [j for j in open_jobs if str(j["state"] or "") == "blocked"]
+                blocked_only = [j for j in open_jobs if str(j["state"] or "") in ("blocked", "blocked_approval")]
                 waiting_dep = [j for j in open_jobs if str(j["state"] or "") == "waiting_deps"]
 
                 # Strict WIP preference: keep implementer active and avoid parallel architect churn.
