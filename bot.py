@@ -6179,6 +6179,10 @@ def _autopilot_tick(
     - Autopilot enqueues an autonomous Jarvis job per active order only when the order is idle.
     - The Jarvis job is labeled `kind=autopilot` and is allowed to delegate.
     """
+    lane_state = _proactive_lane_state(cfg)
+    if bool(lane_state.get("paused", False)):
+        return 0
+
     created = 0
     try:
         created += _jarvis_final_sweep_tick(

@@ -1127,6 +1127,62 @@ class TestFinalSweepGuard(unittest.TestCase):
             self.assertEqual(children, [])
 
 
+class TestAutopilotTick(unittest.TestCase):
+    def test_autopilot_tick_skips_when_proactive_lane_is_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-autopilot-paused"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Paused proactive order",
+                body="AUTONOMOUS PROACTIVE SPRINT",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+            bot._set_proactive_lane_pause(
+                cfg,
+                paused=True,
+                reason="manual_pause_command",
+                manual=True,
+            )
+
+            created = bot._autopilot_tick(
+                cfg=cfg,
+                orch_q=q,
+                profiles=None,
+                chat_id=1,
+                now=_time.time(),
+            )
+
+            self.assertEqual(created, 0)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=100)
+            self.assertEqual(children, [])
+
+
 class TestRunningWatchdog(unittest.TestCase):
     def test_requeues_silent_local_ollama_before_full_runtime_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:
