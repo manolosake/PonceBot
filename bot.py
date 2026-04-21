@@ -6370,11 +6370,12 @@ def _jarvis_final_sweep_tick(
     except Exception:
         cooldown_s = 600.0
     try:
-        idle_terminal_close_threshold = int(os.environ.get("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", "40").strip() or "40")
+        # Default threshold intentionally low enough to avoid idle_no_open_jobs loops.
+        idle_terminal_close_threshold = int(os.environ.get("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", "10").strip() or "10")
         if idle_terminal_close_threshold < 1:
             idle_terminal_close_threshold = 1
     except Exception:
-        idle_terminal_close_threshold = 40
+        idle_terminal_close_threshold = 10
 
     open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     terminal_states = {"done", "failed", "cancelled", "blocked"}
