@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import tools.proactive_3h_autofix_monitor as monitor
 from tools.proactive_3h_autofix_monitor import _log
 
 
@@ -55,6 +57,76 @@ class TestProactive3hAutofixMonitorLog(unittest.TestCase):
             self.assertEqual(len(lines), workers * writes_per_worker)
             payloads = [json.loads(line) for line in lines]
             self.assertTrue(all(p["msg"] == "mp_event" for p in payloads))
+
+
+class TestProactive3hAutofixMonitorSweep(unittest.TestCase):
+    def test_closes_active_proactive_order_when_idle_and_reseed_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                """
+                CREATE TABLE ceo_orders (
+                    order_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    title TEXT,
+                    body TEXT,
+                    status TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    updated_at REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT PRIMARY KEY,
+                    parent_job_id TEXT,
+                    role TEXT,
+                    state TEXT,
+                    model TEXT,
+                    created_at REAL,
+                    updated_at REAL,
+                    trace TEXT
+                )
+                """
+            )
+            order_id = "65b0b3ec-f69f-4c06-94df-572debf167a9"
+            conn.execute(
+                "INSERT INTO ceo_orders(order_id, chat_id, title, body, status, phase, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, 10, "Proactive Sprint", "[proactive: reliability]", "active", "review", 1.0),
+            )
+            conn.execute(
+                "INSERT INTO jobs(job_id, parent_job_id, role, state, model, created_at, updated_at, trace) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("job-1", order_id, "backend", "done", "gpt-5", 1.0, 1.0, "{}"),
+            )
+            conn.commit()
+            conn.close()
+
+            class _Clock:
+                def __init__(self) -> None:
+                    self.now = 0.0
+
+                def __call__(self) -> float:
+                    self.now += 0.2
+                    return self.now
+
+            with (
+                mock.patch.object(monitor, "DB_PATH", db_path),
+                mock.patch.object(monitor, "_trigger_autopilot", return_value=0),
+                mock.patch.object(monitor.time, "time", side_effect=_Clock()),
+                mock.patch.object(monitor.time, "sleep", return_value=None),
+            ):
+                rc = monitor.run_monitor(duration_s=1, interval_s=0, log_path=Path(td) / "monitor.log")
+            self.assertEqual(rc, 0)
+
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute("SELECT status, phase FROM ceo_orders WHERE order_id=?", (order_id,)).fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "done")
+            self.assertEqual(str(row[1]), "done")
 
 
 if __name__ == "__main__":

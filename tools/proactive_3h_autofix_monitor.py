@@ -97,6 +97,24 @@ def _recent_role_jobs(
     ).fetchall()
 
 
+def _terminal_children_count(conn: sqlite3.Connection, *, order_id: str) -> int:
+    placeholders = ",".join("?" for _ in OPEN_STATES)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM jobs WHERE parent_job_id=? AND state NOT IN ({placeholders})",
+        (order_id, *OPEN_STATES),
+    ).fetchone()
+    return int((row["c"] if row is not None else 0) or 0)
+
+
+def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
+    now = float(time.time())
+    cur = conn.execute(
+        "UPDATE ceo_orders SET status='done', phase='done', updated_at=? WHERE order_id=? AND status='active'",
+        (now, order_id),
+    )
+    return int(cur.rowcount or 0) > 0
+
+
 def _update_job_state(
     conn: sqlite3.Connection,
     *,
@@ -262,6 +280,17 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                     if created:
                         actions += int(created)
                         _log("autopilot_reseed", path=log_path, order_id=order_id, created=int(created))
+                    else:
+                        terminal_count = _terminal_children_count(conn, order_id=order_id)
+                        if terminal_count > 0 and _close_order_done(conn, order_id=order_id):
+                            conn.commit()
+                            actions += 1
+                            _log(
+                                "closed_idle_order_no_open_jobs",
+                                path=log_path,
+                                order_id=order_id,
+                                terminal_children=terminal_count,
+                            )
                 _log(
                     "loop_status",
                     path=log_path,
