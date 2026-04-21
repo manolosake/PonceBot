@@ -6369,6 +6369,12 @@ def _jarvis_final_sweep_tick(
         cooldown_s = max(60.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "600").strip() or "600"))
     except Exception:
         cooldown_s = 600.0
+    try:
+        idle_terminal_close_threshold = int(os.environ.get("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", "40").strip() or "40")
+        if idle_terminal_close_threshold < 1:
+            idle_terminal_close_threshold = 1
+    except Exception:
+        idle_terminal_close_threshold = 40
 
     open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     terminal_states = {"done", "failed", "cancelled", "blocked"}
@@ -6414,6 +6420,34 @@ def _jarvis_final_sweep_tick(
             except Exception:
                 continue
         child_idle_s = int(max(0.0, float(now) - last_child_ts)) if last_child_ts > 0 else int(root_age_s)
+
+        proactive_order = bool(_is_proactive_order_record(o)) or bool((root.trace or {}).get("proactive_lane", False))
+        if proactive_order and len(terminal_children) >= int(idle_terminal_close_threshold):
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                orch_q.update_trace(
+                    oid,
+                    final_sweep_terminal_only_closed=True,
+                    final_sweep_terminal_only_closed_at=float(now),
+                    final_sweep_terminal_only_closed_count=int(len(terminal_children)),
+                    final_sweep_terminal_only_closed_idle_age_s=float(child_idle_s),
+                    live_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.final_sweep_auto_closed_terminal_only",
+                    actor="scheduler",
+                    details={
+                        "order_id": oid,
+                        "terminal_child_count": int(len(terminal_children)),
+                        "idle_age_s": float(child_idle_s),
+                        "threshold": int(idle_terminal_close_threshold),
+                        "reason": "idle_no_open_jobs",
+                    },
+                )
+            except Exception:
+                pass
+            continue
 
         pr = o.get("priority")
         try:
