@@ -22,7 +22,8 @@ def _log(msg: str, *, path: Path, **fields: Any) -> None:
     payload = {"ts": _ts(), "msg": msg, **fields}
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=True)
-    path.write_text((path.read_text(encoding="utf-8") if path.exists() else "") + line + "\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
     print(line, flush=True)
 
 
@@ -161,6 +162,49 @@ def _trigger_autopilot(chat_id: int, *, log_path: Path) -> int:
         return 0
 
 
+def _promote_waiting_qa_to_rw(conn: sqlite3.Connection, *, order_id: str, log_path: Path) -> int:
+    waiting_qa = conn.execute(
+        """
+        SELECT job_id, mode_hint, blocked_reason
+        FROM jobs
+        WHERE parent_job_id=? AND role='qa' AND state='waiting_deps'
+        ORDER BY updated_at DESC
+        """,
+        (order_id,),
+    ).fetchall()
+    actions = 0
+    for row in waiting_qa:
+        job_id = str(row["job_id"] or "").strip()
+        mode_hint = str(row["mode_hint"] or "").strip().lower()
+        if not job_id or mode_hint == "rw":
+            continue
+        conn.execute(
+            """
+            UPDATE jobs
+            SET mode_hint='rw',
+                updated_at=?,
+                trace=json_set(
+                    coalesce(trace,'{}'),
+                    '$.autofix_mode_promotion','rw',
+                    '$.autofix_mode_reason','qa_waiting_deps_needs_validation_access',
+                    '$.autofix_mode_at',?
+                )
+            WHERE job_id=?
+            """,
+            (float(time.time()), float(time.time()), job_id),
+        )
+        actions += 1
+        _log(
+            "promote_waiting_qa_mode",
+            path=log_path,
+            order_id=order_id,
+            job_id=job_id,
+            from_mode=mode_hint or "(empty)",
+            to_mode="rw",
+        )
+    return actions
+
+
 def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
     start = float(time.time())
     end = start + float(duration_s)
@@ -247,6 +291,9 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                     )
                     actions += 1
                     _log("requeue_stale_implementer", path=log_path, order_id=order_id, job_id=str(impl["job_id"]), age_s=int(age_s))
+
+                # Improve downstream validation reliability for blocked QA checks.
+                actions += _promote_waiting_qa_to_rw(conn, order_id=order_id, log_path=log_path)
 
                 conn.commit()
 
