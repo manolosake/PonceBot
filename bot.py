@@ -7417,6 +7417,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/pause":
         return "Uso: /pause <role>", None
 
+    # Keep underscore and hyphen spellings stable for QA/ops command variants.
     if text in ("/pause_autonomy", "/pause-autonomy"):
         return _orch_marker("pause_autonomy"), None
 
@@ -7435,6 +7436,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/resume":
         return "Uso: /resume <role>", None
 
+    # Keep underscore and hyphen spellings stable for QA/ops command variants.
     if text in ("/resume_autonomy", "/resume-autonomy"):
         return _orch_marker("resume_autonomy"), None
 
