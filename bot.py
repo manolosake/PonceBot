@@ -6911,6 +6911,81 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
     return cleaned
 
 
+def _running_watchdog_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Re-queue stale silent local Ollama runs before full runtime budget exhaustion.
+    """
+    del cfg, profiles
+    try:
+        silent_after_s = max(
+            60.0,
+            float(os.environ.get("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", "240").strip() or "240"),
+        )
+    except Exception:
+        silent_after_s = 240.0
+
+    recovered = 0
+    running = orch_q.jobs_by_state(state="running", limit=300)
+    for job in running:
+        tr = dict(job.trace or {})
+        if str(tr.get("live_phase") or "").strip().lower() != "local_ollama":
+            continue
+
+        age_s = max(
+            0.0,
+            float(now)
+            - float(getattr(job, "updated_at", 0.0) or getattr(job, "created_at", 0.0) or 0.0),
+        )
+        if age_s < float(silent_after_s):
+            continue
+
+        out_paths: list[Path] = []
+        for key in ("live_stdout_path", "live_stderr_path"):
+            p = str(tr.get(key) or "").strip()
+            if p:
+                out_paths.append(Path(p))
+        if not out_paths and str(job.artifacts_dir or "").strip():
+            ad = Path(str(job.artifacts_dir))
+            out_paths.extend([ad / "local_ollama_live.md", ad / "local_ollama_stream.jsonl"])
+
+        has_output = False
+        for p in out_paths:
+            try:
+                if p.exists() and p.stat().st_size > 0:
+                    has_output = True
+                    break
+            except Exception:
+                continue
+        if has_output:
+            continue
+
+        summary = "Requeued by running watchdog: no local Ollama output observed before runtime budget."
+        try:
+            orch_q.update_state(
+                job.job_id,
+                "queued",
+                result_summary=summary,
+                result_next_action="retry_local_ollama",
+            )
+            orch_q.update_trace(
+                job.job_id,
+                running_watchdog_silent_local=True,
+                running_watchdog_requeued_at=float(now),
+                result_summary=summary,
+                live_at=float(now),
+            )
+            recovered += 1
+        except Exception:
+            continue
+    return recovered
+
+
 def _sla_overdue_tick(
     *,
     cfg: BotConfig,
