@@ -5,6 +5,7 @@ import argparse
 import json
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,70 @@ def _open_children(conn: sqlite3.Connection, *, order_id: str) -> list[sqlite3.R
         """,
         (order_id, *OPEN_STATES),
     ).fetchall()
+
+
+def _terminal_children_count(conn: sqlite3.Connection, *, order_id: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM jobs
+        WHERE parent_job_id=? AND state IN ('done', 'failed', 'cancelled')
+        """,
+        (order_id,),
+    ).fetchone()
+    return int((row["c"] if row is not None else 0) or 0)
+
+
+def _enqueue_fallback_followup(conn: sqlite3.Connection, *, order_id: str, chat_id: int) -> str:
+    now = float(time.time())
+    job_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            job_id, source, role, input_text, request_type, priority, model, effort, mode_hint,
+            requires_approval, max_cost_window_usd, created_at, updated_at, due_at, state,
+            chat_id, user_id, reply_to_message_id, is_autonomous, parent_job_id, owner,
+            depends_on, ttl_seconds, retry_count, max_retries, labels, requires_review,
+            artifacts_dir, blocked_reason, plan_revision, stalled_since, trace
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            "autopilot",
+            "architect_local",
+            "Finalize proactive order closure conditions and handoff one bounded implementation-ready next task.",
+            "task",
+            2,
+            "gpt-5",
+            "medium",
+            "rw",
+            0,
+            2.0,
+            now,
+            now,
+            None,
+            "queued",
+            int(chat_id),
+            None,
+            None,
+            1,
+            order_id,
+            "autofix_monitor",
+            "[]",
+            None,
+            0,
+            0,
+            "{}",
+            0,
+            None,
+            None,
+            0,
+            None,
+            json.dumps({"result_next_action": "bounded_followup_after_idle_guardrail"}),
+        ),
+    )
+    return job_id
 
 
 def _recent_role_jobs(
@@ -257,6 +322,21 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                     if created:
                         actions += int(created)
                         _log("autopilot_reseed", path=log_path, order_id=order_id, created=int(created))
+                    else:
+                        terminal_count = _terminal_children_count(conn, order_id=order_id)
+                        if terminal_count > 0:
+                            conn.execute(
+                                "UPDATE ceo_orders SET status='completed', phase='completed', updated_at=? WHERE order_id=? AND status='active'",
+                                (float(time.time()), order_id),
+                            )
+                            conn.commit()
+                            actions += 1
+                            _log("closed_idle_order_no_open_jobs", path=log_path, order_id=order_id, terminal_children=terminal_count)
+                        else:
+                            followup_job_id = _enqueue_fallback_followup(conn, order_id=order_id, chat_id=chat_id)
+                            conn.commit()
+                            actions += 1
+                            _log("enqueued_fallback_followup", path=log_path, order_id=order_id, job_id=followup_job_id)
                 _log(
                     "loop_status",
                     path=log_path,
