@@ -6362,9 +6362,9 @@ def _jarvis_final_sweep_tick(
     """
     del profiles  # currently unused; kept for forward compatibility with scheduler tick signature
     try:
-        stale_after_s = max(60.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300"))
+        stale_after_s = max(60.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "120").strip() or "120"))
     except Exception:
-        stale_after_s = 300.0
+        stale_after_s = 120.0
     try:
         cooldown_s = max(60.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "600").strip() or "600"))
     except Exception:

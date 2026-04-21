@@ -1407,6 +1407,67 @@ class TestFinalSweepGuard(unittest.TestCase):
             assert order is not None
             self.assertEqual(str(order.get("status") or ""), "done")
 
+    def test_final_sweep_default_stale_window_enqueues_sooner(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-default-stale-window"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    # Keep defaults for stale threshold and close threshold.
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
 
 class TestAutopilotTick(unittest.TestCase):
     def test_autopilot_tick_skips_when_proactive_lane_is_paused(self) -> None:
