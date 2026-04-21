@@ -247,7 +247,10 @@ def _collect_diff_capture(
     if ahead or behind:
         diffstat = _run(["git", "diff", "--stat", f"{base_ref}..{head_ref}"], cwd=repo)
         changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=repo)
-        return "branch", diffstat, changed
+        # If rev-list indicates divergence but direct diff capture is empty,
+        # fall back instead of emitting misleading `(none)` artifacts.
+        if diffstat.strip() or changed.strip():
+            return "branch", diffstat, changed
     if working_tree_dirty:
         diffstat = _run(["git", "diff", "--stat", "HEAD"], cwd=repo)
         changed = _run(["git", "diff", "--name-only", "HEAD"], cwd=repo)

@@ -85,6 +85,44 @@ class TestReleaseGovernanceDiffCapture(unittest.TestCase):
         self.assertEqual(changed, "")
         mocked.assert_not_called()
 
+    def test_falls_back_when_branch_counts_diverged_but_branch_diff_empty(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], *, cwd: Path) -> str:
+            calls.append(cmd)
+            if cmd == ["git", "diff", "--stat", "origin/main..feature/x"]:
+                return ""
+            if cmd == ["git", "diff", "--name-only", "origin/main..feature/x"]:
+                return ""
+            if cmd == ["git", "diff", "--stat", "HEAD"]:
+                return " file.txt | 1 +"
+            if cmd == ["git", "diff", "--name-only", "HEAD"]:
+                return "file.txt"
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with patch.object(rg, "_run", side_effect=fake_run):
+            basis, diffstat, changed = rg._collect_diff_capture(
+                Path("."),
+                base_ref="origin/main",
+                head_ref="feature/x",
+                ahead=0,
+                behind=2,
+                working_tree_dirty=True,
+            )
+
+        self.assertEqual(basis, "working_tree")
+        self.assertEqual(diffstat, " file.txt | 1 +")
+        self.assertEqual(changed, "file.txt")
+        self.assertEqual(
+            calls,
+            [
+                ["git", "diff", "--stat", "origin/main..feature/x"],
+                ["git", "diff", "--name-only", "origin/main..feature/x"],
+                ["git", "diff", "--stat", "HEAD"],
+                ["git", "diff", "--name-only", "HEAD"],
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
