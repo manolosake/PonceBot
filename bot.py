@@ -5885,6 +5885,42 @@ def _watch_status_text(orch_q: OrchestratorQueue) -> str:
     return "\n".join(lines)
 
 
+def _final_sweep_requests_root_cause_close(result_summary: str) -> bool:
+    """
+    Parse FINAL SWEEP close intent conservatively:
+    - close when summary explicitly carries blocked_with_root_cause signal, or
+    - close when NO-GO and close-order language are both present.
+    Avoid false closures on GO/negated text (e.g. "GO ... do not close").
+    """
+    text = str(result_summary or "").strip().lower()
+    if not text:
+        return False
+    norm = text.replace("_", " ")
+
+    # Explicit root-cause closure marker from controller/reviewer output.
+    if "blocked with root cause" in norm:
+        return True
+
+    no_go = bool(re.search(r"\bno[\s-]?go\b", norm))
+    close_signal = any(
+        sig in norm
+        for sig in (
+            "close this order",
+            "close order",
+            "close the order",
+            "mark order done",
+            "set order done",
+        )
+    )
+    if not (no_go and close_signal):
+        return False
+
+    # Explicit negations should block closure even if "close" appears.
+    if any(neg in norm for neg in ("do not close", "don't close", "dont close", "no cerrar")):
+        return False
+    return True
+
+
 def _tick_watch_messages(*, cfg: BotConfig, api: TelegramAPI, orch_q: OrchestratorQueue) -> None:
     """
     Periodically edit the stored /watch message(s) (one per chat).
@@ -6574,11 +6610,36 @@ def _sync_order_phase_from_runtime(
     root_job = orch_q.get_job(rid)
     root_trace = dict((root_job.trace or {}) if root_job else {})
     merged_to_main = bool(root_trace.get("merged_to_main", False))
+    proactive_order = bool(_is_proactive_order_record(order)) or bool(root_trace.get("proactive_lane", False))
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     if not children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
+
+    if proactive_order:
+        final_sweeps_done = [
+            c
+            for c in children
+            if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+            and str(c.state or "").strip().lower() == "done"
+        ]
+        if final_sweeps_done:
+            final_sweeps_done.sort(key=lambda t: float(getattr(t, "updated_at", 0.0) or 0.0), reverse=True)
+            summary = str(((final_sweeps_done[0].trace or {}).get("result_summary") or "")).strip()
+            if _final_sweep_requests_root_cause_close(summary):
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+                try:
+                    orch_q.update_trace(
+                        rid,
+                        proactive_blocked_with_root_cause=True,
+                        proactive_blocked_with_root_cause_at=time.time(),
+                        proactive_blocked_with_root_cause_summary=(summary[:400] if summary else ""),
+                    )
+                except Exception:
+                    pass
+                return
 
     states = [str(c.state or "").strip().lower() for c in children]
     wrapups = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "wrapup"]
@@ -6623,6 +6684,18 @@ def _sync_order_phase_from_runtime(
                 pass
         return
     orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+
+
+def _is_proactive_order_record(order: dict[str, Any]) -> bool:
+    intent = str((order or {}).get("intent_type") or "").strip().lower()
+    body = str((order or {}).get("body") or "").strip().lower()
+    title = str((order or {}).get("title") or "").strip().lower()
+    return (
+        "proactive" in intent
+        or "autonomous proactive sprint" in body
+        or "[proactive:" in body
+        or "proactive sprint" in title
+    )
 
 
 def _orchestrator_min_evidence_gate(

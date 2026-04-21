@@ -925,6 +925,77 @@ class TestOrchestratorStorage(unittest.TestCase):
             assert root is not None
             self.assertTrue(bool((root.trace or {}).get("proactive_blocked_with_root_cause", False)))
 
+    def test_sync_order_phase_does_not_close_proactive_order_on_go_or_negated_close_text(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-proactive-go-no-close-01"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="final sweep",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    trace={
+                        "result_summary": (
+                            "GO to remain active. Do not close this order yet; "
+                            "continue delegated remediation and QA+reviewer gates."
+                        )
+                    },
+                    labels={"ticket": order_id, "kind": "final_sweep"},
+                    job_id="job-skynet-final-go",
+                )
+            )
+
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            got = q.get_order(order_id, chat_id=1)
+            assert got is not None
+            self.assertEqual(str(got.get("status")), "active")
+            self.assertNotEqual(str(got.get("phase")), "done")
+
+            root = q.get_job(order_id)
+            assert root is not None
+            self.assertFalse(bool((root.trace or {}).get("proactive_blocked_with_root_cause", False)))
+
     def test_set_order_phase_accepts_ready_for_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
