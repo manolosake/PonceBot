@@ -485,6 +485,66 @@ def _state_access_mode(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     return v if v in ("default", "full") else ""
 
 
+def _effective_access_mode(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
+    mode = _state_access_mode(cfg, chat_id=chat_id)
+    return mode if mode in ("default", "full") else "default"
+
+
+def _effective_notify_scope(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
+    allowed = {"all", "critical", "state_change"}
+    st = _get_state(cfg)
+    if chat_id is not None:
+        by_chat = st.get("notify_scope_by_chat")
+        if isinstance(by_chat, dict):
+            raw = by_chat.get(str(int(chat_id)))
+            v = str(raw or "").strip().lower()
+            if v in allowed:
+                return v
+    v = str(getattr(cfg, "notify_scope", "all") or "all").strip().lower()
+    return v if v in allowed else "all"
+
+
+def _notify_dedupe_allow(
+    cfg: "BotConfig",
+    *,
+    chat_id: int,
+    signature: str,
+    now_ts: float | None = None,
+) -> bool:
+    now = float(now_ts if now_ts is not None else time.time())
+    cooldown = max(0, int(getattr(cfg, "notify_dedupe_cooldown_seconds", 0) or 0))
+    if cooldown <= 0:
+        return True
+    allowed = True
+
+    def _m(st: dict[str, Any]) -> None:
+        nonlocal allowed
+        raw = st.get("notify_dedupe")
+        by_chat = raw if isinstance(raw, dict) else {}
+        key = str(int(chat_id))
+        per_chat_raw = by_chat.get(key)
+        per_chat = per_chat_raw if isinstance(per_chat_raw, dict) else {}
+        prev_raw = per_chat.get(signature)
+        try:
+            prev = float(prev_raw)
+        except Exception:
+            prev = 0.0
+        if prev > 0 and (now - prev) < float(cooldown):
+            allowed = False
+            return
+        per_chat[signature] = now
+        # Keep map bounded.
+        if len(per_chat) > 300:
+            oldest = sorted(per_chat.items(), key=lambda kv: float(kv[1] or 0.0))[:-200]
+            for k, _v in oldest:
+                per_chat.pop(str(k), None)
+        by_chat[key] = per_chat
+        st["notify_dedupe"] = by_chat
+
+    _update_state(cfg, _m)
+    return allowed
+
+
 def _get_breakglass_state(cfg: "BotConfig") -> dict[str, Any]:
     st = _get_state(cfg)
     raw = st.get("breakglass")
@@ -734,9 +794,10 @@ def _maybe_resume_proactive_lane_for_manual_ceo_request(cfg: "BotConfig") -> boo
 def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
     # Mirror the Codex CLI picker labels, but also show how to set it from Telegram.
     bypass = _effective_bypass_sandbox(cfg, chat_id=chat_id)
+    selected_mode = _effective_access_mode(cfg, chat_id=chat_id)
     bg_active, bg = _breakglass_is_active(cfg)
-    default_line = "- Default (current)" if not bypass else "- Default"
-    full_line = "- Full access (current)" if bypass else "- Full access"
+    default_line = "- Default (selected)" if selected_mode != "full" else "- Default"
+    full_line = "- Full access (selected)" if selected_mode == "full" else "- Full access"
     bg_reason = str((bg or {}).get("reason") or "").strip() or "(none)"
     bg_exp = (bg or {}).get("expires_at")
     try:
@@ -753,6 +814,7 @@ def _permissions_text(cfg: "BotConfig", *, chat_id: int | None = None) -> str:
             "Breakglass (dangerous bypass):",
             f"- status: {bg_status}",
             f"- reason: {bg_reason}",
+            f"- selected_access_mode: {selected_mode}",
             "",
             "Uso:",
             "- /permissions default",
@@ -975,7 +1037,6 @@ class BotConfig:
     state_file: Path
     notify_chat_id: int | None
     notify_on_start: bool
-
     codex_workdir: Path
     codex_timeout_seconds: int
     codex_use_oss: bool
@@ -1008,6 +1069,9 @@ class BotConfig:
     orchestrator_default_max_cost_window_usd: float = 8.0
     orchestrator_default_role: str = "jarvis"
     orchestrator_daily_digest_seconds: int = 6 * 60 * 60
+    notify_scope: str = "all"
+    notify_dedupe_cooldown_seconds: int = 300
+    notify_child_worker_completions: bool = False
     orchestrator_agent_profiles: Path = Path(__file__).with_name("orchestrator") / "agents.yaml"
     orchestrator_worker_count: int = 3
     orchestrator_sessions_enabled: bool = True
@@ -4016,6 +4080,9 @@ _ORCHESTRATOR_ROLES = (
     "security",
     "research",
     "release_mgr",
+    "architect_local",
+    "implementer_local",
+    "reviewer_local",
 )
 
 
@@ -6585,21 +6652,91 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
     eta = int(spec.eta_minutes) if spec.eta_minutes is not None else _default_eta_minutes_for_spec(spec)
     eta = max(5, min(7 * 24 * 60, eta))
     sla = _normalize_sla_tier(spec.sla_tier, priority=int(spec.priority or 2))
+    role_norm = str(spec.role or "").strip().lower()
+    mode_hint = spec.mode_hint
+    requires_approval = bool(spec.requires_approval)
+    if role_norm in {"architect_local", "implementer_local", "reviewer_local"}:
+        mode_hint = "ro"
+        requires_approval = False
 
     # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
     return TaskSpec(
         key=spec.key,
         role=spec.role,
         text=base_text,
-        mode_hint=spec.mode_hint,
+        mode_hint=mode_hint,
         priority=int(spec.priority or 2),
         depends_on=list(spec.depends_on or []),
-        requires_approval=bool(spec.requires_approval),
+        requires_approval=requires_approval,
         acceptance_criteria=acceptance,
         definition_of_done=dod,
         eta_minutes=int(eta),
         sla_tier=sla,
     )
+
+
+def _inject_local_specialist_specs(
+    *,
+    specs: list[TaskSpec],
+    root_ticket: str,
+    existing_keys: set[str],
+    request_type: str,
+    is_top_level_manual: bool,
+    proactive_lane: bool,
+    allow_delegation: bool,
+) -> list[TaskSpec]:
+    del request_type, allow_delegation  # reserved for policy refinements
+    enforce_raw = str(os.environ.get("BOT_LOCAL_SPECIALISTS_ENFORCE", "1") or "1").strip().lower()
+    if enforce_raw in {"0", "false", "off", "no"}:
+        return list(specs)
+
+    manual_override = str(os.environ.get("BOT_CEO_INJECT_LOCAL_SPECIALISTS", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    if not proactive_lane and is_top_level_manual and not manual_override:
+        return list(specs)
+    if not proactive_lane and not manual_override:
+        return list(specs)
+
+    out = list(specs)
+    existing_roles = {str(s.role or "").strip().lower() for s in out}
+    all_keys = {str(k or "").strip() for k in existing_keys if str(k or "").strip()}
+    all_keys.update(str(s.key or "").strip() for s in out if str(s.key or "").strip())
+    base_id = re.sub(r"[^a-z0-9]+", "", str(root_ticket or "").strip().lower())[:8] or "ticket"
+
+    specialist_templates: list[tuple[str, str]] = [
+        ("architect_local", "Define bounded architecture slice and blast radius before implementation."),
+        ("implementer_local", "Implement one bounded backend change and provide validation evidence."),
+        ("reviewer_local", "Review implementation risks/regressions and map findings to acceptance criteria."),
+    ]
+    for role, text in specialist_templates:
+        if role in existing_roles:
+            continue
+        key_base = f"auto_{role}_{base_id}"
+        key = key_base
+        suffix = 1
+        while key in all_keys:
+            key = f"{key_base}_{suffix}"
+            suffix += 1
+        all_keys.add(key)
+        out.append(
+            TaskSpec(
+                key=key,
+                role=role,
+                text=text,
+                mode_hint="ro",
+                priority=2,
+                requires_approval=False,
+                acceptance_criteria=["Provide concrete, verifiable output for assigned scope."],
+                definition_of_done=["Residual risks and explicit next action documented."],
+                eta_minutes=30,
+                sla_tier="normal",
+            )
+        )
+    return out
 
 
 def _implementer_failure_summary_has_actionable_signal(summary: str) -> bool:
@@ -6696,6 +6833,526 @@ def _extract_changed_files_from_patch_text(text: str) -> list[str]:
         seen.add(path)
         out.append(path)
     return out
+
+
+def _classify_local_slice_failure(*, role_norm: str, orch_state: str, summary: str, attempt_n: int) -> str:
+    role = str(role_norm or "").strip().lower()
+    state = str(orch_state or "").strip().lower()
+    s = str(summary or "").strip().lower()
+    if "blocker:" in s:
+        return "blocked"
+    terminal_tokens = (
+        "no valid patches in input",
+        "allow with \"--allow-empty\"",
+        "patch is empty",
+        "nothing to apply",
+        "no worktree changes after apply",
+        "read-only file system",
+        "filesystem is read-only",
+        "read only file system",
+        "bwrap: failed to create namespace",
+        "bubblewrap execution failed",
+    )
+    if any(tok in s for tok in terminal_tokens):
+        return "terminal"
+    retryable_patch_tokens = ("patch apply failed", "operation not permitted")
+    if role == "implementer_local" and any(tok in s for tok in retryable_patch_tokens):
+        return "retriable" if int(attempt_n or 1) <= 1 else "terminal"
+    if state == "blocked":
+        return "blocked"
+    return "retriable"
+
+
+def _collect_order_local_autonomy_funnel(*, orch_q: OrchestratorQueue, root_ticket: str, now: float) -> dict[str, Any]:
+    del now
+    children = orch_q.jobs_by_parent(parent_job_id=str(root_ticket or "").strip(), limit=600)
+    slices: dict[str, dict[str, bool]] = {}
+    controller_without_slice = False
+
+    for c in children:
+        role = _coerce_orchestrator_role(str(c.role or ""))
+        tr = dict(c.trace or {})
+        sid = str(tr.get("slice_id") or "").strip()
+        if role == "implementer_local" and sid:
+            st = slices.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
+            st["started"] = True
+            st["applied"] = bool(tr.get("slice_patch_applied", False) or str(tr.get("slice_status") or "").strip().lower() in {"applied", "validated", "reviewed_ready", "closed"})
+            st["validated"] = bool(tr.get("slice_validation_ok", False) or str(tr.get("slice_status") or "").strip().lower() in {"validated", "reviewed_ready", "closed"})
+        elif role == "reviewer_local" and sid:
+            st = slices.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
+            st["reviewed_ready"] = str(tr.get("slice_status") or "").strip().lower() == "reviewed_ready" or "ready" in str(getattr(c, "result_summary", "") or "").strip().lower()
+        elif role in {"jarvis", "skynet"}:
+            improved = bool(tr.get("improvement_verified", False)) or "verified_improvement" in str(getattr(c, "result_summary", "") or "").strip().lower()
+            if not improved:
+                continue
+            if sid:
+                st = slices.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
+                st["controller_verified"] = True
+            else:
+                controller_without_slice = True
+
+    if controller_without_slice:
+        for st in slices.values():
+            if st.get("reviewed_ready"):
+                st["controller_verified"] = True
+                break
+
+    started = sum(1 for st in slices.values() if st.get("started"))
+    applied = sum(1 for st in slices.values() if st.get("applied"))
+    validated = sum(1 for st in slices.values() if st.get("validated"))
+    closed = sum(1 for st in slices.values() if st.get("validated") and st.get("reviewed_ready") and st.get("controller_verified"))
+    improved = closed > 0
+    gate = "closed" if improved else ("validated" if validated > 0 else "open")
+    return {
+        "slices_started": int(started),
+        "slices_applied": int(applied),
+        "slices_validated": int(validated),
+        "slices_closed": int(closed),
+        "improvement_verified": bool(improved),
+        "quality_gate_status": gate,
+    }
+
+
+def _prune_local_specs_against_active_backlog(*, specs: list[TaskSpec], existing_children: list[Task]) -> list[TaskSpec]:
+    has_applied = any(bool((c.trace or {}).get("slice_patch_applied", False)) for c in existing_children)
+    out: list[TaskSpec] = []
+    for s in specs:
+        role = _coerce_orchestrator_role(str(s.role or ""))
+        if role == "reviewer_local" and not has_applied:
+            continue
+        out.append(s)
+    return out
+
+
+def _local_role_worktree_dir(*, cfg: BotConfig | None = None, role: str | None = None, root_ticket: str | None = None) -> Path:
+    del role, root_ticket
+    if cfg is not None:
+        return Path(cfg.codex_workdir).resolve()
+    return Path(".").resolve()
+
+
+def _structured_handoff_is_actionable(text: str, *, require_artifact_contract: bool = False) -> bool:
+    s = str(text or "")
+    required = ("FILES:", "CHANGE:", "VALIDATION:", "RISK:")
+    if not all(tok in s for tok in required):
+        return False
+    if require_artifact_contract and "ARTIFACT_CONTRACT:" not in s:
+        return False
+    return True
+
+
+def _augment_local_specialist_prompt_with_workspace_context(
+    *,
+    task: Any,
+    user_prompt: str,
+    worktree_dir: Path,
+    role: str,
+) -> str:
+    del role
+    base = str(user_prompt or "").strip()
+    query = f"{str(getattr(task, 'input_text', '') or '')}\n{base}"
+    symbol_match = re.search(r"(_[A-Za-z][A-Za-z0-9_]*)", query)
+    symbol = str(symbol_match.group(1) if symbol_match else "").strip()
+
+    file_hint_match = re.search(r"\b([A-Za-z0-9_/.-]+\.py)\b", query)
+    path_hint = str(file_hint_match.group(1) if file_hint_match else "").strip()
+
+    candidate: Path | None = None
+    if path_hint:
+        p = (Path(worktree_dir) / path_hint).resolve()
+        if p.is_file() and str(p).startswith(str(Path(worktree_dir).resolve())):
+            candidate = p
+    if candidate is None:
+        # Rank python files by symbol match first, then bot.py fallback.
+        py_files = list(Path(worktree_dir).glob("*.py"))
+        if not py_files:
+            py_files = list(Path(worktree_dir).rglob("*.py"))[:30]
+        for p in py_files:
+            try:
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if symbol and symbol in txt:
+                candidate = p
+                break
+        if candidate is None:
+            for p in py_files:
+                if p.name == "bot.py":
+                    candidate = p
+                    break
+    if candidate is None:
+        return base
+
+    rel = str(candidate.relative_to(worktree_dir))
+    text = candidate.read_text(encoding="utf-8", errors="ignore")
+    lines = text.splitlines()
+    excerpt = ""
+    marker = "# [TRUNCATED_EXACT_TARGET_CONTEXT]"
+    if symbol and symbol in text:
+        idx = next((i for i, ln in enumerate(lines) if symbol in ln), 0)
+        lo = max(0, idx - 20)
+        hi = min(len(lines), idx + 20)
+        excerpt = "\n".join(lines[lo:hi])
+        marker = "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]"
+    else:
+        excerpt = "\n".join(lines[:160])
+    return "\n".join([base, "", f"FILE: {rel}", marker, excerpt]).strip()
+
+
+def _augment_implementer_failure_summary(*, summary: str, job_id: str, artifacts_dir: str) -> str:
+    out = str(summary or "").strip()
+    ad = Path(artifacts_dir)
+    val = ad / "local_ollama_validation.txt"
+    gs = ad / "local_ollama_git_status.txt"
+    if val.is_file():
+        out += "\n\nFAILED_VALIDATION_OUTPUT:\n" + val.read_text(encoding="utf-8", errors="ignore").strip()
+    if gs.is_file():
+        out += "\n\nFAILED_CHANGED_FILES:\n" + gs.read_text(encoding="utf-8", errors="ignore").strip()
+    if job_id:
+        out += f"\n\njob_id: {job_id}"
+    return out.strip()
+
+
+def _finalize_local_implementer_change(
+    *,
+    artifacts_dir: Path,
+    worktree_dir: Path,
+    artifacts: list[str],
+    apply_mode: str,
+    rewrite_files: list[str] | None,
+    changed_files_hint: list[str] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    del apply_mode
+    changed = [str(p).strip() for p in (changed_files_hint or rewrite_files or []) if str(p).strip()]
+    if not changed:
+        changed = _extract_changed_files_from_patch_text("")
+    py_files = [p for p in changed if p.endswith(".py")]
+    validation_ok = True
+    if py_files:
+        cmd = ["python3", "-m", "py_compile", *py_files]
+        proc = subprocess.run(cmd, cwd=worktree_dir, capture_output=True, text=True)
+        validation_ok = proc.returncode == 0
+        (Path(artifacts_dir) / "local_ollama_validation.txt").write_text(
+            (proc.stdout or "") + (proc.stderr or ""),
+            encoding="utf-8",
+        )
+        artifacts.append(str((Path(artifacts_dir) / "local_ollama_validation.txt").resolve()))
+    patch = subprocess.run(["git", "diff", "--", *changed], cwd=worktree_dir, capture_output=True, text=True)
+    patch_path = Path(artifacts_dir) / "local_ollama_patch.diff"
+    patch_path.write_text(str(patch.stdout or ""), encoding="utf-8")
+    artifacts.append(str(patch_path.resolve()))
+    return artifacts, {"changed_files": changed, "validation_ok": bool(validation_ok)}
+
+
+def _apply_autonomous_local_first_policy(
+    *,
+    specs: list[TaskSpec],
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float,
+) -> list[TaskSpec]:
+    del now
+    existing = orch_q.jobs_by_parent(parent_job_id=str(root_ticket or "").strip(), limit=200)
+    blocked_impl = [
+        c for c in existing
+        if _coerce_orchestrator_role(str(c.role or "")) == "implementer_local"
+        and str(c.state or "").strip().lower() == "blocked"
+    ]
+    if not blocked_impl:
+        return specs
+    latest = sorted(blocked_impl, key=lambda x: float(getattr(x, "updated_at", 0.0) or getattr(x, "created_at", 0.0) or 0.0), reverse=True)[0]
+    summary = str(getattr(latest, "result_summary", "") or "").strip()
+    wt = _local_role_worktree_dir(role="implementer_local", root_ticket=root_ticket)
+    files: list[str] = []
+    if "bot.py" in summary and (Path(wt) / "bot.py").is_file():
+        files.append("bot.py")
+    if not files:
+        return specs
+    text = (
+        "LATEST_IMPLEMENTER_BLOCKER:\n"
+        + summary
+        + "\n\nGrounding files:\n"
+        + "\n".join(f"- {p}" for p in files)
+        + "\n\nValidation:\n- python -m py_compile bot.py\n"
+    )
+    return [
+        TaskSpec(
+            key=f"auto_implementer_local_{str(root_ticket)[:8]}",
+            role="implementer_local",
+            text=text,
+            mode_hint="ro",
+            priority=1,
+            requires_approval=False,
+            acceptance_criteria=["Resolve blocker with grounded patch."],
+            definition_of_done=["Validation command succeeds."],
+            eta_minutes=30,
+            sla_tier="high",
+        )
+    ]
+
+
+def _classify_local_slice_failure(*, role_norm: str, orch_state: str, summary: str, attempt_n: int) -> str:
+    s = str(summary or "").strip().lower()
+    role = str(role_norm or "").strip().lower()
+    if "blocker:" in s:
+        return "blocked"
+    terminal_markers = (
+        "no valid patches in input",
+        "allow with \"--allow-empty\"",
+        "patch is empty",
+        "nothing to apply",
+        "no worktree changes after apply",
+        "read-only file system",
+        "filesystem is read-only",
+        "read only file system",
+        "bwrap: failed to create namespace",
+        "bubblewrap execution failed",
+    )
+    if any(m in s for m in terminal_markers):
+        return "terminal"
+    if role == "implementer_local" and "patch apply failed" in s:
+        return "retriable" if int(attempt_n or 0) <= 1 else "terminal"
+    if str(orch_state or "").strip().lower() == "blocked":
+        return "blocked"
+    return "retriable"
+
+
+def _collect_order_local_autonomy_funnel(*, orch_q: OrchestratorQueue, root_ticket: str, now: float) -> dict[str, Any]:
+    del now
+    children = orch_q.jobs_by_parent(parent_job_id=str(root_ticket or "").strip(), limit=600)
+    per_slice: dict[str, dict[str, bool]] = {}
+    controller_without_slice = False
+    for c in children:
+        role = _coerce_orchestrator_role(str(c.role or ""))
+        tr = dict(c.trace or {})
+        sid = str(tr.get("slice_id") or "").strip()
+        info = per_slice.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
+        if role == "implementer_local":
+            if sid:
+                info["started"] = True
+            if bool(tr.get("slice_patch_applied", False)) or str(tr.get("slice_status") or "").strip().lower() in {"applied", "validated", "reviewed_ready", "closed"}:
+                info["applied"] = True
+            if bool(tr.get("slice_validation_ok", False)) or str(tr.get("slice_status") or "").strip().lower() in {"validated", "reviewed_ready", "closed"}:
+                info["validated"] = True
+        elif role == "reviewer_local":
+            if str(tr.get("slice_status") or "").strip().lower() == "reviewed_ready":
+                info["reviewed_ready"] = True
+        if bool(tr.get("improvement_verified", False)) or "verified_improvement" in str(getattr(c, "result_summary", "") or "").strip().lower():
+            if sid:
+                info["controller_verified"] = True
+            else:
+                controller_without_slice = True
+
+    if controller_without_slice:
+        for sid, info in per_slice.items():
+            if sid and info.get("reviewed_ready", False):
+                info["controller_verified"] = True
+                break
+
+    slices_started = sum(1 for sid, info in per_slice.items() if sid and info.get("started", False))
+    slices_applied = sum(1 for sid, info in per_slice.items() if sid and info.get("applied", False))
+    slices_validated = sum(1 for sid, info in per_slice.items() if sid and info.get("validated", False))
+    slices_closed = sum(
+        1
+        for sid, info in per_slice.items()
+        if sid and info.get("validated", False) and info.get("reviewed_ready", False) and info.get("controller_verified", False)
+    )
+    quality_gate_status = "closed" if slices_closed > 0 else ("validated" if slices_validated > 0 else "open")
+    return {
+        "slices_started": int(slices_started),
+        "slices_applied": int(slices_applied),
+        "slices_validated": int(slices_validated),
+        "slices_closed": int(slices_closed),
+        "improvement_verified": bool(slices_closed > 0),
+        "quality_gate_status": quality_gate_status,
+    }
+
+
+def _prune_local_specs_against_active_backlog(*, specs: list[TaskSpec], existing_children: list[Task]) -> list[TaskSpec]:
+    has_applied_evidence = False
+    for c in existing_children:
+        tr = dict((c.trace or {}))
+        if bool(tr.get("slice_patch_applied", False)) or str(tr.get("slice_status") or "").strip().lower() in {"applied", "validated", "reviewed_ready", "closed"}:
+            has_applied_evidence = True
+            break
+    out: list[TaskSpec] = []
+    for s in specs:
+        role = _coerce_orchestrator_role(str(s.role or ""))
+        if role == "reviewer_local" and not has_applied_evidence:
+            continue
+        out.append(s)
+    return out
+
+
+def _local_role_worktree_dir(cfg: BotConfig, *, role: str) -> Path:
+    del role
+    return Path(cfg.codex_workdir).resolve()
+
+
+def _apply_autonomous_local_first_policy(
+    *,
+    specs: list[TaskSpec],
+    orch_q: OrchestratorQueue,
+    root_ticket: str,
+    now: float,
+) -> list[TaskSpec]:
+    del now
+    children = orch_q.jobs_by_parent(parent_job_id=str(root_ticket or "").strip(), limit=300)
+    blocked_impl: Task | None = None
+    for c in children:
+        if _coerce_orchestrator_role(str(c.role or "")) != "implementer_local":
+            continue
+        state = str(c.state or "").strip().lower()
+        if state != "blocked":
+            continue
+        blocked_impl = c
+    if blocked_impl is None:
+        return specs
+    tr = dict(blocked_impl.trace or {})
+    summary = str(getattr(blocked_impl, "result_summary", "") or tr.get("result_summary") or "")
+    if "blocker" not in summary.lower():
+        return specs
+    files = sorted(set(re.findall(r"`([^`]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt))`", summary)))
+    file_lines = [f"- {p}" for p in files] if files else ["- (no explicit file paths found)"]
+    py_targets = [p for p in files if p.endswith(".py")]
+    validation_hint = "python -m py_compile " + " ".join(py_targets) if py_targets else "python -m py_compile <target_files.py>"
+    rewritten = TaskSpec(
+        key="local_first_impl_followup",
+        role="implementer_local",
+        text=(
+            "LATEST_IMPLEMENTER_BLOCKER\n"
+            + summary.strip()
+            + "\n\nTarget files:\n"
+            + "\n".join(file_lines)
+            + "\n\nValidation command:\n"
+            + validation_hint
+        ).strip(),
+        mode_hint="ro",
+        priority=1,
+        acceptance_criteria=["Resolve the blocker with concrete file-level update and validation evidence."],
+        definition_of_done=["Residual risks and next action documented."],
+        eta_minutes=30,
+        sla_tier="high",
+    )
+    return [rewritten]
+
+
+def _structured_handoff_is_actionable(text: str, *, require_artifact_contract: bool = False) -> bool:
+    s = str(text or "")
+    required_sections = ("files:", "change:", "validation:", "risk:")
+    lower = s.lower()
+    if not all(sec in lower for sec in required_sections):
+        return False
+    if require_artifact_contract and "artifact_contract:" not in lower:
+        return False
+    return True
+
+
+def _finalize_local_implementer_change(
+    *,
+    artifacts_dir: Path,
+    worktree_dir: Path,
+    artifacts: list[str],
+    apply_mode: str,
+    rewrite_files: list[str] | None,
+    changed_files_hint: list[str] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    del apply_mode
+    artifacts_out = list(artifacts or [])
+    changed_files = [str(p).strip() for p in (rewrite_files or changed_files_hint or []) if str(p).strip()]
+    changed_files = list(dict.fromkeys(changed_files))
+    if not changed_files:
+        changed_files = _extract_changed_files_from_patch_text(_extract_first_diff_block(""))
+
+    validation_ok = True
+    py_files = [p for p in changed_files if p.endswith(".py")]
+    validation_lines: list[str] = []
+    if py_files:
+        cmd = ["python3", "-m", "py_compile", *py_files]
+        p = subprocess.run(cmd, cwd=worktree_dir, capture_output=True, text=True)
+        validation_ok = p.returncode == 0
+        validation_lines.append("$ " + " ".join(cmd))
+        if p.stdout:
+            validation_lines.append(p.stdout.rstrip())
+        if p.stderr:
+            validation_lines.append(p.stderr.rstrip())
+    else:
+        validation_lines.append("No Python files in changed slice; py_compile skipped.")
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    vpath = (artifacts_dir / "local_ollama_validation.txt").resolve()
+    vpath.write_text("\n".join(validation_lines).strip() + "\n", encoding="utf-8")
+    artifacts_out.append(str(vpath))
+
+    return artifacts_out, {"changed_files": changed_files, "validation_ok": bool(validation_ok)}
+
+
+def _augment_implementer_failure_summary(*, summary: str, job_id: str, artifacts_dir: str | Path) -> str:
+    out = str(summary or "").strip()
+    ad = Path(artifacts_dir)
+    val_p = ad / "local_ollama_validation.txt"
+    status_p = ad / "local_ollama_git_status.txt"
+    if val_p.exists():
+        out += "\n\nFAILED_VALIDATION_OUTPUT:\n" + val_p.read_text(encoding="utf-8", errors="replace").strip()
+    if status_p.exists():
+        out += "\n\nFAILED_CHANGED_FILES:\n" + status_p.read_text(encoding="utf-8", errors="replace").strip()
+    if job_id:
+        out += f"\n\nJOB_ID: {job_id}"
+    return out.strip()
+
+
+def _augment_local_specialist_prompt_with_workspace_context(
+    *,
+    task: Any,
+    user_prompt: str,
+    worktree_dir: Path,
+    role: str,
+) -> str:
+    del role
+    base_prompt = str(user_prompt or "").strip()
+    task_text = str(getattr(task, "input_text", "") or "")
+    combined = (base_prompt + "\n" + task_text).strip()
+    symbol_match = re.search(r"(_[A-Za-z0-9_]+)", combined)
+    symbol = str(symbol_match.group(1) if symbol_match else "").strip()
+    explicit_paths = re.findall(r"\b([A-Za-z0-9_./-]+\.py)\b", combined)
+
+    candidate_path: Path | None = None
+    if explicit_paths:
+        p = (worktree_dir / explicit_paths[0]).resolve()
+        if p.exists() and p.is_file():
+            candidate_path = p
+    if candidate_path is None and symbol:
+        for py in sorted(worktree_dir.rglob("*.py")):
+            try:
+                txt = py.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if symbol in txt:
+                candidate_path = py
+                break
+    if candidate_path is None:
+        fallback = (worktree_dir / "bot.py").resolve()
+        if fallback.exists():
+            candidate_path = fallback
+
+    if candidate_path is None:
+        return base_prompt
+
+    rel = str(candidate_path.relative_to(worktree_dir))
+    text = candidate_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    section = ""
+    if symbol and symbol in text:
+        idx = next((i for i, ln in enumerate(lines) if symbol in ln), 0)
+        lo = max(0, idx - 20)
+        hi = min(len(lines), idx + 40)
+        snippet = "\n".join(lines[lo:hi])
+        section = "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n" + snippet
+    else:
+        snippet = "\n".join(lines[:220])
+        section = "# [TRUNCATED_EXACT_TARGET_CONTEXT]\n" + snippet
+
+    return (base_prompt + "\n\nFILE: " + rel + "\n" + section).strip()
 
 
 def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
@@ -7927,7 +8584,14 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
                 return f"No permitido por tu perfil ({profile}).", None
         if arg in ("default", "full"):
             _set_access_mode(cfg, arg, chat_id=msg.chat_id)
-            return f"OK. permissions={arg}", None
+            active, _ = _breakglass_is_active(cfg)
+            bypass = _effective_bypass_sandbox(cfg, chat_id=msg.chat_id)
+            return (
+                f"OK. permissions={arg} "
+                f"(access_mode_selected={arg}, dangerous_bypass={'active' if bypass else 'inactive'}, "
+                f"breakglass={'active' if active else 'inactive'})",
+                None,
+            )
         if arg == "clear":
             _set_access_mode(cfg, None, chat_id=msg.chat_id)
             return "OK. permissions cleared (using env defaults).", None
@@ -7947,6 +8611,8 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             bg_left = 0
         lines = [
             f"permissions: {'full' if bypass else 'default'}",
+            f"access_mode_selected: {_effective_access_mode(eff_cfg, chat_id=msg.chat_id)}",
+            f"dangerous_bypass: {'active' if bypass else 'inactive'}",
             f"breakglass: {'ACTIVE' if bg_active else 'inactive'}",
             f"breakglass_left_seconds: {bg_left}",
             f"breakglass_reason: {bg_reason}",
@@ -7963,10 +8629,14 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         else:
             lines.append("codex: -a never (no approval prompts)")
             lines.append(f"codex sandbox default: {_threaded_sandbox_mode_label(eff_cfg)}")
+            if _effective_access_mode(eff_cfg, chat_id=msg.chat_id) == "full":
+                lines.append("note: full selected, but dangerous bypass is OFF until breakglass is active")
         return "\n".join(lines), None
 
     if text == "/breakglass":
         active, raw = _breakglass_is_active(cfg)
+        selected_mode = _effective_access_mode(cfg, chat_id=msg.chat_id)
+        bypass = _effective_bypass_sandbox(cfg, chat_id=msg.chat_id)
         reason = str(raw.get("reason") or "").strip() or "(none)"
         source = str(raw.get("source") or "").strip() or "(none)"
         exp = raw.get("expires_at")
@@ -7979,6 +8649,8 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             f"seconds_left: {left_s}",
             f"reason: {reason}",
             f"source: {source}",
+            f"access_mode_selected: {selected_mode}",
+            f"dangerous_bypass: {'active' if bypass else 'inactive'}",
             "",
             "Usage:",
             "- /breakglass on <minutes> <reason>",
@@ -8524,6 +9196,21 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
             st["notify_chat_id"] = int(msg.chat_id)
         _update_state(cfg, _m)
         return f"OK. notify_chat_id={msg.chat_id}", None
+
+    if text.startswith("/notify policy "):
+        scope = text[len("/notify policy ") :].strip().lower()
+        if scope not in ("all", "critical", "state_change"):
+            return "Usage: /notify policy all|critical|state_change", None
+
+        def _m(st: dict[str, Any]) -> None:
+            by_chat = st.get("notify_scope_by_chat")
+            if not isinstance(by_chat, dict):
+                by_chat = {}
+            by_chat[str(int(msg.chat_id))] = scope
+            st["notify_scope_by_chat"] = by_chat
+
+        _update_state(cfg, _m)
+        return f"Notify policy set to {scope} for chat {msg.chat_id}.", None
 
     if text.startswith("/notify "):
         payload = text[len("/notify ") :].strip()
@@ -10144,6 +10831,49 @@ def _send_orchestrator_result(
         prefer_voice = bool((task.trace or {}).get("prefer_voice_reply", False))
         force_notify = prefer_voice and bool(cfg.voice_out_enabled)
         notify = _should_notify() or force_notify
+        scope = _effective_notify_scope(cfg, chat_id=int(task.chat_id))
+        dedupe_cooldown = max(1, int(getattr(cfg, "notify_dedupe_cooldown_seconds", 300) or 300))
+        if (
+            notify
+            and scope == "state_change"
+            and bool(getattr(cfg, "notify_child_worker_completions", False))
+            and child_or_autonomous
+            and status == "ok"
+        ):
+            fingerprint = "|".join(
+                [
+                    str(task.chat_id),
+                    str(ticket_hint or task.parent_job_id or task.job_id),
+                    str(task.role or ""),
+                    str(status or ""),
+                    _first_line(summary, max_chars=220),
+                ]
+            )
+            now_ts = float(time.time())
+            suppressed = False
+
+            def _m(st: dict[str, Any]) -> None:
+                nonlocal suppressed
+                raw = st.get("notify_dedupe")
+                bucket = raw if isinstance(raw, dict) else {}
+                last_raw = bucket.get(fingerprint)
+                try:
+                    last = float(last_raw)
+                except Exception:
+                    last = 0.0
+                if last > 0 and (now_ts - last) < float(dedupe_cooldown):
+                    suppressed = True
+                    return
+                bucket[fingerprint] = now_ts
+                if len(bucket) > 600:
+                    # trim oldest-ish entries deterministically
+                    for k in list(bucket.keys())[:200]:
+                        bucket.pop(k, None)
+                st["notify_dedupe"] = bucket
+
+            _update_state(cfg, _m)
+            if suppressed:
+                return
 
         if notify:
             role_name = _humanize_orchestrator_role(task.role)
@@ -10553,6 +11283,16 @@ def orchestrator_worker_loop(
                     }
 
                     specs = parse_orchestrator_subtasks(getattr(result, "structured_digest", None))
+                    if specs:
+                        specs = _inject_local_specialist_specs(
+                            specs=specs,
+                            root_ticket=root_ticket,
+                            existing_keys=existing_keys,
+                            request_type=str(task.request_type or "task"),
+                            is_top_level_manual=bool(is_top_level_manual),
+                            proactive_lane=bool(task.trace.get("proactive_lane", False)),
+                            allow_delegation=bool(allow_delegation),
+                        )
                     current_plan_revision = 0
                     try:
                         current_plan_revision = int((task.trace or {}).get("plan_revision", 0) or 0)
