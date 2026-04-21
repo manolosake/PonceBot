@@ -221,6 +221,139 @@ class TestProactive3hAutofixMonitorSweep(unittest.TestCase):
             self.assertEqual(str(row[2]), "queued")
             self.assertEqual(str(row[3]), "autopilot")
 
+    def test_cancels_stale_blocked_only_job(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                """
+                CREATE TABLE ceo_orders (
+                    order_id TEXT PRIMARY KEY,
+                    chat_id INTEGER NOT NULL,
+                    title TEXT,
+                    body TEXT,
+                    status TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    updated_at REAL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    input_text TEXT NOT NULL,
+                    request_type TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    model TEXT NOT NULL,
+                    effort TEXT NOT NULL,
+                    mode_hint TEXT NOT NULL,
+                    requires_approval INTEGER NOT NULL DEFAULT 0,
+                    max_cost_window_usd REAL NOT NULL DEFAULT 0.0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    due_at REAL,
+                    state TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER,
+                    reply_to_message_id INTEGER,
+                    is_autonomous INTEGER NOT NULL DEFAULT 0,
+                    parent_job_id TEXT,
+                    owner TEXT,
+                    depends_on TEXT NOT NULL DEFAULT '[]',
+                    ttl_seconds INTEGER,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    max_retries INTEGER NOT NULL DEFAULT 0,
+                    labels TEXT NOT NULL DEFAULT '{}',
+                    requires_review INTEGER NOT NULL DEFAULT 0,
+                    artifacts_dir TEXT,
+                    blocked_reason TEXT,
+                    plan_revision INTEGER NOT NULL DEFAULT 0,
+                    stalled_since REAL,
+                    trace TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            order_id = "65b0b3ec-f69f-4c06-94df-572debf167a9"
+            conn.execute(
+                "INSERT INTO ceo_orders(order_id, chat_id, title, body, status, phase, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, 10, "Proactive Sprint", "[proactive: reliability]", "active", "review", 1.0),
+            )
+            conn.execute(
+                """
+                INSERT INTO jobs(
+                    job_id, source, role, input_text, request_type, priority, model, effort, mode_hint,
+                    requires_approval, max_cost_window_usd, created_at, updated_at, due_at, state, chat_id,
+                    user_id, reply_to_message_id, is_autonomous, parent_job_id, owner, depends_on, ttl_seconds,
+                    retry_count, max_retries, labels, requires_review, artifacts_dir, blocked_reason, plan_revision,
+                    stalled_since, trace
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "blocked-1",
+                    "autopilot",
+                    "backend",
+                    "stuck",
+                    "task",
+                    2,
+                    "gpt-5",
+                    "medium",
+                    "rw",
+                    0,
+                    2.0,
+                    -2000.0,
+                    -2000.0,
+                    None,
+                    "blocked",
+                    10,
+                    None,
+                    None,
+                    1,
+                    order_id,
+                    "autofix_monitor",
+                    "[]",
+                    None,
+                    0,
+                    0,
+                    "{}",
+                    0,
+                    None,
+                    "legacy_blocker",
+                    0,
+                    None,
+                    "{}",
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            class _Clock:
+                def __init__(self) -> None:
+                    self.now = 0.0
+
+                def __call__(self) -> float:
+                    self.now += 0.2
+                    return self.now
+
+            with (
+                mock.patch.object(monitor, "DB_PATH", db_path),
+                mock.patch.object(monitor, "_trigger_autopilot", return_value=0),
+                mock.patch.object(monitor.time, "time", side_effect=_Clock()),
+                mock.patch.object(monitor.time, "sleep", return_value=None),
+            ):
+                rc = monitor.run_monitor(duration_s=1, interval_s=0, log_path=Path(td) / "monitor.log")
+            self.assertEqual(rc, 0)
+
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute("SELECT state, blocked_reason FROM jobs WHERE job_id='blocked-1'").fetchone()
+            conn.close()
+            self.assertIsNotNone(row)
+            self.assertEqual(str(row[0]), "cancelled")
+            self.assertEqual(str(row[1]), "autofix_stale_blocked_only")
+
 
 if __name__ == "__main__":
     unittest.main()

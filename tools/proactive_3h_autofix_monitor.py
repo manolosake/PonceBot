@@ -14,6 +14,7 @@ ROOT = Path("/home/aponce/codexbot")
 DB_PATH = ROOT / "data" / "jobs.sqlite"
 DEFAULT_LOG = ROOT / "data" / "artifacts" / "proactive_health" / "autofix_monitor.log"
 OPEN_STATES = ("queued", "running", "waiting_deps", "blocked", "blocked_approval", "pending_review")
+STALE_BLOCKED_ONLY_AGE_S = 900.0
 
 
 def _ts() -> str:
@@ -266,6 +267,8 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
 
                 running_impl = [j for j in by_role.get("implementer_local", []) if str(j["state"] or "") == "running"]
                 running_arch = [j for j in by_role.get("architect_local", []) if str(j["state"] or "") == "running"]
+                blocked_only = [j for j in open_jobs if str(j["state"] or "") == "blocked"]
+                waiting_dep = [j for j in open_jobs if str(j["state"] or "") == "waiting_deps"]
 
                 # Strict WIP preference: keep implementer active and avoid parallel architect churn.
                 if running_impl and running_arch:
@@ -323,6 +326,29 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                     )
                     actions += 1
                     _log("requeue_stale_implementer", path=log_path, order_id=order_id, job_id=str(impl["job_id"]), age_s=int(age_s))
+
+                # FINAL SWEEP: when only blocked jobs remain (and none are waiting_deps), clear stale blockers.
+                if blocked_only and (len(blocked_only) == len(open_jobs)) and (not waiting_dep):
+                    for job in blocked_only:
+                        age_s = max(0.0, now - float(job["updated_at"] or job["created_at"] or now))
+                        if age_s < STALE_BLOCKED_ONLY_AGE_S:
+                            continue
+                        _update_job_state(
+                            conn,
+                            job_id=str(job["job_id"]),
+                            state="cancelled",
+                            blocked_reason="autofix_stale_blocked_only",
+                            result_summary=f"Autofix monitor cancelled stale blocked-only job after {int(age_s)}s to unblock proactive lane.",
+                            result_next_action="reseed_or_enqueue_followup",
+                        )
+                        actions += 1
+                        _log(
+                            "cancel_stale_blocked_only",
+                            path=log_path,
+                            order_id=order_id,
+                            job_id=str(job["job_id"]),
+                            age_s=int(age_s),
+                        )
 
                 conn.commit()
 
