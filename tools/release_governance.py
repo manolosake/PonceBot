@@ -55,6 +55,49 @@ def _new_pr_url(*, slug: str, head: str) -> str:
     return f"https://github.com/{slug}/pull/new/{head}"
 
 
+def _token_exact_in_text(text: str, token: str) -> bool:
+    t = (token or "").strip()
+    if not t:
+        return False
+    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(t)}(?![A-Za-z0-9_])", text or ""))
+
+
+def _order_token_from_branch(branch: str) -> str:
+    b = (branch or "").strip()
+    m = re.search(r"order-([0-9a-fA-F]{8})", b)
+    return f"order:{m.group(1).lower()}" if m else ""
+
+
+def _key_token_from_depends_on(depends_on: str) -> str:
+    d = (depends_on or "").strip()
+    if not d:
+        return ""
+    return d if d.startswith("key:") else f"key:{d}"
+
+
+def _traceability_count_from_log(log_text: str, *, order_token: str, key_token: str) -> int:
+    count = 0
+    for line in (log_text or "").splitlines():
+        if _token_exact_in_text(line, order_token) and _token_exact_in_text(line, key_token):
+            count += 1
+    return count
+
+
+def _load_depends_on_key(qa_result_path: Path | None) -> str:
+    if qa_result_path is None or (not qa_result_path.exists()):
+        return ""
+    try:
+        payload = json.loads(qa_result_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ""
+    dep = payload.get("depends_on")
+    if isinstance(dep, list) and dep:
+        return str(dep[0] or "").strip()
+    if isinstance(dep, str):
+        return dep.strip()
+    return ""
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -139,6 +182,7 @@ def main() -> int:
     ap.add_argument("--head", default="", help="head branch name (default: current branch)")
     ap.add_argument("--order-branch", default="", help="explicit order branch to prefer as release head")
     ap.add_argument("--artifacts-dir", default="", help="optional artifacts dir to write checklist files")
+    ap.add_argument("--qa-result", default="", help="optional path to qa_result.json")
     ap.add_argument("--run-tests", action="store_true", help="run python -m unittest -q as part of checklist")
     ap.add_argument("--require-pr", action="store_true", help="fail checklist if head==base")
     args = ap.parse_args()
@@ -173,6 +217,49 @@ def main() -> int:
 
     if args.require_pr:
         checks.append(Check("requires_pr_branch", head_branch != base_branch, f"head={head_branch} base={base_branch}"))
+
+    qa_result_path: Path | None = None
+    if args.qa_result:
+        qa_result_path = Path(args.qa_result).expanduser().resolve()
+    elif args.artifacts_dir:
+        cand = Path(args.artifacts_dir).expanduser().resolve() / "qa_result.json"
+        if cand.exists():
+            qa_result_path = cand
+    dep_key = _load_depends_on_key(qa_result_path)
+    if dep_key:
+        order_token = _order_token_from_branch(head_branch)
+        key_token = _key_token_from_depends_on(dep_key)
+        head_body = _run(["git", "log", "-1", "--pretty=%B", "HEAD"], cwd=root)
+        head_tokens_ok = bool(
+            order_token
+            and key_token
+            and _token_exact_in_text(head_body, order_token)
+            and _token_exact_in_text(head_body, key_token)
+        )
+        checks.append(
+            Check(
+                "traceability_head_tokens_match",
+                head_tokens_ok,
+                f"order_token={order_token or '<missing>'} key_token={key_token or '<missing>'}",
+            )
+        )
+        tl = _run(
+            [
+                "git",
+                "log",
+                "--all-match",
+                "--oneline",
+                "--grep",
+                order_token,
+                "--grep",
+                key_token,
+                "-n",
+                "200",
+            ],
+            cwd=root,
+        )
+        tcount = _traceability_count_from_log(tl, order_token=order_token, key_token=key_token)
+        checks.append(Check("traceability_count_positive", tcount > 0, f"count={tcount}"))
 
     ok_all = all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)
 
