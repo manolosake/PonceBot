@@ -15,6 +15,7 @@ DB_PATH = ROOT / "data" / "jobs.sqlite"
 DEFAULT_LOG = ROOT / "data" / "artifacts" / "proactive_health" / "autofix_monitor.log"
 OPEN_STATES = ("queued", "running", "waiting_deps", "blocked", "blocked_approval", "pending_review")
 STALE_BLOCKED_ONLY_AGE_S = 900.0
+STALE_BLOCKED_UNKNOWN_AGE_S = 300.0
 
 
 def _ts() -> str:
@@ -141,6 +142,16 @@ def _extract_waiting_job_id(blocked_reason: str) -> str:
         if txt.startswith(prefix):
             return txt[len(prefix) :].strip()
     return ""
+
+
+def _blocked_cleanup_age_threshold(blocked_reason: str) -> float:
+    # Structured blocker reasons are granted more time; unknown blockers clear faster.
+    if _extract_waiting_job_id(blocked_reason):
+        return STALE_BLOCKED_ONLY_AGE_S
+    txt = str(blocked_reason or "").strip().lower()
+    if txt in ("", "unknown_blocker", "legacy_blocker", "approval_timeout"):
+        return STALE_BLOCKED_UNKNOWN_AGE_S
+    return STALE_BLOCKED_ONLY_AGE_S
 
 
 def _job_is_terminal(conn: sqlite3.Connection, *, job_id: str) -> bool:
@@ -451,14 +462,15 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                             continue
 
                         age_s = max(0.0, now - float(job["updated_at"] or job["created_at"] or now))
-                        if age_s < STALE_BLOCKED_ONLY_AGE_S:
+                        threshold_s = _blocked_cleanup_age_threshold(blocked_reason)
+                        if age_s < threshold_s:
                             continue
                         _update_job_state(
                             conn,
                             job_id=job_id,
                             state="cancelled",
                             blocked_reason="autofix_stale_blocked_only",
-                            result_summary=f"Autofix monitor cancelled stale blocked-only job after {int(age_s)}s to unblock proactive lane.",
+                            result_summary=f"Autofix monitor cancelled stale blocked-only job after {int(age_s)}s (threshold {int(threshold_s)}s) to unblock proactive lane.",
                             result_next_action="reseed_or_enqueue_followup",
                         )
                         actions += 1
