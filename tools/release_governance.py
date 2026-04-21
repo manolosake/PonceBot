@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -54,6 +55,39 @@ def _new_pr_url(*, slug: str, head: str) -> str:
     return f"https://github.com/{slug}/pull/new/{head}"
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_branch: str) -> str:
+    requested = (explicit_head or order_branch or "").strip()
+    if requested:
+        # Accept local branch, local ref, or remote branch.
+        candidates = [
+            requested,
+            f"refs/heads/{requested}",
+            f"refs/remotes/{remote}/{requested}",
+        ]
+        for cand in candidates:
+            rc, _out, _err = _try_run(["git", "rev-parse", "--verify", "--quiet", cand], cwd=repo)
+            if rc == 0:
+                return requested
+        # Try fetching the requested branch from remote explicitly, then verify again.
+        _try_run(["git", "fetch", "--prune", remote, requested], cwd=repo)
+        rc, _out, _err = _try_run(["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{requested}"], cwd=repo)
+        if rc == 0:
+            return requested
+        raise RuntimeError(f"unable to resolve head branch ref: {requested}")
+    return _run(["git", "branch", "--show-current"], cwd=repo).strip()
+
+
 @dataclass(frozen=True)
 class Check:
     key: str
@@ -103,6 +137,7 @@ def main() -> int:
     ap.add_argument("--remote", default="origin", help="remote name (default: origin)")
     ap.add_argument("--base", default="main", help="base branch name (default: main)")
     ap.add_argument("--head", default="", help="head branch name (default: current branch)")
+    ap.add_argument("--order-branch", default="", help="explicit order branch to prefer as release head")
     ap.add_argument("--artifacts-dir", default="", help="optional artifacts dir to write checklist files")
     ap.add_argument("--run-tests", action="store_true", help="run python -m unittest -q as part of checklist")
     ap.add_argument("--require-pr", action="store_true", help="fail checklist if head==base")
@@ -112,9 +147,12 @@ def main() -> int:
     root = _git_root(repo)
 
     # Determine branches.
-    head_branch = (args.head or "").strip()
-    if not head_branch:
-        head_branch = _run(["git", "branch", "--show-current"], cwd=root).strip()
+    head_branch = _resolve_head_branch(
+        repo=root,
+        remote=args.remote,
+        explicit_head=(args.head or "").strip(),
+        order_branch=(args.order_branch or "").strip(),
+    )
     base_branch = (args.base or "main").strip()
 
     remote_url = _run(["git", "remote", "get-url", args.remote], cwd=root)
@@ -158,23 +196,61 @@ def main() -> int:
         "ok": bool(ok_all),
         "pr_compare_url": pr_compare,
         "pr_new_url": pr_new,
+        "order_branch_requested": (args.order_branch or "").strip() or None,
     }
 
     artifacts_dir = Path(args.artifacts_dir).expanduser().resolve() if args.artifacts_dir else None
     if artifacts_dir:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        (artifacts_dir / "RELEASE_CHECKLIST.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        checklist_path = artifacts_dir / "RELEASE_CHECKLIST.json"
+        checklist_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if pr_compare:
             (artifacts_dir / "PR_URL.txt").write_text(pr_compare + "\n", encoding="utf-8")
         if diffstat:
             (artifacts_dir / "DIFFSTAT.txt").write_text(diffstat + "\n", encoding="utf-8")
+        changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=root)
+        (artifacts_dir / "CHANGED_FILES.txt").write_text((changed + "\n") if changed else "(none)\n", encoding="utf-8")
+
+        required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt"]
+        present_non_empty = []
+        for p in required:
+            present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
+        pr_targets_head = bool(pr_compare and (f"...{head_branch}?" in pr_compare))
+        final_checks = {
+            "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
+            "pr_url_targets_head": bool(pr_targets_head),
+            "required_artifacts_non_empty": bool(all(present_non_empty)),
+        }
+        final_ok = bool(all(final_checks.values()))
+        payload["final_validation"] = {
+            "ok": final_ok,
+            "checks": final_checks,
+            "validated_at": _utc_iso(),
+        }
+        payload["ok"] = bool(final_ok)
+        checklist_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (artifacts_dir / "FINAL_VALIDATION.json").write_text(
+            json.dumps(payload["final_validation"], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        manifest = {
+            "generated_at": _utc_iso(),
+            "files": [],
+        }
+        for p in sorted(artifacts_dir.iterdir()):
+            if p.is_file():
+                manifest["files"].append(
+                    {
+                        "name": p.name,
+                        "size": int(p.stat().st_size),
+                        "sha256": _sha256_file(p),
+                    }
+                )
+        (artifacts_dir / "FINAL_MANIFEST.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    return 0 if ok_all else 2
+    return 0 if bool(payload.get("ok")) else 2
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
