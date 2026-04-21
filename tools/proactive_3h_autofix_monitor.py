@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +114,58 @@ def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
         (now, order_id),
     )
     return int(cur.rowcount or 0) > 0
+
+
+def _enqueue_fallback_followup(conn: sqlite3.Connection, *, order_id: str, chat_id: int) -> str:
+    now = float(time.time())
+    job_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            job_id, source, role, input_text, request_type, priority, model, effort, mode_hint,
+            requires_approval, max_cost_window_usd, created_at, updated_at, due_at, state,
+            chat_id, user_id, reply_to_message_id, is_autonomous, parent_job_id, owner,
+            depends_on, ttl_seconds, retry_count, max_retries, labels, requires_review,
+            artifacts_dir, blocked_reason, plan_revision, stalled_since, trace
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            "autopilot",
+            "architect_local",
+            "Fallback proactive reseed: synthesize one concrete reliability improvement with tests and evidence.",
+            "task",
+            2,
+            "gpt-5",
+            "medium",
+            "rw",
+            0,
+            2.0,
+            now,
+            now,
+            None,
+            "queued",
+            int(chat_id),
+            None,
+            None,
+            1,
+            order_id,
+            "autofix_monitor",
+            "[]",
+            None,
+            0,
+            0,
+            json.dumps({"kind": "proactive_fallback", "order_id": order_id}),
+            0,
+            None,
+            None,
+            0,
+            None,
+            json.dumps({"result_next_action": "execute_fallback_followup"}),
+        ),
+    )
+    return job_id
 
 
 def _update_job_state(
@@ -275,8 +328,8 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
 
                 # Keep proactive lane moving if no open work exists.
                 refreshed_open = _open_children(conn, order_id=order_id)
-                if not refreshed_open and chat_id > 0:
-                    created = _trigger_autopilot(chat_id, log_path=log_path)
+                if not refreshed_open:
+                    created = _trigger_autopilot(chat_id, log_path=log_path) if chat_id > 0 else 0
                     if created:
                         actions += int(created)
                         _log("autopilot_reseed", path=log_path, order_id=order_id, created=int(created))
@@ -290,6 +343,17 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                                 path=log_path,
                                 order_id=order_id,
                                 terminal_children=terminal_count,
+                            )
+                        else:
+                            followup_job_id = _enqueue_fallback_followup(conn, order_id=order_id, chat_id=chat_id)
+                            conn.commit()
+                            actions += 1
+                            refreshed_open = _open_children(conn, order_id=order_id)
+                            _log(
+                                "enqueued_fallback_followup",
+                                path=log_path,
+                                order_id=order_id,
+                                job_id=followup_job_id,
                             )
                 _log(
                     "loop_status",
