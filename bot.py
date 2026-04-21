@@ -6180,6 +6180,16 @@ def _autopilot_tick(
     - The Jarvis job is labeled `kind=autopilot` and is allowed to delegate.
     """
     created = 0
+    try:
+        created += _jarvis_final_sweep_tick(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            now=now,
+        )
+    except Exception:
+        LOG.exception("Final sweep tick failed")
+
     orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=30)
     if not orders:
         return 0
@@ -6295,6 +6305,122 @@ def _autopilot_tick(
         if created >= 1:
             break
 
+    return created
+
+
+def _jarvis_final_sweep_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    now: float,
+) -> int:
+    """
+    Guardrail for idle active orders:
+    when an order has no live children and has been idle long enough, enqueue a single
+    bounded FINAL SWEEP task so the lane either closes the order or enqueues one next step.
+    """
+    del profiles  # currently unused; kept for forward compatibility with scheduler tick signature
+    try:
+        stale_after_s = max(60.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300"))
+    except Exception:
+        stale_after_s = 300.0
+    try:
+        cooldown_s = max(60.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "600").strip() or "600"))
+    except Exception:
+        cooldown_s = 600.0
+
+    open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    terminal_states = {"done", "failed", "cancelled", "blocked"}
+    created = 0
+    try:
+        orders = orch_q.list_orders_global(status="active", limit=100)
+    except Exception:
+        # Fallback for older queue implementations that might not expose global listing.
+        orders = orch_q.list_orders(chat_id=1, status="active", limit=100)
+
+    for o in orders:
+        oid = str(o.get("order_id") or "").strip()
+        if not oid:
+            continue
+        chat_id = int(o.get("chat_id") or 0) or 1
+        children = orch_q.jobs_by_parent(parent_job_id=oid, limit=300)
+        if any(str(c.state or "").strip().lower() in open_states for c in children):
+            continue
+
+        recent_sweep = False
+        for c in children:
+            if str((c.labels or {}).get("kind") or "").strip().lower() != "final_sweep":
+                continue
+            age_s = max(0.0, float(now) - float(c.updated_at or c.created_at or now))
+            if age_s < cooldown_s:
+                recent_sweep = True
+                break
+        if recent_sweep:
+            continue
+
+        root = orch_q.get_job(oid)
+        if root is None:
+            continue
+        root_age_s = max(0.0, float(now) - float(root.updated_at or root.created_at or now))
+        if root_age_s < stale_after_s:
+            continue
+
+        terminal_children = [c for c in children if str(c.state or "").strip().lower() in terminal_states]
+        last_child_ts = 0.0
+        for c in terminal_children:
+            try:
+                last_child_ts = max(last_child_ts, float(c.updated_at or c.created_at or 0.0))
+            except Exception:
+                continue
+        child_idle_s = int(max(0.0, float(now) - last_child_ts)) if last_child_ts > 0 else int(root_age_s)
+
+        pr = o.get("priority")
+        try:
+            pr_i = int(pr) if pr is not None else 2
+        except Exception:
+            pr_i = 2
+        pr_i = max(1, min(3, pr_i))
+
+        job_id = str(uuid.uuid4())
+        text = (
+            "FINAL SWEEP\n"
+            f"Order/Ticket: {oid}\n"
+            "Reason: idle_no_open_jobs\n"
+            f"Terminal child jobs: {len(terminal_children)}\n"
+            f"Last child activity age (s): {child_idle_s}\n"
+            "Action required:\n"
+            "- Do not leave this order active with zero live jobs.\n"
+            "- Either close the order if work is complete, or enqueue exactly one bounded next-step job.\n"
+        )
+        t = Task.new(
+            source="telegram",
+            role="jarvis",
+            input_text=text,
+            request_type="maintenance",
+            priority=int(pr_i),
+            model="",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            is_autonomous=True,
+            parent_job_id=oid,
+            owner="scheduler",
+            labels={"ticket": oid, "kind": "final_sweep", "order": oid},
+            artifacts_dir=str((cfg.artifacts_root / job_id).resolve()),
+            trace={
+                "source": "scheduler",
+                "autopilot": True,
+                "allow_delegation": True,
+                "order_id": oid,
+                "final_sweep_reason": "idle_no_open_jobs",
+            },
+            job_id=job_id,
+        )
+        orch_q.submit_task(t)
+        created += 1
     return created
 
 
