@@ -117,7 +117,7 @@ def _recent_cancelled_blocked_cleanup_count(conn: sqlite3.Connection, *, order_i
             FROM jobs
             WHERE parent_job_id=?
               AND state='cancelled'
-              AND blocked_reason IN ('autofix_stale_blocked_only', 'autofix_superseded_blocker')
+              AND blocked_reason IN ('autofix_stale_blocked_only', 'autofix_superseded_blocker', 'autofix_superseded_by_newer_terminal')
               AND updated_at>=?
             """,
             (order_id, since),
@@ -149,6 +149,27 @@ def _job_is_terminal(conn: sqlite3.Connection, *, job_id: str) -> bool:
         return False
     state = str(row["state"] or "").strip().lower()
     return state not in OPEN_STATES
+
+
+def _is_superseded_by_newer_terminal_same_role(
+    conn: sqlite3.Connection,
+    *,
+    order_id: str,
+    role: str,
+    created_at: float,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM jobs
+        WHERE parent_job_id=?
+          AND role=?
+          AND created_at>?
+          AND state NOT IN ({})
+        """.format(",".join("?" for _ in OPEN_STATES)),
+        (order_id, role, float(created_at), *OPEN_STATES),
+    ).fetchone()
+    return int((row["c"] if row is not None else 0) or 0) > 0
 
 
 def _close_order_done(conn: sqlite3.Connection, *, order_id: str) -> bool:
@@ -374,6 +395,8 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                 if blocked_only and (len(blocked_only) == len(open_jobs)) and (not waiting_dep):
                     for job in blocked_only:
                         job_id = str(job["job_id"] or "")
+                        role = str(job["role"] or "")
+                        created_at = float(job["created_at"] or now)
                         blocked_reason = _job_blocked_reason(conn, job_id=job_id)
                         waiting_job_id = _extract_waiting_job_id(blocked_reason)
                         if waiting_job_id and _job_is_terminal(conn, job_id=waiting_job_id):
@@ -392,6 +415,30 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                                 order_id=order_id,
                                 job_id=job_id,
                                 dependency_job_id=waiting_job_id,
+                            )
+                            continue
+
+                        if _is_superseded_by_newer_terminal_same_role(
+                            conn,
+                            order_id=order_id,
+                            role=role,
+                            created_at=created_at,
+                        ):
+                            _update_job_state(
+                                conn,
+                                job_id=job_id,
+                                state="cancelled",
+                                blocked_reason="autofix_superseded_by_newer_terminal",
+                                result_summary=f"Autofix monitor cancelled blocked job because a newer terminal job exists for role={role or 'unknown'}.",
+                                result_next_action="reseed_or_enqueue_followup",
+                            )
+                            actions += 1
+                            _log(
+                                "cancel_superseded_by_newer_terminal",
+                                path=log_path,
+                                order_id=order_id,
+                                job_id=job_id,
+                                role=role or "unknown",
                             )
                             continue
 
