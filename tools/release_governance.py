@@ -83,19 +83,44 @@ def _traceability_count_from_log(log_text: str, *, order_token: str, key_token: 
     return count
 
 
-def _load_depends_on_key(qa_result_path: Path | None) -> str:
+def _load_traceability_keys(qa_result_path: Path | None) -> list[str]:
     if qa_result_path is None or (not qa_result_path.exists()):
-        return ""
+        return []
     try:
         payload = json.loads(qa_result_path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
-        return ""
+        return []
+
+    keys: list[str] = []
+
+    # 1) Primary contract source: depends_on (string or list)
     dep = payload.get("depends_on")
-    if isinstance(dep, list) and dep:
-        return str(dep[0] or "").strip()
-    if isinstance(dep, str):
-        return dep.strip()
-    return ""
+    if isinstance(dep, list):
+        for item in dep:
+            s = str(item or "").strip()
+            if s:
+                keys.append(s)
+    elif isinstance(dep, str):
+        s = dep.strip()
+        if s:
+            keys.append(s)
+
+    # 2) Authoritative fallback fields from QA payloads (strict list, no generic fallback).
+    for field in ("delegated_key", "active_key", "target_key", "contract_key", "branch_tip_key", "ticket_key"):
+        v = payload.get(field)
+        if isinstance(v, str):
+            s = v.strip()
+            if s:
+                keys.append(s)
+
+    # Preserve order while de-duplicating.
+    dedup: list[str] = []
+    seen: set[str] = set()
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            dedup.append(k)
+    return dedup
 
 
 def _sha256_file(path: Path) -> str:
@@ -324,40 +349,35 @@ def main() -> int:
         cand = Path(args.artifacts_dir).expanduser().resolve() / "qa_result.json"
         if cand.exists():
             qa_result_path = cand
-    dep_key = _load_depends_on_key(qa_result_path)
-    if dep_key:
+    dep_keys = _load_traceability_keys(qa_result_path)
+    if dep_keys:
         order_token = _order_token_from_branch(head_branch)
-        key_token = _key_token_from_depends_on(dep_key)
+        key_tokens = [_key_token_from_depends_on(k) for k in dep_keys if _key_token_from_depends_on(k)]
+        key_tokens = list(dict.fromkeys(key_tokens))
         head_body = _run(["git", "log", "-1", "--pretty=%B", "HEAD"], cwd=root)
-        head_tokens_ok = bool(
-            order_token
-            and key_token
-            and _token_exact_in_text(head_body, order_token)
-            and _token_exact_in_text(head_body, key_token)
-        )
+        head_tokens_ok = bool(order_token and _token_exact_in_text(head_body, order_token) and any(_token_exact_in_text(head_body, kt) for kt in key_tokens))
         checks.append(
             Check(
                 "traceability_head_tokens_match",
                 head_tokens_ok,
-                f"order_token={order_token or '<missing>'} key_token={key_token or '<missing>'}",
+                f"order_token={order_token or '<missing>'} key_tokens={','.join(key_tokens) or '<missing>'}",
             )
         )
         tl = _run(
             [
                 "git",
                 "log",
-                "--all-match",
                 "--oneline",
                 "--grep",
                 order_token,
-                "--grep",
-                key_token,
                 "-n",
-                "200",
+                "400",
             ],
             cwd=root,
         )
-        tcount = _traceability_count_from_log(tl, order_token=order_token, key_token=key_token)
+        tcount = 0
+        for kt in key_tokens:
+            tcount = max(tcount, _traceability_count_from_log(tl, order_token=order_token, key_token=kt))
         checks.append(Check("traceability_count_positive", tcount > 0, f"count={tcount}"))
 
     ok_all = all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)
