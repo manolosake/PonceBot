@@ -5,6 +5,7 @@ import time
 import subprocess
 import unittest
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -265,6 +266,20 @@ class TestLocalAutonomyFlow(unittest.TestCase):
                     attempt_n=1,
                 )
                 self.assertEqual(klass, "terminal")
+
+    def test_local_autonomy_helpers_are_not_shadowed_by_duplicate_defs(self) -> None:
+        source = Path(bot.__file__).read_text(encoding="utf-8")
+        helpers = (
+            "_classify_local_slice_failure",
+            "_collect_order_local_autonomy_funnel",
+            "_prune_local_specs_against_active_backlog",
+        )
+        for helper in helpers:
+            with self.subTest(helper=helper):
+                self.assertEqual(
+                    len(re.findall(rf"^def {re.escape(helper)}\(", source, flags=re.MULTILINE)),
+                    1,
+                )
 
     def test_failure_class_local_env_blockers_are_terminal_immediately(self) -> None:
         cases = (
