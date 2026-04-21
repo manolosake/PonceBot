@@ -1593,3 +1593,30 @@ class TestVoiceNormalization(unittest.TestCase):
         out = bot._normalize_tts_speak_text("rebase y merge en branch main", backend="piper")
         self.assertIn("rei beis", out.lower())
         self.assertIn("merch", out.lower())
+
+
+class TestWorktreeSyncHygiene(unittest.TestCase):
+    def test_sync_worktree_resets_and_cleans_before_branch_sync(self) -> None:
+        calls: list[list[str]] = []
+
+        def _ok(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def _fake_run_git(repo: Path, args: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> SimpleNamespace:
+            del repo, check, env
+            calls.append(list(args))
+            return _ok()
+
+        with patch.object(bot, "_git_ensure_branch_from_main", return_value=(True, "already_exists")):
+            with patch.object(bot, "_run_git", side_effect=_fake_run_git):
+                ok, msg = bot._sync_worktree_to_order_branch(
+                    base_repo=Path("/tmp/base"),
+                    worktree_dir=Path("/tmp/wt"),
+                    order_branch="feature/order-9cbd96bf-proactive-sprint-codexbot-reliability-",
+                )
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "synced")
+        self.assertIn(["reset", "--hard"], calls)
+        self.assertIn(["clean", "-fdx"], calls)
+        self.assertLess(calls.index(["reset", "--hard"]), calls.index(["fetch", "origin", "refs/heads/feature/order-9cbd96bf-proactive-sprint-codexbot-reliability-:refs/remotes/origin/feature/order-9cbd96bf-proactive-sprint-codexbot-reliability-"]))

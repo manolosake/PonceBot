@@ -4272,6 +4272,16 @@ def _sync_worktree_to_order_branch(
     if not ok:
         return False, f"ensure_branch_failed:{msg}"
 
+    # Hygiene guard: clear tracked/untracked worktree state before any branch sync steps.
+    pre_reset = _run_git(worktree_dir, ["reset", "--hard"], check=False)
+    if pre_reset.returncode != 0:
+        err = (pre_reset.stderr or pre_reset.stdout or "").strip()
+        return False, f"pre_reset_failed:{err or 'unknown'}"
+    pre_clean = _run_git(worktree_dir, ["clean", "-fdx"], check=False)
+    if pre_clean.returncode != 0:
+        err = (pre_clean.stderr or pre_clean.stdout or "").strip()
+        return False, f"pre_clean_failed:{err or 'unknown'}"
+
     # Some repos use narrow fetch refspecs; fetch branch explicitly to guarantee local visibility.
     f = _run_git(
         worktree_dir,
