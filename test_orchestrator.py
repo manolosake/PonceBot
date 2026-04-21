@@ -235,6 +235,23 @@ class TestDelegationParsing(unittest.TestCase):
         self.assertEqual(int(s.eta_minutes or 0), 95)
         self.assertEqual(s.sla_tier, "high")
 
+    def test_orchestrator_subtasks_normalize_key_alignment(self) -> None:
+        specs = parse_orchestrator_subtasks(
+            {
+                "subtasks": [
+                    {
+                        "key": " Ship API ",
+                        "role": "backend",
+                        "text": "Implement endpoint",
+                        "depends_on": [" ARCH ", " Ship API "],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].key, "ship_api")
+        self.assertEqual(specs[0].depends_on, ["arch"])
+
 
 class TestOrchestratorEvidenceGate(unittest.TestCase):
     def test_backend_requires_meaningful_evidence(self) -> None:

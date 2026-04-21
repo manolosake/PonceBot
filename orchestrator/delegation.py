@@ -3,11 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 import json
+import re
 
 
 _ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local")
 _ALLOWED_MODES = ("ro", "rw", "full")
 _ALLOWED_SLA = ("normal", "high", "urgent")
+
+
+def _normalize_spec_key(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return re.sub(r"[^a-z0-9_.-]+", "_", raw).strip("_")
 
 
 @dataclass(frozen=True)
@@ -73,7 +81,7 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
     for raw in items:
         if not isinstance(raw, dict):
             continue
-        key = str(raw.get("key") or "").strip()
+        key = _normalize_spec_key(raw.get("key"))
         role = str(raw.get("role") or "").strip().lower()
         text = str(raw.get("text") or "").strip()
         if not key or not text:
@@ -103,7 +111,8 @@ def parse_jarvis_subtasks(structured: dict[str, Any] | str | None) -> list[TaskS
         deps_raw = raw.get("depends_on") or []
         deps: list[str] = []
         if isinstance(deps_raw, list):
-            deps = [str(x).strip() for x in deps_raw if str(x).strip()]
+            deps = [_normalize_spec_key(x) for x in deps_raw]
+            deps = [x for x in deps if x and x != key]
 
         requires_approval = bool(raw.get("requires_approval", False))
         if mode == "full":
