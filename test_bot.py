@@ -1542,6 +1542,46 @@ class TestDiffExtraction(unittest.TestCase):
         self.assertIn("diff --git a/bar.txt b/bar.txt", out)
         self.assertIn("+after", out)
 
+    def test_extract_changed_files_from_patch_text_uses_diff_headers(self) -> None:
+        patch = (
+            "diff --git a/foo.py b/foo.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/foo.py\n"
+            "+++ b/foo.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/bar/baz.txt b/bar/baz.txt\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/bar/baz.txt\n"
+            "+++ b/bar/baz.txt\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+        self.assertEqual(
+            bot._extract_changed_files_from_patch_text(patch),
+            ["foo.py", "bar/baz.txt"],
+        )
+
+    def test_extract_changed_files_from_patch_text_falls_back_to_plus_markers(self) -> None:
+        patch = (
+            "--- a/alpha.txt\n"
+            "+++ b/alpha.txt\n"
+            "@@ -1 +1 @@\n"
+            "-x\n"
+            "+y\n"
+            "--- a/beta.txt\n"
+            "+++ b/beta.txt\n"
+            "@@ -1 +1 @@\n"
+            "-m\n"
+            "+n\n"
+        )
+        self.assertEqual(
+            bot._extract_changed_files_from_patch_text(patch),
+            ["alpha.txt", "beta.txt"],
+        )
+
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:

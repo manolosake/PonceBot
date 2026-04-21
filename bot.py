@@ -6649,12 +6649,37 @@ def _should_ignore_cancelled_local_failure(
 
 def _extract_first_diff_block(text: str) -> str:
     s = str(text or "")
-    fence_re = re.compile(r"```(?:patch|udiff)\\n(.*?)```", re.IGNORECASE | re.DOTALL)
+    fence_re = re.compile(r"```(?:patch|udiff)\n(.*?)```", re.IGNORECASE | re.DOTALL)
     for m in fence_re.finditer(s):
         block = str(m.group(1) or "").strip()
         if "diff --git " in block:
             return block
     return ""
+
+
+def _extract_changed_files_from_patch_text(text: str) -> list[str]:
+    patch = str(text or "")
+    if not patch.strip():
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    # Prefer canonical `diff --git a/... b/...` headers.
+    for m in re.finditer(r"^diff --git a/(.+?) b/(.+?)$", patch, flags=re.MULTILINE):
+        path = str(m.group(2) or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    if out:
+        return out
+    # Fallback for partial patches containing only file markers.
+    for m in re.finditer(r"^\+\+\+\s+b/(.+)$", patch, flags=re.MULTILINE):
+        path = str(m.group(1) or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
 
 
 def _compose_subtask_instruction(spec: TaskSpec, *, root_ticket: str) -> str:
