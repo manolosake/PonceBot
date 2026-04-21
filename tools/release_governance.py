@@ -232,6 +232,29 @@ def _git_diffstat(repo: Path, *, base_ref: str, head_ref: str) -> str:
     return _run(["git", "diff", "--stat", f"{base_ref}..{head_ref}"], cwd=repo)
 
 
+def _collect_diff_capture(
+    repo: Path,
+    *,
+    base_ref: str,
+    head_ref: str,
+    ahead: int,
+    behind: int,
+    working_tree_dirty: bool,
+) -> tuple[str, str, str]:
+    """
+    Return (basis, diffstat, changed_files) using one consistent comparison basis.
+    """
+    if ahead or behind:
+        diffstat = _run(["git", "diff", "--stat", f"{base_ref}..{head_ref}"], cwd=repo)
+        changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=repo)
+        return "branch", diffstat, changed
+    if working_tree_dirty:
+        diffstat = _run(["git", "diff", "--stat", "HEAD"], cwd=repo)
+        changed = _run(["git", "diff", "--name-only", "HEAD"], cwd=repo)
+        return "working_tree", diffstat, changed
+    return "none", "", ""
+
+
 def _run_unit_tests(repo: Path) -> Check:
     rc, out, err = _try_run([sys.executable, "-m", "unittest", "-q"], cwd=repo)
     ok = (rc == 0)
@@ -278,7 +301,15 @@ def main() -> int:
     # Ensure base ref exists.
     _run(["git", "fetch", args.remote, base_branch], cwd=root)
     ahead, behind = _git_ahead_behind(root, base_ref=base_ref, head_ref=head_ref)
-    diffstat = _git_diffstat(root, base_ref=base_ref, head_ref=head_ref) if (ahead or behind) else ""
+    working_tree_dirty = not checks[0].ok
+    diff_basis, diffstat, changed = _collect_diff_capture(
+        root,
+        base_ref=base_ref,
+        head_ref=head_ref,
+        ahead=ahead,
+        behind=behind,
+        working_tree_dirty=working_tree_dirty,
+    )
 
     if args.require_pr:
         checks.append(Check("requires_pr_branch", head_branch != base_branch, f"head={head_branch} base={base_branch}"))
@@ -343,6 +374,7 @@ def main() -> int:
         "base_ref": base_ref,
         "ahead_commits": int(ahead),
         "behind_commits": int(behind),
+        "diff_basis": diff_basis,
         "diffstat": diffstat,
         "checks": [{"key": c.key, "ok": bool(c.ok), "details": c.details} for c in checks],
         "ok": bool(ok_all),
@@ -363,7 +395,6 @@ def main() -> int:
                 _atomic_write_text(artifacts_dir / "PR_URL.txt", pr_compare + "\n")
             if diffstat:
                 _atomic_write_text(artifacts_dir / "DIFFSTAT.txt", diffstat + "\n")
-            changed = _run(["git", "diff", "--name-only", f"{base_ref}..{head_ref}"], cwd=root)
             _atomic_write_text(artifacts_dir / "CHANGED_FILES.txt", (changed + "\n") if changed else "(none)\n")
 
             required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt"]
