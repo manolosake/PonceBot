@@ -22,7 +22,8 @@ def _log(msg: str, *, path: Path, **fields: Any) -> None:
     payload = {"ts": _ts(), "msg": msg, **fields}
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=True)
-    path.write_text((path.read_text(encoding="utf-8") if path.exists() else "") + line + "\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
     print(line, flush=True)
 
 
