@@ -214,6 +214,55 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(funnel["slices_closed"], 1)
         self.assertTrue(funnel["improvement_verified"])
 
+    def test_funnel_ignores_non_controller_improvement_flags_for_closure(self) -> None:
+        td, q = self._queue()
+        self.addCleanup(td.cleanup)
+        order_id = "44444444-4444-4444-4444-444444444444"
+        slice_id = "slice_delta"
+
+        impl = _new_task(role="implementer_local", parent_job_id=order_id, key=f"local_impl_guard_{slice_id}")
+        q.submit_task(impl)
+        q.update_state(
+            impl.job_id,
+            "done",
+            result_summary="validated implementation",
+            slice_id=slice_id,
+            slice_status="validated",
+            quality_gate_status="validated",
+            failure_class="retriable",
+            attempt_n=1,
+            slice_patch_applied=True,
+            slice_validation_ok=True,
+        )
+        rev = _new_task(role="reviewer_local", parent_job_id=order_id, key=f"local_review_guard_{slice_id}")
+        q.submit_task(rev)
+        q.update_state(
+            rev.job_id,
+            "done",
+            result_summary="READY with evidence",
+            slice_id=slice_id,
+            slice_status="reviewed_ready",
+            quality_gate_status="reviewed_ready",
+            failure_class="retriable",
+            attempt_n=1,
+        )
+
+        # Non-controller role must not satisfy controller verification gate.
+        backend_job = _new_task(role="backend", parent_job_id=order_id, key="backend_signal")
+        q.submit_task(backend_job)
+        q.update_state(
+            backend_job.job_id,
+            "done",
+            result_summary="VERIFIED_IMPROVEMENT",
+            slice_id=slice_id,
+            improvement_verified=True,
+        )
+
+        funnel = bot._collect_order_local_autonomy_funnel(orch_q=q, root_ticket=order_id, now=time.time())
+        self.assertEqual(funnel["slices_validated"], 1)
+        self.assertEqual(funnel["slices_closed"], 0)
+        self.assertFalse(funnel["improvement_verified"])
+
     def test_failure_class_patch_apply_errors_retry_once_then_terminal(self) -> None:
         msg = "patch apply failed: hunk error"
         first = bot._classify_local_slice_failure(

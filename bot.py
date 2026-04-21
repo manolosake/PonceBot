@@ -6880,7 +6880,8 @@ def _collect_order_local_autonomy_funnel(*, orch_q: OrchestratorQueue, root_tick
     controller_without_slice = False
 
     for c in children:
-        role = _coerce_orchestrator_role(str(c.role or ""))
+        raw_role = str(c.role or "").strip().lower()
+        role = _coerce_orchestrator_role(raw_role)
         tr = dict(c.trace or {})
         sid = str(tr.get("slice_id") or "").strip()
         if role == "implementer_local" and sid:
@@ -6891,10 +6892,11 @@ def _collect_order_local_autonomy_funnel(*, orch_q: OrchestratorQueue, root_tick
         elif role == "reviewer_local" and sid:
             st = slices.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
             st["reviewed_ready"] = str(tr.get("slice_status") or "").strip().lower() == "reviewed_ready" or "ready" in str(getattr(c, "result_summary", "") or "").strip().lower()
-        # Controller role aliases can vary by lane/profile; treat explicit
-        # improvement evidence as authoritative regardless of role label.
+        # Require controller identity for verification to avoid false positives
+        # from implementer/reviewer/backend jobs carrying improvement flags.
+        is_controller = role == "jarvis" or raw_role in {"jarvis", "skynet", "ceo", "orchestrator"}
         improved = bool(tr.get("improvement_verified", False)) or "verified_improvement" in str(getattr(c, "result_summary", "") or "").strip().lower()
-        if improved:
+        if is_controller and improved:
             if sid:
                 st = slices.setdefault(sid, {"started": False, "applied": False, "validated": False, "reviewed_ready": False, "controller_verified": False})
                 st["controller_verified"] = True
