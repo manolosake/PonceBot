@@ -1228,6 +1228,69 @@ class TestHardeningControls(unittest.TestCase):
                 )
             self.assertEqual(warn.call_count, 2)
 
+    def test_breakglass_disabled_warning_is_deduped_for_repeated_same_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._LAST_BREAKGLASS_ENABLED_WARN_SIG = None
+            bot._LAST_BREAKGLASS_DISABLED_WARN_SIG = None
+            with patch.object(bot.LOG, "warning") as warn:
+                bot._activate_breakglass(
+                    cfg,
+                    reason="same reason",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._deactivate_breakglass(
+                    cfg,
+                    reason="manual_off",
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._deactivate_breakglass(
+                    cfg,
+                    reason="manual_off",
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+            # 1x enable + 1x disable; second identical disable is suppressed.
+            self.assertEqual(warn.call_count, 2)
+
+    def test_breakglass_lifecycle_reenable_after_disable_emits_again_for_same_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            bot._LAST_BREAKGLASS_ENABLED_WARN_SIG = None
+            bot._LAST_BREAKGLASS_DISABLED_WARN_SIG = None
+            with patch.object(bot.LOG, "warning") as warn:
+                bot._activate_breakglass(
+                    cfg,
+                    reason="same reason",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._deactivate_breakglass(
+                    cfg,
+                    reason="manual_off",
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+                bot._activate_breakglass(
+                    cfg,
+                    reason="same reason",
+                    ttl_seconds=120,
+                    chat_id=1,
+                    user_id=2,
+                    source="startup_env",
+                )
+            # Expected lifecycle behavior: enable -> disable -> enable emits three warnings.
+            self.assertEqual(warn.call_count, 3)
+
     def test_auth_touch_session_extends_expiry(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = self._cfg(Path(td) / "state.json")

@@ -656,6 +656,7 @@ def _deactivate_breakglass(
     user_id: int | None,
     source: str,
 ) -> None:
+    global _LAST_BREAKGLASS_ENABLED_WARN_SIG
     global _LAST_BREAKGLASS_DISABLED_WARN_SIG
     old = _get_breakglass_state(cfg)
 
@@ -690,6 +691,9 @@ def _deactivate_breakglass(
                 warn_sig[3],
             )
             _LAST_BREAKGLASS_DISABLED_WARN_SIG = warn_sig
+        # Lifecycle semantics: after a disable event, the next enable should emit again even
+        # when payload is identical to a previous enable.
+        _LAST_BREAKGLASS_ENABLED_WARN_SIG = None
 
 
 def _effective_bypass_sandbox(cfg: "BotConfig", *, chat_id: int | None = None) -> bool:
