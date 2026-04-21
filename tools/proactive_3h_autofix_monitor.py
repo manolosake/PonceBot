@@ -252,6 +252,66 @@ def _enqueue_fallback_followup(conn: sqlite3.Connection, *, order_id: str, chat_
     return job_id
 
 
+def _enqueue_blocker_review_followup(conn: sqlite3.Connection, *, order_id: str, chat_id: int) -> str:
+    now = float(time.time())
+    job_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO jobs (
+            job_id, source, role, input_text, request_type, priority, model, effort, mode_hint,
+            requires_approval, max_cost_window_usd, created_at, updated_at, due_at, state,
+            chat_id, user_id, reply_to_message_id, is_autonomous, parent_job_id, owner,
+            depends_on, ttl_seconds, retry_count, max_retries, labels, requires_review,
+            artifacts_dir, blocked_reason, plan_revision, stalled_since, trace
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id,
+            "autopilot",
+            "reviewer_local",
+            "Validate blocked-only leftovers and confirm blockers are still valid or superseded.",
+            "task",
+            2,
+            "gpt-5",
+            "medium",
+            "rw",
+            0,
+            2.0,
+            now,
+            now,
+            None,
+            "queued",
+            int(chat_id),
+            None,
+            None,
+            1,
+            order_id,
+            "autofix_monitor",
+            "[]",
+            None,
+            0,
+            0,
+            json.dumps({"kind": "blocker_validity_review", "order_id": order_id}),
+            0,
+            None,
+            None,
+            0,
+            None,
+            json.dumps({"result_next_action": "review_blocker_validity"}),
+        ),
+    )
+    return job_id
+
+
+def _has_open_role(conn: sqlite3.Connection, *, order_id: str, role: str) -> bool:
+    row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM jobs WHERE parent_job_id=? AND role=? AND state IN ({','.join('?' for _ in OPEN_STATES)})",
+        (order_id, role, *OPEN_STATES),
+    ).fetchone()
+    return int((row["c"] if row is not None else 0) or 0) > 0
+
+
 def _update_job_state(
     conn: sqlite3.Connection,
     *,
@@ -411,6 +471,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                     _log("requeue_stale_implementer", path=log_path, order_id=order_id, job_id=str(impl["job_id"]), age_s=int(age_s))
 
                 # FINAL SWEEP: when only blocked jobs remain (and none are waiting_deps), clear stale blockers.
+                blocked_cleanup_actions = 0
                 if blocked_only and (len(blocked_only) == len(open_jobs)) and (not waiting_dep):
                     for job in blocked_only:
                         job_id = str(job["job_id"] or "")
@@ -428,6 +489,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                                 result_next_action="reseed_or_enqueue_followup",
                             )
                             actions += 1
+                            blocked_cleanup_actions += 1
                             _log(
                                 "cancel_superseded_blocked_only",
                                 path=log_path,
@@ -452,6 +514,7 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                                 result_next_action="reseed_or_enqueue_followup",
                             )
                             actions += 1
+                            blocked_cleanup_actions += 1
                             _log(
                                 "cancel_superseded_by_newer_terminal",
                                 path=log_path,
@@ -474,12 +537,27 @@ def run_monitor(*, duration_s: int, interval_s: int, log_path: Path) -> int:
                             result_next_action="reseed_or_enqueue_followup",
                         )
                         actions += 1
+                        blocked_cleanup_actions += 1
                         _log(
                             "cancel_stale_blocked_only",
                             path=log_path,
                             order_id=order_id,
                             job_id=str(job["job_id"]),
                             age_s=int(age_s),
+                        )
+
+                if blocked_only and (len(blocked_only) == len(open_jobs)) and (not waiting_dep) and blocked_cleanup_actions == 0:
+                    max_age_s = max(max(0.0, now - float(j["updated_at"] or j["created_at"] or now)) for j in blocked_only)
+                    if max_age_s >= 300.0 and not _has_open_role(conn, order_id=order_id, role="reviewer_local"):
+                        review_job_id = _enqueue_blocker_review_followup(conn, order_id=order_id, chat_id=chat_id)
+                        _set_order_phase_planning(conn, order_id=order_id)
+                        actions += 1
+                        _log(
+                            "enqueue_blocker_validity_review",
+                            path=log_path,
+                            order_id=order_id,
+                            job_id=review_job_id,
+                            max_age_s=int(max_age_s),
                         )
 
                 conn.commit()
