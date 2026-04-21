@@ -12,6 +12,7 @@ Design goals:
 from __future__ import annotations
 
 import json
+import math
 import logging
 import mimetypes
 import os
@@ -6410,7 +6411,7 @@ def _jarvis_final_sweep_tick(
             for v in vals:
                 try:
                     f = float(v)
-                    if f > 0:
+                    if math.isfinite(f) and f > 0:
                         return f
                 except Exception:
                     continue
