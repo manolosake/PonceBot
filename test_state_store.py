@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 from state_store import StateStore
+from tools import coverage_gate as cg
 
 
 class TestStateStoreConcurrency(unittest.TestCase):
@@ -36,6 +37,12 @@ class TestStateStoreConcurrency(unittest.TestCase):
 
 
 class TestStateStoreBasics(unittest.TestCase):
+    def test_path_property_is_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            self.assertEqual(store.path, p.resolve())
+
     def test_set_get_delete_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "state.json"
@@ -128,6 +135,17 @@ class TestStateStoreBasics(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "mutator boom"):
                 store.update(_m)
             self.assertEqual(store.read(), {"stable": 1})
+
+
+class TestCoverageGateDiscovery(unittest.TestCase):
+    def test_discover_suite_uses_each_pattern(self) -> None:
+        patterns = ["test_state_store.py", "test_release_governance_*.py"]
+        with mock.patch.object(cg.unittest.defaultTestLoader, "discover", return_value=unittest.TestSuite()) as discover:
+            suite = cg._discover_suite(patterns=patterns)
+        self.assertIsInstance(suite, unittest.TestSuite)
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(discover.call_args_list[0].kwargs["pattern"], "test_state_store.py")
+        self.assertEqual(discover.call_args_list[1].kwargs["pattern"], "test_release_governance_*.py")
 
 
 if __name__ == "__main__":
