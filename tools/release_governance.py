@@ -539,6 +539,14 @@ def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_b
     return _run(["git", "branch", "--show-current"], cwd=repo).strip()
 
 
+def _resolve_canonical_head_ref(*, repo: Path, remote: str, head_branch: str) -> str:
+    remote_ref = f"refs/remotes/{remote}/{head_branch}"
+    rc, _out, _err = _try_run(["git", "rev-parse", "--verify", "--quiet", remote_ref], cwd=repo)
+    if rc == 0:
+        return remote_ref
+    return head_branch
+
+
 @dataclass(frozen=True)
 class Check:
     key: str
@@ -616,7 +624,7 @@ def _collect_patch_capture(
 
 
 def _collect_status_capture(repo: Path) -> str:
-    return _run(["git", "status", "--porcelain=v1"], cwd=repo)
+    return _run(["git", "status", "--short", "--branch"], cwd=repo)
 
 
 def _run_unit_tests(repo: Path) -> Check:
@@ -864,7 +872,9 @@ def main() -> int:
         )
 
     base_ref = f"{args.remote}/{base_branch}"
-    head_ref = head_branch
+    # Keep local remote-tracking refs current, then use canonical resolved head ref.
+    _run(["git", "fetch", args.remote, head_branch], cwd=root)
+    head_ref = _resolve_canonical_head_ref(repo=root, remote=args.remote, head_branch=head_branch)
     # Ensure base ref exists.
     _run(["git", "fetch", args.remote, base_branch], cwd=root)
     ahead, behind = _git_ahead_behind(root, base_ref=base_ref, head_ref=head_ref)
@@ -977,7 +987,7 @@ def main() -> int:
             )
             status_text = _collect_status_capture(root)
             _atomic_write_text(artifacts_dir / "changes.patch", patch_text if patch_text else "(none)\n")
-            _atomic_write_text(artifacts_dir / "git_status.txt", (status_text + "\n") if status_text else "clean\n")
+            _atomic_write_text(artifacts_dir / "git_status.txt", (status_text + "\n") if status_text else "## clean\n")
             provenance = _build_run_provenance(
                 generated_at=_utc_iso(),
                 branch=head_branch,

@@ -1,7 +1,9 @@
 import unittest
 import json
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from tools import release_governance as rg
 
@@ -170,6 +172,27 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
             manifest_mismatch_count=0,
         )
         self.assertFalse(fv["ok"])
+
+    def test_resolve_canonical_head_ref_prefers_remote_tracking_ref(self) -> None:
+        with patch.object(rg, "_try_run", return_value=(0, "", "")):
+            ref = rg._resolve_canonical_head_ref(
+                repo=Path("."),
+                remote="origin",
+                head_branch="feature/order-2b13cb16-proactive-sprint-codexbot-reliability-",
+            )
+        self.assertEqual(ref, "refs/remotes/origin/feature/order-2b13cb16-proactive-sprint-codexbot-reliability-")
+
+    def test_collect_status_capture_uses_branch_style_output_for_clean_repo(self) -> None:
+        with TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "config", "user.name", "QA"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            (repo / "README.md").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            status = rg._collect_status_capture(repo)
+            self.assertTrue(status.startswith("## "))
 
 
 if __name__ == "__main__":
