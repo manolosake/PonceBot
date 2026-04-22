@@ -12,6 +12,13 @@ _ALLOWED_MODES = ("ro", "rw", "full")
 _ALLOWED_SLA = ("normal", "high", "urgent")
 
 
+def _normalize_spec_key(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")
+
+
 def _synth_task_key(*, role: str, text: str) -> str:
     role_token = re.sub(r"[^a-z0-9_]+", "_", str(role or "task").strip().lower()).strip("_") or "task"
     normalized = " ".join(str(text or "").strip().lower().split())
