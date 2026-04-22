@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.proactive_health_report import classify_open_job_mode
+from tools.proactive_health_report import classify_open_job_mode, is_blocked_without_open_jobs
 
 
 class TestProactiveHealthReport(unittest.TestCase):
@@ -39,6 +39,13 @@ class TestProactiveHealthReport(unittest.TestCase):
         self.assertEqual(classify_open_job_mode({"architect_local": 1}, 1), "local")
         self.assertEqual(classify_open_job_mode({"backend": 1}, 1), "cli")
         self.assertEqual(classify_open_job_mode({"backend": 1, "reviewer_local": 1}, 2), "mixed")
+
+    def test_is_blocked_without_open_jobs_detects_stall_condition(self) -> None:
+        self.assertTrue(is_blocked_without_open_jobs("blocked", 0))
+        self.assertTrue(is_blocked_without_open_jobs("blocked_waiting_only", 0))
+        self.assertTrue(is_blocked_without_open_jobs("blocked_approval", 0))
+        self.assertFalse(is_blocked_without_open_jobs("blocked", 1))
+        self.assertFalse(is_blocked_without_open_jobs("review", 0))
 
 
 if __name__ == "__main__":

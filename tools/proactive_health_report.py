@@ -58,6 +58,13 @@ def classify_open_job_mode(counts_by_role: dict, open_jobs: int) -> str:
     return 'controller'
 
 
+def is_blocked_without_open_jobs(phase: str, open_jobs: int) -> bool:
+    phase_norm = str(phase or '').strip().lower()
+    if int(open_jobs or 0) > 0:
+        return False
+    return phase_norm in {'blocked', 'blocked_waiting_only', 'blocked_approval'}
+
+
 def load_json(raw: str):
     try:
         return json.loads(raw or '{}')
@@ -506,6 +513,13 @@ def main() -> int:
         if ready_with_open:
             anomalies.append({
                 'type': 'ready_with_open_work',
+                'order_id': order_id,
+                'phase': order.get('phase'),
+                'open_jobs': len(open_children),
+            })
+        if is_blocked_without_open_jobs(phase, len(open_children)):
+            anomalies.append({
+                'type': 'blocked_without_open_jobs',
                 'order_id': order_id,
                 'phase': order.get('phase'),
                 'open_jobs': len(open_children),
