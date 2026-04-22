@@ -310,30 +310,19 @@ def _append_transcript(path: Path, *, label: str, cmd: list[str], rc: int, out: 
 
 def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str) -> list[Check]:
     """
-    Run clean-shell replay sanity commands (c02-c04 equivalents) in an isolated venv.
+    Run clean-shell replay sanity commands (c02-c04 equivalents).
+    Uses canonical bootstrap script to keep replay behavior deterministic.
     """
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     transcript_path = artifacts_dir / "command_transcript.txt"
-    venv_dir = artifacts_dir / ".qa_replay_venv"
-    vpy = str((venv_dir / "bin" / "python").resolve())
-
-    c01 = [python_bin, "-m", "venv", str(venv_dir)]
-    rc1, out1, err1 = _try_run(c01, cwd=repo)
-    _append_transcript(transcript_path, label="c01", cmd=c01, rc=rc1, out=out1, err=err1)
-    if rc1 != 0:
-        return [Check("replay_bootstrap", False, "c01_failed")]
-
-    c01b = [vpy, "-m", "pip", "install", "--upgrade", "pip", "pytest"]
-    rc1b, out1b, err1b = _try_run(c01b, cwd=repo)
-    _append_transcript(transcript_path, label="c01b", cmd=c01b, rc=rc1b, out=out1b, err=err1b)
-    if rc1b != 0:
-        return [Check("replay_bootstrap", False, "c01b_failed")]
-
+    bootstrap = str((repo / "scripts" / "bootstrap_pytest_python3.sh").resolve())
     env = _clean_shell_env()
+    env["BOOTSTRAP_PYTEST_PYTHON_BIN"] = str(python_bin or "python3")
+    env["BOOTSTRAP_PYTEST_VENV_DIR"] = str((artifacts_dir / ".qa_replay_venv").resolve())
     commands = [
-        ("c02", [vpy, "-m", "pytest", "--version"], "replay_c02_pytest_version"),
-        ("c03", [vpy, "-m", "pytest", "--collect-only", "-q", "test_state_store.py"], "replay_c03_collect_targeted"),
-        ("c04", [vpy, "-m", "pytest", "--collect-only", "-q"], "replay_c04_collect_all"),
+        ("c02", [bootstrap, "-m", "pytest", "--version"], "replay_c02_pytest_version"),
+        ("c03", [bootstrap, "-m", "pytest", "--collect-only", "-q", "test_state_store.py"], "replay_c03_collect_targeted"),
+        ("c04", [bootstrap, "-m", "pytest", "--collect-only", "-q"], "replay_c04_collect_all"),
     ]
     checks: list[Check] = []
     for label, cmd, key in commands:
