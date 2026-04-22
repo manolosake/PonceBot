@@ -1,4 +1,5 @@
 import unittest
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -77,6 +78,34 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         )
         self.assertFalse(fv["ok"])
         self.assertFalse(fv["checks"]["artifact_provenance_gate_ok"])
+
+    def test_build_final_validation_fails_on_publication_discoverability_mismatch(self) -> None:
+        fv = rg._build_final_validation(
+            base_checks={
+                "checks_ok": True,
+                "pr_url_targets_head": True,
+                "required_artifacts_non_empty": True,
+                "artifact_provenance_gate_ok": True,
+                "publication_discoverability_consistent": False,
+            },
+            manifest_mismatch_count=0,
+        )
+        self.assertFalse(fv["ok"])
+        self.assertFalse(fv["checks"]["publication_discoverability_consistent"])
+
+    def test_infer_job_id_from_artifacts_dir_uses_uuid_leaf(self) -> None:
+        inferred = rg._infer_job_id_from_artifacts_dir("/tmp/artifacts/060a361f-6bd1-41f5-b94f-0b3245dd8724")
+        self.assertEqual(inferred, "060a361f-6bd1-41f5-b94f-0b3245dd8724")
+        self.assertEqual(rg._infer_job_id_from_artifacts_dir("/tmp/artifacts/not-a-job-id"), "")
+
+    def test_qa_publication_discoverability_reads_nested_report(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "qa_result.json"
+            p.write_text(
+                json.dumps({"verification_report": {"publication_discoverable": True}}),
+                encoding="utf-8",
+            )
+            self.assertTrue(rg._qa_publication_discoverability(p))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ def _utc_iso(ts: float | None = None) -> str:
 
 _SSH_GH_RE = re.compile(r"^git@github\.com:(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?$")
 _HTTPS_GH_RE = re.compile(r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _parse_github_slug(remote_url: str) -> str | None:
@@ -122,6 +123,48 @@ def _load_traceability_keys(qa_result_path: Path | None) -> list[str]:
             seen.add(k)
             dedup.append(k)
     return dedup
+
+
+def _infer_job_id_from_artifacts_dir(artifacts_dir: str) -> str:
+    p = Path(str(artifacts_dir or "").strip()).expanduser()
+    name = p.name.strip()
+    return name if _UUID_RE.match(name) else ""
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"true", "1", "yes", "y", "pass", "ok"}:
+            return True
+        if s in {"false", "0", "no", "n", "fail", "ng"}:
+            return False
+    return None
+
+
+def _qa_publication_discoverability(qa_result_path: Path | None) -> bool | None:
+    if qa_result_path is None or (not qa_result_path.exists()):
+        return None
+    try:
+        payload = json.loads(qa_result_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    for field in ("publication_discoverable", "publication_discoverability_ok", "discoverability_ok"):
+        if field in payload:
+            v = _coerce_optional_bool(payload.get(field))
+            if v is not None:
+                return v
+
+    nested = payload.get("verification_report")
+    if isinstance(nested, dict):
+        for field in ("publication_discoverable", "publication_discoverability_ok", "discoverability_ok"):
+            if field in nested:
+                v = _coerce_optional_bool(nested.get(field))
+                if v is not None:
+                    return v
+    return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -339,9 +382,10 @@ def _build_final_validation(*, base_checks: dict[str, bool], manifest_mismatch_c
     checks["manifest_integrity_ok"] = int(manifest_mismatch_count) == 0
     checks["manifest_mismatch_count"] = int(manifest_mismatch_count)
     artifact_gate_ok = bool(checks.get("artifact_provenance_gate_ok", True))
+    publication_consistent = bool(checks.get("publication_discoverability_consistent", True))
     ok = bool(checks.get("manifest_integrity_ok")) and bool(checks.get("checks_ok")) and bool(
         checks.get("pr_url_targets_head")
-    ) and bool(checks.get("required_artifacts_non_empty")) and artifact_gate_ok
+    ) and bool(checks.get("required_artifacts_non_empty")) and artifact_gate_ok and publication_consistent
     return {
         "ok": ok,
         "checks": checks,
@@ -710,6 +754,8 @@ def main() -> int:
         args.job_id,
         ["ORCH_JOB_ID", "ORCHESTRATOR_JOB_ID", "JOB_ID", "TARGET_JOB_ID"],
     )
+    if not str(job_id or "").strip() and str(args.artifacts_dir or "").strip():
+        job_id = _infer_job_id_from_artifacts_dir(str(args.artifacts_dir))
     ticket_id = _resolve_traceability_value(
         args.ticket_id,
         ["ORCH_TICKET_ID", "ORCHESTRATOR_TICKET_ID", "TICKET_ID", "ORDER_ID"],
@@ -878,10 +924,22 @@ def main() -> int:
                 artifacts_dir=artifacts_dir,
                 implementation_claim=implementation_claim,
             )
+            qa_publication_discoverable = _qa_publication_discoverability(qa_result_path)
+            verification_publication_discoverable = bool(all(present_non_empty))
+            publication_consistent = (
+                True
+                if qa_publication_discoverable is None
+                else (bool(qa_publication_discoverable) == verification_publication_discoverable)
+            )
             final_checks_base = {
                 "checks_ok": bool(_checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
-                "required_artifacts_non_empty": bool(all(present_non_empty)),
+                "required_artifacts_non_empty": bool(verification_publication_discoverable),
+                "publication_discoverability_consistent": bool(publication_consistent),
+                "publication_discoverability_qa_result": (
+                    None if qa_publication_discoverable is None else bool(qa_publication_discoverable)
+                ),
+                "publication_discoverability_verification_report": bool(verification_publication_discoverable),
                 "artifact_provenance_gate_ok": bool(artifact_gate_ok),
                 "artifact_provenance_gate_claim_implementation": bool(implementation_claim),
                 "artifact_provenance_gate_claim_source": str(claim_source),
