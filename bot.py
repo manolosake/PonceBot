@@ -6512,6 +6512,43 @@ def _jarvis_final_sweep_tick(
         if recent_sweep:
             continue
 
+        terminal_sweeps_done = [
+            c
+            for c in children
+            if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+            and str(c.state or "").strip().lower() == "done"
+        ]
+        if terminal_sweeps_done:
+            try:
+                terminal_sweeps_done.sort(
+                    key=lambda t: float(getattr(t, "updated_at", 0.0) or getattr(t, "created_at", 0.0) or 0.0),
+                    reverse=True,
+                )
+            except Exception:
+                pass
+            latest_summary = str(((terminal_sweeps_done[0].trace or {}).get("result_summary") or "")).strip()
+            if _final_sweep_requests_root_cause_close(latest_summary):
+                try:
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                    orch_q.update_trace(
+                        oid,
+                        final_sweep_root_cause_closed=True,
+                        final_sweep_root_cause_closed_at=float(now),
+                        final_sweep_root_cause_closed_summary=(latest_summary[:400] if latest_summary else ""),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.final_sweep_root_cause_closed",
+                        actor="scheduler",
+                        details={
+                            "order_id": oid,
+                            "reason": "final_sweep_root_cause_close_signal",
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+
         def _first_valid_ts(*vals: Any) -> float:
             for v in vals:
                 try:
