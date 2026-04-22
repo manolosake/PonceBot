@@ -369,6 +369,23 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             )
         )
 
+    def test_local_blocker_requests_grounded_excerpt_detects_uppercase_variant(self) -> None:
+        self.assertTrue(
+            bot._local_blocker_requests_grounded_excerpt(
+                "Need the CURRENT EXCERPT of bot.py around _classify_local_slice_failure before continuing."
+            )
+        )
+
+    def test_failure_class_uppercase_excerpt_variant_is_blocked(self) -> None:
+        msg = "Need the CURRENT EXCERPT of bot.py around _classify_local_slice_failure before continuing."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_local_blocker_requests_grounded_excerpt_ignores_generic_blockers(self) -> None:
         self.assertFalse(
             bot._local_blocker_requests_grounded_excerpt(

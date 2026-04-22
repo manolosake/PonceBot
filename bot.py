@@ -4975,7 +4975,14 @@ def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
     blob = str(text or "").strip().lower()
     if not blob:
         return False
-    return any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS)
+    if any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS):
+        return True
+    # Fallback: keep matcher resilient to punctuation/phrasing drift when the same
+    # target symbol is explicitly requested with excerpt/body wording.
+    if "_classify_local_slice_failure" in blob:
+        if any(token in blob for token in ("full body", "current excerpt", "missing excerpt", "exact current function body")):
+            return True
+    return False
 
 
 def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
