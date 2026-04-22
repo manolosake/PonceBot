@@ -103,6 +103,8 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             names = [p.name for p in required]
             self.assertIn("RELEASE_CHECKLIST.json", names)
             self.assertIn("RUN_PROVENANCE.json", names)
+            self.assertIn("command_transcript.jsonl", names)
+            self.assertIn("test_logs.txt", names)
             self.assertIn("release_governance_run.stdout.json", names)
             self.assertIn("release_governance_run.exit_code.txt", names)
 

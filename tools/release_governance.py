@@ -205,9 +205,34 @@ def _required_final_artifacts(*, artifacts_dir: Path, checklist_path: Path) -> l
         artifacts_dir / "PR_URL.txt",
         artifacts_dir / "CHANGED_FILES.txt",
         artifacts_dir / "RUN_PROVENANCE.json",
+        artifacts_dir / "command_transcript.jsonl",
+        artifacts_dir / "test_logs.txt",
         artifacts_dir / "release_governance_run.stdout.json",
         artifacts_dir / "release_governance_run.exit_code.txt",
     ]
+
+
+def _write_check_artifacts(*, artifacts_dir: Path, checks: list["Check"]) -> None:
+    transcript_lines = []
+    for c in checks:
+        transcript_lines.append(
+            json.dumps({"key": c.key, "ok": bool(c.ok), "details": c.details}, ensure_ascii=False)
+        )
+    _atomic_write_text(
+        artifacts_dir / "command_transcript.jsonl",
+        ("\n".join(transcript_lines) + "\n") if transcript_lines else "",
+    )
+    test_log_lines = [f"{c.key}: ok={bool(c.ok)} details={c.details}" for c in checks if "test" in c.key or "replay_" in c.key]
+    _atomic_write_text(
+        artifacts_dir / "test_logs.txt",
+        ("\n".join(test_log_lines) + "\n") if test_log_lines else "no test/replay checks executed\n",
+    )
+
+
+def _final_exit_code(*, checks_ok: bool, manifest_mismatch_count: int) -> int:
+    if int(manifest_mismatch_count) > 0:
+        return 2
+    return 0 if bool(checks_ok) else 2
 
 
 def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_branch: str) -> str:
@@ -551,6 +576,17 @@ def main() -> int:
                 artifacts_dir / "RUN_PROVENANCE.json",
                 json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
             )
+            _write_check_artifacts(artifacts_dir=artifacts_dir, checks=checks)
+            _atomic_write_text(
+                artifacts_dir / "release_governance.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(
+                artifacts_dir / "release_governance_run.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
+            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
 
             required = _required_final_artifacts(artifacts_dir=artifacts_dir, checklist_path=checklist_path)
             present_non_empty = []
@@ -569,7 +605,6 @@ def main() -> int:
                 "validated_at": _utc_iso(),
             }
             payload["ok"] = bool(final_ok)
-            computed_exit = 0 if bool(payload.get("ok")) else 2
             _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             _atomic_write_text(
                 artifacts_dir / "FINAL_VALIDATION.json",
@@ -583,8 +618,8 @@ def main() -> int:
                 artifacts_dir / "release_governance_run.stdout.json",
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             )
-            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{computed_exit}\n")
-            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{computed_exit}\n")
+            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
+            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
 
             # FINAL_MANIFEST must be generated after all other artifact outputs are finalized.
             manifest = {
@@ -601,11 +636,17 @@ def main() -> int:
                 artifacts_dir / "FINAL_MANIFEST.json",
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             )
+            computed_exit = _final_exit_code(
+                checks_ok=bool(payload.get("ok")),
+                manifest_mismatch_count=int(manifest.get("mismatch_count", 0)),
+            )
         finally:
             _release_artifact_lock(lock_path, lock_fd)
+    else:
+        computed_exit = 0 if bool(payload.get("ok")) else 2
 
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    return 0 if bool(payload.get("ok")) else 2
+    return int(computed_exit)
 
 
 if __name__ == "__main__":

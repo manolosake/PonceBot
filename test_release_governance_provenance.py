@@ -26,6 +26,11 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         self.assertFalse(chk.ok)
         self.assertIn("job_id=<missing>", chk.details)
 
+    def test_final_exit_code_hard_fails_on_manifest_mismatch(self) -> None:
+        self.assertEqual(rg._final_exit_code(checks_ok=True, manifest_mismatch_count=1), 2)
+        self.assertEqual(rg._final_exit_code(checks_ok=False, manifest_mismatch_count=0), 2)
+        self.assertEqual(rg._final_exit_code(checks_ok=True, manifest_mismatch_count=0), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
