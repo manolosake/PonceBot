@@ -19301,8 +19301,8 @@ def _jarvis_final_sweep_tick(
             if not post_sweep_non_final_activity:
                 try:
                     close_reason = "final_sweep_no_followup_closed"
-                    orch_q.set_order_status(oid, "done")
-                    orch_q.set_order_phase(oid, "done")
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
                     orch_q.update_trace(
                         oid,
                         final_sweep_no_followup_closed_reason=close_reason,
