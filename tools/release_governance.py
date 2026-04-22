@@ -578,6 +578,8 @@ def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
         "jarvis",
         "orchestrator",
         "controller",
+        "release_mgr",
+        "release_manager",
         "reviewer_local",
         "architect_local",
         "qa",
