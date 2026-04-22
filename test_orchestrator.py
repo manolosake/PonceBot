@@ -1407,6 +1407,184 @@ class TestFinalSweepGuard(unittest.TestCase):
             assert order is not None
             self.assertEqual(str(order.get("status") or ""), "done")
 
+    def test_final_sweep_blocker_predicate_ignores_controller_review_overhead(self) -> None:
+        overhead_children = [
+            Task.new(
+                source="telegram",
+                role="qa",
+                input_text="qa follow-up",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id="ord-overhead",
+            ),
+            Task.new(
+                source="telegram",
+                role="reviewer_local",
+                input_text="review pass",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                parent_job_id="ord-overhead",
+            ),
+        ]
+        blockers_overhead = bot._final_sweep_blocker_count(children=overhead_children)
+        self.assertEqual(blockers_overhead, 0)
+
+        real_blocker_children = overhead_children + [
+            Task.new(
+                source="telegram",
+                role="backend",
+                input_text="real delivery work",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id="ord-overhead",
+            )
+        ]
+        blockers_real = bot._final_sweep_blocker_count(children=real_blocker_children)
+        self.assertGreater(blockers_real, 0)
+
+    def test_final_sweep_auto_closes_with_only_review_overhead_open(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-review-overhead-only"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="attempt 1",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-overhead-1",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="attempt 2",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-overhead-2",
+                )
+            )
+            # Controller/review overhead stays open but should not self-block closure.
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="qa",
+                    input_text="post-check",
+                    request_type="review",
+                    priority=2,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="running",
+                    job_id="job-overhead-qa-open",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "2",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+
     def test_final_sweep_default_stale_window_enqueues_sooner(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)

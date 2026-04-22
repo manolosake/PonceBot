@@ -6426,6 +6426,34 @@ def _autopilot_tick(
     return created
 
 
+def _final_sweep_blocker_count(*, children: Sequence[Task], open_states: set[str] | None = None) -> int:
+    """
+    Count close-gate blockers for FINAL SWEEP.
+
+    Real delivery work in open states blocks closure; controller/review overhead does not.
+    """
+    states = open_states or {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    non_blocking_roles = {
+        "skynet",
+        "jarvis",
+        "orchestrator",
+        "controller",
+        "reviewer_local",
+        "architect_local",
+        "qa",
+    }
+    blockers = 0
+    for c in children:
+        st = str(c.state or "").strip().lower()
+        if st not in states:
+            continue
+        role = str(c.role or "").strip().lower()
+        if role in non_blocking_roles:
+            continue
+        blockers += 1
+    return blockers
+
+
 def _jarvis_final_sweep_tick(
     *,
     cfg: BotConfig,
@@ -6470,7 +6498,7 @@ def _jarvis_final_sweep_tick(
             continue
         chat_id = int(o.get("chat_id") or 0) or 1
         children = orch_q.jobs_by_parent(parent_job_id=oid, limit=300)
-        if any(str(c.state or "").strip().lower() in open_states for c in children):
+        if _final_sweep_blocker_count(children=children, open_states=open_states) > 0:
             continue
 
         recent_sweep = False
