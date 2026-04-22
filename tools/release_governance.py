@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -476,6 +477,50 @@ def _clean_shell_env() -> dict[str, str]:
     return env
 
 
+def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
+    """
+    Contract-aligned close-gate predicate:
+    - open delivery jobs are blockers
+    - controller/review overhead roles are non-blocking
+    """
+    non_blocking_roles = {
+        "skynet",
+        "jarvis",
+        "orchestrator",
+        "controller",
+        "reviewer_local",
+        "architect_local",
+        "qa",
+    }
+    open_states = {"queued", "running", "waiting_deps", "blocked", "blocked_approval"}
+    blockers = 0
+    for row in rows:
+        state = str(row.get("state") or "").strip().lower()
+        if state not in open_states:
+            continue
+        role = str(row.get("role") or "").strip().lower()
+        if role in non_blocking_roles:
+            continue
+        blockers += 1
+    return blockers
+
+
+def _close_gate_blocker_count_for_ticket(db_path: Path, ticket_id: str) -> int:
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """
+        SELECT role, state
+        FROM jobs
+        WHERE parent_job_id = ?
+          AND state IN ('queued','running','waiting_deps','blocked','blocked_approval')
+        """,
+        (str(ticket_id),),
+    ).fetchall()
+    payload = [dict(r) for r in rows]
+    return _close_gate_blocker_count(payload)
+
+
 def _append_transcript(path: Path, *, label: str, cmd: list[str], rc: int, out: str, err: str) -> None:
     lines: list[str] = [f"$ {label} {' '.join(cmd)}", f"exit_code={int(rc)}"]
     if out:
@@ -486,7 +531,7 @@ def _append_transcript(path: Path, *, label: str, cmd: list[str], rc: int, out: 
         f.write("\n".join(lines) + "\n\n")
 
 
-def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str) -> list[Check]:
+def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str, ticket_id: str = "") -> list[Check]:
     """
     Run clean-shell replay sanity commands (c02-c04 equivalents).
     Uses canonical bootstrap script to keep replay behavior deterministic.
@@ -509,6 +554,24 @@ def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str) -> lis
         _atomic_write_text(artifacts_dir / f"{label}.exit_code.txt", f"{int(rc)}\n")
         detail = (out or err or f"{label}_failed")[:4000]
         checks.append(Check(key, rc == 0, detail))
+
+    ticket = str(ticket_id or "").strip()
+    if ticket:
+        db_path = Path(os.environ.get("ORCH_JOBS_DB", "/home/aponce/codexbot/data/jobs.sqlite")).expanduser()
+        blockers = _close_gate_blocker_count_for_ticket(db_path, ticket)
+        rc = 0 if int(blockers) == 0 else 2
+        out = f"ticket_id={ticket}\nblocking_active_children={int(blockers)}\n"
+        cmd = [str(python_bin or "python3"), "-c", "close_gate_contract_check", ticket]
+        _append_transcript(
+            transcript_path,
+            label="c05",
+            cmd=cmd,
+            rc=rc,
+            out=out,
+            err="",
+        )
+        _atomic_write_text(artifacts_dir / "c05.exit_code.txt", f"{int(rc)}\n")
+        checks.append(Check("replay_c05_close_gate_contract", rc == 0, out.strip()))
     return checks
 
 
@@ -566,7 +629,14 @@ def main() -> int:
         checks.append(_run_unit_tests(root))
     if args.run_replay_gate:
         run_artifacts_dir = Path(args.artifacts_dir).expanduser().resolve() if args.artifacts_dir else (root / "data" / "artifacts" / "_replay")
-        checks.extend(_run_replay_gate(root, artifacts_dir=run_artifacts_dir, python_bin=str(args.replay_python or "python3")))
+        checks.extend(
+            _run_replay_gate(
+                root,
+                artifacts_dir=run_artifacts_dir,
+                python_bin=str(args.replay_python or "python3"),
+                ticket_id=str(ticket_id or ""),
+            )
+        )
 
     base_ref = f"{args.remote}/{base_branch}"
     head_ref = head_branch
