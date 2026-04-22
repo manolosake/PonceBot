@@ -181,7 +181,19 @@ def _manifest_mismatches(manifest: dict[str, Any], artifacts_dir: Path) -> list[
         if not p.exists() or (not p.is_file()):
             mismatches.append({"name": name, "reason": "missing"})
             continue
-        expected_size = int(item.get("size", -1))
+        raw_expected_size = item.get("size", -1)
+        try:
+            expected_size = int(raw_expected_size)
+        except (TypeError, ValueError):
+            mismatches.append(
+                {
+                    "name": name,
+                    "reason": "malformed_metadata",
+                    "field": "size",
+                    "value": raw_expected_size,
+                }
+            )
+            continue
         expected_sha = str(item.get("sha256", ""))
         actual_size = int(p.stat().st_size)
         actual_sha = _sha256_file(p)
