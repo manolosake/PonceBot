@@ -6437,7 +6437,41 @@ def _orchestrator_run_local_ollama(
                     default_branch=repo_default_branch,
                 )
                 if not ok_sync:
-                    raise RuntimeError(f"order branch sync failed: {sync_msg}")
+                    fallback_branch = repo_default_branch
+                    fallback_ok, fallback_msg = _sync_worktree_to_order_branch(
+                        base_repo=repo_base_dir,
+                        worktree_dir=repo_role_worktree,
+                        order_branch=fallback_branch,
+                        default_branch=repo_default_branch,
+                    )
+                    sync_warning = (
+                        "order branch sync fallback "
+                        f"order_branch={order_branch} "
+                        f"fallback_branch={fallback_branch} "
+                        f"sync_msg={sync_msg} "
+                        f"fallback_ok={fallback_ok} "
+                        f"fallback_msg={fallback_msg}"
+                    )
+                    try:
+                        task_context = getattr(task, "context", None)
+                        if isinstance(task_context, dict):
+                            task_context["order_branch_sync_warning"] = sync_warning
+                            task_context["order_branch_sync_warning_msg"] = str(sync_msg)
+                    except Exception:
+                        pass
+                    try:
+                        run_context = getattr(orch_q, "run_context", None)
+                        if isinstance(run_context, dict):
+                            run_context["order_branch_sync_warning"] = sync_warning
+                            run_context["order_branch_sync_warning_msg"] = str(sync_msg)
+                    except Exception:
+                        pass
+                    try:
+                        setattr(task, "order_branch_sync_warning", sync_warning)
+                        setattr(task, "order_branch_sync_warning_msg", str(sync_msg))
+                    except Exception:
+                        pass
+                    print(sync_warning, flush=True)
         except Exception:
             repo_role_worktree = None
     shared_local_worktree = _local_role_worktree_dir("implementer_local")
