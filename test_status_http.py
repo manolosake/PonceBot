@@ -15,6 +15,24 @@ from orchestrator.status_service import StatusService
 from orchestrator.storage import SQLiteTaskStorage
 
 
+def _wait_for_http_ready(base_url: str, auth_token: str = "secret", timeout_s: float = 2.0) -> None:
+    """Poll the snapshot endpoint until the HTTP server is accepting requests."""
+    deadline = time.time() + timeout_s
+    req = urllib.request.Request(
+        f"{base_url}/api/v1/status/snapshot",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    )
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=0.5) as resp:
+                if resp.status == 200:
+                    return
+        except Exception:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 class TestStatusHTTP(unittest.TestCase):
     def test_snapshot_requires_token_when_configured_and_supports_v1_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -34,9 +52,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             url = base + "/api/v1/status/snapshot"
 
             # No token => 401
@@ -79,9 +97,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             url = base + "/api/v1/status/snapshot?token=secret"
 
             with urllib.request.urlopen(url, timeout=2) as resp:
@@ -110,9 +128,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             url = base + "/api/v1/status/snapshot"
 
             # Disallowed origin => 403
@@ -153,9 +171,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             url = base + "/api/v1/status/stream"
             req = urllib.request.Request(url, headers={"Authorization": "Bearer secret"})
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -194,9 +212,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             headers = {"Authorization": "Bearer secret"}
             for suffix in ("/api/v1/status/alerts", "/api/v1/status/risks", "/api/v1/status/decisions"):
                 req = urllib.request.Request(base + suffix, headers=headers)
@@ -232,9 +250,9 @@ class TestStatusHTTP(unittest.TestCase):
             )
             t = threading.Thread(target=http_srv.serve_forever, daemon=True)
             t.start()
-            time.sleep(0.05)
 
             base = f"http://{http_srv.host}:{http_srv.port}"
+            _wait_for_http_ready(base)
             req = urllib.request.Request(base + "/api/v1/orchestration/overview", headers={"Authorization": "Bearer secret"})
             with urllib.request.urlopen(req, timeout=2) as resp:
                 self.assertEqual(resp.status, 200)
