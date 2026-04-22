@@ -16,7 +16,17 @@ SERVICE = "codexbot.service"
 RUNBOOK_ID = "jarvis_proactive_lane"
 
 LOCAL_ROLES = {"architect_local", "implementer_local", "reviewer_local", "frontend_local", "ops_local"}
-FORBIDDEN_CLI_ROLES = {"backend", "frontend", "qa", "sre", "security", "research", "release_mgr", "product_ops"}
+LOCAL_ONLY_FACTORY = str(os.environ.get("BOT_SKYNET_FACTORY_LOCAL_ONLY", "0") or "0").strip().lower() in {
+    "1",
+    "true",
+    "on",
+    "yes",
+}
+FORBIDDEN_CLI_ROLES = (
+    {"backend", "frontend", "qa", "sre", "security", "research", "release_mgr", "product_ops"}
+    if LOCAL_ONLY_FACTORY
+    else set()
+)
 OPEN_STATES = ("queued", "running", "waiting_deps", "blocked", "blocked_approval")
 
 ROUND_SECONDS = 15 * 60

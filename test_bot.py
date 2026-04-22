@@ -1339,7 +1339,7 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
         self.assertNotIn("implementer_local", roles)
         self.assertNotIn("reviewer_local", roles)
 
-    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane(self) -> None:
+    def test_inject_local_specialists_skips_proactive_lane_by_default_codex_first(self) -> None:
         specs = [
             bot.TaskSpec(
                 key="backend_fix",
@@ -1365,6 +1365,38 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
             proactive_lane=True,
             allow_delegation=False,
         )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane_when_local_only(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-123",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=False,
+                proactive_lane=True,
+                allow_delegation=False,
+            )
         roles = [str(x.role or "").strip().lower() for x in out]
         self.assertIn("architect_local", roles)
         self.assertIn("implementer_local", roles)

@@ -2397,3 +2397,60 @@ class TestTraceEvents(unittest.TestCase):
             summary = q.trace_noise_summary(window_seconds=3600)
             self.assertGreaterEqual(int(summary.get("total_events") or 0), 2)
             self.assertGreaterEqual(int(summary.get("duplicate_events") or 0), 1)
+
+
+class TestLocalSpecialistInjectionPolicy(unittest.TestCase):
+    def test_proactive_default_is_codex_first(self) -> None:
+        specs = [
+            bot.TaskSpec(key="backend_fix", role="backend", text="Fix backend", mode_hint="rw", priority=2),
+        ]
+        out = bot._inject_local_specialist_specs(
+            specs=specs,
+            root_ticket="ticket-xyz",
+            existing_keys=set(),
+            request_type="task",
+            is_top_level_manual=False,
+            proactive_lane=True,
+            allow_delegation=False,
+        )
+        roles = {str(x.role or "").strip().lower() for x in out}
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_proactive_local_only_override_keeps_local_injection(self) -> None:
+        specs = [
+            bot.TaskSpec(key="backend_fix", role="backend", text="Fix backend", mode_hint="rw", priority=2),
+        ]
+        with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-xyz",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=False,
+                proactive_lane=True,
+                allow_delegation=False,
+            )
+        roles = {str(x.role or "").strip().lower() for x in out}
+        self.assertIn("architect_local", roles)
+        self.assertIn("implementer_local", roles)
+        self.assertIn("reviewer_local", roles)
+
+    def test_manual_non_proactive_default_behavior_unchanged(self) -> None:
+        specs = [
+            bot.TaskSpec(key="backend_fix", role="backend", text="Fix backend", mode_hint="rw", priority=2),
+        ]
+        out = bot._inject_local_specialist_specs(
+            specs=specs,
+            root_ticket="ticket-xyz",
+            existing_keys=set(),
+            request_type="task",
+            is_top_level_manual=True,
+            proactive_lane=False,
+            allow_delegation=False,
+        )
+        roles = {str(x.role or "").strip().lower() for x in out}
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)

@@ -6699,6 +6699,16 @@ def _inject_local_specialist_specs(
     enforce_raw = str(os.environ.get("BOT_LOCAL_SPECIALISTS_ENFORCE", "1") or "1").strip().lower()
     if enforce_raw in {"0", "false", "off", "no"}:
         return list(specs)
+    local_only_factory = str(os.environ.get("BOT_SKYNET_FACTORY_LOCAL_ONLY", "0") or "0").strip().lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    # Default proactive behavior is codex-first. Preserve legacy local-specialist
+    # injection only when local-only mode is explicitly enabled.
+    if proactive_lane and not local_only_factory:
+        return list(specs)
 
     manual_override = str(os.environ.get("BOT_CEO_INJECT_LOCAL_SPECIALISTS", "0") or "0").strip().lower() in {
         "1",
