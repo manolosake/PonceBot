@@ -6421,7 +6421,7 @@ def _orchestrator_run_local_ollama(
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
     repo_role_worktree: Path | None = None
-    order_branch = _resolve_order_branch_from_task(task, orch_q)
+    order_branch = (_resolve_order_branch_from_task(task, orch_q) or "").strip() or None
     if repo_base_dir is not None and (repo_base_dir / ".git").exists():
         try:
             role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
