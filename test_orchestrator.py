@@ -1540,6 +1540,21 @@ class TestFinalSweepGuard(unittest.TestCase):
                 state="queued",
                 parent_job_id="ord-overhead",
             ),
+            Task.new(
+                source="telegram",
+                role="qa_local",
+                input_text="qa local follow-up",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id="ord-overhead",
+            ),
         ]
         blockers_overhead = bot._final_sweep_blocker_count(children=overhead_children)
         self.assertEqual(blockers_overhead, 0)

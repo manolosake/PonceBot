@@ -6441,6 +6441,8 @@ def _final_sweep_blocker_count(*, children: Sequence[Task], open_states: set[str
         "reviewer_local",
         "architect_local",
         "qa",
+        "qa_local",
+        "quality_assurance",
     }
     blockers = 0
     for c in children:
