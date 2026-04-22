@@ -1499,6 +1499,14 @@ class TestFinalSweepGuard(unittest.TestCase):
             self.assertIsNotNone(root)
             assert root is not None
             self.assertTrue(bool((root.trace or {}).get("final_sweep_reenqueue_exhausted_closed", False)))
+            with storage._conn() as conn:
+                row = conn.execute(
+                    "SELECT event_type FROM audit_log WHERE event_type = ? ORDER BY id DESC LIMIT 1",
+                    ("order.final_sweep_auto_closed_reenqueue_exhausted",),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(str(row["event_type"]), "order.final_sweep_auto_closed_reenqueue_exhausted")
 
     def test_final_sweep_blocker_predicate_ignores_controller_review_overhead(self) -> None:
         overhead_children = [
