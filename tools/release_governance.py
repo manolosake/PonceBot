@@ -661,7 +661,10 @@ def _fetch_head_ref(*, repo: Path, remote: str, head_branch: str) -> None:
         hb = hb[len(f"refs/remotes/{remote}/") :]
     elif hb.startswith("refs/heads/"):
         hb = hb[len("refs/heads/") :]
-    _run(["git", "fetch", remote, hb], cwd=repo)
+    # Force remote-tracking ref update so downstream checks read a fresh origin/<branch>.
+    src = f"refs/heads/{hb}"
+    dst = f"refs/remotes/{remote}/{hb}"
+    _run(["git", "fetch", "--prune", remote, f"{src}:{dst}"], cwd=repo)
 
 
 @dataclass(frozen=True)

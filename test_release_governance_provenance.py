@@ -220,6 +220,24 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
             )
         self.assertEqual(ref, "refs/remotes/origin/feature/order-2b13cb16-proactive-sprint-codexbot-reliability-")
 
+    def test_fetch_head_ref_updates_remote_tracking_refspec(self) -> None:
+        with patch.object(rg, "_run") as run_mock:
+            rg._fetch_head_ref(
+                repo=Path("."),
+                remote="origin",
+                head_branch="feature/order-2b13cb16-proactive-sprint-codexbot-reliability-",
+            )
+        run_mock.assert_called_once_with(
+            [
+                "git",
+                "fetch",
+                "--prune",
+                "origin",
+                "refs/heads/feature/order-2b13cb16-proactive-sprint-codexbot-reliability-:refs/remotes/origin/feature/order-2b13cb16-proactive-sprint-codexbot-reliability-",
+            ],
+            cwd=Path("."),
+        )
+
     def test_collect_status_capture_uses_branch_style_output_for_clean_repo(self) -> None:
         with TemporaryDirectory() as td:
             repo = Path(td)
