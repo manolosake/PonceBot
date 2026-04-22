@@ -5893,19 +5893,41 @@ def _finalize_local_implementer_change(
 
     validation_lines: list[str] = []
     changed_py = [p for p in changed_files if p.endswith(".py")]
+    existing_changed_py: list[str] = []
+    missing_changed_py: list[str] = []
+    worktree_root = worktree_dir.resolve()
+    for rel_path in changed_py:
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside_worktree = disk_path.is_relative_to(worktree_root)
+        except AttributeError:
+            inside_worktree = str(disk_path).startswith(str(worktree_root))
+        if inside_worktree and disk_path.is_file():
+            existing_changed_py.append(rel_path)
+        else:
+            missing_changed_py.append(rel_path)
+
     validation_ok = True
-    if changed_py:
+    if existing_changed_py:
         py_compile = subprocess.run(
-            ["python3", "-m", "py_compile", *changed_py],
+            ["python3", "-m", "py_compile", *existing_changed_py],
             cwd=str(worktree_dir),
             capture_output=True,
             text=True,
             timeout=180,
         )
-        validation_lines.append("$ python3 -m py_compile " + " ".join(changed_py))
+        validation_lines.append("$ python3 -m py_compile " + " ".join(existing_changed_py))
         validation_lines.append((py_compile.stdout or "").strip())
         validation_lines.append((py_compile.stderr or "").strip())
         validation_ok = py_compile.returncode == 0
+        if missing_changed_py:
+            validation_lines.append(
+                "Skipped missing changed Python files: " + ", ".join(missing_changed_py)
+            )
+    elif changed_py:
+        validation_lines.append(
+            "All changed Python files were missing under the worktree (likely deleted/renamed); skipped py_compile."
+        )
     else:
         validation_lines.append("No Python files changed; skipped py_compile.")
     validation_text = "\n".join(line for line in validation_lines if line).strip()
