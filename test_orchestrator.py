@@ -2024,6 +2024,55 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             self.assertTrue(str(refreshed.blocked_reason or "").startswith("dependencies_pending"))
             self.assertGreater(float(refreshed.updated_at), now)
 
+    def test_terminal_dependency_update_immediately_releases_waiting_deps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep running",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                )
+            )
+            blocked = Task.new(
+                source="telegram",
+                role="qa",
+                input_text="blocked by dep",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep],
+            )
+            jid = q.submit_task(blocked)
+            self.assertIsNone(q.take_next())  # transitions blocked task to waiting_deps
+            waiting = q.get_job(jid)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting.state, "waiting_deps")
+
+            self.assertTrue(q.update_state(dep, "done"))
+            released = q.get_job(jid)
+            self.assertIsNotNone(released)
+            assert released is not None
+            self.assertEqual(released.state, "queued")
+            self.assertIsNone(released.blocked_reason)
+
 
 class TestRetryScheduling(unittest.TestCase):
     def test_bump_retry_moves_job_to_queued_and_increments_counter(self) -> None:
