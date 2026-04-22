@@ -1,4 +1,5 @@
 import unittest
+import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
@@ -31,6 +32,34 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             key_token="key:proactive_cli_reseed_r1",
         )
         self.assertEqual(count, 1)
+
+    def test_traceability_pipeline_check_matches_order_and_key_tokens(self) -> None:
+        with TemporaryDirectory() as td:
+            repo = Path(td)
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "config", "user.name", "QA"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            (repo / "README.md").write_text("x\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(
+                ["git", "commit", "-m", "order:2b13cb16 key:proactive_cli_seed_r1_4 replay token"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            rc, matches = rg._traceability_pipeline_check(
+                repo=repo,
+                ref="HEAD",
+                order_token="order:2b13cb16",
+                key_token="key:proactive_cli_seed_r1_4",
+            )
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(len(matches), 1)
+            self.assertIn("order:2b13cb16", matches[0])
+            self.assertIn("key:proactive_cli_seed_r1_4", matches[0])
 
     def test_manifest_mismatch_count_zero_for_stable_files(self) -> None:
         with TemporaryDirectory() as td:

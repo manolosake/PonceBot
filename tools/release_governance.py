@@ -85,6 +85,31 @@ def _traceability_count_from_log(log_text: str, *, order_token: str, key_token: 
     return count
 
 
+def _traceability_pipeline_check(
+    *,
+    repo: Path,
+    ref: str,
+    order_token: str,
+    key_token: str,
+    max_commits: int = 400,
+) -> tuple[int, list[str]]:
+    """
+    Non-shell equivalent of:
+      git log --oneline <ref> -n <max_commits> | rg '<order_token>.*<key_token>'
+    """
+    log_text = _run(
+        ["git", "log", "--oneline", str(ref), "-n", str(int(max_commits))],
+        cwd=repo,
+    )
+    matches = [
+        line
+        for line in (log_text or "").splitlines()
+        if _token_exact_in_text(line, order_token) and _token_exact_in_text(line, key_token)
+    ]
+    rc = 0 if matches else 1
+    return rc, matches
+
+
 def _load_traceability_keys(qa_result_path: Path | None) -> list[str]:
     if qa_result_path is None or (not qa_result_path.exists()):
         return []
@@ -877,21 +902,29 @@ def main() -> int:
                 f"order_token={order_token or '<missing>'} key_tokens={','.join(key_tokens) or '<missing>'}",
             )
         )
-        tl = _run(
-            [
-                "git",
-                "log",
-                "--oneline",
-                "--grep",
-                order_token,
-                "-n",
-                "400",
-            ],
-            cwd=root,
-        )
         tcount = 0
+        c01_ok = False
+        c01_details = []
         for kt in key_tokens:
-            tcount = max(tcount, _traceability_count_from_log(tl, order_token=order_token, key_token=kt))
+            rc, matches = _traceability_pipeline_check(
+                repo=root,
+                ref=head_ref,
+                order_token=order_token,
+                key_token=kt,
+                max_commits=400,
+            )
+            tcount = max(tcount, len(matches))
+            if rc == 0:
+                c01_ok = True
+                if matches:
+                    c01_details.append(matches[0])
+        checks.append(
+            Check(
+                "c01_traceability",
+                c01_ok,
+                c01_details[0] if c01_details else f"order_token={order_token} key_tokens={','.join(key_tokens)}",
+            )
+        )
         checks.append(Check("traceability_count_positive", tcount > 0, f"count={tcount}"))
 
     ok_all = _checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)
