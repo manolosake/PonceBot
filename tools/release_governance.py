@@ -261,6 +261,56 @@ def _required_final_artifacts(*, artifacts_dir: Path, checklist_path: Path) -> l
     ]
 
 
+def _detect_implementation_claim(*, role: str, qa_result_path: Path | None, artifacts_dir: Path) -> tuple[bool, str]:
+    role_norm = str(role or "").strip().lower()
+    no_op_marker = artifacts_dir / "no_op_justification.md"
+    if no_op_marker.exists() and no_op_marker.is_file() and no_op_marker.stat().st_size > 0:
+        return False, "no_op_marker_present"
+
+    payload: dict[str, Any] = {}
+    if qa_result_path is not None and qa_result_path.exists():
+        try:
+            payload = json.loads(qa_result_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            payload = {}
+
+    claim_raw = str(
+        payload.get("claim_type")
+        or payload.get("slice_claim_type")
+        or payload.get("claim")
+        or ""
+    ).strip().lower()
+
+    if claim_raw in {"no_op", "no-op", "state_only", "analysis_only", "advisory_only"}:
+        return False, f"claim_type={claim_raw}"
+    if claim_raw in {"implementation", "code_change", "code-change"}:
+        return True, f"claim_type={claim_raw}"
+
+    # Backend lane defaults to implementation unless explicitly marked no-op.
+    if role_norm == "backend":
+        return True, "backend_default_strict"
+    return False, "non_backend_default"
+
+
+def _artifact_provenance_gate_check(*, artifacts_dir: Path, implementation_claim: bool) -> tuple[bool, list[str]]:
+    if not implementation_claim:
+        return True, []
+
+    reasons: list[str] = []
+    checks = [
+        ("changes.patch", "artifact_missing_changes_patch", "artifact_empty_changes_patch"),
+        ("git_status.txt", "artifact_missing_git_status", "artifact_empty_git_status"),
+    ]
+    for name, miss_reason, empty_reason in checks:
+        p = artifacts_dir / name
+        if not p.exists() or (not p.is_file()):
+            reasons.append(miss_reason)
+            continue
+        if int(p.stat().st_size) <= 0:
+            reasons.append(empty_reason)
+    return len(reasons) == 0, reasons
+
+
 def _write_check_artifacts(*, artifacts_dir: Path, checks: list["Check"]) -> None:
     transcript_lines = []
     for c in checks:
@@ -288,9 +338,10 @@ def _build_final_validation(*, base_checks: dict[str, bool], manifest_mismatch_c
     checks: dict[str, Any] = dict(base_checks)
     checks["manifest_integrity_ok"] = int(manifest_mismatch_count) == 0
     checks["manifest_mismatch_count"] = int(manifest_mismatch_count)
+    artifact_gate_ok = bool(checks.get("artifact_provenance_gate_ok", True))
     ok = bool(checks.get("manifest_integrity_ok")) and bool(checks.get("checks_ok")) and bool(
         checks.get("pr_url_targets_head")
-    ) and bool(checks.get("required_artifacts_non_empty"))
+    ) and bool(checks.get("required_artifacts_non_empty")) and artifact_gate_ok
     return {
         "ok": ok,
         "checks": checks,
@@ -765,10 +816,23 @@ def main() -> int:
             for p in required:
                 present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
             pr_targets_head = bool(pr_compare and (f"...{head_branch}?" in pr_compare))
+            implementation_claim, claim_source = _detect_implementation_claim(
+                role=role,
+                qa_result_path=qa_result_path,
+                artifacts_dir=artifacts_dir,
+            )
+            artifact_gate_ok, artifact_gate_reasons = _artifact_provenance_gate_check(
+                artifacts_dir=artifacts_dir,
+                implementation_claim=implementation_claim,
+            )
             final_checks_base = {
                 "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
                 "required_artifacts_non_empty": bool(all(present_non_empty)),
+                "artifact_provenance_gate_ok": bool(artifact_gate_ok),
+                "artifact_provenance_gate_claim_implementation": bool(implementation_claim),
+                "artifact_provenance_gate_claim_source": str(claim_source),
+                "artifact_provenance_gate_reasons": list(artifact_gate_reasons),
             }
 
             # FINAL_MANIFEST is generated only after all mutable outputs are sealed.
