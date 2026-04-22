@@ -542,6 +542,9 @@ def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
         "reviewer_local",
         "architect_local",
         "qa",
+        "qa_local",
+        "quality_assurance",
+        "quality-assurance",
     }
     open_states = {"queued", "running", "waiting_deps", "blocked", "blocked_approval"}
     blockers = 0

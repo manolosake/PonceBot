@@ -11,6 +11,8 @@ class TestReleaseGovernanceReplayGate(unittest.TestCase):
     def test_close_gate_blocker_count_contract_semantics(self) -> None:
         overhead_only = [
             {"role": "qa", "state": "running"},
+            {"role": "qa_local", "state": "queued"},
+            {"role": "quality_assurance", "state": "waiting_deps"},
             {"role": "reviewer_local", "state": "queued"},
             {"role": "skynet", "state": "blocked"},
         ]
