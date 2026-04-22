@@ -4944,6 +4944,29 @@ def _repair_unified_diff_text(text: str) -> tuple[str, bool]:
     return repaired, changed
 
 
+def _sanitize_git_patch_text(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False
+    changed = False
+    out_lines: list[str] = []
+    metadata_re = re.compile(
+        r"^(?:old mode \d+|new mode \d+|deleted file mode \d+|new file mode \d+|similarity index \d+%|rename from .+|rename to .+)$"
+    )
+    focused_marker_re = re.compile(
+        r"^\s*#\s*\[(?:FOCUSED_[A-Z0-9_:-]+|EXACT_TARGET_CONTEXT|TARGET_CONTEXT|REAL_WORKTREE_DIR|ORDER_BRANCH).*\]\s*$"
+    )
+    for line in raw.splitlines():
+        if metadata_re.match(line) or focused_marker_re.match(line):
+            changed = True
+            continue
+        out_lines.append(line)
+    cleaned = "\n".join(out_lines)
+    if raw.endswith("\n"):
+        cleaned += "\n"
+    return cleaned, changed
+
+
 def _extract_blocker_response(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -6158,6 +6181,10 @@ def _apply_local_implementer_patch(
     repaired_patch_text, patch_repaired = _repair_unified_diff_text(patch_text)
     if repaired_patch_text.strip():
         patch_text = repaired_patch_text
+    sanitized_patch_text, patch_sanitized = _sanitize_git_patch_text(patch_text)
+    if sanitized_patch_text.strip():
+        patch_text = sanitized_patch_text
+    patch_repaired = bool(patch_repaired or patch_sanitized)
     patch_path = artifacts_dir / "local_ollama_patch.diff"
     patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
     artifacts: list[str] = [str(patch_path)]
@@ -6194,6 +6221,33 @@ def _apply_local_implementer_patch(
             timeout=60,
         )
 
+    def _try_patch_3way() -> tuple[bool, str]:
+        check_3way = _run_patch_cmd(["git", "apply", "--check", "--3way", str(patch_path)])
+        if check_3way.returncode != 0:
+            return False, (check_3way.stderr or check_3way.stdout or "").strip() or "git apply --check --3way failed"
+        applied_3way = _run_patch_cmd(["git", "apply", "--3way", str(patch_path)])
+        note_path = artifacts_dir / "local_ollama_patch_3way.txt"
+        note_body = (applied_3way.stdout or "").strip()
+        note_err = (applied_3way.stderr or "").strip()
+        note_path.write_text(
+            "\n".join(
+                line
+                for line in (
+                    "$ git apply --3way " + str(patch_path),
+                    note_body,
+                    note_err,
+                )
+                if line
+            )
+            + "\n",
+            encoding="utf-8",
+            errors="replace",
+        )
+        artifacts.append(str(note_path))
+        if applied_3way.returncode == 0:
+            return True, ""
+        return False, note_err or note_body or "git apply --3way failed"
+
     apply_check = _run_patch_cmd(["git", "apply", "--check", str(patch_path)])
     if apply_check.returncode != 0:
         recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(patch_path)])
@@ -6205,8 +6259,21 @@ def _apply_local_implementer_patch(
         if reverse_check.returncode == 0:
             already_applied = True
         else:
+            applied_3way, err_3way = _try_patch_3way()
+            if applied_3way:
+                return _finalize_local_implementer_change(
+                    artifacts_dir=artifacts_dir,
+                    worktree_dir=worktree_dir,
+                    artifacts=artifacts,
+                    apply_mode="patch_3way",
+                    patch_repaired=patch_repaired,
+                    patch_artifact=str(patch_path),
+                    changed_files_hint=_extract_changed_files_from_patch_text(patch_text),
+                )
             err_path = artifacts_dir / "local_ollama_patch_error.txt"
             err_body = (apply_check.stderr or apply_check.stdout or "").strip() or "git apply --check failed"
+            if err_3way:
+                err_body = (err_body + "\n\n3way fallback:\n" + err_3way).strip()
             err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
             artifacts.append(str(err_path))
             if rewrite_blocks:
@@ -6235,8 +6302,21 @@ def _apply_local_implementer_patch(
             if recount_apply.returncode == 0:
                 applied = recount_apply
         if applied.returncode != 0:
+            applied_3way, err_3way = _try_patch_3way()
+            if applied_3way:
+                return _finalize_local_implementer_change(
+                    artifacts_dir=artifacts_dir,
+                    worktree_dir=worktree_dir,
+                    artifacts=artifacts,
+                    apply_mode="patch_3way",
+                    patch_repaired=patch_repaired,
+                    patch_artifact=str(patch_path),
+                    changed_files_hint=_extract_changed_files_from_patch_text(patch_text),
+                )
             err_path = artifacts_dir / "local_ollama_patch_error.txt"
             err_body = (applied.stderr or applied.stdout or "").strip() or "git apply failed"
+            if err_3way:
+                err_body = (err_body + "\n\n3way fallback:\n" + err_3way).strip()
             err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
             artifacts.append(str(err_path))
             if rewrite_blocks:
@@ -15142,7 +15222,7 @@ def _slice_has_applied_and_validated_evidence(
         state = str(child.state or "").strip().lower()
         if state != "done":
             continue
-        child_slice = _task_slice_id(child, root_ticket=rid)
+        child_slice = _task_closure_bucket_id(child, root_ticket=rid)
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
@@ -15173,7 +15253,7 @@ def _slice_has_no_change_evidence(
         state = str(child.state or "").strip().lower()
         if state != "done":
             continue
-        child_slice = _task_slice_id(child, root_ticket=rid)
+        child_slice = _task_closure_bucket_id(child, root_ticket=rid)
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
@@ -15206,7 +15286,7 @@ def _slice_has_review_ready_evidence(
                 continue
         elif state != "done":
             continue
-        child_slice = _task_slice_id(child, root_ticket=rid)
+        child_slice = _task_closure_bucket_id(child, root_ticket=rid)
         if child_slice != token:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
@@ -15272,7 +15352,7 @@ def _select_latest_ready_slice_for_closure(
                 continue
         elif state != "done":
             continue
-        slice_id = _task_slice_id(child, root_ticket=rid)
+        slice_id = _task_closure_bucket_id(child, root_ticket=rid)
         if not slice_id:
             continue
         trace = dict((child.trace or {}) if isinstance(child.trace, dict) else {})
@@ -15379,6 +15459,22 @@ def _task_slice_id(task: Task | None, *, root_ticket: str = "") -> str:
     if jid:
         return _sanitize_slice_token(jid.split("-", 1)[0], fallback="slice")
     return _sanitize_slice_token(str(root_ticket or "").strip()[:8], fallback="slice")
+
+
+def _task_closure_bucket_id(task: Task | None, *, root_ticket: str = "") -> str:
+    slice_id = _task_slice_id(task, root_ticket=root_ticket)
+    if task is None:
+        return slice_id
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"backend", "frontend", "qa", "sre", "security", "release_mgr"}:
+        return slice_id
+    trace_obj = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+    labels = dict((getattr(task, "labels", {}) or {}) if isinstance(getattr(task, "labels", {}), dict) else {})
+    key_norm = str(labels.get("key") or "").strip().lower()
+    if not key_norm.startswith(("auto_", "rerun_")):
+        return slice_id
+    order_branch = _sanitize_slice_token(str(trace_obj.get("order_branch") or ""), fallback="")
+    return order_branch or slice_id
 
 
 def _task_attempt_n(task: Task | None) -> int:
@@ -24554,7 +24650,7 @@ def orchestrator_worker_loop(
                     next_action = next_action or "delegate"
                     summary = (
                         f"{summary}\n\nController verification gate rejected: VERIFIED_IMPROVEMENT "
-                        "requires prior implementer_local applied+validated evidence plus reviewer_local READY evidence."
+                        "requires prior delivery evidence plus READY review evidence for the same slice or proactive order branch."
                     ).strip()
                     result_meta["result_summary"] = summary
                     result_meta["controller_verification_gate"] = "missing_local_evidence"

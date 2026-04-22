@@ -561,6 +561,49 @@ class TestStateHandling(unittest.TestCase):
             "slice1",
         )
 
+    def test_controller_verified_slice_for_closure_accepts_backend_qa_order_branch_evidence_without_slice_id(self) -> None:
+        branch_bucket = bot._sanitize_slice_token(
+            "feature/order-ticket-1-bounded-reliability-fix",
+            fallback="",
+        )
+        backend = SimpleNamespace(
+            role="backend",
+            state="done",
+            labels={"key": "auto_backend_fix1"},
+            trace={
+                "order_branch": "feature/order-ticket-1-bounded-reliability-fix",
+                "result_summary": "Implemented one bounded reliability fix with attached diff and validation logs.",
+                "result_artifacts": ["/tmp/backend-artifact.txt"],
+            },
+            updated_at=10.0,
+            created_at=9.0,
+        )
+        qa = SimpleNamespace(
+            role="qa",
+            state="done",
+            labels={"key": "auto_qa_fix1"},
+            trace={
+                "order_branch": "feature/order-ticket-1-bounded-reliability-fix",
+                "result_summary": "PASS / GO. Validation succeeded with attached evidence bundle.",
+                "result_artifacts": ["/tmp/qa-artifact.txt"],
+            },
+            updated_at=20.0,
+            created_at=19.0,
+        )
+
+        class _FakeQueue:
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 700) -> list[object]:
+                return [backend, qa]
+
+        self.assertEqual(
+            bot._controller_verified_slice_for_closure(
+                orch_q=_FakeQueue(),
+                root_ticket="ticket-1",
+                trace={"slice_id": "unmatched_local_slice"},
+            ),
+            branch_bucket,
+        )
+
 
     def test_controller_local_recovery_specs_synthesizes_local_patch_flow_from_write_policy(self) -> None:
         specs = bot._controller_local_recovery_specs(
@@ -4026,6 +4069,81 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
             self.assertEqual(specs[0].role, "implementer_local")
             self.assertIn("PRIMARY_ARCHITECT_HANDOFF", specs[0].text)
             self.assertIn("bot.py", specs[0].text)
+
+
+class TestLocalImplementerPatchApply(unittest.TestCase):
+    def test_sanitize_git_patch_text_strips_mode_headers_and_focused_markers(self) -> None:
+        raw = (
+            "diff --git a/bot.py b/bot.py\n"
+            "old mode 100755\n"
+            "new mode 100644\n"
+            "--- a/bot.py\n"
+            "+++ b/bot.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def value():\n"
+            "# [FOCUSED_EXACT_TARGET_CONTEXT bot.py:1-4 symbol=value]\n"
+            "-    return 1\n"
+            "+    return 2\n"
+        )
+        cleaned, changed = bot._sanitize_git_patch_text(raw)
+        self.assertTrue(changed)
+        self.assertNotIn("old mode 100755", cleaned)
+        self.assertNotIn("new mode 100644", cleaned)
+        self.assertNotIn("FOCUSED_EXACT_TARGET_CONTEXT", cleaned)
+        self.assertIn("return 2", cleaned)
+
+    def test_apply_local_implementer_patch_uses_3way_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            (repo / "bot.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+            patch_text = (
+                "diff --git a/bot.py b/bot.py\n"
+                "--- a/bot.py\n"
+                "+++ b/bot.py\n"
+                "@@ -1,2 +1,2 @@\n"
+                " def value():\n"
+                "-    return 1\n"
+                "+    return 2\n"
+            )
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            task = SimpleNamespace(
+                artifacts_dir=str(artifacts_dir),
+                input_text="Implement ticket-1 in bot.py",
+                trace={},
+                parent_job_id="ticket-1",
+            )
+            fake_finalize = (["artifact"], {"apply_mode": "patch_3way", "changed_files": ["bot.py"]})
+            cp = subprocess.CompletedProcess
+            side_effects = [
+                cp(args=["git", "rev-parse", "--show-toplevel"], returncode=0, stdout=str(repo) + "\n", stderr=""),
+                cp(args=["git", "apply", "--check", str(artifacts_dir / "local_ollama_patch.diff")], returncode=1, stdout="", stderr="error: patch failed: bot.py:1\nerror: bot.py: patch does not apply\n"),
+                cp(args=["git", "apply", "--check", "--recount", str(artifacts_dir / "local_ollama_patch.diff")], returncode=1, stdout="", stderr="error: patch failed: bot.py:1\nerror: bot.py: patch does not apply\n"),
+                cp(args=["git", "apply", "--reverse", "--check", str(artifacts_dir / "local_ollama_patch.diff")], returncode=1, stdout="", stderr=""),
+                cp(args=["git", "apply", "--check", "--3way", str(artifacts_dir / "local_ollama_patch.diff")], returncode=0, stdout="", stderr=""),
+                cp(args=["git", "apply", "--3way", str(artifacts_dir / "local_ollama_patch.diff")], returncode=0, stdout="Applied patch to 'bot.py' cleanly.\n", stderr=""),
+            ]
+            with patch.object(bot.subprocess, "run", side_effect=side_effects) as run_mock, patch.object(
+                bot,
+                "_finalize_local_implementer_change",
+                return_value=fake_finalize,
+            ) as finalize_mock:
+                artifacts, patch_info = bot._apply_local_implementer_patch(
+                    task=task,
+                    artifacts_dir=artifacts_dir,
+                    content=f"```diff\n{patch_text}```\n",
+                    worktree_dir=repo,
+                )
+            self.assertIn("bot.py", patch_info.get("changed_files") or [])
+            self.assertEqual(patch_info.get("apply_mode"), "patch_3way")
+            note_path = artifacts_dir / "local_ollama_patch_3way.txt"
+            self.assertTrue(note_path.exists())
+            self.assertIn("git apply --3way", note_path.read_text(encoding="utf-8"))
+            finalize_kwargs = finalize_mock.call_args.kwargs
+            self.assertEqual(finalize_kwargs.get("apply_mode"), "patch_3way")
+            self.assertTrue(any("--3way" in " ".join(map(str, call.args[0])) for call in run_mock.call_args_list[4:6]))
+            self.assertEqual(artifacts, fake_finalize[0])
 
 
 class TestImplementerFailureSelection(unittest.TestCase):
