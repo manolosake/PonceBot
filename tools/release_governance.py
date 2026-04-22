@@ -286,9 +286,9 @@ def _detect_implementation_claim(*, role: str, qa_result_path: Path | None, arti
     if claim_raw in {"implementation", "code_change", "code-change"}:
         return True, f"claim_type={claim_raw}"
 
-    # Backend lane defaults to implementation unless explicitly marked no-op.
-    if role_norm == "backend":
-        return True, "backend_default_strict"
+    # Backend + release manager lanes default to implementation unless explicitly marked no-op.
+    if role_norm in {"backend", "release_mgr"}:
+        return True, f"{role_norm}_default_strict"
     return False, "non_backend_default"
 
 
@@ -473,6 +473,24 @@ def _collect_diff_capture(
     return "none", "", ""
 
 
+def _collect_patch_capture(
+    repo: Path,
+    *,
+    basis: str,
+    base_ref: str,
+    head_ref: str,
+) -> str:
+    if basis == "branch":
+        return _run(["git", "diff", f"{base_ref}..{head_ref}"], cwd=repo)
+    if basis == "working_tree":
+        return _run(["git", "diff", "HEAD"], cwd=repo)
+    return ""
+
+
+def _collect_status_capture(repo: Path) -> str:
+    return _run(["git", "status", "--porcelain=v1"], cwd=repo)
+
+
 def _run_unit_tests(repo: Path) -> Check:
     rc, out, err = _try_run([sys.executable, "-m", "unittest", "-q"], cwd=repo)
     ok = (rc == 0)
@@ -531,6 +549,22 @@ def _clean_shell_env() -> dict[str, str]:
 def _normalize_role_for_close_gate(role: str) -> str:
     # Accept legacy separators/casing so role aliases stay stable across lanes.
     return str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _blocking_check_keys(*, checks: list["Check"], role: str) -> set[str]:
+    keys = {c.key for c in checks}
+    role_norm = _normalize_role_for_close_gate(role)
+    # release_mgr frequently executes in controller worktrees that may be intentionally dirty;
+    # keep repo_clean visibility but don't block final gate solely on that signal.
+    if role_norm == "release_mgr":
+        keys.discard("repo_clean")
+    return keys
+
+
+def _checks_ok_for_role(*, checks: list["Check"], role: str) -> bool:
+    keyset = _blocking_check_keys(checks=checks, role=role)
+    by_key = {c.key: c for c in checks}
+    return all(bool(by_key[k].ok) for k in keyset if k in by_key)
 
 
 def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
@@ -753,7 +787,7 @@ def main() -> int:
             tcount = max(tcount, _traceability_count_from_log(tl, order_token=order_token, key_token=kt))
         checks.append(Check("traceability_count_positive", tcount > 0, f"count={tcount}"))
 
-    ok_all = all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)
+    ok_all = _checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)
 
     pr_compare = _pr_compare_url(slug=slug, base=base_branch, head=head_branch) if slug else None
     pr_new = _new_pr_url(slug=slug, head=head_branch) if slug else None
@@ -795,6 +829,15 @@ def main() -> int:
             if diffstat:
                 _atomic_write_text(artifacts_dir / "DIFFSTAT.txt", diffstat + "\n")
             _atomic_write_text(artifacts_dir / "CHANGED_FILES.txt", (changed + "\n") if changed else "(none)\n")
+            patch_text = _collect_patch_capture(
+                root,
+                basis=diff_basis,
+                base_ref=base_ref,
+                head_ref=head_ref,
+            )
+            status_text = _collect_status_capture(root)
+            _atomic_write_text(artifacts_dir / "changes.patch", patch_text if patch_text else "(none)\n")
+            _atomic_write_text(artifacts_dir / "git_status.txt", (status_text + "\n") if status_text else "clean\n")
             provenance = _build_run_provenance(
                 generated_at=_utc_iso(),
                 branch=head_branch,
@@ -834,7 +877,7 @@ def main() -> int:
                 implementation_claim=implementation_claim,
             )
             final_checks_base = {
-                "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
+                "checks_ok": bool(_checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
                 "required_artifacts_non_empty": bool(all(present_non_empty)),
                 "artifact_provenance_gate_ok": bool(artifact_gate_ok),
