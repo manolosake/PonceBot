@@ -58,6 +58,20 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             self.assertEqual(len(mismatches), 1)
             self.assertEqual(mismatches[0]["name"], "release_governance.stdout.json")
 
+    def test_manifest_mismatch_detects_size_mismatch(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            p = root / "release_governance.stdout.json"
+            p.write_text("{\"ok\":true}\n", encoding="utf-8")
+            real_sha = rg._sha256_file(p)
+            mismatches = rg._manifest_mismatches(
+                {"files": [{"name": p.name, "size": int(p.stat().st_size) + 1, "sha256": real_sha}]},
+                root,
+            )
+            self.assertEqual(len(mismatches), 1)
+            self.assertEqual(mismatches[0]["name"], p.name)
+            self.assertEqual(mismatches[0]["reason"], "hash_or_size_mismatch")
+
     def test_manifest_mismatch_handles_malformed_size_metadata(self) -> None:
         with TemporaryDirectory() as td:
             root = Path(td)

@@ -66,6 +66,16 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(reasons, [])
 
+    def test_artifact_provenance_gate_fails_on_placeholder_non_evidence_artifacts(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "changes.patch").write_text("(none)\n", encoding="utf-8")
+            (root / "git_status.txt").write_text("clean\n", encoding="utf-8")
+            ok, reasons = rg._artifact_provenance_gate_check(artifacts_dir=root, implementation_claim=True)
+            self.assertFalse(ok)
+            self.assertIn("artifact_empty_changes_patch", reasons)
+            self.assertIn("artifact_empty_git_status", reasons)
+
     def test_build_final_validation_respects_artifact_provenance_gate(self) -> None:
         fv = rg._build_final_validation(
             base_checks={
@@ -141,6 +151,25 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         self.assertTrue(gate["publication_discoverability_required"])
         self.assertTrue(gate["publication_discoverability_signal_present"])
         self.assertTrue(gate["publication_discoverability_consistent"])
+
+    def test_final_validation_no_go_when_publication_signal_unresolved_for_release_mgr(self) -> None:
+        gate = rg._publication_discoverability_gate(
+            role="release_mgr",
+            ticket_id="2b13cb16-4b71-48d1-80fd-362b133123cb",
+            qa_publication_discoverable=None,
+            verification_publication_discoverable=True,
+        )
+        fv = rg._build_final_validation(
+            base_checks={
+                "checks_ok": True,
+                "pr_url_targets_head": True,
+                "required_artifacts_non_empty": True,
+                "artifact_provenance_gate_ok": True,
+                "publication_discoverability_consistent": gate["publication_discoverability_consistent"],
+            },
+            manifest_mismatch_count=0,
+        )
+        self.assertFalse(fv["ok"])
 
 
 if __name__ == "__main__":

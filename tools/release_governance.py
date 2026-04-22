@@ -376,6 +376,14 @@ def _artifact_provenance_gate_check(*, artifacts_dir: Path, implementation_claim
             continue
         if int(p.stat().st_size) <= 0:
             reasons.append(empty_reason)
+            continue
+        content = p.read_text(encoding="utf-8", errors="replace").strip().lower()
+        # Harden against placeholder outputs that are technically non-empty but carry no evidence.
+        if name == "changes.patch" and content in {"(none)", "none"}:
+            reasons.append(empty_reason)
+            continue
+        if name == "git_status.txt" and content in {"clean", "(clean)"}:
+            reasons.append(empty_reason)
     return len(reasons) == 0, reasons
 
 
