@@ -194,7 +194,18 @@ def _manifest_mismatches(manifest: dict[str, Any], artifacts_dir: Path) -> list[
                 }
             )
             continue
-        expected_sha = str(item.get("sha256", ""))
+        raw_expected_sha = item.get("sha256", "")
+        expected_sha = str(raw_expected_sha)
+        if len(expected_sha) != 64 or any(ch not in "0123456789abcdef" for ch in expected_sha.lower()):
+            mismatches.append(
+                {
+                    "name": name,
+                    "reason": "malformed_metadata",
+                    "field": "sha256",
+                    "value": raw_expected_sha,
+                }
+            )
+            continue
         actual_size = int(p.stat().st_size)
         actual_sha = _sha256_file(p)
         if expected_size != actual_size or expected_sha != actual_sha:
