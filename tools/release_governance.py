@@ -235,13 +235,37 @@ def _final_exit_code(*, checks_ok: bool, manifest_mismatch_count: int) -> int:
     return 0 if bool(checks_ok) else 2
 
 
+def _build_final_validation(*, base_checks: dict[str, bool], manifest_mismatch_count: int) -> dict[str, Any]:
+    checks: dict[str, Any] = dict(base_checks)
+    checks["manifest_integrity_ok"] = int(manifest_mismatch_count) == 0
+    checks["manifest_mismatch_count"] = int(manifest_mismatch_count)
+    ok = bool(checks.get("manifest_integrity_ok")) and bool(checks.get("checks_ok")) and bool(
+        checks.get("pr_url_targets_head")
+    ) and bool(checks.get("required_artifacts_non_empty"))
+    return {
+        "ok": ok,
+        "checks": checks,
+        "validated_at": _utc_iso(),
+    }
+
+
 def _finalize_manifest(*, artifacts_dir: Path, lock_path: Path) -> dict[str, Any]:
     # Snapshot entries only after all mutable artifact outputs are written.
+    excluded = {
+        "FINAL_MANIFEST.json",
+        "RELEASE_CHECKLIST.json",
+        "FINAL_VALIDATION.json",
+        "release_governance.stdout.json",
+        "release_governance_run.stdout.json",
+        "release_governance.exit_code.txt",
+        "release_governance_run.exit_code.txt",
+        lock_path.name,
+    }
     manifest = {
         "generated_at": _utc_iso(),
         "files": _manifest_entries(
             artifacts_dir,
-            exclude_names={"FINAL_MANIFEST.json", lock_path.name},
+            exclude_names=excluded,
         ),
     }
     pre_capture_mismatches = _manifest_mismatches(manifest, artifacts_dir)
@@ -616,22 +640,24 @@ def main() -> int:
             for p in required:
                 present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
             pr_targets_head = bool(pr_compare and (f"...{head_branch}?" in pr_compare))
-            final_checks = {
+            final_checks_base = {
                 "checks_ok": bool(all(c.ok for c in checks) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
                 "required_artifacts_non_empty": bool(all(present_non_empty)),
             }
-            final_ok = bool(all(final_checks.values()))
-            payload["final_validation"] = {
-                "ok": final_ok,
-                "checks": final_checks,
-                "validated_at": _utc_iso(),
-            }
-            payload["ok"] = bool(final_ok)
+
+            # FINAL_MANIFEST is generated only after all mutable outputs are sealed.
+            manifest = _finalize_manifest(artifacts_dir=artifacts_dir, lock_path=lock_path)
+            final_validation = _build_final_validation(
+                base_checks=final_checks_base,
+                manifest_mismatch_count=int(manifest.get("mismatch_count", 0)),
+            )
+            payload["final_validation"] = final_validation
+            payload["ok"] = bool(final_validation.get("ok"))
             _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             _atomic_write_text(
                 artifacts_dir / "FINAL_VALIDATION.json",
-                json.dumps(payload["final_validation"], ensure_ascii=False, indent=2) + "\n",
+                json.dumps(final_validation, ensure_ascii=False, indent=2) + "\n",
             )
             _atomic_write_text(
                 artifacts_dir / "release_governance.stdout.json",
@@ -641,15 +667,12 @@ def main() -> int:
                 artifacts_dir / "release_governance_run.stdout.json",
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             )
-            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
-            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
-
-            # FINAL_MANIFEST is generated only after all mutable outputs are sealed.
-            manifest = _finalize_manifest(artifacts_dir=artifacts_dir, lock_path=lock_path)
             computed_exit = _final_exit_code(
-                checks_ok=bool(payload.get("ok")),
+                checks_ok=bool(final_validation.get("ok")),
                 manifest_mismatch_count=int(manifest.get("mismatch_count", 0)),
             )
+            _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{computed_exit}\n")
+            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{computed_exit}\n")
         finally:
             _release_artifact_lock(lock_path, lock_fd)
     else:

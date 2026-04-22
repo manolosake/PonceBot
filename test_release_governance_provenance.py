@@ -31,6 +31,19 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         self.assertEqual(rg._final_exit_code(checks_ok=False, manifest_mismatch_count=0), 2)
         self.assertEqual(rg._final_exit_code(checks_ok=True, manifest_mismatch_count=0), 0)
 
+    def test_build_final_validation_marks_not_ok_on_manifest_mismatch(self) -> None:
+        fv = rg._build_final_validation(
+            base_checks={
+                "checks_ok": True,
+                "pr_url_targets_head": True,
+                "required_artifacts_non_empty": True,
+            },
+            manifest_mismatch_count=2,
+        )
+        self.assertFalse(fv["ok"])
+        self.assertFalse(fv["checks"]["manifest_integrity_ok"])
+        self.assertEqual(fv["checks"]["manifest_mismatch_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
