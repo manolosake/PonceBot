@@ -173,6 +173,28 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         )
         self.assertFalse(fv["ok"])
 
+    def test_qa_publication_signal_check_fails_closed_for_release_mgr_without_result(self) -> None:
+        ok, details = rg._qa_publication_signal_check(qa_result_path=None, role="release_mgr")
+        self.assertFalse(ok)
+        self.assertEqual(details, "qa_signal_missing_path")
+
+    def test_qa_publication_signal_check_passes_for_backend_without_result(self) -> None:
+        ok, details = rg._qa_publication_signal_check(qa_result_path=None, role="backend")
+        self.assertTrue(ok)
+        self.assertEqual(details, "qa_signal_not_required_for_role")
+
+    def test_build_final_validation_includes_qa_publication_signal_key(self) -> None:
+        fv = rg._build_final_validation(
+            base_checks={
+                "checks_ok": True,
+                "pr_url_targets_head": True,
+                "required_artifacts_non_empty": True,
+                "qa_publication_signal_ok": False,
+            },
+            manifest_mismatch_count=0,
+        )
+        self.assertIn("qa_publication_signal_ok", fv["checks"])
+
     def test_resolve_canonical_head_ref_prefers_remote_tracking_ref(self) -> None:
         with patch.object(rg, "_try_run", return_value=(0, "", "")):
             ref = rg._resolve_canonical_head_ref(

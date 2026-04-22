@@ -971,6 +971,8 @@ def main() -> int:
         cand = Path(args.artifacts_dir).expanduser().resolve() / "qa_result.json"
         if cand.exists():
             qa_result_path = cand
+    qa_signal_ok, qa_signal_detail = _qa_publication_signal_check(qa_result_path=qa_result_path, role=role)
+    checks.append(Check("qa_publication_signal_ok", bool(qa_signal_ok), str(qa_signal_detail)))
     dep_keys = _load_traceability_keys(qa_result_path)
     if dep_keys:
         order_token = _order_token_from_branch(head_branch)
@@ -1118,6 +1120,7 @@ def main() -> int:
                 "checks_ok": bool(_checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
                 "required_artifacts_non_empty": bool(verification_publication_discoverable),
+                "qa_publication_signal_ok": bool(qa_signal_ok),
                 "publication_discoverability_required": bool(publication_gate["publication_discoverability_required"]),
                 "publication_discoverability_signal_present": bool(publication_gate["publication_discoverability_signal_present"]),
                 "publication_discoverability_consistent": bool(publication_gate["publication_discoverability_consistent"]),
