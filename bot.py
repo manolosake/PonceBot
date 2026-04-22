@@ -5022,11 +5022,48 @@ def _repo_worktree_root(cfg: BotConfig, *, repo_id: str) -> Path:
     return (cfg.worktree_root / "factory_repos" / token).resolve()
 
 
-def _local_role_worktree_dir(role: str, *, cfg: BotConfig | None = None, repo_id: str | None = None) -> Path:
+def _repo_change_worktree_root(
+    cfg: BotConfig,
+    *,
+    repo_id: str,
+    change_token: str,
+) -> Path:
+    repo_root = _repo_worktree_root(cfg, repo_id=repo_id)
+    token = _slug_token(change_token or "change", max_len=48)
+    return (repo_root / "changes" / token).resolve()
+
+
+def _local_role_worktree_dir(
+    role: str,
+    *,
+    cfg: BotConfig | None = None,
+    repo_id: str | None = None,
+    change_token: str | None = None,
+) -> Path:
     base = Path(__file__).resolve().parent
     if cfg is not None and repo_id:
-        return (_repo_worktree_root(cfg, repo_id=repo_id) / str(role or "").strip() / "slot1").resolve()
+        return (
+            _repo_change_worktree_root(cfg, repo_id=repo_id, change_token=change_token or "shared")
+            / str(role or "").strip()
+            / "slot1"
+        ).resolve()
     return (base / "data" / "worktrees" / str(role or "").strip() / "slot1").resolve()
+
+
+def _local_workspace_change_token(task: Any) -> str:
+    trace_obj = getattr(task, "trace", {}) if isinstance(getattr(task, "trace", {}), dict) else {}
+    labels_obj = getattr(task, "labels", {}) if isinstance(getattr(task, "labels", {}), dict) else {}
+    for candidate in (
+        trace_obj.get("slice_id"),
+        trace_obj.get("delegation_slug"),
+        labels_obj.get("slice"),
+        labels_obj.get("key"),
+        getattr(task, "job_id", ""),
+    ):
+        token = _slug_token(str(candidate or "").strip(), max_len=48)
+        if token:
+            return token
+    return "shared"
 
 
 def _latest_local_specialist_response(
@@ -6374,11 +6411,14 @@ def _orchestrator_run_local_ollama(
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
     repo_role_worktree: Path | None = None
+    local_worktree_repo_id = ""
     order_branch = _resolve_order_branch_from_task(task, orch_q)
+    change_token = _local_workspace_change_token(task)
     if repo_base_dir is not None and (repo_base_dir / ".git").exists():
         try:
             role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
-            repo_root = _repo_worktree_root(cfg, repo_id=role_repo_id)
+            local_worktree_repo_id = role_repo_id
+            repo_root = _repo_change_worktree_root(cfg, repo_id=role_repo_id, change_token=change_token)
             ensure_worktree_pool(base_repo=repo_base_dir, root=repo_root, role=role, slots=1)
             repo_role_worktree = (repo_root / role / "slot1").resolve()
             prepare_clean_workspace(repo_role_worktree)
@@ -6393,7 +6433,12 @@ def _orchestrator_run_local_ollama(
                     raise RuntimeError(f"order branch sync failed: {sync_msg}")
         except Exception:
             repo_role_worktree = None
-    shared_local_worktree = _local_role_worktree_dir("implementer_local")
+    shared_local_worktree = _local_role_worktree_dir(
+        "implementer_local",
+        cfg=cfg if local_worktree_repo_id else None,
+        repo_id=local_worktree_repo_id or None,
+        change_token=change_token,
+    )
     if repo_role_worktree is not None:
         worktree_dir = repo_role_worktree
     elif role == "implementer_local" and mode != "ro":
@@ -10729,8 +10774,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "Rules:\n"
             "- You may now execute this larger approved plan.\n"
             "- If scope drifts materially beyond the approved plan, ask the CEO again before proceeding.\n"
-            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
-            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- Use the dedicated local specialist lane as the primary executor pool: architect_local, implementer_local, reviewer_local.\n"
+            "- Keep Jarvis Codex delivery roles reserved for CEO/manual orders unless the operator explicitly overrides the separation policy.\n"
             "- Keep evidence explicit and close work in bounded slices.\n"
         )
     elif decision_norm in ("reject", "timeout"):
@@ -10750,8 +10795,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "- Do NOT execute the larger/drastic proposal now.\n"
             "- Continue with simpler bounded work like the normal factory lane.\n"
             "- Stay inside the current registered repo and keep changes incremental.\n"
-            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
-            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- Use the dedicated local specialist lane as the primary executor pool: architect_local, implementer_local, reviewer_local.\n"
+            "- Keep Jarvis Codex delivery roles reserved for CEO/manual orders unless the operator explicitly overrides the separation policy.\n"
         )
     else:
         input_text = (
@@ -10764,8 +10809,8 @@ def _enqueue_factory_ceo_strategy_followup(
             "- Do NOT execute the larger/drastic change yet.\n"
             "- Replan from the CEO feedback.\n"
             "- Either produce a revised CEO approval proposal or downgrade to bounded work if possible.\n"
-            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors.\n"
-            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- Use the dedicated local specialist lane as the primary executor pool: architect_local, implementer_local, reviewer_local.\n"
+            "- Keep Jarvis Codex delivery roles reserved for CEO/manual orders unless the operator explicitly overrides the separation policy.\n"
         )
 
     trace: dict[str, Any] = {
@@ -12741,15 +12786,16 @@ def _spawn_proactive_order(
         "  1) repeated conversion failures in the local funnel,",
         "  2) reliability/evidence tests currently failing or flaky,",
         "  3) debt that measurably reduces operational noise.",
+        "- Use only the dedicated local specialist lane for execution on this proactive order: architect_local plans, implementer_local edits, reviewer_local validates. Do not delegate backend/frontend/qa/release_mgr for this lane.",
         "- Do not seed a new local task for a role that already has open work on this ticket.",
         "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.",
         "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.",
-        "- If the best next move is a new capability, a drastic change, or a materially broader plan, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.",
+        "- If the best next move is a net-new feature, a drastic change, or a materially broader plan, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.",
         "- If CEO approval is pending for a larger/drastic idea, do not delegate execution subtasks for that idea.",
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
-        "- Default to one bounded Codex delivery slice plus one validation slice; do not spray parallel tasks.",
+        "- Default to one bounded local change plus one validation slice; do not spray parallel tasks.",
         "- When delegating implementation, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.",
         "- If work becomes repetitive, empty, or low-signal, slow down and re-plan one narrower evidence-first path instead of spawning more tasks.",
         "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.",
@@ -13543,10 +13589,10 @@ def _enqueue_order_autopilot_task(
             "- Only propose work that advances this order.\n"
             "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
             "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
-            "- If the best next move is a larger strategic idea, a new capability, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
-            "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors for proactive work.\n"
-            "- Keep local specialists as optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
-            "- If a cycle stalls or returns low-signal output, slow down and re-plan a narrower Codex slice with stronger evidence requirements.\n"
+            "- If the best next move is a larger strategic idea, a net-new feature, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
+            "- Use only the dedicated local specialist lane for proactive work: architect_local, implementer_local, reviewer_local.\n"
+            "- Keep Jarvis Codex delivery roles reserved for CEO/manual orders unless the operator explicitly overrides the separation policy.\n"
+            "- If a cycle stalls or returns low-signal output, slow down and re-plan a narrower local slice with stronger evidence requirements.\n"
             "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
             "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
             "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
@@ -13997,9 +14043,10 @@ def _ceo_local_injection_enabled() -> bool:
 
 
 def _skynet_factory_local_only_enabled() -> bool:
-    # Proactive work defaults to Codex delivery roles. The old local-only factory
-    # mode remains available as an explicit opt-in escape hatch.
-    raw = os.environ.get("BOT_SKYNET_FACTORY_LOCAL_ONLY", "0")
+    # Proactive work is isolated by default so Skynet uses its own local
+    # specialist lane and Jarvis capacity remains available for CEO work.
+    # Operators can still opt out explicitly if they need the legacy shared mode.
+    raw = os.environ.get("BOT_SKYNET_FACTORY_LOCAL_ONLY", "1")
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -16514,6 +16561,7 @@ def _apply_autonomous_local_first_policy(
         "implementer_local",
         cfg=cfg if (cfg is not None and local_support_repo_id) else None,
         repo_id=local_support_repo_id or None,
+        change_token=rid,
     )
 
     local_roles = {"architect_local", "implementer_local", "reviewer_local"}
@@ -19146,7 +19194,7 @@ def _jarvis_final_sweep_tick(
                 "- Verify if remaining blockers are still valid.\n"
                 "- Discard/cancel stale or superseded leftovers.\n"
                 "- Re-plan an executable path for unresolved blockers.\n"
-                "- Keep execution aligned with ticket policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+                "- Keep execution aligned with ticket policy; proactive tickets should stay in the dedicated local-specialist lane unless the operator explicitly overrides that separation.\n"
                 "- Keep iterating until this ticket has no blocked/waiting leftovers.\n"
             )
             extra_trace = {
@@ -19166,7 +19214,7 @@ def _jarvis_final_sweep_tick(
                 "Action required:\n"
                 "- Do not leave this order active with zero live jobs.\n"
                 "- Either close the order explicitly with evidence, or delegate the next highest-impact executable work now.\n"
-                "- Re-plan using the ticket execution policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+                "- Re-plan using the ticket execution policy; proactive tickets should stay in the dedicated local-specialist lane unless the operator explicitly overrides that separation.\n"
                 "- Require validation/evidence before any final wrap-up.\n"
             )
             extra_trace = {

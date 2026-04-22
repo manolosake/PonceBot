@@ -4117,10 +4117,32 @@ class TestImplementerFailureSelection(unittest.TestCase):
 
 
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
-    def test_skynet_factory_local_only_disabled_by_default(self) -> None:
+    def test_skynet_factory_local_only_enabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_SKYNET_FACTORY_LOCAL_ONLY", None)
+            self.assertTrue(bot._skynet_factory_local_only_enabled())
+
+    def test_skynet_factory_local_only_can_be_disabled_explicitly(self) -> None:
+        with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "0"}, clear=False):
             self.assertFalse(bot._skynet_factory_local_only_enabled())
+
+    def test_local_role_worktree_dir_scopes_repo_workspace_by_change_token(self) -> None:
+        cfg = SimpleNamespace(worktree_root=Path("/tmp/poncebot-worktrees"))
+        path_a = bot._local_role_worktree_dir(
+            "implementer_local",
+            cfg=cfg,
+            repo_id="codexbot-12345678",
+            change_token="slice_a",
+        )
+        path_b = bot._local_role_worktree_dir(
+            "implementer_local",
+            cfg=cfg,
+            repo_id="codexbot-12345678",
+            change_token="slice_b",
+        )
+        self.assertNotEqual(path_a, path_b)
+        self.assertIn("/changes/slice_a/", str(path_a))
+        self.assertIn("/changes/slice_b/", str(path_b))
 
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
