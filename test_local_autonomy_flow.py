@@ -569,6 +569,70 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertIn("- bot.py", planned[0].text)
         self.assertIn("python3 -m py_compile bot.py", planned[0].text)
 
+    def test_apply_local_first_policy_excerpt_blocker_without_path_defaults_to_bot_py(self) -> None:
+        td, q = self._queue()
+        self.addCleanup(td.cleanup)
+        order_id = "57555555-5555-5555-5555-555555555555"
+        summary = (
+            "BLOCKER: Need full body of _classify_local_slice_failure to continue this patch."
+        )
+        impl = _new_task(
+            role="implementer_local",
+            parent_job_id=order_id,
+            key="local_impl_guard_slice_excerpt_no_path",
+            trace={
+                "slice_id": "slice_excerpt_no_path",
+                "slice_status": "blocked",
+                "quality_gate_status": "blocked",
+                "failure_class": "blocked",
+                "attempt_n": 1,
+            },
+        )
+        q.submit_task(impl)
+        q.update_state(
+            impl.job_id,
+            "blocked",
+            result_summary=summary,
+            slice_id="slice_excerpt_no_path",
+            slice_status="blocked",
+            quality_gate_status="blocked",
+            failure_class="blocked",
+            attempt_n=1,
+        )
+
+        specs = [
+            bot.TaskSpec(
+                key="backend_followup_no_path",
+                role="backend",
+                text="Investigate the local autonomy blocker.",
+                mode_hint="ro",
+                priority=2,
+                acceptance_criteria=["Produce one next step."],
+                definition_of_done=["One next step is identified."],
+                eta_minutes=15,
+                sla_tier="medium",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as worktree_td:
+            worktree = Path(worktree_td)
+            (worktree / "bot.py").write_text(
+                "def _classify_local_slice_failure(*, role_norm: str, orch_state: str, summary: str, attempt_n: int) -> str:\n"
+                "    return 'blocked'\n",
+                encoding="utf-8",
+            )
+            with patch.object(bot, "_local_role_worktree_dir", return_value=worktree):
+                planned = bot._apply_autonomous_local_first_policy(
+                    specs=specs,
+                    orch_q=q,
+                    root_ticket=order_id,
+                    now=time.time(),
+                )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].role, "implementer_local")
+        self.assertIn("- bot.py", planned[0].text)
+        self.assertIn("python3 -m py_compile bot.py", planned[0].text)
+
     def test_structured_handoff_actionable_requires_sections(self) -> None:
         good = (
             "FILES:\n"

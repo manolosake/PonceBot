@@ -17292,7 +17292,17 @@ def _apply_autonomous_local_first_policy(
             if len(candidate_files) >= 3:
                 break
         if not candidate_files:
-            return []
+            excerpt_blocker_text = blocker_payload or arch_payload
+            if _local_blocker_requests_grounded_excerpt(excerpt_blocker_text):
+                bot_file = (worktree / "bot.py").resolve()
+                try:
+                    inside = str(bot_file).startswith(str(worktree))
+                except Exception:
+                    inside = False
+                if inside and bot_file.is_file():
+                    candidate_files = ["bot.py"]
+            if not candidate_files:
+                return []
         # Keep direct unblock scope tight: prefer executable/source files over docs.
         non_doc_candidates = [p for p in candidate_files if not str(p).lower().endswith(".md")]
         if non_doc_candidates:
