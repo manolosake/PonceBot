@@ -33,7 +33,7 @@ def _candidate_lines(path: pathlib.Path) -> set[int]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Minimal coverage gate for hardening-critical modules")
-    ap.add_argument("--min", dest="min_cov", type=float, default=0.65)
+    ap.add_argument("--min", dest="min_cov", type=float, default=0.70)
     args = ap.parse_args()
 
     suite = unittest.defaultTestLoader.discover(".", pattern="test_*.py")

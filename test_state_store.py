@@ -61,6 +61,13 @@ class TestStateStoreBasics(unittest.TestCase):
             store = StateStore(p)
             self.assertEqual(store.read(), {})
 
+    def test_read_falls_back_to_empty_on_os_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            with mock.patch.object(Path, "read_text", side_effect=OSError("io failure")):
+                self.assertEqual(store.read(), {})
+
     def test_update_recovers_from_non_dict_json(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "state.json"
@@ -108,6 +115,19 @@ class TestStateStoreBasics(unittest.TestCase):
 
             leftovers = list(Path(td).glob("state.json.*.tmp"))
             self.assertEqual(leftovers, [])
+
+    def test_update_mutator_error_does_not_corrupt_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            store.replace({"stable": 1})
+
+            def _m(_st):
+                raise RuntimeError("mutator boom")
+
+            with self.assertRaisesRegex(RuntimeError, "mutator boom"):
+                store.update(_m)
+            self.assertEqual(store.read(), {"stable": 1})
 
 
 if __name__ == "__main__":
