@@ -248,6 +248,23 @@ class TestDelegationParsing(unittest.TestCase):
         self.assertEqual(int(s.eta_minutes or 0), 95)
         self.assertEqual(s.sla_tier, "high")
 
+    def test_orchestrator_subtasks_normalize_key_alignment(self) -> None:
+        specs = parse_orchestrator_subtasks(
+            {
+                "subtasks": [
+                    {
+                        "key": " Ship API ",
+                        "role": "backend",
+                        "text": "Implement endpoint",
+                        "depends_on": [" ARCH ", " Ship API "],
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0].key, "ship_api")
+        self.assertEqual(specs[0].depends_on, ["arch"])
+
 
 class TestOrchestratorRoleNormalization(unittest.TestCase):
     def test_known_roles_are_stable(self) -> None:
@@ -1632,6 +1649,924 @@ class TestOrderBranchPolicy(unittest.TestCase):
             )
 
 
+class TestFinalSweepGuard(unittest.TestCase):
+    def test_final_sweep_enqueues_when_active_order_has_no_children_and_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-stale"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 600.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_jobs = [j for j in children if str((j.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_jobs), 1)
+            sweep = sweep_jobs[0]
+            self.assertEqual(str(sweep.state or ""), "queued")
+            self.assertEqual(str((sweep.trace or {}).get("final_sweep_reason") or ""), "idle_no_open_jobs")
+            self.assertIn("Do not leave this order active with zero live jobs.", str(sweep.input_text or ""))
+
+    def test_final_sweep_does_not_enqueue_when_no_children_but_root_is_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-fresh"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            recent_ts = now - 30.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(recent_ts), float(recent_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "300",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            self.assertEqual(children, [])
+
+    def test_final_sweep_auto_closes_proactive_terminal_only_order_after_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-terminal-only-close"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="attempt 1",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="failed",
+                    job_id="job-terminal-1",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="attempt 2",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-2",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "2",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("final_sweep_terminal_only_closed", False)))
+
+    def test_final_sweep_default_terminal_threshold_closes_at_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-default-threshold"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            for i in range(11):
+                q.submit_task(
+                    Task.new(
+                        source="telegram",
+                        role="implementer_local",
+                        input_text=f"attempt {i + 1}",
+                        request_type="task",
+                        priority=1,
+                        model="",
+                        effort="",
+                        mode_hint="rw",
+                        requires_approval=False,
+                        max_cost_window_usd=1.0,
+                        chat_id=1,
+                        parent_job_id=order_id,
+                        state="done",
+                        job_id=f"job-terminal-default-{i + 1}",
+                    )
+                )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+
+    def test_final_sweep_blocker_predicate_ignores_controller_review_overhead(self) -> None:
+        overhead_children = [
+            Task.new(
+                source="telegram",
+                role="qa",
+                input_text="qa follow-up",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id="ord-overhead",
+            ),
+            Task.new(
+                source="telegram",
+                role="reviewer_local",
+                input_text="review pass",
+                request_type="review",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                parent_job_id="ord-overhead",
+            ),
+        ]
+        blockers_overhead = bot._final_sweep_blocker_count(children=overhead_children)
+        self.assertEqual(blockers_overhead, 0)
+
+        real_blocker_children = overhead_children + [
+            Task.new(
+                source="telegram",
+                role="backend",
+                input_text="real delivery work",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id="ord-overhead",
+            )
+        ]
+        blockers_real = bot._final_sweep_blocker_count(children=real_blocker_children)
+        self.assertGreater(blockers_real, 0)
+
+    def test_final_sweep_auto_closes_with_only_review_overhead_open(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-review-overhead-only"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="attempt 1",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-overhead-1",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="attempt 2",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-overhead-2",
+                )
+            )
+            # Controller/review overhead stays open but should not self-block closure.
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="qa",
+                    input_text="post-check",
+                    request_type="review",
+                    priority=2,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="running",
+                    job_id="job-overhead-qa-open",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "2",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+
+    def test_final_sweep_default_stale_window_enqueues_sooner(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-default-stale-window"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    # Keep defaults for stale threshold and close threshold.
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
+    def test_final_sweep_invalid_stale_env_uses_safe_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-invalid-stale-env"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    # Broken env value should fall back to safe default instead of disabling stale sweep.
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "not-a-number",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
+    def test_final_sweep_enqueues_for_stale_active_order_without_root_job(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-orphaned-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE ceo_orders SET created_at = ?, updated_at = ? WHERE order_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
+    def test_final_sweep_uses_first_valid_timestamp_when_updated_at_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-invalid-updated-at"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE ceo_orders SET created_at = ?, updated_at = ? WHERE order_id = ?",
+                    (float(stale_ts), "bad-timestamp", order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
+    def test_final_sweep_rejects_non_finite_timestamp_values(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-non-finite-ts"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 180.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), "nan", order_id),
+                )
+                conn.execute(
+                    "UPDATE ceo_orders SET updated_at = ? WHERE order_id = ?",
+                    ("inf", order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_children = [c for c in children if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_children), 1)
+
+    def test_final_sweep_does_not_reenqueue_when_done_sweep_requests_root_cause_close(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-root-cause-closed"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="final sweep",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    labels={"ticket": order_id, "kind": "final_sweep"},
+                    trace={"result_summary": "NO-GO: close this order due blocked with root cause."},
+                    job_id="job-final-sweep-done-close",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1800.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), "job-final-sweep-done-close"),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=100)
+            queued_sweeps = [
+                c
+                for c in children
+                if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+                and str(c.state or "").strip().lower() == "queued"
+            ]
+            self.assertEqual(queued_sweeps, [])
+
+
+class TestAutopilotTick(unittest.TestCase):
+    def test_autopilot_tick_skips_when_proactive_lane_is_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-autopilot-paused"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Paused proactive order",
+                body="AUTONOMOUS PROACTIVE SPRINT",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+            bot._set_proactive_lane_pause(
+                cfg,
+                paused=True,
+                reason="manual_pause_command",
+                manual=True,
+            )
+
+            created = bot._autopilot_tick(
+                cfg=cfg,
+                orch_q=q,
+                profiles=None,
+                chat_id=1,
+                now=_time.time(),
+            )
+
+            self.assertEqual(created, 0)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=100)
+            self.assertEqual(children, [])
+
+
 class TestRunningWatchdog(unittest.TestCase):
     def test_requeues_silent_local_ollama_before_full_runtime_budget(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1766,6 +2701,13 @@ class TestYamlLikeParsing(unittest.TestCase):
         rb = rbs[0]
         self.assertNotEqual(rb.prompt.strip(), "|")
         self.assertTrue(rb.prompt.strip())
+
+    def test_release_manager_governance_command_pins_qa_role(self) -> None:
+        profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")
+        rm = profiles["release_mgr"]
+        system_prompt = str(rm.get("system_prompt") or "")
+        self.assertIn("tools/release_governance.py", system_prompt)
+        self.assertIn("--role qa", system_prompt)
 
 
 class TestScreenshotUrlValidation(unittest.TestCase):
@@ -1913,6 +2855,55 @@ class TestOrchestratorDependencyGating(unittest.TestCase):
             self.assertIsNone(refreshed.due_at)
             self.assertTrue(str(refreshed.blocked_reason or "").startswith("dependencies_pending"))
             self.assertGreater(float(refreshed.updated_at), now)
+
+    def test_terminal_dependency_update_immediately_releases_waiting_deps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            dep = q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="dep running",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="running",
+                )
+            )
+            blocked = Task.new(
+                source="telegram",
+                role="qa",
+                input_text="blocked by dep",
+                request_type="task",
+                priority=2,
+                model="",
+                effort="",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                depends_on=[dep],
+            )
+            jid = q.submit_task(blocked)
+            self.assertIsNone(q.take_next())  # transitions blocked task to waiting_deps
+            waiting = q.get_job(jid)
+            self.assertIsNotNone(waiting)
+            assert waiting is not None
+            self.assertEqual(waiting.state, "waiting_deps")
+
+            self.assertTrue(q.update_state(dep, "done"))
+            released = q.get_job(jid)
+            self.assertIsNotNone(released)
+            assert released is not None
+            self.assertEqual(released.state, "queued")
+            self.assertIsNone(released.blocked_reason)
 
 
 class TestRetryScheduling(unittest.TestCase):

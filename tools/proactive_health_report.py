@@ -415,6 +415,9 @@ def main() -> int:
     if not DB.exists():
         return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
+    if not DB.exists():
+        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
+
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     cur = con.cursor()

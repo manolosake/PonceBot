@@ -14,4 +14,4 @@ test:
 	$(PYTHON) -m unittest -q
 
 coverage:
-	$(PYTHON) tools/coverage_gate.py --min 0.65
+	$(PYTHON) tools/coverage_gate.py --min 0.70

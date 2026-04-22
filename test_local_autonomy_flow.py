@@ -5,7 +5,10 @@ import time
 import subprocess
 import unittest
 import os
+import re
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import bot
 from orchestrator.queue import OrchestratorQueue
@@ -211,6 +214,55 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(funnel["slices_closed"], 1)
         self.assertTrue(funnel["improvement_verified"])
 
+    def test_funnel_ignores_non_controller_improvement_flags_for_closure(self) -> None:
+        td, q = self._queue()
+        self.addCleanup(td.cleanup)
+        order_id = "44444444-4444-4444-4444-444444444444"
+        slice_id = "slice_delta"
+
+        impl = _new_task(role="implementer_local", parent_job_id=order_id, key=f"local_impl_guard_{slice_id}")
+        q.submit_task(impl)
+        q.update_state(
+            impl.job_id,
+            "done",
+            result_summary="validated implementation",
+            slice_id=slice_id,
+            slice_status="validated",
+            quality_gate_status="validated",
+            failure_class="retriable",
+            attempt_n=1,
+            slice_patch_applied=True,
+            slice_validation_ok=True,
+        )
+        rev = _new_task(role="reviewer_local", parent_job_id=order_id, key=f"local_review_guard_{slice_id}")
+        q.submit_task(rev)
+        q.update_state(
+            rev.job_id,
+            "done",
+            result_summary="READY with evidence",
+            slice_id=slice_id,
+            slice_status="reviewed_ready",
+            quality_gate_status="reviewed_ready",
+            failure_class="retriable",
+            attempt_n=1,
+        )
+
+        # Non-controller role must not satisfy controller verification gate.
+        backend_job = _new_task(role="backend", parent_job_id=order_id, key="backend_signal")
+        q.submit_task(backend_job)
+        q.update_state(
+            backend_job.job_id,
+            "done",
+            result_summary="VERIFIED_IMPROVEMENT",
+            slice_id=slice_id,
+            improvement_verified=True,
+        )
+
+        funnel = bot._collect_order_local_autonomy_funnel(orch_q=q, root_ticket=order_id, now=time.time())
+        self.assertEqual(funnel["slices_validated"], 1)
+        self.assertEqual(funnel["slices_closed"], 0)
+        self.assertFalse(funnel["improvement_verified"])
+
     def test_failure_class_patch_apply_errors_retry_once_then_terminal(self) -> None:
         msg = "patch apply failed: hunk error"
         first = bot._classify_local_slice_failure(
@@ -316,6 +368,73 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         pruned = bot._prune_local_specs_against_active_backlog(specs=specs, existing_children=[blocked_impl])
         roles = [bot._coerce_orchestrator_role(str(s.role or "")) for s in pruned]
         self.assertIn("architect_local", roles)
+
+    def test_apply_local_first_policy_directs_grounded_excerpt_blocker_to_implementer(self) -> None:
+        td, q = self._queue()
+        self.addCleanup(td.cleanup)
+        order_id = "55555555-5555-5555-5555-555555555555"
+        summary = (
+            "BLOCKER: Missing current excerpt for `bot.py` around `_classify_local_slice_failure` "
+            "(full function body). Please provide the exact current function body so I can add the "
+            "terminal classification predicate."
+        )
+        impl = _new_task(
+            role="implementer_local",
+            parent_job_id=order_id,
+            key="local_impl_guard_slice_excerpt",
+            trace={
+                "slice_id": "slice_excerpt",
+                "slice_status": "blocked",
+                "quality_gate_status": "blocked",
+                "failure_class": "blocked",
+                "attempt_n": 1,
+            },
+        )
+        q.submit_task(impl)
+        q.update_state(
+            impl.job_id,
+            "blocked",
+            result_summary=summary,
+            slice_id="slice_excerpt",
+            slice_status="blocked",
+            quality_gate_status="blocked",
+            failure_class="blocked",
+            attempt_n=1,
+        )
+
+        specs = [
+            bot.TaskSpec(
+                key="backend_followup",
+                role="backend",
+                text="Investigate the local autonomy blocker.",
+                mode_hint="ro",
+                priority=2,
+                acceptance_criteria=["Produce one next step."],
+                definition_of_done=["One next step is identified."],
+                eta_minutes=15,
+                sla_tier="medium",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as worktree_td:
+            worktree = Path(worktree_td)
+            (worktree / "bot.py").write_text(
+                "def _classify_local_slice_failure(*, role_norm: str, orch_state: str, summary: str, attempt_n: int) -> str:\n"
+                "    return 'blocked'\n",
+                encoding="utf-8",
+            )
+            with patch.object(bot, "_local_role_worktree_dir", return_value=worktree):
+                planned = bot._apply_autonomous_local_first_policy(
+                    specs=specs,
+                    orch_q=q,
+                    root_ticket=order_id,
+                    now=time.time(),
+                )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].role, "implementer_local")
+        self.assertIn("LATEST_IMPLEMENTER_BLOCKER", planned[0].text)
+        self.assertIn("- bot.py", planned[0].text)
+        self.assertIn("python3 -m py_compile bot.py", planned[0].text)
 
     def test_structured_handoff_actionable_requires_sections(self) -> None:
         good = (
@@ -472,6 +591,92 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             self.assertIn("FAILED_VALIDATION_OUTPUT", summary)
             self.assertIn("tools/example.py", summary)
             self.assertIn("FAILED_CHANGED_FILES", summary)
+
+    def test_workspace_context_large_exact_target_includes_symbol_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            filler = 'x = "' + ("a" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            task = SimpleNamespace(
+                input_text="Please patch bot.py around _classify_local_slice_failure.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify bot.py for _classify_local_slice_failure reliability.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("def _classify_local_slice_failure", prompt)
+            self.assertIn("# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]", prompt)
+
+    def test_workspace_context_large_exact_target_symbol_not_found_uses_truncated_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            filler = 'x = "' + ("b" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            task = SimpleNamespace(
+                input_text="Please patch bot.py around _symbol_not_present_in_file.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify bot.py for _symbol_not_present_in_file reliability.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("# [TRUNCATED_EXACT_TARGET_CONTEXT]", prompt)
+            self.assertNotIn("def _classify_local_slice_failure", prompt)
+
+    def test_workspace_context_large_ranked_python_candidate_includes_symbol_excerpt_without_path_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            subprocess.run(["git", "init"], cwd=worktree, check=True, capture_output=True, text=True)
+            filler = 'x = "' + ("c" * 70) + '"'
+            lines = [f"{filler}  # {i}" for i in range(1300)]
+            lines.extend(
+                [
+                    "",
+                    "def _classify_local_slice_failure(role_norm: str) -> str:",
+                    "    return role_norm",
+                    "",
+                ]
+            )
+            (worktree / "bot.py").write_text("\n".join(lines), encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=worktree, check=True, capture_output=True, text=True)
+            task = SimpleNamespace(
+                input_text="Please patch _classify_local_slice_failure reliability.",
+                trace={},
+            )
+            prompt = bot._augment_local_specialist_prompt_with_workspace_context(
+                task=task,
+                user_prompt="Modify the local failure classifier to reduce implementer blockers.",
+                worktree_dir=worktree,
+                role="implementer_local",
+            )
+            self.assertIn("FILE: bot.py", prompt)
+            self.assertIn("def _classify_local_slice_failure", prompt)
+            self.assertIn("# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]", prompt)
 
 
 if __name__ == "__main__":

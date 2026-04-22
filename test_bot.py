@@ -3190,8 +3190,11 @@ class TestDrainPendingUpdates(unittest.TestCase):
                 def get_updates(self, *, offset: int, timeout_seconds: int) -> list[dict]:
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with patch.object(bot.LOG, "warning") as warn_mock, patch.object(bot.LOG, "exception") as exc_mock:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 0)
+            warn_mock.assert_called_once()
+            exc_mock.assert_not_called()
 
     def test_drain_returns_partial_offset_on_midway_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3207,8 +3210,11 @@ class TestDrainPendingUpdates(unittest.TestCase):
                         return [{"update_id": 41}, {"update_id": 42}]
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with patch.object(bot.LOG, "warning") as warn_mock, patch.object(bot.LOG, "exception") as exc_mock:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 43)
+            warn_mock.assert_called_once()
+            exc_mock.assert_not_called()
 
 
 class TestCodexConfigParsing(unittest.TestCase):
@@ -3461,12 +3467,15 @@ class TestHardeningControls(unittest.TestCase):
                 chat_id=1,
                 user_id=2,
                 message_id=10,
-                username="u",
-                text="/breakglass on 1 emergency fix",
-            )
-            resp, job = bot._parse_job(cfg, msg)
+                    username="u",
+                    text="/breakglass on 1 emergency fix",
+                )
+            with patch.object(bot.LOG, "warning") as warn_mock:
+                resp, job = bot._parse_job(cfg, msg)
             self.assertIsNone(job)
             self.assertIn("breakglass enabled", resp)
+            warn_mock.assert_called_once()
+            self.assertIn("BREAKGLASS ENABLED", str(warn_mock.call_args.args[0]))
 
             bot._set_access_mode(cfg, "full", chat_id=1)
             self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
@@ -3718,7 +3727,7 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
         self.assertNotIn("implementer_local", roles)
         self.assertNotIn("reviewer_local", roles)
 
-    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane(self) -> None:
+    def test_inject_local_specialists_skips_proactive_lane_by_default_codex_first(self) -> None:
         specs = [
             bot.TaskSpec(
                 key="backend_fix",
@@ -3744,6 +3753,38 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
             proactive_lane=True,
             allow_delegation=False,
         )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane_when_local_only(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-123",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=False,
+                proactive_lane=True,
+                allow_delegation=False,
+            )
         roles = [str(x.role or "").strip().lower() for x in out]
         self.assertIn("architect_local", roles)
         self.assertIn("implementer_local", roles)

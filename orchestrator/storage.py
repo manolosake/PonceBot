@@ -1418,6 +1418,10 @@ class SQLiteTaskStorage:
                     return False
                 ok = self._update_state_in_conn(conn, job_id=resolved, state=str(state), metadata=metadata)
                 if ok:
+                    # Promote waiting dependency jobs immediately when a dependency
+                    # reaches terminal state, instead of waiting for the next claim loop.
+                    if str(state) in ("done", "failed", "cancelled"):
+                        self._reconcile_waiting_jobs_in_conn(conn, now=time.time())
                     conn.commit()
                 return ok
 
