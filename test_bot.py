@@ -1113,12 +1113,15 @@ class TestHardeningControls(unittest.TestCase):
                 chat_id=1,
                 user_id=2,
                 message_id=10,
-                username="u",
-                text="/breakglass on 1 emergency fix",
-            )
-            resp, job = bot._parse_job(cfg, msg)
+                    username="u",
+                    text="/breakglass on 1 emergency fix",
+                )
+            with patch.object(bot.LOG, "warning") as warn_mock:
+                resp, job = bot._parse_job(cfg, msg)
             self.assertIsNone(job)
             self.assertIn("breakglass enabled", resp)
+            warn_mock.assert_called_once()
+            self.assertIn("BREAKGLASS ENABLED", str(warn_mock.call_args.args[0]))
 
             bot._set_access_mode(cfg, "full", chat_id=1)
             self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
