@@ -4957,6 +4957,19 @@ def _extract_blocker_response(text: str) -> str:
     return blocker[:2000].strip()
 
 
+def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    markers = (
+        "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
+        "please provide the full function body for `_classify_local_slice_failure`",
+        "provide the exact current function body",
+        "missing current excerpt for `bot.py` around `_classify_local_slice_failure`",
+    )
+    return any(marker in blob for marker in markers)
+
+
 def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
     raw = str(text or "")
     if not raw.strip():
@@ -5518,7 +5531,9 @@ def _focused_workspace_symbol_excerpt(
         if not snippet_body:
             continue
         snippet = (
-            f"# [FOCUSED_EXACT_TARGET_CONTEXT {rel_path}:{start + 1}-{end} symbol={token}]\n"
+            "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n"
+            f"# [FOCUSED_EXACT_TARGET_CONTEXT {rel_path}:{start + 1}-{end}]\n"
+            f"# path={rel_path}:{start + 1}-{end} symbol={token}\n"
             + snippet_body
         )
         if snippets and total_chars + len(snippet) > max_chars:
@@ -5653,13 +5668,17 @@ def _augment_local_specialist_prompt_with_workspace_context(
                         excerpt = raw.rstrip()
                     else:
                         head = raw[:24000].rstrip()
-                        tail = raw[-24000:].lstrip()
-                        excerpt = (
-                            head
-                            + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
-                            + "# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]\n"
-                            + tail
-                        )
+                        explicit_symbol_tokens = re.findall(r"\b_[A-Za-z][A-Za-z0-9_]{3,}\b", "\n".join(context_texts))
+                        if explicit_symbol_tokens:
+                            excerpt = head + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
+                        else:
+                            tail = raw[-12000:].lstrip()
+                            excerpt = (
+                                head
+                                + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
+                                + tail
+                                + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]\n"
+                            )
             elif focused_excerpt:
                 excerpt = focused_excerpt
             else:
@@ -5667,9 +5686,22 @@ def _augment_local_specialist_prompt_with_workspace_context(
                 if len(excerpt) > excerpt_chars_cap:
                     excerpt = excerpt[:excerpt_chars_cap].rstrip()
         else:
-            excerpt = "\n".join(lines[:excerpt_lines_cap])
-            if len(excerpt) > excerpt_chars_cap:
-                excerpt = excerpt[:excerpt_chars_cap].rstrip()
+            focused_excerpt = ""
+            if role == "implementer_local" and (len(lines) > excerpt_lines_cap or len(raw) > excerpt_chars_cap):
+                focused_excerpt = _focused_workspace_symbol_excerpt(
+                    raw=raw,
+                    rel_path=rel_path,
+                    context_texts=context_texts,
+                    max_snippets=2,
+                    context_lines=14,
+                    max_chars=8000,
+                )
+            if focused_excerpt:
+                excerpt = focused_excerpt
+            else:
+                excerpt = "\n".join(lines[:excerpt_lines_cap])
+                if len(excerpt) > excerpt_chars_cap:
+                    excerpt = excerpt[:excerpt_chars_cap].rstrip()
         chunks.extend([
             "",
             f"FILE: {rel_path}",
@@ -14047,6 +14079,9 @@ def _inject_local_specialist_specs(
         return specs
     if not (bool(is_top_level_manual) or bool(proactive_lane) or bool(allow_delegation)):
         return specs
+    # Proactive lane stays Codex-delivery-first by default.
+    if bool(proactive_lane) and (not _skynet_factory_local_only_enabled()):
+        return specs
 
     roles_present = {str(s.role or "").strip().lower() for s in specs}
     delivery_roles = {
@@ -16349,7 +16384,7 @@ def _recent_ticket_role_activity(
 
 def _apply_autonomous_local_first_policy(
     *,
-    cfg: BotConfig | None,
+    cfg: BotConfig | None = None,
     specs: list[TaskSpec],
     orch_q: OrchestratorQueue,
     root_ticket: str,
@@ -17268,7 +17303,7 @@ def _apply_autonomous_local_first_policy(
             if low.startswith("test") or "/test" in low or low.startswith("tests/"):
                 test_target = rel_path
                 break
-        validation_cmd = f"pytest -q {test_target}" if test_target else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        validation_cmd = f"pytest -q {test_target}" if test_target else f"python3 -m py_compile {' '.join(candidate_files[:2])}"
         suffix_base = _sanitize_slice_token(latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
         direct_suffix = _sanitize_slice_token(
             f"{suffix_base}_direct_r{int(max(2, recent_non_actionable_arch_count + 1))}",
@@ -17620,6 +17655,10 @@ def _apply_autonomous_local_first_policy(
         if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
             return _no_change_review_specs()
         if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+            if _local_blocker_requests_grounded_excerpt(latest_impl_failed_blocker):
+                direct_specs = _direct_blocker_implementer_specs()
+                if direct_specs:
+                    return direct_specs
             if int(recent_non_actionable_arch_count) >= 2:
                 direct_specs = _direct_blocker_implementer_specs()
                 if (not direct_specs) and _response_signals_repo_access_blocker(latest_arch_response):
@@ -17701,6 +17740,10 @@ def _apply_autonomous_local_first_policy(
         and not active_implementer_open
         and not active_reviewer_open
     ):
+        if _local_blocker_requests_grounded_excerpt(latest_impl_failed_blocker):
+            direct_specs = _direct_blocker_implementer_specs()
+            if direct_specs:
+                return direct_specs
         if int(recent_non_actionable_arch_count) >= 2:
             direct_specs = _direct_blocker_implementer_specs()
             if direct_specs:
