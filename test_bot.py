@@ -2447,7 +2447,7 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(result["status"], "ok")
             self.assertIn("patch_info", result["structured_digest"])
             self.assertTrue(bool(result["structured_digest"]["patch_info"].get("validation_ok", False)))
-            worktree_target = bot._repo_worktree_root(cfg, repo_id=repo_id) / "implementer_local" / "slot1" / "bot.py"
+            worktree_target = bot._task_scoped_repo_worktree_root(cfg, task=task, repo_base_dir=repo, repo_id=repo_id) / "implementer_local" / "slot1" / "bot.py"
             self.assertTrue(worktree_target.is_file())
             self.assertEqual(worktree_target.read_text(encoding="utf-8"), updated)
 
@@ -4143,6 +4143,26 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertNotEqual(path_a, path_b)
         self.assertIn("/changes/slice_a/", str(path_a))
         self.assertIn("/changes/slice_b/", str(path_b))
+
+    def test_task_scoped_repo_worktree_root_uses_change_token(self) -> None:
+        cfg = SimpleNamespace(worktree_root=Path("/tmp/poncebot-worktrees"))
+        task_a = SimpleNamespace(trace={"slice_id": "slice_a"}, labels={}, job_id="job-a")
+        task_b = SimpleNamespace(trace={"slice_id": "slice_b"}, labels={}, job_id="job-b")
+        root_a = bot._task_scoped_repo_worktree_root(
+            cfg,
+            task=task_a,
+            repo_base_dir=Path("/tmp/repo"),
+            repo_id="codexbot-12345678",
+        )
+        root_b = bot._task_scoped_repo_worktree_root(
+            cfg,
+            task=task_b,
+            repo_base_dir=Path("/tmp/repo"),
+            repo_id="codexbot-12345678",
+        )
+        self.assertNotEqual(root_a, root_b)
+        self.assertIn("/changes/slice_a", str(root_a))
+        self.assertIn("/changes/slice_b", str(root_b))
 
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

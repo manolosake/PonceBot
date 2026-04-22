@@ -5066,6 +5066,23 @@ def _local_workspace_change_token(task: Any) -> str:
     return "shared"
 
 
+def _task_scoped_repo_worktree_root(
+    cfg: BotConfig,
+    *,
+    task: Any,
+    repo_base_dir: Path | None,
+    repo_id: str | None,
+) -> Path:
+    if repo_base_dir is None:
+        return cfg.worktree_root
+    resolved_repo_id = repo_id or _factory_repo_id(repo_base_dir)
+    return _repo_change_worktree_root(
+        cfg,
+        repo_id=resolved_repo_id,
+        change_token=_local_workspace_change_token(task),
+    )
+
+
 def _latest_local_specialist_response(
     *,
     root_ticket: str,
@@ -6418,7 +6435,7 @@ def _orchestrator_run_local_ollama(
         try:
             role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
             local_worktree_repo_id = role_repo_id
-            repo_root = _repo_change_worktree_root(cfg, repo_id=role_repo_id, change_token=change_token)
+            repo_root = _task_scoped_repo_worktree_root(cfg, task=task, repo_base_dir=repo_base_dir, repo_id=role_repo_id)
             ensure_worktree_pool(base_repo=repo_base_dir, root=repo_root, role=role, slots=1)
             repo_role_worktree = (repo_root / role / "slot1").resolve()
             prepare_clean_workspace(repo_role_worktree)
@@ -22539,7 +22556,7 @@ def _orchestrator_run_codex(
                     "next_action": "retry",
                     "structured_digest": {"role": role, "workspace": "unavailable"},
                 }
-            worktree_root = _repo_worktree_root(cfg, repo_id=repo_id or _factory_repo_id(lease_base_repo)) if repo_base_dir is not None else cfg.worktree_root
+            worktree_root = _task_scoped_repo_worktree_root(cfg, task=task, repo_base_dir=repo_base_dir, repo_id=repo_id or _factory_repo_id(lease_base_repo))
             ensure_worktree_pool(base_repo=lease_base_repo, root=worktree_root, role=role, slots=slots)
             worktree_dir = (worktree_root / role / f"slot{leased_slot}").resolve()
             prepare_clean_workspace(worktree_dir)
