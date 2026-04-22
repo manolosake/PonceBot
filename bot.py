@@ -15564,7 +15564,7 @@ def _classify_local_slice_failure(
         "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
         "please provide the full function body for `_classify_local_slice_failure`",
     )
-    if any(tok in blob for tok in blocker_markers):
+    if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
     if "patch rejected by git apply --check" in blob and "no valid patches in input" in blob:

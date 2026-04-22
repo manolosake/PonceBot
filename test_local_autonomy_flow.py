@@ -337,6 +337,26 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "blocked")
 
+    def test_failure_class_plaintext_full_body_request_is_blocked(self) -> None:
+        msg = "Need full body of _classify_local_slice_failure so I can complete this fix."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_failure_class_plaintext_missing_excerpt_request_is_blocked(self) -> None:
+        msg = "Missing current excerpt for bot.py around _classify_local_slice_failure."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_local_blocker_requests_grounded_excerpt_detects_plaintext_variants(self) -> None:
         self.assertTrue(
             bot._local_blocker_requests_grounded_excerpt(
