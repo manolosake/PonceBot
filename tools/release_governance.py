@@ -765,6 +765,36 @@ def _resolve_traceability_value(explicit: str, env_keys: list[str]) -> str:
     return ""
 
 
+def _resolve_execution_role(*, role: str, job_id: str) -> tuple[str, str, str]:
+    requested = _normalize_role_for_close_gate(role or "backend") or "backend"
+    jid = str(job_id or "").strip()
+    if not jid:
+        return requested, "explicit_or_default", ""
+
+    db_path = Path(os.environ.get("ORCH_JOBS_DB", "/home/aponce/codexbot/data/jobs.sqlite")).expanduser()
+    try:
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT role, source FROM jobs WHERE job_id = ?", (jid,)).fetchone()
+    except Exception:
+        row = None
+
+    if row is None:
+        return requested, "explicit_or_default", ""
+
+    db_role = _normalize_role_for_close_gate(str(row["role"] or ""))
+    db_source = str(row["source"] or "").strip()
+    if not db_role:
+        return requested, "explicit_or_default", db_source
+
+    qa_like = {"qa", "qa_local", "quality_assurance", "release_mgr", "release_manager"}
+    if requested in qa_like and db_role not in qa_like:
+        return db_role, f"job_role_override_from_db:{requested}->{db_role}", db_source
+    if requested in {"backend", "frontend", "sre", "data"} and db_role != requested:
+        return db_role, f"job_role_override_from_db:{requested}->{db_role}", db_source
+    return requested, "explicit_or_default", db_source
+
+
 def _traceability_ids_check(*, job_id: str, ticket_id: str) -> Check:
     ok = bool(str(job_id or "").strip() and str(ticket_id or "").strip())
     return Check(
@@ -780,6 +810,8 @@ def _build_run_provenance(
     branch: str,
     commit_sha: str,
     role: str,
+    role_source: str = "",
+    execution_source: str = "",
     job_id: str,
     ticket_id: str,
 ) -> dict[str, Any]:
@@ -789,6 +821,8 @@ def _build_run_provenance(
         "branch": str(branch or "").strip(),
         "commit_sha": str(commit_sha or "").strip(),
         "role": str(role or "").strip(),
+        "role_source": str(role_source or "").strip(),
+        "execution_source": str(execution_source or "").strip(),
         "job_id": str(job_id or "").strip(),
         "ticket_id": str(ticket_id or "").strip(),
     }
@@ -856,19 +890,30 @@ def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
     return blockers
 
 
-def _close_gate_blocker_count_for_ticket(db_path: Path, ticket_id: str) -> int:
+def _close_gate_blocker_count_for_ticket(
+    db_path: Path,
+    ticket_id: str,
+    *,
+    ignore_job_ids: set[str] | None = None,
+) -> int:
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
     rows = con.execute(
         """
-        SELECT role, state
+        SELECT job_id, role, state
         FROM jobs
         WHERE parent_job_id = ?
           AND state IN ('queued','running','waiting_deps','blocked','blocked_approval')
         """,
         (str(ticket_id),),
     ).fetchall()
-    payload = [dict(r) for r in rows]
+    ignore_ids = {str(x).strip() for x in (ignore_job_ids or set()) if str(x).strip()}
+    payload = []
+    for r in rows:
+        item = dict(r)
+        if str(item.get("job_id") or "").strip() in ignore_ids:
+            continue
+        payload.append(item)
     return _close_gate_blocker_count(payload)
 
 
@@ -882,7 +927,14 @@ def _append_transcript(path: Path, *, label: str, cmd: list[str], rc: int, out: 
         f.write("\n".join(lines) + "\n\n")
 
 
-def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str, ticket_id: str = "") -> list[Check]:
+def _run_replay_gate(
+    repo: Path,
+    *,
+    artifacts_dir: Path,
+    python_bin: str,
+    ticket_id: str = "",
+    job_id: str = "",
+) -> list[Check]:
     """
     Run clean-shell replay sanity commands (c02-c04 equivalents).
     Uses canonical bootstrap script to keep replay behavior deterministic.
@@ -909,7 +961,9 @@ def _run_replay_gate(repo: Path, *, artifacts_dir: Path, python_bin: str, ticket
     ticket = str(ticket_id or "").strip()
     if ticket:
         db_path = Path(os.environ.get("ORCH_JOBS_DB", "/home/aponce/codexbot/data/jobs.sqlite")).expanduser()
-        blockers = _close_gate_blocker_count_for_ticket(db_path, ticket)
+        current_job = str(job_id or "").strip()
+        ignore_ids = {current_job} if current_job else set()
+        blockers = _close_gate_blocker_count_for_ticket(db_path, ticket, ignore_job_ids=ignore_ids)
         rc = 0 if int(blockers) == 0 else 2
         out = f"ticket_id={ticket}\nblocking_active_children={int(blockers)}\n"
         cmd = [str(python_bin or "python3"), "-c", "close_gate_contract_check", ticket]
@@ -972,9 +1026,11 @@ def main() -> int:
         args.ticket_id,
         ["ORCH_TICKET_ID", "ORCHESTRATOR_TICKET_ID", "TICKET_ID", "ORDER_ID"],
     )
-    role = _resolve_traceability_value(args.role, ["ORCH_ROLE", "ROLE"]) or "backend"
+    requested_role = _resolve_traceability_value(args.role, ["ORCH_ROLE", "ROLE"]) or "backend"
+    role, role_source, execution_source = _resolve_execution_role(role=requested_role, job_id=str(job_id or ""))
 
     checks: list[Check] = []
+    checks.append(Check("execution_role_resolved", True, f"requested={requested_role} resolved={role} source={role_source}"))
     checks.append(_git_status_clean(root))
     checks.append(_git_has_tracked_data(root))
     checks.append(_traceability_ids_check(job_id=job_id, ticket_id=ticket_id))
@@ -988,6 +1044,7 @@ def main() -> int:
                 artifacts_dir=run_artifacts_dir,
                 python_bin=str(args.replay_python or "python3"),
                 ticket_id=str(ticket_id or ""),
+                job_id=str(job_id or ""),
             )
         )
 
@@ -1122,6 +1179,8 @@ def main() -> int:
                 branch=head_branch,
                 commit_sha=_run(["git", "rev-parse", "HEAD"], cwd=root),
                 role=role,
+                role_source=role_source,
+                execution_source=execution_source,
                 job_id=job_id,
                 ticket_id=ticket_id,
             )

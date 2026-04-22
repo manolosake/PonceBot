@@ -1,5 +1,6 @@
 import unittest
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,8 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
             branch="feature/order-aaa28bd3-proactive-sprint-codexbot-reliability-",
             commit_sha="abc123",
             role="backend",
+            role_source="job_role_override_from_db:qa->backend",
+            execution_source="scheduler",
             job_id="060a361f-6bd1-41f5-b94f-0b3245dd8724",
             ticket_id="aaa28bd3-3cdd-402c-917d-881544b08927",
         )
@@ -22,8 +25,26 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         self.assertEqual(payload["branch"], "feature/order-aaa28bd3-proactive-sprint-codexbot-reliability-")
         self.assertEqual(payload["commit_sha"], "abc123")
         self.assertEqual(payload["role"], "backend")
+        self.assertEqual(payload["role_source"], "job_role_override_from_db:qa->backend")
+        self.assertEqual(payload["execution_source"], "scheduler")
         self.assertEqual(payload["job_id"], "060a361f-6bd1-41f5-b94f-0b3245dd8724")
         self.assertEqual(payload["ticket_id"], "aaa28bd3-3cdd-402c-917d-881544b08927")
+
+    def test_resolve_execution_role_prefers_job_role_for_qa_override(self) -> None:
+        with TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            with sqlite3.connect(db_path) as con:
+                con.execute("CREATE TABLE jobs(job_id TEXT, role TEXT, source TEXT)")
+                con.execute(
+                    "INSERT INTO jobs(job_id,role,source) VALUES(?,?,?)",
+                    ("job-1", "backend", "scheduler"),
+                )
+                con.commit()
+            with patch.dict("os.environ", {"ORCH_JOBS_DB": str(db_path)}, clear=False):
+                role, role_source, execution_source = rg._resolve_execution_role(role="qa", job_id="job-1")
+        self.assertEqual(role, "backend")
+        self.assertIn("job_role_override_from_db:qa->backend", role_source)
+        self.assertEqual(execution_source, "scheduler")
 
     def test_traceability_ids_check_fails_when_missing(self) -> None:
         chk = rg._traceability_ids_check(job_id="", ticket_id="aaa28bd3-3cdd-402c-917d-881544b08927")

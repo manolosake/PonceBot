@@ -100,6 +100,42 @@ class TestReleaseGovernanceReplayGate(unittest.TestCase):
             transcript = (artifacts / "command_transcript.txt").read_text(encoding="utf-8")
             self.assertIn("$ c05", transcript)
 
+    def test_run_replay_gate_excludes_current_job_from_close_gate_blockers(self) -> None:
+        def fake_try_run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+            return 0, "ok", ""
+
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            artifacts = root / "artifacts"
+            scripts = root / "scripts"
+            scripts.mkdir(parents=True, exist_ok=True)
+            (scripts / "bootstrap_pytest_python3.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            db_path = root / "jobs.sqlite"
+            with sqlite3.connect(db_path) as con:
+                con.execute("CREATE TABLE jobs(job_id TEXT, parent_job_id TEXT, role TEXT, state TEXT)")
+                con.execute(
+                    "INSERT INTO jobs(job_id,parent_job_id,role,state) VALUES(?,?,?,?)",
+                    ("cur-job", "ord-1", "backend", "running"),
+                )
+                con.execute(
+                    "INSERT INTO jobs(job_id,parent_job_id,role,state) VALUES(?,?,?,?)",
+                    ("qa-wait", "ord-1", "qa", "waiting_deps"),
+                )
+                con.commit()
+            with patch.object(rg, "_try_run", side_effect=fake_try_run):
+                with patch.dict("os.environ", {"ORCH_JOBS_DB": str(db_path)}, clear=False):
+                    checks = rg._run_replay_gate(
+                        root,
+                        artifacts_dir=artifacts,
+                        python_bin="python3",
+                        ticket_id="ord-1",
+                        job_id="cur-job",
+                    )
+
+            c05 = [c for c in checks if c.key == "replay_c05_close_gate_contract"][0]
+            self.assertTrue(c05.ok)
+            self.assertIn("blocking_active_children=0", c05.details)
+
     def test_run_replay_gate_records_failure_without_short_circuit(self) -> None:
         def fake_try_run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
             if cmd[-3:] == ["-m", "pytest", "--version"]:
