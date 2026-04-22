@@ -376,6 +376,17 @@ class TestLocalAutonomyFlow(unittest.TestCase):
             )
         )
 
+    def test_grounded_excerpt_marker_parity_between_helper_and_classifier(self) -> None:
+        summary = "Need full body of _classify_local_slice_failure to proceed."
+        self.assertTrue(bot._local_blocker_requests_grounded_excerpt(summary))
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=summary,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_prune_local_specs_blocks_reviewer_without_applied_evidence(self) -> None:
         specs = [
             bot.TaskSpec(key="review", role="reviewer_local", text="review", mode_hint="ro", priority=1),

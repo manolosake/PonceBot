@@ -4957,23 +4957,25 @@ def _extract_blocker_response(text: str) -> str:
     return blocker[:2000].strip()
 
 
+_LOCAL_EXCERPT_BLOCKER_MARKERS: tuple[str, ...] = (
+    "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
+    "missing excerpt for bot.py around _classify_local_slice_failure",
+    "please provide the full function body for `_classify_local_slice_failure`",
+    "please provide the full function body for _classify_local_slice_failure",
+    "need full body of _classify_local_slice_failure",
+    "provide the exact current function body",
+    "exact current function body of _classify_local_slice_failure",
+    "missing current excerpt for `bot.py` around `_classify_local_slice_failure`",
+    "missing current excerpt for bot.py around _classify_local_slice_failure",
+    "need exact current excerpt for `bot.py` around `_classify_local_slice_failure`",
+)
+
+
 def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
     blob = str(text or "").strip().lower()
     if not blob:
         return False
-    markers = (
-        "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
-        "missing excerpt for bot.py around _classify_local_slice_failure",
-        "please provide the full function body for `_classify_local_slice_failure`",
-        "please provide the full function body for _classify_local_slice_failure",
-        "need full body of _classify_local_slice_failure",
-        "provide the exact current function body",
-        "exact current function body of _classify_local_slice_failure",
-        "missing current excerpt for `bot.py` around `_classify_local_slice_failure`",
-        "missing current excerpt for bot.py around _classify_local_slice_failure",
-        "need exact current excerpt for `bot.py` around `_classify_local_slice_failure`",
-    )
-    return any(marker in blob for marker in markers)
+    return any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS)
 
 
 def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
@@ -15561,8 +15563,6 @@ def _classify_local_slice_failure(
         "cannot safely implement",
         "handoff is still not actionable",
         "provide the exact file path",
-        "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
-        "please provide the full function body for `_classify_local_slice_failure`",
     )
     if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
