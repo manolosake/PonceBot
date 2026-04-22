@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from tools import release_governance as rg
 
@@ -107,6 +108,22 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             self.assertIn("test_logs.txt", names)
             self.assertIn("release_governance_run.stdout.json", names)
             self.assertIn("release_governance_run.exit_code.txt", names)
+
+    def test_finalize_manifest_detects_post_capture_drift(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            lock_path = root / ".finalize.lock"
+            lock_path.write_text("lock\n", encoding="utf-8")
+            (root / "test_logs.txt").write_text("ok\n", encoding="utf-8")
+            with patch.object(
+                rg,
+                "_manifest_mismatches",
+                side_effect=[[], [{"name": "test_logs.txt", "reason": "hash_or_size_mismatch"}]],
+            ):
+                manifest = rg._finalize_manifest(artifacts_dir=root, lock_path=lock_path)
+            self.assertEqual(manifest["pre_capture_mismatch_count"], 0)
+            self.assertEqual(manifest["mismatch_count"], 1)
+            self.assertEqual(manifest["mismatches"][0]["name"], "test_logs.txt")
 
 
 if __name__ == "__main__":

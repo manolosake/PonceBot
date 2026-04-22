@@ -235,6 +235,29 @@ def _final_exit_code(*, checks_ok: bool, manifest_mismatch_count: int) -> int:
     return 0 if bool(checks_ok) else 2
 
 
+def _finalize_manifest(*, artifacts_dir: Path, lock_path: Path) -> dict[str, Any]:
+    # Snapshot entries only after all mutable artifact outputs are written.
+    manifest = {
+        "generated_at": _utc_iso(),
+        "files": _manifest_entries(
+            artifacts_dir,
+            exclude_names={"FINAL_MANIFEST.json", lock_path.name},
+        ),
+    }
+    pre_capture_mismatches = _manifest_mismatches(manifest, artifacts_dir)
+    # Hard integrity check at completion time against the captured snapshot.
+    post_capture_mismatches = _manifest_mismatches(manifest, artifacts_dir)
+    manifest["pre_capture_mismatch_count"] = len(pre_capture_mismatches)
+    manifest["pre_capture_mismatches"] = pre_capture_mismatches
+    manifest["mismatch_count"] = len(post_capture_mismatches)
+    manifest["mismatches"] = post_capture_mismatches
+    _atomic_write_text(
+        artifacts_dir / "FINAL_MANIFEST.json",
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+    )
+    return manifest
+
+
 def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_branch: str) -> str:
     requested = (explicit_head or order_branch or "").strip()
     if requested:
@@ -621,21 +644,8 @@ def main() -> int:
             _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
             _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{(0 if bool(payload.get('ok')) else 2)}\n")
 
-            # FINAL_MANIFEST must be generated after all other artifact outputs are finalized.
-            manifest = {
-                "generated_at": _utc_iso(),
-                "files": _manifest_entries(
-                    artifacts_dir,
-                    exclude_names={"FINAL_MANIFEST.json", lock_path.name},
-                ),
-            }
-            mismatches = _manifest_mismatches(manifest, artifacts_dir)
-            manifest["mismatch_count"] = len(mismatches)
-            manifest["mismatches"] = mismatches
-            _atomic_write_text(
-                artifacts_dir / "FINAL_MANIFEST.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            )
+            # FINAL_MANIFEST is generated only after all mutable outputs are sealed.
+            manifest = _finalize_manifest(artifacts_dir=artifacts_dir, lock_path=lock_path)
             computed_exit = _final_exit_code(
                 checks_ok=bool(payload.get("ok")),
                 manifest_mismatch_count=int(manifest.get("mismatch_count", 0)),

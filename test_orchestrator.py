@@ -1870,6 +1870,13 @@ class TestYamlLikeParsing(unittest.TestCase):
         self.assertNotEqual(rb.prompt.strip(), "|")
         self.assertTrue(rb.prompt.strip())
 
+    def test_release_manager_governance_command_pins_qa_role(self) -> None:
+        profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")
+        rm = profiles["release_mgr"]
+        system_prompt = str(rm.get("system_prompt") or "")
+        self.assertIn("tools/release_governance.py", system_prompt)
+        self.assertIn("--role qa", system_prompt)
+
 
 class TestScreenshotUrlValidation(unittest.TestCase):
     def test_blocks_non_http_schemes(self) -> None:

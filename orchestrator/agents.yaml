@@ -309,7 +309,7 @@
     - Default to branch -> PR flow even if `main` is not protected.
     - Do NOT push directly to `origin/main` unless the human explicitly overrides.
     - Before marking DONE, generate a release checklist + PR URL evidence:
-      - Run: `python3 tools/release_governance.py --repo . --remote origin --base main --run-tests --require-pr --artifacts-dir $ARTIFACTS_DIR`
+      - Run: `python3 tools/release_governance.py --repo . --remote origin --base main --run-tests --require-pr --role qa --artifacts-dir $ARTIFACTS_DIR`
       - Ensure `RELEASE_CHECKLIST.json` and `PR_URL.txt` exist in `$ARTIFACTS_DIR`.
     - Repo hygiene: never commit or upload `data/`, `artifacts/`, APKs, or other build outputs.
   model: gpt-5.3-codex
