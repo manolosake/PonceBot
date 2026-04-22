@@ -337,6 +337,25 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "blocked")
 
+    def test_local_blocker_requests_grounded_excerpt_detects_plaintext_variants(self) -> None:
+        self.assertTrue(
+            bot._local_blocker_requests_grounded_excerpt(
+                "Missing current excerpt for bot.py around _classify_local_slice_failure."
+            )
+        )
+        self.assertTrue(
+            bot._local_blocker_requests_grounded_excerpt(
+                "Need full body of _classify_local_slice_failure to continue."
+            )
+        )
+
+    def test_local_blocker_requests_grounded_excerpt_ignores_generic_blockers(self) -> None:
+        self.assertFalse(
+            bot._local_blocker_requests_grounded_excerpt(
+                "BLOCKER: please provide failing test output for release_governance."
+            )
+        )
+
     def test_prune_local_specs_blocks_reviewer_without_applied_evidence(self) -> None:
         specs = [
             bot.TaskSpec(key="review", role="reviewer_local", text="review", mode_hint="ro", priority=1),

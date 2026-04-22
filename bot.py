@@ -4966,6 +4966,7 @@ def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
         "missing excerpt for bot.py around _classify_local_slice_failure",
         "please provide the full function body for `_classify_local_slice_failure`",
         "please provide the full function body for _classify_local_slice_failure",
+        "need full body of _classify_local_slice_failure",
         "provide the exact current function body",
         "exact current function body of _classify_local_slice_failure",
         "missing current excerpt for `bot.py` around `_classify_local_slice_failure`",
