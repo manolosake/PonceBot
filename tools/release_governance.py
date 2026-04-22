@@ -379,6 +379,32 @@ def _artifact_provenance_gate_check(*, artifacts_dir: Path, implementation_claim
     return len(reasons) == 0, reasons
 
 
+def _qa_publication_signal_check(*, qa_result_path: Path | None, role: str) -> tuple[bool, str]:
+    role_norm = _normalize_role_for_close_gate(role)
+    requires_signal = {
+        "release_mgr",
+        "qa",
+        "qa_local",
+        "quality_assurance",
+    }
+    if role_norm not in requires_signal:
+        return True, "qa_signal_not_required_for_role"
+    if qa_result_path is None:
+        return False, "qa_signal_missing_path"
+    if (not qa_result_path.exists()) or (not qa_result_path.is_file()) or int(qa_result_path.stat().st_size) <= 0:
+        return False, "qa_signal_missing_file"
+    try:
+        payload = json.loads(qa_result_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return False, "qa_signal_invalid_json"
+    if not isinstance(payload, dict):
+        return False, "qa_signal_invalid_payload"
+    marker_keys = ("verdict", "go_no_go", "ok", "acceptance")
+    if not any(k in payload for k in marker_keys):
+        return False, "qa_signal_missing_verdict_fields"
+    return True, "qa_signal_present"
+
+
 def _write_check_artifacts(*, artifacts_dir: Path, checks: list["Check"]) -> None:
     transcript_lines = []
     for c in checks:
