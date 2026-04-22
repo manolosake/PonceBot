@@ -88,6 +88,15 @@ class TestStateStoreBasics(unittest.TestCase):
             self.assertEqual(out.get("k"), "v")
             self.assertEqual(store.read().get("k"), "v")
 
+    def test_set_recovers_from_malformed_json_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            p.write_text("{broken-json", encoding="utf-8")
+            store = StateStore(p)
+            out = store.set("recovered", True)
+            self.assertTrue(bool(out.get("recovered")))
+            self.assertEqual(store.read(), {"recovered": True})
+
     def test_update_handles_mixed_key_types_without_crash(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "state.json"
