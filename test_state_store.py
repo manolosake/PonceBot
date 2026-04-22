@@ -110,6 +110,15 @@ class TestStateStoreBasics(unittest.TestCase):
             self.assertEqual(data.get("outer", {}).get("a"), 1)
             self.assertEqual(data.get("outer", {}).get("2"), "two")
 
+    def test_replace_normalizes_list_nested_mixed_key_types(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            store.replace({"items": [{1: "one", "inner": [{2: "two"}]}]})
+            data = store.read()
+            self.assertEqual(data.get("items", [])[0].get("1"), "one")
+            self.assertEqual(data.get("items", [])[0].get("inner", [])[0].get("2"), "two")
+
     def test_replace_failure_cleans_orphan_tmp_and_reraises(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "state.json"
@@ -122,6 +131,17 @@ class TestStateStoreBasics(unittest.TestCase):
 
             leftovers = list(Path(td).glob("state.json.*.tmp"))
             self.assertEqual(leftovers, [])
+
+    def test_replace_failure_keeps_original_error_when_unlink_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "state.json"
+            store = StateStore(p)
+            err = OSError("replace failed")
+
+            with mock.patch.object(Path, "replace", side_effect=err):
+                with mock.patch.object(Path, "unlink", side_effect=OSError("unlink failed")):
+                    with self.assertRaisesRegex(OSError, "replace failed"):
+                        store.replace({"k": "v"})
 
     def test_update_mutator_error_does_not_corrupt_state(self) -> None:
         with tempfile.TemporaryDirectory() as td:
