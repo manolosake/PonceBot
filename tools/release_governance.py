@@ -290,6 +290,46 @@ def _run_unit_tests(repo: Path) -> Check:
     return Check("tests", ok, detail[:4000])
 
 
+def _resolve_traceability_value(explicit: str, env_keys: list[str]) -> str:
+    s = str(explicit or "").strip()
+    if s:
+        return s
+    for k in env_keys:
+        v = str(os.environ.get(k, "")).strip()
+        if v:
+            return v
+    return ""
+
+
+def _traceability_ids_check(*, job_id: str, ticket_id: str) -> Check:
+    ok = bool(str(job_id or "").strip() and str(ticket_id or "").strip())
+    return Check(
+        "traceability_ids_present",
+        ok,
+        f"job_id={str(job_id or '').strip() or '<missing>'} ticket_id={str(ticket_id or '').strip() or '<missing>'}",
+    )
+
+
+def _build_run_provenance(
+    *,
+    generated_at: str,
+    branch: str,
+    commit_sha: str,
+    role: str,
+    job_id: str,
+    ticket_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "branch": str(branch or "").strip(),
+        "commit_sha": str(commit_sha or "").strip(),
+        "role": str(role or "").strip(),
+        "job_id": str(job_id or "").strip(),
+        "ticket_id": str(ticket_id or "").strip(),
+    }
+
+
 def _clean_shell_env() -> dict[str, str]:
     env = {"PATH": "/usr/bin:/bin"}
     home = str(os.environ.get("HOME", "")).strip()
@@ -343,6 +383,9 @@ def main() -> int:
     ap.add_argument("--order-branch", default="", help="explicit order branch to prefer as release head")
     ap.add_argument("--artifacts-dir", default="", help="optional artifacts dir to write checklist files")
     ap.add_argument("--qa-result", default="", help="optional path to qa_result.json")
+    ap.add_argument("--job-id", default="", help="orchestrator target job id for strict traceability")
+    ap.add_argument("--ticket-id", default="", help="ticket/order id for strict traceability")
+    ap.add_argument("--role", default="", help="role lane (e.g. backend)")
     ap.add_argument("--run-tests", action="store_true", help="run python -m unittest -q as part of checklist")
     ap.add_argument(
         "--run-replay-gate",
@@ -367,10 +410,20 @@ def main() -> int:
 
     remote_url = _run(["git", "remote", "get-url", args.remote], cwd=root)
     slug = _parse_github_slug(remote_url)
+    job_id = _resolve_traceability_value(
+        args.job_id,
+        ["ORCH_JOB_ID", "ORCHESTRATOR_JOB_ID", "JOB_ID", "TARGET_JOB_ID"],
+    )
+    ticket_id = _resolve_traceability_value(
+        args.ticket_id,
+        ["ORCH_TICKET_ID", "ORCHESTRATOR_TICKET_ID", "TICKET_ID", "ORDER_ID"],
+    )
+    role = _resolve_traceability_value(args.role, ["ORCH_ROLE", "ROLE"]) or "backend"
 
     checks: list[Check] = []
     checks.append(_git_status_clean(root))
     checks.append(_git_has_tracked_data(root))
+    checks.append(_traceability_ids_check(job_id=job_id, ticket_id=ticket_id))
     if args.run_tests:
         checks.append(_run_unit_tests(root))
     if args.run_replay_gate:
@@ -447,6 +500,9 @@ def main() -> int:
         "github_slug": slug,
         "base_branch": base_branch,
         "head_branch": head_branch,
+        "job_id": job_id or None,
+        "ticket_id": ticket_id or None,
+        "role": role,
         "base_ref": base_ref,
         "ahead_commits": int(ahead),
         "behind_commits": int(behind),
@@ -472,8 +528,20 @@ def main() -> int:
             if diffstat:
                 _atomic_write_text(artifacts_dir / "DIFFSTAT.txt", diffstat + "\n")
             _atomic_write_text(artifacts_dir / "CHANGED_FILES.txt", (changed + "\n") if changed else "(none)\n")
+            provenance = _build_run_provenance(
+                generated_at=_utc_iso(),
+                branch=head_branch,
+                commit_sha=_run(["git", "rev-parse", "HEAD"], cwd=root),
+                role=role,
+                job_id=job_id,
+                ticket_id=ticket_id,
+            )
+            _atomic_write_text(
+                artifacts_dir / "RUN_PROVENANCE.json",
+                json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+            )
 
-            required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt"]
+            required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt", artifacts_dir / "RUN_PROVENANCE.json"]
             present_non_empty = []
             for p in required:
                 present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
