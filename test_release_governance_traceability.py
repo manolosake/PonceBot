@@ -95,6 +95,17 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
         ]
         self.assertEqual(max(counts), 1)
 
+    def test_required_final_artifacts_includes_run_outputs(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            checklist_path = root / "RELEASE_CHECKLIST.json"
+            required = rg._required_final_artifacts(artifacts_dir=root, checklist_path=checklist_path)
+            names = [p.name for p in required]
+            self.assertIn("RELEASE_CHECKLIST.json", names)
+            self.assertIn("RUN_PROVENANCE.json", names)
+            self.assertIn("release_governance_run.stdout.json", names)
+            self.assertIn("release_governance_run.exit_code.txt", names)
+
 
 if __name__ == "__main__":
     unittest.main()

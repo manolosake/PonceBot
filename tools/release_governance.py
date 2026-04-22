@@ -199,6 +199,17 @@ def _manifest_mismatches(manifest: dict[str, Any], artifacts_dir: Path) -> list[
     return mismatches
 
 
+def _required_final_artifacts(*, artifacts_dir: Path, checklist_path: Path) -> list[Path]:
+    return [
+        checklist_path,
+        artifacts_dir / "PR_URL.txt",
+        artifacts_dir / "CHANGED_FILES.txt",
+        artifacts_dir / "RUN_PROVENANCE.json",
+        artifacts_dir / "release_governance_run.stdout.json",
+        artifacts_dir / "release_governance_run.exit_code.txt",
+    ]
+
+
 def _resolve_head_branch(*, repo: Path, remote: str, explicit_head: str, order_branch: str) -> str:
     requested = (explicit_head or order_branch or "").strip()
     if requested:
@@ -541,7 +552,7 @@ def main() -> int:
                 json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
             )
 
-            required = [checklist_path, artifacts_dir / "PR_URL.txt", artifacts_dir / "CHANGED_FILES.txt", artifacts_dir / "RUN_PROVENANCE.json"]
+            required = _required_final_artifacts(artifacts_dir=artifacts_dir, checklist_path=checklist_path)
             present_non_empty = []
             for p in required:
                 present_non_empty.append(bool(p.exists() and p.is_file() and p.stat().st_size > 0))
