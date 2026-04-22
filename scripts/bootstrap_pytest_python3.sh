@@ -16,7 +16,11 @@ if [[ ! -x "$VENV_PY" ]]; then
   "$PY_BIN" -m venv "$VENV_DIR"
 fi
 
-"$VENV_PY" -m pip install --upgrade pip pytest >/dev/null
+# Keep bootstrap idempotent for pre-provisioned envs (for example .venv):
+# only install pytest tooling when it is actually missing.
+if ! "$VENV_PY" -m pytest --version >/dev/null 2>&1; then
+  "$VENV_PY" -m pip install --upgrade pip pytest >/dev/null
+fi
 
 if [[ "$#" -eq 0 ]]; then
   set -- -m pytest --version
