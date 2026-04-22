@@ -113,11 +113,21 @@ def _coerce_result(value: Any, task: Task, duration_s: float, *, status: str) ->
         artifacts = list(value.get("artifacts", []) or [])
         logs = str(value.get("logs", ""))
         next_action = value.get("next_action")
+        if isinstance(next_action, dict):
+            next_action = next_action.get("type")
+        elif next_action is not None:
+            next_action = str(next_action)
         structured = value.get("structured_digest", {})
         if not isinstance(structured, dict):
             structured = {"notes": structured}
         if parsed:
             structured = {**structured, **parsed}
+            if next_action is None:
+                parsed_next_action = parsed.get("next_action")
+                if isinstance(parsed_next_action, dict):
+                    next_action = parsed_next_action.get("type")
+                elif parsed_next_action is not None:
+                    next_action = str(parsed_next_action)
         return TaskResult(
             status=str(value.get("status", status)),
             summary=summary,

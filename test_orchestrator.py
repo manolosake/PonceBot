@@ -651,6 +651,46 @@ class TestOrchestratorRunner(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.artifacts, ["a.png"])
 
+    def test_run_task_uses_next_action_from_json_block(self) -> None:
+        task = Task.new(
+            source="telegram",
+            role="backend",
+            input_text="need approval",
+            request_type="task",
+            priority=1,
+            model="gpt-5.2",
+            effort="low",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=8.0,
+            chat_id=1,
+            state="queued",
+        )
+        result = run_task(
+            task,
+            executor=DummyExecutor(
+                {
+                    "status": "blocked",
+                    "summary": (
+                        "Waiting for approval\n"
+                        "```json\n"
+                        "{\"summary\":\"Waiting for approval\",\"next_action\":\"approve\"}\n"
+                        "```"
+                    ),
+                }
+            ),
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.next_action, "approve")
+
+
+class TestOrchestratorRoleAliases(unittest.TestCase):
+    def test_legacy_orchestrator_alias_is_valid(self) -> None:
+        profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")
+        self.assertTrue(bot._orchestrator_role_is_valid("orchestrator", profiles))
+        self.assertTrue(bot._orchestrator_role_is_valid("ceo", profiles))
+        self.assertFalse(bot._orchestrator_role_is_valid("definitely-not-a-role", profiles))
+
 
 class TestOrchestratorStorage(unittest.TestCase):
     def test_approve_does_not_deadlock(self) -> None:
@@ -1630,6 +1670,163 @@ class TestOrderBranchPolicy(unittest.TestCase):
                 bot._resolve_order_branch_from_task(child, q),
                 "feature/order-ord-bran-root",
             )
+
+
+class TestFinalSweepGuard(unittest.TestCase):
+    def test_final_sweep_enqueues_when_active_order_has_no_children_and_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-stale"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 600.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 1)
+            children = q.jobs_by_parent(parent_job_id=order_id, limit=50)
+            sweep_jobs = [j for j in children if str((j.labels or {}).get("kind") or "").strip().lower() == "final_sweep"]
+            self.assertEqual(len(sweep_jobs), 1)
+            sweep = sweep_jobs[0]
+            self.assertEqual(str(sweep.state or ""), "queued")
+            self.assertEqual(str((sweep.trace or {}).get("final_sweep_reason") or ""), "idle_no_open_jobs")
+            self.assertIn("Do not leave this order active with zero live jobs.", str(sweep.input_text or ""))
+
+    def test_final_sweep_does_not_enqueue_when_no_children_but_root_is_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-no-children-fresh"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Manual order",
+                body="body",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    job_id=order_id,
+                )
+            )
+
+            now = _time.time()
+            recent_ts = now - 30.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(recent_ts), float(recent_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "300",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "600",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+
+
+class TestControllerTerminalCloseSignals(unittest.TestCase):
+    def test_summary_requests_terminal_close(self) -> None:
+        self.assertTrue(
+            bot._controller_requests_terminal_close(
+                summary="NO-GO to remain active. Close this order as BLOCKED_WITH_ROOT_CAUSE.",
+                structured_digest={},
+            )
+        )
+
+    def test_next_action_type_requests_terminal_close(self) -> None:
+        self.assertTrue(
+            bot._controller_requests_terminal_close(
+                summary="closeout ready",
+                structured_digest={"next_action": {"type": "close_order"}},
+            )
+        )
+
+    def test_regular_subtasks_do_not_count_as_terminal_close(self) -> None:
+        self.assertFalse(
+            bot._controller_requests_terminal_close(
+                summary="delegate another bounded slice",
+                structured_digest={
+                    "subtasks": [
+                        {
+                            "key": "ship_fix",
+                            "role": "backend",
+                            "text": "Implement the next bounded improvement.",
+                        }
+                    ]
+                },
+            )
+        )
 
 
 class TestRunningWatchdog(unittest.TestCase):

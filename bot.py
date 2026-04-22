@@ -7445,6 +7445,8 @@ def _orchestrator_known_roles(profiles: dict[str, dict[str, Any]]) -> tuple[str,
 
 def _orchestrator_role_is_valid(role: str, profiles: dict[str, dict[str, Any]]) -> bool:
     normalized = (role or "").strip().lower()
+    if normalized in ("ceo", "orchestrator"):
+        normalized = "jarvis"
     return normalized in _orchestrator_known_roles(profiles)
 
 
@@ -15366,6 +15368,52 @@ def _summary_has_verified_improvement_signal(text: str) -> bool:
     return bool(re.search(r"\bpass\b.{0,80}\bverified[_ ]improvement\b", compact))
 
 
+_TERMINAL_CONTROLLER_NEXT_ACTION_TYPES = frozenset(
+    {
+        "blocked_with_root_cause",
+        "close_order",
+        "close_ticket",
+        "complete_order",
+        "complete_ticket",
+        "done",
+        "verified_improvement",
+    }
+)
+
+
+def _structured_next_action_type(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    next_action = payload.get("next_action")
+    if not isinstance(next_action, dict):
+        return ""
+    return str(next_action.get("type") or "").strip().lower()
+
+
+def _summary_has_terminal_close_signal(text: str) -> bool:
+    blob = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not blob:
+        return False
+    close_phrases = (
+        "close order now",
+        "close the order",
+        "close this order",
+        "close ticket now",
+        "close the ticket",
+        "close this ticket",
+        "no-go to remain active",
+        "should not remain active",
+    )
+    return any(phrase in blob for phrase in close_phrases)
+
+
+def _controller_requests_terminal_close(*, summary: str, structured_digest: Any) -> bool:
+    next_action_type = _structured_next_action_type(structured_digest)
+    if next_action_type in _TERMINAL_CONTROLLER_NEXT_ACTION_TYPES:
+        return True
+    return _summary_has_terminal_close_signal(summary)
+
+
 def _trace_patch_info(trace: dict[str, Any] | None) -> dict[str, Any]:
     trace_obj = trace if isinstance(trace, dict) else {}
     patch_info = trace_obj.get("local_patch_info")
@@ -19053,9 +19101,17 @@ def _jarvis_final_sweep_tick(
         if chat_id <= 0:
             continue
 
+        root_job = orch_q.get_job(order_id)
+        try:
+            root_activity_at = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
+        except Exception:
+            root_activity_at = 0.0
+        if root_activity_at <= 0:
+            try:
+                root_activity_at = float(row.get("updated_at") or row.get("created_at") or 0.0)
+            except Exception:
+                root_activity_at = 0.0
         children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=500)
-        if not children:
-            continue
         proactive_order = bool(_is_proactive_order_record(row))
 
         if proactive_order and _order_has_verified_no_change_resolution(
@@ -19106,8 +19162,8 @@ def _jarvis_final_sweep_tick(
         waiting_n = 0
         blocked_n = 0
         terminal_n = 0
-        latest_child_activity = 0.0
-        latest_non_meta_child_activity = 0.0
+        latest_child_activity = float(root_activity_at)
+        latest_non_meta_child_activity = float(root_activity_at)
         for c in children:
             st = str(c.state or "").strip().lower()
             updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
@@ -19176,7 +19232,6 @@ def _jarvis_final_sweep_tick(
         else:
             continue
 
-        root_job = orch_q.get_job(order_id)
         root_trace = dict((root_job.trace if root_job else {}) or {})
         try:
             last_sweep_at = float(root_trace.get("final_sweep_last_at", 0.0) or 0.0)
@@ -24948,6 +25003,13 @@ def orchestrator_worker_loop(
                             order_is_proactive = _is_proactive_order_record(order_row)
                         except Exception:
                             order_is_proactive = False
+                    terminal_close_requested = bool(
+                        autonomous_non_manual
+                        and _controller_requests_terminal_close(
+                            summary=summary,
+                            structured_digest=structured_digest,
+                        )
+                    )
 
                     enforce_local_only = bool(
                         _skynet_factory_local_only_enabled()
@@ -25015,7 +25077,13 @@ def orchestrator_worker_loop(
                             except Exception:
                                 pass
                     proactive_cli_promotion = bool(autonomous_non_manual and (not enforce_local_only))
-                    if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
+                    if (
+                        (not specs)
+                        and autonomous_non_manual
+                        and (not strategic_proposal_requested)
+                        and (not terminal_close_requested)
+                        and proactive_cli_promotion
+                    ):
                         objective_snippet = str(task.input_text or "").strip()
                         if len(objective_snippet) > 240:
                             objective_snippet = objective_snippet[:240] + "..."
@@ -25086,7 +25154,13 @@ def orchestrator_worker_loop(
                             )
                         except Exception:
                             pass
-                    elif (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and enforce_local_only:
+                    elif (
+                        (not specs)
+                        and autonomous_non_manual
+                        and (not strategic_proposal_requested)
+                        and (not terminal_close_requested)
+                        and enforce_local_only
+                    ):
                         try:
                             live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
                         except Exception:
@@ -25400,7 +25474,13 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
 
-                        if (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and proactive_cli_promotion:
+                        if (
+                            (not specs)
+                            and autonomous_non_manual
+                            and (not strategic_proposal_requested)
+                            and (not terminal_close_requested)
+                            and proactive_cli_promotion
+                        ):
                             objective_snippet = str(task.input_text or "").strip()
                             if len(objective_snippet) > 240:
                                 objective_snippet = objective_snippet[:240] + "..."
@@ -25472,7 +25552,13 @@ def orchestrator_worker_loop(
                                 )
                             except Exception:
                                 pass
-                        elif (not specs) and autonomous_non_manual and (not strategic_proposal_requested) and enforce_local_only:
+                        elif (
+                            (not specs)
+                            and autonomous_non_manual
+                            and (not strategic_proposal_requested)
+                            and (not terminal_close_requested)
+                            and enforce_local_only
+                        ):
                             try:
                                 live_local_children = orch_q.jobs_by_parent(parent_job_id=root_ticket, limit=500)
                             except Exception:
@@ -25584,6 +25670,20 @@ def orchestrator_worker_loop(
                                     )
                                 except Exception:
                                     pass
+                        elif terminal_close_requested:
+                            try:
+                                orch_q.append_audit_event(
+                                    event_type="delegation.terminal_close_no_reseed",
+                                    actor=controller_actor,
+                                    details={
+                                        "order_id": root_ticket,
+                                        "reason": "controller_requested_terminal_close",
+                                        "summary": str(summary or "")[:240],
+                                        "next_action_type": (_structured_next_action_type(structured_digest) or None),
+                                    },
+                                )
+                            except Exception:
+                                pass
 
                         if specs:
                             next_plan_revision = max(1, current_plan_revision + 1)
