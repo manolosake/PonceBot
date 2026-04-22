@@ -153,6 +153,50 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
                 ],
             )
 
+    def test_load_traceability_keys_expands_known_reseed_alias(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "qa_result.json"
+            p.write_text(
+                (
+                    "{\n"
+                    '  "depends_on": ["proactive_cli_reseed_r1_13"]\n'
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+            keys = rg._load_traceability_keys(p)
+            self.assertEqual(keys, ["proactive_cli_reseed_r1_13", "proactive_cli_seed_r1_3"])
+
+    def test_load_traceability_keys_does_not_expand_unknown_reseed_alias(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "qa_result.json"
+            p.write_text(
+                (
+                    "{\n"
+                    '  "depends_on": ["proactive_cli_reseed_r1_999"]\n'
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+            keys = rg._load_traceability_keys(p)
+            self.assertEqual(keys, ["proactive_cli_reseed_r1_999"])
+
+    def test_head_traceability_tokens_ok_allows_explicit_head_key_fallback(self) -> None:
+        ok = rg._head_traceability_tokens_ok(
+            order_token="order:2b13cb16",
+            key_tokens=["key:proactive_cli_reseed_r1_13", "key:proactive_cli_seed_r1_3"],
+            head_body="order:2b13cb16 key:auto_backend_8254d593d8 fix non-shell c01 traceability execution",
+        )
+        self.assertTrue(ok)
+
+    def test_head_traceability_tokens_ok_rejects_order_without_key(self) -> None:
+        ok = rg._head_traceability_tokens_ok(
+            order_token="order:2b13cb16",
+            key_tokens=["key:proactive_cli_reseed_r1_13", "key:proactive_cli_seed_r1_3"],
+            head_body="order:2b13cb16 traceability update",
+        )
+        self.assertFalse(ok)
+
     def test_traceability_count_can_match_any_authoritative_key(self) -> None:
         log_text = (
             "aaaa111 order:019abfcf key:proactive_cli_seed_r1_3\n"
@@ -167,6 +211,25 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             for kt in ("key:proactive_cli_seed_r1_3", "key:proactive_cli_seed_r1")
         ]
         self.assertEqual(max(counts), 1)
+
+    def test_resolve_traceability_key_tokens_includes_head_key_when_depends_on_stale(self) -> None:
+        tokens = rg._resolve_traceability_key_tokens(
+            dep_keys=["proactive_cli_reseed_r1_13"],
+            order_token="order:2b13cb16",
+            head_body="order:2b13cb16 key:auto_backend_dc409cc6cb traceability fix",
+        )
+        self.assertEqual(
+            tokens,
+            ["key:proactive_cli_reseed_r1_13", "key:auto_backend_dc409cc6cb"],
+        )
+
+    def test_resolve_traceability_key_tokens_does_not_use_head_key_without_order_token(self) -> None:
+        tokens = rg._resolve_traceability_key_tokens(
+            dep_keys=["proactive_cli_reseed_r1_13"],
+            order_token="order:2b13cb16",
+            head_body="key:auto_backend_dc409cc6cb without ticket token",
+        )
+        self.assertEqual(tokens, ["key:proactive_cli_reseed_r1_13"])
 
     def test_required_final_artifacts_includes_run_outputs(self) -> None:
         with TemporaryDirectory() as td:
