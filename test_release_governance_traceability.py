@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from unittest.mock import patch
 
 from tools import release_governance as rg
@@ -124,6 +125,41 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             self.assertEqual(manifest["pre_capture_mismatch_count"], 0)
             self.assertEqual(manifest["mismatch_count"], 1)
             self.assertEqual(manifest["mismatches"][0]["name"], "test_logs.txt")
+
+    def test_manifest_post_write_violations_detects_mtime_drift(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            covered = root / "command_transcript.jsonl"
+            covered.write_text("initial\n", encoding="utf-8")
+            manifest_path = root / "FINAL_MANIFEST.json"
+            manifest_path.write_text(
+                '{"files":[{"name":"command_transcript.jsonl","size":8,"sha256":"x"}]}\n',
+                encoding="utf-8",
+            )
+            # Ensure mtime drift after manifest by rewriting covered file.
+            time.sleep(0.01)
+            covered.write_text("modified\n", encoding="utf-8")
+            violations = rg._manifest_post_write_violations(
+                manifest={"files": [{"name": "command_transcript.jsonl"}]},
+                artifacts_dir=root,
+                manifest_path=manifest_path,
+            )
+            self.assertEqual(len(violations), 1)
+            self.assertEqual(violations[0]["name"], "command_transcript.jsonl")
+
+    def test_finalize_manifest_ignores_non_covered_side_logs(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            lock_path = root / ".finalize.lock"
+            lock_path.write_text("lock\n", encoding="utf-8")
+            (root / "CHANGED_FILES.txt").write_text("a.py\n", encoding="utf-8")
+            (root / "command_transcript.jsonl").write_text('{"k":"v"}\n', encoding="utf-8")
+            (root / "release_governance_run.invocation.stdout.log").write_text("volatile\n", encoding="utf-8")
+            manifest = rg._finalize_manifest(artifacts_dir=root, lock_path=lock_path)
+            names = [f["name"] for f in manifest.get("files", [])]
+            self.assertIn("CHANGED_FILES.txt", names)
+            self.assertIn("command_transcript.jsonl", names)
+            self.assertNotIn("release_governance_run.invocation.stdout.log", names)
 
 
 if __name__ == "__main__":

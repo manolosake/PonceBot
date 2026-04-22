@@ -199,6 +199,31 @@ def _manifest_mismatches(manifest: dict[str, Any], artifacts_dir: Path) -> list[
     return mismatches
 
 
+def _manifest_post_write_violations(*, manifest: dict[str, Any], artifacts_dir: Path, manifest_path: Path) -> list[dict[str, Any]]:
+    if not manifest_path.exists():
+        return [{"name": "FINAL_MANIFEST.json", "reason": "manifest_missing"}]
+    manifest_mtime_ns = int(manifest_path.stat().st_mtime_ns)
+    violations: list[dict[str, Any]] = []
+    for item in manifest.get("files", []):
+        name = str(item.get("name", ""))
+        if not name:
+            continue
+        p = artifacts_dir / name
+        if not p.exists() or (not p.is_file()):
+            continue
+        mtime_ns = int(p.stat().st_mtime_ns)
+        if mtime_ns > manifest_mtime_ns:
+            violations.append(
+                {
+                    "name": name,
+                    "reason": "mtime_after_manifest",
+                    "file_mtime_ns": mtime_ns,
+                    "manifest_mtime_ns": manifest_mtime_ns,
+                }
+            )
+    return violations
+
+
 def _required_final_artifacts(*, artifacts_dir: Path, checklist_path: Path) -> list[Path]:
     return [
         checklist_path,
@@ -251,22 +276,29 @@ def _build_final_validation(*, base_checks: dict[str, bool], manifest_mismatch_c
 
 def _finalize_manifest(*, artifacts_dir: Path, lock_path: Path) -> dict[str, Any]:
     # Snapshot entries only after all mutable artifact outputs are written.
-    excluded = {
-        "FINAL_MANIFEST.json",
-        "RELEASE_CHECKLIST.json",
-        "FINAL_VALIDATION.json",
-        "release_governance.stdout.json",
-        "release_governance_run.stdout.json",
-        "release_governance.exit_code.txt",
-        "release_governance_run.exit_code.txt",
-        lock_path.name,
-    }
+    covered_names = [
+        "CHANGED_FILES.txt",
+        "DIFFSTAT.txt",
+        "PR_URL.txt",
+        "RUN_PROVENANCE.json",
+        "command_transcript.jsonl",
+        "test_logs.txt",
+    ]
+    files = []
+    for name in covered_names:
+        p = artifacts_dir / name
+        if not p.exists() or (not p.is_file()):
+            continue
+        files.append(
+            {
+                "name": p.name,
+                "size": int(p.stat().st_size),
+                "sha256": _sha256_file(p),
+            }
+        )
     manifest = {
         "generated_at": _utc_iso(),
-        "files": _manifest_entries(
-            artifacts_dir,
-            exclude_names=excluded,
-        ),
+        "files": files,
     }
     pre_capture_mismatches = _manifest_mismatches(manifest, artifacts_dir)
     # Hard integrity check at completion time against the captured snapshot.
@@ -654,6 +686,30 @@ def main() -> int:
             )
             payload["final_validation"] = final_validation
             payload["ok"] = bool(final_validation.get("ok"))
+            _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            _atomic_write_text(
+                artifacts_dir / "FINAL_VALIDATION.json",
+                json.dumps(final_validation, ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(
+                artifacts_dir / "release_governance.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            _atomic_write_text(
+                artifacts_dir / "release_governance_run.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            post_write_violations = _manifest_post_write_violations(
+                manifest=manifest,
+                artifacts_dir=artifacts_dir,
+                manifest_path=artifacts_dir / "FINAL_MANIFEST.json",
+            )
+            final_validation["checks"]["manifest_post_write_violations"] = len(post_write_violations) == 0
+            final_validation["checks"]["manifest_post_write_violation_count"] = len(post_write_violations)
+            final_validation["checks"]["manifest_post_write_violation_names"] = [v.get("name") for v in post_write_violations]
+            final_validation["ok"] = bool(final_validation["ok"]) and (len(post_write_violations) == 0)
+            payload["final_validation"] = final_validation
+            payload["ok"] = bool(final_validation["ok"])
             _atomic_write_text(checklist_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             _atomic_write_text(
                 artifacts_dir / "FINAL_VALIDATION.json",
