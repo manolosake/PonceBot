@@ -519,6 +519,50 @@ def _write_check_artifacts(*, artifacts_dir: Path, checks: list["Check"]) -> Non
     )
 
 
+def _extract_artifacts_dir_from_argv(argv: list[str]) -> str:
+    for i, token in enumerate(argv):
+        if token == "--artifacts-dir" and i + 1 < len(argv):
+            return str(argv[i + 1] or "").strip()
+    return ""
+
+
+def _write_failure_artifacts_bundle(*, artifacts_dir: Path, error_text: str) -> None:
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "generated_at": _utc_iso(),
+        "ok": False,
+        "fatal_error": str(error_text or "unknown_error"),
+    }
+    final_validation = {
+        "ok": False,
+        "checks": {
+            "checks_ok": False,
+            "pr_url_targets_head": False,
+            "required_artifacts_non_empty": False,
+            "manifest_integrity_ok": False,
+            "manifest_mismatch_count": 1,
+        },
+        "validated_at": _utc_iso(),
+    }
+
+    _atomic_write_text(artifacts_dir / "RELEASE_CHECKLIST.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write_text(artifacts_dir / "FINAL_VALIDATION.json", json.dumps(final_validation, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write_text(artifacts_dir / "release_governance.stdout.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write_text(artifacts_dir / "release_governance_run.stdout.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", "2\n")
+    _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", "2\n")
+    # Ensure transcript/test files are always present and non-empty for lane evidence contracts.
+    if not (artifacts_dir / "command_transcript.jsonl").exists() or int((artifacts_dir / "command_transcript.jsonl").stat().st_size) <= 0:
+        _atomic_write_text(
+            artifacts_dir / "command_transcript.jsonl",
+            json.dumps({"key": "fatal_error", "ok": False, "details": str(error_text or "unknown_error")}, ensure_ascii=False)
+            + "\n",
+        )
+    if not (artifacts_dir / "test_logs.txt").exists() or int((artifacts_dir / "test_logs.txt").stat().st_size) <= 0:
+        _atomic_write_text(artifacts_dir / "test_logs.txt", f"fatal_error: {str(error_text or 'unknown_error')}\n")
+
+
 def _final_exit_code(*, checks_ok: bool, manifest_mismatch_count: int) -> int:
     if int(manifest_mismatch_count) > 0:
         return 2
@@ -1195,4 +1239,18 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        artifacts_arg = _extract_artifacts_dir_from_argv(sys.argv[1:])
+        if artifacts_arg:
+            try:
+                _write_failure_artifacts_bundle(
+                    artifacts_dir=Path(artifacts_arg).expanduser().resolve(),
+                    error_text=str(exc),
+                )
+            except Exception:
+                pass
+        raise

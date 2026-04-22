@@ -195,6 +195,22 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         )
         self.assertIn("qa_publication_signal_ok", fv["checks"])
 
+    def test_write_failure_artifacts_bundle_writes_required_lane_evidence_files(self) -> None:
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            rg._write_failure_artifacts_bundle(artifacts_dir=root, error_text="simulated_failure")
+            required = [
+                "release_governance.stdout.json",
+                "FINAL_VALIDATION.json",
+                "release_governance.exit_code.txt",
+                "command_transcript.jsonl",
+                "test_logs.txt",
+            ]
+            for name in required:
+                p = root / name
+                self.assertTrue(p.exists(), msg=f"{name} missing")
+                self.assertGreater(p.stat().st_size, 0, msg=f"{name} empty")
+
     def test_resolve_canonical_head_ref_prefers_remote_tracking_ref(self) -> None:
         with patch.object(rg, "_try_run", return_value=(0, "", "")):
             ref = rg._resolve_canonical_head_ref(
