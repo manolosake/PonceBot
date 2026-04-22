@@ -19274,6 +19274,57 @@ def _jarvis_final_sweep_tick(
                 pass
             continue
 
+        latest_done_final_sweep_at = 0.0
+        proactive_lane = False
+        for c in children:
+            labels = getattr(c, "labels", {}) if isinstance(getattr(c, "labels", {}), dict) else {}
+            trace = getattr(c, "trace", {}) if isinstance(getattr(c, "trace", {}), dict) else {}
+            kind = str(labels.get("kind") or "").strip().lower()
+            child_updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
+            if bool(trace.get("proactive_lane", False)):
+                proactive_lane = True
+            if kind == "final_sweep" and str(c.state or "").strip().lower() == "done":
+                if child_updated_at > latest_done_final_sweep_at:
+                    latest_done_final_sweep_at = child_updated_at
+
+        if proactive_lane and latest_done_final_sweep_at > 0.0 and (now - latest_done_final_sweep_at) >= cooldown_s:
+            post_sweep_non_final_activity = False
+            for c in children:
+                labels = getattr(c, "labels", {}) if isinstance(getattr(c, "labels", {}), dict) else {}
+                kind = str(labels.get("kind") or "").strip().lower()
+                if kind == "final_sweep":
+                    continue
+                child_updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
+                if child_updated_at > latest_done_final_sweep_at:
+                    post_sweep_non_final_activity = True
+                    break
+            if not post_sweep_non_final_activity:
+                try:
+                    close_reason = "final_sweep_no_followup_closed"
+                    orch_q.set_order_status(oid, "done")
+                    orch_q.set_order_phase(oid, "done")
+                    orch_q.update_trace(
+                        oid,
+                        final_sweep_no_followup_closed_reason=close_reason,
+                        final_sweep_no_followup_closed_at=float(now),
+                        final_sweep_no_followup_last_done_sweep_at=float(latest_done_final_sweep_at),
+                        final_sweep_no_followup_cooldown_s=float(cooldown_s),
+                        live_at=float(now),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.final_sweep_no_followup_closed",
+                        actor="scheduler",
+                        details={
+                            "order_id": oid,
+                            "reason": close_reason,
+                            "latest_done_final_sweep_at": float(latest_done_final_sweep_at),
+                            "cooldown_s": float(cooldown_s),
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
+
         sweep_reason = "idle_no_open_jobs"
         prompt_body = (
             f"Terminal child jobs: {len(terminal_children)}\n"
