@@ -107,6 +107,41 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
             )
             self.assertTrue(rg._qa_publication_discoverability(p))
 
+    def test_publication_gate_fails_closed_for_ticketed_release_mgr_when_missing_qa_signal(self) -> None:
+        gate = rg._publication_discoverability_gate(
+            role="release_mgr",
+            ticket_id="2b13cb16-4b71-48d1-80fd-362b133123cb",
+            qa_publication_discoverable=None,
+            verification_publication_discoverable=True,
+        )
+        self.assertTrue(gate["publication_discoverability_required"])
+        self.assertFalse(gate["publication_discoverability_signal_present"])
+        self.assertFalse(gate["publication_discoverability_consistent"])
+
+    def test_qa_publication_discoverability_handles_empty_qa_file_as_missing(self) -> None:
+        with TemporaryDirectory() as td:
+            p = Path(td) / "qa_result.json"
+            p.write_text("", encoding="utf-8")
+            self.assertIsNone(rg._qa_publication_discoverability(p))
+            gate = rg._publication_discoverability_gate(
+                role="release_mgr",
+                ticket_id="2b13cb16-4b71-48d1-80fd-362b133123cb",
+                qa_publication_discoverable=rg._qa_publication_discoverability(p),
+                verification_publication_discoverable=True,
+            )
+            self.assertFalse(gate["publication_discoverability_consistent"])
+
+    def test_publication_gate_passes_when_valid_qa_signal_matches_verification(self) -> None:
+        gate = rg._publication_discoverability_gate(
+            role="release_mgr",
+            ticket_id="2b13cb16-4b71-48d1-80fd-362b133123cb",
+            qa_publication_discoverable=True,
+            verification_publication_discoverable=True,
+        )
+        self.assertTrue(gate["publication_discoverability_required"])
+        self.assertTrue(gate["publication_discoverability_signal_present"])
+        self.assertTrue(gate["publication_discoverability_consistent"])
+
 
 if __name__ == "__main__":
     unittest.main()

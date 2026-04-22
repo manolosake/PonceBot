@@ -167,6 +167,31 @@ def _qa_publication_discoverability(qa_result_path: Path | None) -> bool | None:
     return None
 
 
+def _publication_discoverability_gate(
+    *,
+    role: str,
+    ticket_id: str,
+    qa_publication_discoverable: bool | None,
+    verification_publication_discoverable: bool,
+) -> dict[str, Any]:
+    role_norm = str(role or "").strip().lower()
+    required = bool(str(ticket_id or "").strip()) and role_norm in {"release_mgr", "release_manager"}
+    signal_present = qa_publication_discoverable is not None
+    if qa_publication_discoverable is None:
+        consistent = (not required)
+    else:
+        consistent = bool(qa_publication_discoverable) == bool(verification_publication_discoverable)
+    return {
+        "publication_discoverability_required": bool(required),
+        "publication_discoverability_signal_present": bool(signal_present),
+        "publication_discoverability_consistent": bool(consistent),
+        "publication_discoverability_qa_result": (
+            None if qa_publication_discoverable is None else bool(qa_publication_discoverable)
+        ),
+        "publication_discoverability_verification_report": bool(verification_publication_discoverable),
+    }
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -926,20 +951,23 @@ def main() -> int:
             )
             qa_publication_discoverable = _qa_publication_discoverability(qa_result_path)
             verification_publication_discoverable = bool(all(present_non_empty))
-            publication_consistent = (
-                True
-                if qa_publication_discoverable is None
-                else (bool(qa_publication_discoverable) == verification_publication_discoverable)
+            publication_gate = _publication_discoverability_gate(
+                role=role,
+                ticket_id=ticket_id,
+                qa_publication_discoverable=qa_publication_discoverable,
+                verification_publication_discoverable=verification_publication_discoverable,
             )
             final_checks_base = {
                 "checks_ok": bool(_checks_ok_for_role(checks=checks, role=role) and (not args.require_pr or head_branch != base_branch)),
                 "pr_url_targets_head": bool(pr_targets_head),
                 "required_artifacts_non_empty": bool(verification_publication_discoverable),
-                "publication_discoverability_consistent": bool(publication_consistent),
-                "publication_discoverability_qa_result": (
-                    None if qa_publication_discoverable is None else bool(qa_publication_discoverable)
+                "publication_discoverability_required": bool(publication_gate["publication_discoverability_required"]),
+                "publication_discoverability_signal_present": bool(publication_gate["publication_discoverability_signal_present"]),
+                "publication_discoverability_consistent": bool(publication_gate["publication_discoverability_consistent"]),
+                "publication_discoverability_qa_result": publication_gate["publication_discoverability_qa_result"],
+                "publication_discoverability_verification_report": bool(
+                    publication_gate["publication_discoverability_verification_report"]
                 ),
-                "publication_discoverability_verification_report": bool(verification_publication_discoverable),
                 "artifact_provenance_gate_ok": bool(artifact_gate_ok),
                 "artifact_provenance_gate_claim_implementation": bool(implementation_claim),
                 "artifact_provenance_gate_claim_source": str(claim_source),
