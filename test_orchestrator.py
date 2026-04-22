@@ -1407,6 +1407,99 @@ class TestFinalSweepGuard(unittest.TestCase):
             assert order is not None
             self.assertEqual(str(order.get("status") or ""), "done")
 
+    def test_final_sweep_auto_closes_when_reenqueue_attempts_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            order_id = "ord-final-sweep-reenqueue-exhausted"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Proactive Sprint: Reliability",
+                body="AUTONOMOUS PROACTIVE SPRINT\n[proactive:poncebot-core]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="review",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=order_id,
+                )
+            )
+            for i in range(3):
+                q.submit_task(
+                    Task.new(
+                        source="telegram",
+                        role="jarvis",
+                        input_text=f"final sweep {i + 1}",
+                        request_type="maintenance",
+                        priority=1,
+                        model="",
+                        effort="medium",
+                        mode_hint="ro",
+                        requires_approval=False,
+                        max_cost_window_usd=1.0,
+                        chat_id=1,
+                        parent_job_id=order_id,
+                        state="done",
+                        labels={"ticket": order_id, "kind": "final_sweep"},
+                        job_id=f"job-final-sweep-attempt-{i + 1}",
+                    )
+                )
+
+            now = _time.time()
+            stale_ts = now - 1800.0
+            with storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "99",
+                    "BOT_JARVIS_FINAL_SWEEP_MAX_REENQUEUE": "3",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(cfg=cfg, orch_q=q, profiles=None, now=now)
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("final_sweep_reenqueue_exhausted_closed", False)))
+
     def test_final_sweep_blocker_predicate_ignores_controller_review_overhead(self) -> None:
         overhead_children = [
             Task.new(

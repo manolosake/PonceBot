@@ -6482,6 +6482,13 @@ def _jarvis_final_sweep_tick(
             idle_terminal_close_threshold = 1
     except Exception:
         idle_terminal_close_threshold = 10
+    try:
+        # Cap repeated FINAL SWEEP churn when an order keeps resurfacing with no live jobs.
+        max_reenqueue_attempts = int(os.environ.get("BOT_JARVIS_FINAL_SWEEP_MAX_REENQUEUE", "3").strip() or "3")
+        if max_reenqueue_attempts < 1:
+            max_reenqueue_attempts = 1
+    except Exception:
+        max_reenqueue_attempts = 3
 
     open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     terminal_states = {"done", "failed", "cancelled", "blocked"}
@@ -6571,6 +6578,11 @@ def _jarvis_final_sweep_tick(
             continue
 
         terminal_children = [c for c in children if str(c.state or "").strip().lower() in terminal_states]
+        terminal_final_sweeps = [
+            c
+            for c in terminal_children
+            if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+        ]
         last_child_ts = 0.0
         for c in terminal_children:
             try:
@@ -6580,6 +6592,33 @@ def _jarvis_final_sweep_tick(
         child_idle_s = int(max(0.0, float(now) - last_child_ts)) if last_child_ts > 0 else int(root_age_s)
 
         proactive_order = bool(_is_proactive_order_record(o)) or bool((root.trace or {}).get("proactive_lane", False) if root is not None else False)
+        if proactive_order and len(terminal_final_sweeps) >= int(max_reenqueue_attempts):
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                orch_q.update_trace(
+                    oid,
+                    final_sweep_reenqueue_exhausted_closed=True,
+                    final_sweep_reenqueue_exhausted_closed_at=float(now),
+                    final_sweep_reenqueue_exhausted_count=int(len(terminal_final_sweeps)),
+                    final_sweep_reenqueue_exhausted_idle_age_s=float(child_idle_s),
+                    live_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.final_sweep_auto_closed_reenqueue_exhausted",
+                    actor="scheduler",
+                    details={
+                        "order_id": oid,
+                        "terminal_final_sweep_count": int(len(terminal_final_sweeps)),
+                        "idle_age_s": float(child_idle_s),
+                        "threshold": int(max_reenqueue_attempts),
+                        "reason": "idle_no_open_jobs_reenqueue_exhausted",
+                    },
+                )
+            except Exception:
+                pass
+            continue
+
         if proactive_order and len(terminal_children) >= int(idle_terminal_close_threshold):
             try:
                 orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
