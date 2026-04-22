@@ -13,6 +13,45 @@ def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_ACTIVE_STATES = ("blocked", "blocked_approval", "waiting_deps", "running", "queued")
+
+
+def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[list[dict], str]:
+    rows = [
+        dict(r)
+        for r in con.execute(
+            f"""
+            SELECT job_id, role, state, COALESCE(depends_on,'[]') AS depends_on,
+                   COALESCE(blocked_reason,'') AS blocked_reason, updated_at
+            FROM jobs
+            WHERE parent_job_id = ?
+              AND state IN ({",".join("?" for _ in _ACTIVE_STATES)})
+            ORDER BY created_at
+            """,
+            (str(ticket_id), *_ACTIVE_STATES),
+        ).fetchall()
+    ]
+    if rows:
+        return rows, "parent_job_id"
+
+    # Fallback for lanes where ticket lineage is stored in labels JSON.
+    rows = [
+        dict(r)
+        for r in con.execute(
+            f"""
+            SELECT job_id, role, state, COALESCE(depends_on,'[]') AS depends_on,
+                   COALESCE(blocked_reason,'') AS blocked_reason, updated_at
+            FROM jobs
+            WHERE labels LIKE ?
+              AND state IN ({",".join("?" for _ in _ACTIVE_STATES)})
+            ORDER BY created_at
+            """,
+            (f'%"ticket": "{ticket_id}"%', *_ACTIVE_STATES),
+        ).fetchall()
+    ]
+    return rows, "labels_ticket_fallback"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Replayable blocker validity check for proactive sweeps")
     ap.add_argument("--db", default="/home/aponce/codexbot/data/jobs.sqlite")
@@ -24,20 +63,7 @@ def main() -> int:
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
 
-    rows = [
-        dict(r)
-        for r in con.execute(
-            """
-            SELECT job_id, role, state, COALESCE(depends_on,'[]') AS depends_on,
-                   COALESCE(blocked_reason,'') AS blocked_reason, updated_at
-            FROM jobs
-            WHERE parent_job_id = ?
-              AND state IN ('blocked','blocked_approval','waiting_deps','running','queued')
-            ORDER BY created_at
-            """,
-            (str(args.ticket_id),),
-        ).fetchall()
-    ]
+    rows, selector_strategy = _select_rows_for_ticket(con, str(args.ticket_id))
 
     now = time.time()
     for r in rows:
@@ -61,6 +87,8 @@ def main() -> int:
     payload = {
         "generated_at": _utc_now(),
         "ticket_id": str(args.ticket_id),
+        "selector_strategy": selector_strategy,
+        "candidate_count": len(rows),
         "blocked_or_waiting_count": len(blocked),
         "stale_threshold_seconds": float(args.stale_seconds),
         "stale_blocked_count": len(stale),
