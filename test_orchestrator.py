@@ -2688,10 +2688,12 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 merge_commit=merge_commit,
             )
             self.assertEqual(str(result.get("status") or ""), "ok")
-            self.assertEqual((repo / ".deployed_commit").read_text(encoding="utf-8"), str(merge_commit))
-            self.assertEqual((repo / "app.txt").read_text(encoding="utf-8"), "v2\n")
+            deploy_dir = (repo / "data" / "deploy_worktrees" / "main" / "deploy" / "slot1").resolve()
+            self.assertTrue(deploy_dir.exists())
+            self.assertEqual((deploy_dir / ".deployed_commit").read_text(encoding="utf-8"), str(merge_commit))
+            self.assertEqual((deploy_dir / "app.txt").read_text(encoding="utf-8"), "v2\n")
 
-    def test_deploy_after_merge_uses_runtime_worktree_when_repo_not_on_main(self) -> None:
+    def test_deploy_after_merge_uses_managed_deploy_worktree_when_repo_not_on_main(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
             remote = td_path / "remote.git"
@@ -2760,10 +2762,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             )
             self.assertEqual(str(result.get("status") or ""), "ok")
 
-            runtime_dir = (repo / "data" / "runtime_worktrees" / "main").resolve()
-            self.assertTrue(runtime_dir.exists())
-            self.assertEqual((runtime_dir / ".deployed_commit").read_text(encoding="utf-8"), str(merge_commit))
-            self.assertEqual((runtime_dir / ".deployed_branch").read_text(encoding="utf-8").strip(), "poncebot/runtime/main")
+            deploy_dir = (repo / "data" / "deploy_worktrees" / "main" / "deploy" / "slot1").resolve()
+            self.assertTrue(deploy_dir.exists())
+            self.assertEqual((deploy_dir / ".deployed_commit").read_text(encoding="utf-8"), str(merge_commit))
+            self.assertTrue((deploy_dir / ".deployed_branch").read_text(encoding="utf-8").strip().endswith("/deploy/slot1"))
             self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "workspace/dev")
 
     def test_auto_merge_unsuspends_when_new_merge_ready_signal_arrives(self) -> None:

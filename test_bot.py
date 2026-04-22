@@ -4282,6 +4282,24 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertIn("/changes/slice_a", str(root_a))
         self.assertIn("/changes/slice_b", str(root_b))
 
+    def test_local_workspace_change_token_uses_order_namespace_when_key_is_generic(self) -> None:
+        task = SimpleNamespace(
+            trace={},
+            labels={"key": "project"},
+            parent_job_id="",
+            job_id="533df86f-8895-4685-8f33-287375e01121",
+        )
+        self.assertEqual(bot._local_workspace_change_token(task), "533df86f")
+
+    def test_local_workspace_change_token_combines_order_namespace_with_concrete_slice(self) -> None:
+        task = SimpleNamespace(
+            trace={"slice_id": "82f10b4b_r2"},
+            labels={"key": "project"},
+            parent_job_id="533df86f-8895-4685-8f33-287375e01121",
+            job_id="4b6f0ceb-36e0-43d2-8615-a785b4c2bd47",
+        )
+        self.assertEqual(bot._local_workspace_change_token(task), "533df86f_82f10b4b_r2")
+
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)
@@ -4329,6 +4347,70 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
         self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
 
+
+class TestDeployCheckoutSync(unittest.TestCase):
+    def test_sync_repo_checkout_prefers_managed_deploy_worktree(self) -> None:
+        repo = Path("/tmp/factory-repo")
+        deploy_checkout = repo / "data" / "deploy_worktrees" / "main" / "deploy" / "slot1"
+        calls: list[tuple[Path, list[str]]] = []
+
+        def fake_run_git(target_repo: Path, args: list[str], *, check: bool = False):
+            calls.append((target_repo, list(args)))
+            if args[:2] == ["status", "--porcelain"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:2] == ["merge", "--ff-only"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:3] == ["rev-parse", "--short", "HEAD"]:
+                return subprocess.CompletedProcess(args, 0, stdout="af259ae\n", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with patch("bot._git_fetch_remote_branch", return_value=(True, "ok")):
+            with patch("bot._prepare_managed_deploy_checkout", return_value=(True, "deploy_checkout_ready", deploy_checkout)):
+                with patch("bot._run_git", side_effect=fake_run_git):
+                    ok, msg, commit, synced_dir = bot._sync_repo_checkout_to_default_branch(repo=repo, default_branch="main")
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "synced")
+        self.assertEqual(commit, "af259ae")
+        self.assertEqual(synced_dir, deploy_checkout)
+        self.assertTrue(any(target == deploy_checkout and args[:2] == ["status", "--porcelain"] for target, args in calls))
+        self.assertFalse(any(target == repo and args[:2] == ["status", "--porcelain"] for target, args in calls))
+
+    def test_deploy_after_order_merge_rewrites_repo_relative_cwd_to_synced_checkout(self) -> None:
+        cfg = SimpleNamespace()
+        repo_dir = Path("/tmp/factory-repo").resolve()
+        deploy_repo_dir = (repo_dir / "data" / "deploy_worktrees" / "main" / "deploy" / "slot1").resolve()
+        observed_cwds: list[str] = []
+
+        def fake_run(cmd, *, cwd, env, stdout, stderr, text, timeout, check):
+            observed_cwds.append(str(cwd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+        with patch(
+            "bot._repo_deploy_policy",
+            return_value={
+                "cwd": str(repo_dir / "deploy"),
+                "command": ["./deploy.sh"],
+                "verify_command": [],
+                "background": False,
+                "service": "",
+                "timeout_seconds": 60,
+            },
+        ):
+            with patch("bot._sync_repo_checkout_to_default_branch", return_value=(True, "synced", "af259ae", deploy_repo_dir)):
+                with patch("subprocess.run", side_effect=fake_run):
+                    result = bot._deploy_after_order_merge(
+                        cfg=cfg,
+                        repo_record={"repo_id": "codexbot-6fb8d5b9"},
+                        repo_dir=repo_dir,
+                        default_branch="main",
+                        order_id="533df86f-8895-4685-8f33-287375e01121",
+                        order_branch="feature/order-533df86f-proactive-sprint-codexbot-reliability-",
+                        merge_commit="af259ae",
+                    )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(observed_cwds, [str((deploy_repo_dir / "deploy").resolve())])
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:

@@ -5073,21 +5073,73 @@ def _local_role_worktree_dir(
     return (base / "data" / "worktrees" / str(role or "").strip() / "slot1").resolve()
 
 
+_GENERIC_CHANGE_TOKEN_PREFIXES = (
+    "project",
+    "shared",
+    "default",
+    "change",
+    "ticket",
+    "seed",
+    "proactive_local_seed_r",
+    "proactive-local-seed-r",
+    "proactive_cli_reseed_r",
+    "proactive-cli-reseed-r",
+)
+
+
+def _workspace_token_is_generic(token: str) -> bool:
+    raw = str(token or "").strip().lower()
+    if not raw:
+        return True
+    return any(raw == prefix or raw.startswith(prefix) for prefix in _GENERIC_CHANGE_TOKEN_PREFIXES)
+
+
+def _workspace_namespace_token(value: Any) -> str:
+    token = _slug_token(str(value or "").strip(), max_len=48)
+    if not token:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", token):
+        return token.split("-", 1)[0]
+    return token[:16]
+
+
+def _local_workspace_root_token(task: Any) -> str:
+    trace_obj = getattr(task, "trace", {}) if isinstance(getattr(task, "trace", {}), dict) else {}
+    labels_obj = getattr(task, "labels", {}) if isinstance(getattr(task, "labels", {}), dict) else {}
+    for candidate in (
+        trace_obj.get("order_id"),
+        labels_obj.get("ticket"),
+        getattr(task, "parent_job_id", ""),
+    ):
+        token = _workspace_namespace_token(candidate)
+        if token and not _workspace_token_is_generic(token):
+            return token
+    return ""
+
+
 def _local_workspace_change_token(task: Any) -> str:
     trace_obj = getattr(task, "trace", {}) if isinstance(getattr(task, "trace", {}), dict) else {}
     labels_obj = getattr(task, "labels", {}) if isinstance(getattr(task, "labels", {}), dict) else {}
+    root_token = _local_workspace_root_token(task)
     for candidate in (
         trace_obj.get("slice_id"),
         trace_obj.get("delegation_slug"),
         labels_obj.get("slice"),
         labels_obj.get("key"),
-        getattr(task, "job_id", ""),
     ):
         token = _slug_token(str(candidate or "").strip(), max_len=48)
+        if not token:
+            continue
+        if _workspace_token_is_generic(token):
+            break
+        if root_token and token != root_token and not token.startswith(f"{root_token}_") and not token.startswith(f"{root_token}-"):
+            return _slug_token(f"{root_token}_{token}", max_len=48)
         if token:
             return token
-    return "shared"
-
+    if root_token:
+        return root_token
+    token = _workspace_namespace_token(getattr(task, "job_id", ""))
+    return token or "shared"
 
 def _task_scoped_repo_worktree_root(
     cfg: BotConfig,
@@ -8404,6 +8456,22 @@ def _tail_text(blob: str, *, max_chars: int = 1200) -> str:
     return "..." + text[-max_chars:]
 
 
+def _prepare_managed_deploy_checkout(
+    *,
+    repo: Path,
+    default_branch: str = "main",
+) -> tuple[bool, str, Path | None]:
+    branch_slug = _slug_token(default_branch or "main", max_len=24) or "main"
+    root = (repo / "data" / "deploy_worktrees" / branch_slug).resolve()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        ensure_worktree_pool(base_repo=repo, root=root, role="deploy", slots=1)
+        checkout_dir = (root / "deploy" / "slot1").resolve()
+        prepare_clean_workspace(checkout_dir)
+        return True, "deploy_checkout_ready", checkout_dir
+    except Exception as exc:
+        return False, f"deploy_checkout_prepare_failed:{exc}", None
+
 def _sync_repo_checkout_to_default_branch(
     *,
     repo: Path,
@@ -8431,6 +8499,13 @@ def _sync_repo_checkout_to_default_branch(
         rev = _run_git(target_repo, ["rev-parse", "--short", "HEAD"], check=False)
         deployed_commit = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
         return True, "synced", (deployed_commit or None), target_repo
+
+    deploy_checkout_ok, deploy_checkout_msg, deploy_checkout_dir = _prepare_managed_deploy_checkout(
+        repo=repo,
+        default_branch=branch,
+    )
+    if deploy_checkout_ok and deploy_checkout_dir is not None:
+        return _finalize_synced_checkout(deploy_checkout_dir)
 
     def _runtime_worktree_dir() -> Path:
         branch_slug = _slug_token(branch) or "main"
@@ -8461,7 +8536,12 @@ def _sync_repo_checkout_to_default_branch(
             if checkout.returncode != 0:
                 detail = (checkout.stderr or checkout.stdout or "").strip()
                 return False, detail or "runtime_worktree_checkout_failed", None, None
-    return _finalize_synced_checkout(worktree_dir)
+    ok, msg, commit, synced_dir = _finalize_synced_checkout(worktree_dir)
+    if ok:
+        return ok, msg, commit, synced_dir
+    if deploy_checkout_msg:
+        return False, f"{msg}; fallback_from={deploy_checkout_msg}", None, None
+    return ok, msg, commit, synced_dir
 
 
 def _ensure_project_workspace(
@@ -12065,10 +12145,14 @@ def _deploy_after_order_merge(
             policy_cwd_path = Path(policy_cwd).expanduser().resolve()
         except Exception:
             policy_cwd_path = Path(policy_cwd).expanduser()
-        if str(policy_cwd_path) == str(repo_dir):
-            cwd = str(deploy_repo_dir)
+        try:
+            rel_cwd = policy_cwd_path.relative_to(repo_dir)
+        except Exception:
+            rel_cwd = None
+        if rel_cwd is None:
+            cwd = str(deploy_repo_dir) if str(policy_cwd_path) == str(repo_dir) else str(policy_cwd_path)
         else:
-            cwd = str(policy_cwd_path)
+            cwd = str((deploy_repo_dir / rel_cwd).resolve())
     timeout_seconds = int(policy.get("timeout_seconds") or 900)
     command_text = shlex.join(command)
 
