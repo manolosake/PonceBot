@@ -528,6 +528,11 @@ def _clean_shell_env() -> dict[str, str]:
     return env
 
 
+def _normalize_role_for_close_gate(role: str) -> str:
+    # Accept legacy separators/casing so role aliases stay stable across lanes.
+    return str(role or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
 def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
     """
     Contract-aligned close-gate predicate:
@@ -552,7 +557,7 @@ def _close_gate_blocker_count(rows: list[dict[str, Any]]) -> int:
         state = str(row.get("state") or "").strip().lower()
         if state not in open_states:
             continue
-        role = str(row.get("role") or "").strip().lower()
+        role = _normalize_role_for_close_gate(str(row.get("role") or ""))
         if role in non_blocking_roles:
             continue
         blockers += 1

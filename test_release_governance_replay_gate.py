@@ -13,6 +13,7 @@ class TestReleaseGovernanceReplayGate(unittest.TestCase):
             {"role": "qa", "state": "running"},
             {"role": "qa_local", "state": "queued"},
             {"role": "quality_assurance", "state": "waiting_deps"},
+            {"role": "Quality-Assurance", "state": "blocked"},
             {"role": "reviewer_local", "state": "queued"},
             {"role": "skynet", "state": "blocked"},
         ]
