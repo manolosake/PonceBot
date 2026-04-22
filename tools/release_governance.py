@@ -568,7 +568,12 @@ def main() -> int:
                 artifacts_dir / "release_governance.stdout.json",
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             )
+            _atomic_write_text(
+                artifacts_dir / "release_governance_run.stdout.json",
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
             _atomic_write_text(artifacts_dir / "release_governance.exit_code.txt", f"{computed_exit}\n")
+            _atomic_write_text(artifacts_dir / "release_governance_run.exit_code.txt", f"{computed_exit}\n")
 
             # FINAL_MANIFEST must be generated after all other artifact outputs are finalized.
             manifest = {

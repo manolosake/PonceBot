@@ -36,6 +36,7 @@ class TestReleaseGovernanceTraceability(unittest.TestCase):
             (root / "command_transcript.txt").write_text("cmd\n", encoding="utf-8")
             (root / "release_governance.exit_code.txt").write_text("0\n", encoding="utf-8")
             (root / "release_governance.stdout.json").write_text("{\"ok\":true}\n", encoding="utf-8")
+            (root / "release_governance_run.stdout.json").write_text("{\"ok\":true}\n", encoding="utf-8")
             manifest = {
                 "files": rg._manifest_entries(root, exclude_names=set()),
             }
