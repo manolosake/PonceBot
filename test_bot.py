@@ -2451,6 +2451,116 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertTrue(worktree_target.is_file())
             self.assertEqual(worktree_target.read_text(encoding="utf-8"), updated)
 
+    def test_orchestrator_run_codex_refuses_base_repo_fallback_when_worktree_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            cfg = bot.dataclasses.replace(
+                cfg,
+                codex_workdir=repo,
+                worktree_root=Path(td) / "worktrees",
+                artifacts_root=Path(td) / "artifacts_root",
+                orchestrator_sessions_enabled=False,
+                orchestrator_live_update_seconds=0,
+                codex_timeout_seconds=5,
+            )
+            cfg.artifacts_root.mkdir(parents=True, exist_ok=True)
+            cfg.worktree_root.mkdir(parents=True, exist_ok=True)
+            repo_id = "codexbot-12345678"
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.updated: list[tuple[str, dict[str, object]]] = []
+                    self.released = False
+
+                def lease_workspace(self, *, role: str, job_id: str, slots: int = 1) -> int:
+                    return 1
+
+                def release_workspace(self, *, job_id: str) -> None:
+                    self.released = True
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    self.updated.append((job_id, dict(kwargs)))
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+            task = bot.Task.new(
+                job_id="job-sync-fail",
+                source="test",
+                role="implementer_local",
+                input_text="Implement one bounded improvement.",
+                request_type="task",
+                priority=1,
+                model="gpt-5.3-codex",
+                effort="medium",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                state="running",
+                artifacts_dir=str((cfg.artifacts_root / "job-sync-fail").resolve()),
+                trace={
+                    "repo_id": repo_id,
+                    "repo_path": str(repo),
+                    "repo_default_branch": "main",
+                    "order_branch": "feature/missing-order-branch",
+                },
+            )
+
+            fake_queue = _FakeQueue()
+            profiles = {
+                "implementer_local": {
+                    "execution_backend": "codex",
+                    "model": "gpt-5.3-codex",
+                    "effort": "medium",
+                    "max_parallel_jobs": 1,
+                }
+            }
+
+            with patch.object(bot, "_sync_worktree_to_order_branch", return_value=(False, "fetch_failed:missing")):
+                with patch.object(bot.CodexRunner, "start", side_effect=AssertionError("must not run in base repo")):
+                    result = bot._orchestrator_run_codex(
+                        cfg,
+                        task,
+                        stop_event=threading.Event(),
+                        orch_q=fake_queue,
+                        profiles=profiles,
+                    )
+
+            self.assertEqual(result["status"], "error")
+            self.assertEqual(result["next_action"], "fix_workspace_sync")
+            self.assertIn("refused base repo fallback", result["summary"])
+            self.assertTrue(fake_queue.released)
+            self.assertTrue(any(update[1].get("live_phase") == "workspace_setup_failed" for update in fake_queue.updated))
+            self.assertTrue((Path(task.artifacts_dir) / "worktree_error.txt").is_file())
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(status.strip(), "")
+
     def test_orchestrator_run_codex_extracts_json_payload_from_body_into_structured_digest(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"

@@ -22798,7 +22798,8 @@ def _orchestrator_run_codex(
             except Exception:
                 pass
         except Exception as e:
-            # Release the lease and fall back to the base repo in read-only mode.
+            # Release the lease and fail closed. Falling back to the runtime repo
+            # still gives Codex write access and can dirty the deployed checkout.
             try:
                 if orch_q is not None:
                     orch_q.release_workspace(job_id=task.job_id)
@@ -22806,16 +22807,33 @@ def _orchestrator_run_codex(
                 pass
             leased_slot = None
             worktree_dir = None
-            eff_cfg = cfg
-            mode = "ro"
-            LOG.exception("Worktree setup failed; falling back to base workdir read-only. job=%s role=%s", task.job_id, role)
+            LOG.exception("Worktree setup failed; refusing base workdir fallback. job=%s role=%s", task.job_id, role)
             artifacts_f = artifacts_dir / "worktree_error.txt"
             artifacts_f.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
             try:
                 if orch_q is not None:
-                    orch_q.update_trace(task.job_id, live_phase="workspace_fallback_ro", live_at=time.time())
+                    orch_q.update_trace(
+                        task.job_id,
+                        live_phase="workspace_setup_failed",
+                        live_at=time.time(),
+                        workspace_error=str(e),
+                        workspace_error_artifact=str(artifacts_f),
+                    )
             except Exception:
                 pass
+            return {
+                "status": "error",
+                "summary": f"Workspace setup failed; refused base repo fallback to protect runtime checkout: {e}",
+                "artifacts": [str(artifacts_f)],
+                "logs": str(e),
+                "next_action": "fix_workspace_sync",
+                "structured_digest": {
+                    "role": role,
+                    "workspace": "setup_failed",
+                    "order_branch": order_branch or None,
+                    "default_branch": repo_default_branch,
+                },
+            }
 
     # Optional screenshot capture (Playwright).
     image_paths: list[Path] = []
