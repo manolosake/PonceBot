@@ -6452,6 +6452,8 @@ def _orchestrator_run_local_ollama(
             repo_role_worktree = (repo_root / role / "slot1").resolve()
             prepare_clean_workspace(repo_role_worktree)
             if order_branch:
+                if order_branch.startswith("refs/heads/"):
+                    order_branch = order_branch[len("refs/heads/"):]
                 ok_sync, sync_msg = _sync_worktree_to_order_branch(
                     base_repo=repo_base_dir,
                     worktree_dir=repo_role_worktree,
