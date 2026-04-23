@@ -10589,9 +10589,32 @@ def _order_command_text(
                 if deploy_status == "failed":
                     orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
                     orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+                    orch_q.update_state(
+                        root_id,
+                        "blocked",
+                        blocked_reason="deploy_failed",
+                        result_status="deploy_failed",
+                        result_summary=(
+                            f"Merged to {default_branch}"
+                            + (f" commit={merge_commit}" if merge_commit else "")
+                            + (f". {deploy_summary}" if deploy_summary else ".")
+                        ),
+                        result_next_action="Inspect deployment failure and complete rollout.",
+                    )
                 else:
                     orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
                     orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+                    orch_q.update_state(
+                        root_id,
+                        "done",
+                        result_status="merged",
+                        result_summary=(
+                            f"Merged to {default_branch}"
+                            + (f" commit={merge_commit}" if merge_commit else "")
+                            + (f". {deploy_summary}" if deploy_summary else ".")
+                        ),
+                        result_next_action="Factory ready for next order.",
+                    )
             except Exception:
                 pass
             try:
