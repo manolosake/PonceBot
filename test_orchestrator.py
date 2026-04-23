@@ -4308,6 +4308,45 @@ class TestSkynetLocalRecovery(unittest.TestCase):
             ]
             self.assertEqual(autopilots, [])
 
+    def test_sync_order_phase_preserves_explicit_merge_ready_without_live_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            q.update_trace(
+                order_id,
+                order_branch="feature/order-pending-branch",
+                merge_ready=True,
+                merge_ready_at=1000.0,
+                merged_to_main=False,
+            )
+            q.set_order_phase(order_id, chat_id=1, phase="ready_for_merge")
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="old terminal failure",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="failed",
+                    trace={"result_status": "failed", "result_summary": "old failed attempt"},
+                    job_id="job-terminal-failure-merge-ready",
+                )
+            )
+
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "active")
+            self.assertEqual(str(order.get("phase") or ""), "ready_for_merge")
+
     def test_blocked_controller_write_policy_violation_requests_local_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _cfg_obj, _q, order_id, repo_dir = self._seed_factory_order(td)

@@ -18010,6 +18010,16 @@ def _sync_order_phase_from_runtime(
 
     proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
 
+    if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live:
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            if not root_trace.get("merge_ready_at"):
+                orch_q.update_trace(rid, merge_ready_at=time.time(), live_at=time.time())
+        except Exception:
+            pass
+        return
+
     if proactive_order and proactive_verified_no_change and not any_live:
         try:
             if merge_required:
