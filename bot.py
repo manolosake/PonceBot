@@ -7466,6 +7466,11 @@ def _coerce_orchestrator_mode(value: str) -> str:
     return mode if mode in ("ro", "rw", "full") else "ro"
 
 
+_ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
+    "architect_local": ["plan", "summarize", "review", "repo_read"],
+}
+
+
 def _default_orchestrator_profile(role: str) -> dict[str, Any]:
     return {
         "name": role.title(),
@@ -7474,7 +7479,7 @@ def _default_orchestrator_profile(role: str) -> dict[str, Any]:
         "model": "",
         "effort": "medium",
         "mode_hint": "ro",
-        "allowed_tools": [],
+        "allowed_tools": list(_ROLE_ALLOWED_TOOLS.get(role, [])),
         "max_parallel_jobs": 1,
         "max_runtime_seconds": 900,
         "approval_required": False,
