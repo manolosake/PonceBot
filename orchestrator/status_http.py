@@ -52,7 +52,10 @@ def _extract_bearer_token(handler: BaseHTTPRequestHandler) -> str:
     if isinstance(auth, str):
         a = auth.strip()
         if a.lower().startswith("bearer "):
-            return a.split(None, 1)[1].strip()
+            parts = a.split(None, 1)
+            if len(parts) < 2:
+                return ""
+            return parts[1].strip()
     return ""
 
 
@@ -68,10 +71,10 @@ class _TokenBucket:
         self.rate_per_s = max(0.0, float(rate_per_s))
         self.burst = max(0.0, float(burst))
         self.tokens = self.burst
-        self.last = time.time()
+        self.last = time.monotonic()
 
     def allow(self, *, cost: float = 1.0) -> bool:
-        now = time.time()
+        now = time.monotonic()
         dt = max(0.0, now - self.last)
         self.last = now
         if self.rate_per_s > 0:
@@ -184,8 +187,11 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             for k, v in extra_headers.items():
                 self.send_header(str(k), str(v))
         self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_OPTIONS(self) -> None:  # pragma: no cover
         ok, cors_headers = self._resolve_cors()

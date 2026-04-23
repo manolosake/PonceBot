@@ -221,6 +221,15 @@ def _role_requires_enforced_read_only(role: str) -> bool:
     return (role or "").strip().lower() in _READ_ONLY_ENFORCED_ROLE_NAMES
 
 
+def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: int) -> str | None:
+    """
+    Enforce controller read-only mode only when dangerous bypass is not active.
+    This prevents forced `ro` from unintentionally disabling breakglass bypass.
+    """
+    enforce = _role_requires_enforced_read_only(role) and not _effective_bypass_sandbox(cfg, chat_id=chat_id)
+    return "ro" if enforce else None
+
+
 def _role_disallows_repo_writes(role: str) -> bool:
     return (role or "").strip().lower() in _NO_WRITE_ROLE_NAMES
 
@@ -6393,7 +6402,11 @@ def _orchestrator_run_local_ollama(
                     raise RuntimeError(f"order branch sync failed: {sync_msg}")
         except Exception:
             repo_role_worktree = None
-    shared_local_worktree = _local_role_worktree_dir("implementer_local")
+    shared_local_worktree = _local_role_worktree_dir(
+        "implementer_local",
+        cfg=cfg if (repo_id and repo_base_dir is not None and (repo_base_dir / ".git").exists()) else None,
+        repo_id=(repo_id or None),
+    )
     if repo_role_worktree is not None:
         worktree_dir = repo_role_worktree
     elif role == "implementer_local" and mode != "ro":
@@ -7538,6 +7551,39 @@ def _run_git(
     )
 
 
+def _git_config_get(repo: Path, key: str) -> str:
+    proc = _run_git(repo, ["config", "--get", str(key or "").strip()], check=False)
+    if proc.returncode != 0:
+        return ""
+    return str(proc.stdout or "").strip()
+
+
+def _autonomous_commit_identity_env(worktree_dir: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    name = (
+        str(os.environ.get("BOT_AUTONOMOUS_GIT_AUTHOR_NAME") or "").strip()
+        or _git_config_get(worktree_dir, "user.name")
+        or "manolosake"
+    )
+    email = (
+        str(os.environ.get("BOT_AUTONOMOUS_GIT_AUTHOR_EMAIL") or "").strip()
+        or _git_config_get(worktree_dir, "user.email")
+        or "manolosake@gmail.com"
+    )
+    # These are assigned, not setdefault: the autonomous worker may inherit stale
+    # PonceBot/Codex env vars from a parent process, but order commits must use the
+    # server git identity.
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": name,
+            "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name,
+            "GIT_COMMITTER_EMAIL": email,
+        }
+    )
+    return env
+
+
 def _git_ref_exists(repo: Path, ref: str) -> bool:
     p = _run_git(repo, ["rev-parse", "--verify", ref], check=False)
     return int(p.returncode if p.returncode is not None else 1) == 0
@@ -8058,12 +8104,7 @@ def _autocommit_push_order_branch(
     if not status_out:
         return {"status": "skipped", "reason": "no_changes"}
 
-    # Ensure deterministic identity for autonomous commits.
-    env = dict(os.environ)
-    env.setdefault("GIT_AUTHOR_NAME", "PonceBot")
-    env.setdefault("GIT_AUTHOR_EMAIL", "poncebot@local")
-    env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
-    env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+    env = _autonomous_commit_identity_env(worktree_dir)
 
     add = _run_git(worktree_dir, ["add", "-A"], check=False, env=env)
     if add.returncode != 0:
@@ -12735,7 +12776,7 @@ def _spawn_proactive_order(
             if repo_path
             else "- Work only inside this initiative scope; do not touch unrelated projects."
         ),
-        "- Avoid work-for-work's-sake: choose the smallest highest-impact improvement that can be validated today.",
+        "- Avoid work-for-work's-sake: choose the smallest highest-impact bugfix, issue resolution, or improvement that can be validated today.",
         "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.",
         "- Task selection priority (deterministic):",
         "  1) repeated conversion failures in the local funnel,",
@@ -12749,7 +12790,7 @@ def _spawn_proactive_order(
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
-        "- Default to one bounded Codex delivery slice plus one validation slice; do not spray parallel tasks.",
+        "- Default to one bounded local slice plus one validation slice; do not spray parallel tasks.",
         "- When delegating implementation, give one concrete slice with likely files/components/tests, not a generic 'implement the fallback' instruction.",
         "- If work becomes repetitive, empty, or low-signal, slow down and re-plan one narrower evidence-first path instead of spawning more tasks.",
         "- After each implementation pass, run a self-review pass. If issues remain, create another fix pass.",
@@ -12986,7 +13027,7 @@ def _proactive_lane_tick(
                 "lane": "factory",
                 "project_hint": str(repo.get("path") or ""),
                 "goal": (
-                    "Ship one bounded reliability, quality, maintenance, or delivery improvement inside this registered repo, "
+                    "Ship one bounded bugfix, issue-resolution, reliability, quality, maintenance, or delivery improvement inside this registered repo, "
                     "with real evidence and no cross-repo writes."
                 ),
                 "success": (
@@ -13442,6 +13483,45 @@ def _enqueue_order_autopilot_task(
     root_job = orch_q.get_job(oid)
     root_trace = dict((root_job.trace if root_job else {}) or {})
     is_proactive = _is_proactive_order_record(order_row)
+    if is_proactive:
+        try:
+            _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+            )
+            merge_required, _merge_branch = _order_trace_requires_merge(
+                root_trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
+        except Exception:
+            merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
+        if merge_required or bool(root_trace.get("merge_ready", False)):
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="ready_for_merge")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=True,
+                    merge_ready_at=float(now),
+                    autopilot_deferred_to_merge=True,
+                    autopilot_deferred_to_merge_at=float(now),
+                    live_at=float(now),
+                    **_merge_ready_trace_reset_payload(now=float(now)),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.autopilot_deferred_to_merge",
+                    actor="skynet",
+                    details={
+                        "order_id": oid,
+                        "reason": str(reason or "").strip() or "autopilot",
+                    },
+                )
+            except Exception:
+                pass
+            return False
     if is_proactive and bool(root_trace.get("local_only_revive_requested", False)) and not _has_open_local_support_work(children):
         if _enqueue_proactive_local_architect_reseed(
             cfg=cfg,
@@ -13545,9 +13625,9 @@ def _enqueue_order_autopilot_task(
             "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
             "- If the best next move is a larger strategic idea, a new capability, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
             "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors for proactive work.\n"
-            "- Keep local specialists as optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
             "- If a cycle stalls or returns low-signal output, slow down and re-plan a narrower Codex slice with stronger evidence requirements.\n"
-            "- If no CEO project is active, switch to maintenance/tech-debt/improvement backlog work.\n"
+            "- If no CEO project is active, switch to maintenance/tech-debt/bugfix/improvement backlog work.\n"
             "- Apply iterative quality loop: after each pass, self-review and queue fixes if needed.\n"
             "- For UI/mobile changes, validate with emulator/browser screenshots before claiming done.\n"
             "- Keep WIP bounded: max 3 running tasks and max 12 queued tasks for this order.\n"
@@ -17268,7 +17348,11 @@ def _apply_autonomous_local_first_policy(
             if low.startswith("test") or "/test" in low or low.startswith("tests/"):
                 test_target = rel_path
                 break
-        validation_cmd = f"pytest -q {test_target}" if test_target else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        validation_cmd = (
+            f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
+            if test_target
+            else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        )
         suffix_base = _sanitize_slice_token(latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
         direct_suffix = _sanitize_slice_token(
             f"{suffix_base}_direct_r{int(max(2, recent_non_actionable_arch_count + 1))}",
@@ -17368,7 +17452,11 @@ def _apply_autonomous_local_first_policy(
             if low.startswith("test") or "/test" in low or low.startswith("tests/"):
                 test_target = rel_path
                 break
-        validation_cmd = f"pytest -q {test_target}" if test_target else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        validation_cmd = (
+            f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
+            if test_target
+            else f"python -m py_compile {' '.join(candidate_files[:2])}"
+        )
         suffix_base = _sanitize_slice_token(latest_arch_job_id or latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
         direct_suffix = _sanitize_slice_token(
             f"{suffix_base}_ws_r{int(max(2, recent_non_actionable_arch_count + 1))}",
@@ -19022,6 +19110,12 @@ def _jarvis_final_sweep_tick(
     except Exception:
         idle_order_stale_s = 300.0
     try:
+        idle_terminal_close_threshold = int(os.environ.get("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", "10").strip() or "10")
+        if idle_terminal_close_threshold < 1:
+            idle_terminal_close_threshold = 1
+    except Exception:
+        idle_terminal_close_threshold = 10
+    try:
         max_per_tick = max(1, min(8, int(os.environ.get("BOT_JARVIS_FINAL_SWEEP_MAX_PER_TICK", "3").strip() or "3")))
     except Exception:
         max_per_tick = 3
@@ -19159,6 +19253,124 @@ def _jarvis_final_sweep_tick(
             idle_age_s = max(0.0, float(now) - latest_child_activity) if latest_child_activity > 0 else float(idle_order_stale_s)
             if idle_age_s < float(idle_order_stale_s):
                 continue
+
+            # High-signal guardrail for proactive lanes:
+            # if an order has only terminal children for a long time and keeps reseeding,
+            # move it forward without generating another sweep loop. If an order branch
+            # exists, never close directly: hand it to the merge/deploy lane.
+            if proactive_order and terminal_n >= int(idle_terminal_close_threshold):
+                root_job = orch_q.get_job(order_id)
+                root_trace = dict((root_job.trace if root_job else {}) or {})
+                try:
+                    _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                        cfg=cfg,
+                        orch_q=orch_q,
+                        order_id=order_id,
+                        chat_id=int(chat_id),
+                    )
+                    merge_required, _merge_branch = _order_trace_requires_merge(
+                        root_trace,
+                        repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                        default_branch=default_branch,
+                    )
+                except Exception:
+                    merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
+
+                if merge_required:
+                    ready_succeeded = False
+                    try:
+                        status_ok = bool(orch_q.set_order_status(order_id, chat_id=int(chat_id), status="active"))
+                        phase_ok = bool(orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="ready_for_merge"))
+                        ready_succeeded = bool(status_ok and phase_ok)
+                    except Exception:
+                        pass
+                    if ready_succeeded:
+                        try:
+                            orch_q.update_trace(
+                                order_id,
+                                final_sweep_terminal_only_ready_for_merge=True,
+                                final_sweep_terminal_only_ready_for_merge_at=float(now),
+                                final_sweep_terminal_only_closed=False,
+                                final_sweep_terminal_only_closed_count=int(terminal_n),
+                                final_sweep_terminal_only_closed_idle_age_s=float(idle_age_s),
+                                merge_ready=True,
+                                merge_ready_at=float(now),
+                                live_at=float(now),
+                                **_merge_ready_trace_reset_payload(now=float(now)),
+                            )
+                            orch_q.append_audit_event(
+                                event_type="order.final_sweep_terminal_only_ready_for_merge",
+                                actor="skynet",
+                                details={
+                                    "order_id": order_id,
+                                    "terminal_child_count": int(terminal_n),
+                                    "idle_age_s": float(idle_age_s),
+                                    "threshold": int(idle_terminal_close_threshold),
+                                    "reason": "pending_order_branch",
+                                },
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+                try:
+                    verified_terminal_outcome = bool(
+                        _order_has_meaningful_improvement(orch_q=orch_q, root_ticket=order_id)
+                        or _order_has_verified_no_change_resolution(orch_q=orch_q, root_ticket=order_id, now=now)
+                    )
+                except Exception:
+                    verified_terminal_outcome = False
+
+                close_succeeded = False
+                try:
+                    status_ok = bool(orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done"))
+                    phase_ok = bool(orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done"))
+                    close_succeeded = bool(status_ok and phase_ok)
+                except Exception:
+                    pass
+                if not close_succeeded:
+                    try:
+                        refreshed = orch_q.get_order(order_id, chat_id=int(chat_id))
+                    except Exception:
+                        refreshed = None
+                    if refreshed is not None:
+                        refreshed_status = str(refreshed.get("status") or "").strip().lower()
+                        refreshed_phase = str(refreshed.get("phase") or "").strip().lower()
+                        close_succeeded = refreshed_status == "done" and refreshed_phase == "done"
+                if close_succeeded:
+                    try:
+                        orch_q.update_trace(
+                            order_id,
+                            final_sweep_terminal_only_closed=True,
+                            final_sweep_terminal_only_closed_at=float(now),
+                            final_sweep_terminal_only_closed_count=int(terminal_n),
+                            final_sweep_terminal_only_closed_idle_age_s=float(idle_age_s),
+                            proactive_blocked_with_root_cause=(not verified_terminal_outcome),
+                            proactive_blocked_with_root_cause_at=(float(now) if not verified_terminal_outcome else None),
+                            proactive_blocked_with_root_cause_summary=(
+                                "Terminal-only proactive loop stopped after repeated terminal jobs "
+                                "without a mergeable branch or verified improvement evidence."
+                                if not verified_terminal_outcome
+                                else None
+                            ),
+                            live_at=float(now),
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.final_sweep_auto_closed_terminal_only",
+                            actor="skynet",
+                            details={
+                                "order_id": order_id,
+                                "terminal_child_count": int(terminal_n),
+                                "idle_age_s": float(idle_age_s),
+                                "threshold": int(idle_terminal_close_threshold),
+                                "reason": "idle_no_open_jobs",
+                                "verified_terminal_outcome": bool(verified_terminal_outcome),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    continue
+
             sweep_reason = "idle_no_open_jobs"
             prompt_body = (
                 f"Terminal child jobs: {terminal_n}\n"
@@ -22725,12 +22937,12 @@ def _orchestrator_run_codex(
         pass
 
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
-    enforce_read_only_runner = _role_requires_enforced_read_only(role)
+    forced_mode = _orchestrator_forced_mode_for_role(eff_cfg, role=role, chat_id=int(task.chat_id))
     runner = CodexRunner(
         eff_cfg,
         chat_id=task.chat_id,
         allow_bypass=True,
-        forced_mode=("ro" if enforce_read_only_runner else None),
+        forced_mode=forced_mode,
     )
     proc: CodexRunner.Running
     used_thread_id: str | None = None
@@ -25217,8 +25429,8 @@ def orchestrator_worker_loop(
                         now_ts = time.time()
                         if specs and autonomous_non_manual:
                             # Policy:
-                            # - Proactive lane defaults to Codex-first execution.
-                            # - Legacy local-only enforcement remains available via env override.
+                            # Proactive lane defaults to isolated local-specialist execution.
+                            # A shared-worker fallback remains available only as an explicit env override.
                             enforce_local_only = bool(
                                 _skynet_factory_local_only_enabled()
                                 and (bool(proactive_lane) or bool(order_is_proactive))
@@ -25240,7 +25452,7 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
                             elif enforce_local_only:
-                                # Legacy proactive policy: execution and retries stay local-only.
+                                # Default proactive policy: execution and retries stay local-only.
                                 specs = _apply_autonomous_local_first_policy(
                                     cfg=cfg,
                                     specs=specs,
@@ -28408,10 +28620,13 @@ def _drain_pending_updates(cfg: BotConfig, api: TelegramAPI) -> int:
     for _ in range(20):
         try:
             updates = api.get_updates(offset=offset, timeout_seconds=0)
-        except Exception:
+        except Exception as exc:
             # On boot, DNS/network can be temporarily unavailable. Draining is a convenience, not a requirement.
             # If we crash here, systemd may hit StartLimit* and leave the bot "off" until manually restarted.
-            LOG.exception("Failed to drain pending Telegram updates; continuing without drain")
+            LOG.warning(
+                "Failed to drain pending Telegram updates; continuing without drain: %s",
+                exc,
+            )
             break
         if not updates:
             break

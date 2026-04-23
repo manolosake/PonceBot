@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -63,6 +64,24 @@ class StateStore:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    def _fsync_dir(self, directory: Path) -> None:
+        if not hasattr(os, "O_DIRECTORY"):
+            return
+        try:
+            fd = os.open(str(directory), os.O_RDONLY | os.O_DIRECTORY)
+        except Exception:
+            return
+        try:
+            os.fsync(fd)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
     def _write_unlocked(self, data: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_f = tempfile.NamedTemporaryFile(
@@ -73,12 +92,29 @@ class StateStore:
             dir=str(self._path.parent),
             delete=False,
         )
+        tmp_path = Path(tmp_f.name)
+        write_ok = False
         try:
             tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
             tmp_f.flush()
+            os.fsync(tmp_f.fileno())
+            write_ok = True
         finally:
             tmp_f.close()
-        Path(tmp_f.name).replace(self._path)
+            if not write_ok:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+        try:
+            tmp_path.replace(self._path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+            raise
+        self._fsync_dir(self._path.parent)
 
     def read(self) -> dict[str, Any]:
         with self._mu:

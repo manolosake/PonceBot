@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -44,8 +45,10 @@ class TestMobileApkFlow(unittest.TestCase):
             old_apk = root / "omnicrewapp-1.0.0-a-universal-release.apk"
             new_apk = root / "omnicrewapp-1.0.0-b-universal-release.apk"
             old_apk.write_bytes(b"old")
-            time.sleep(0.05)
             new_apk.write_bytes(b"new")
+            base = time.time()
+            os.utime(old_apk, (base - 10, base - 10))
+            os.utime(new_apk, (base, base))
             got = bot._mobile_latest_apk(root)
             self.assertIsNotNone(got)
             self.assertEqual(got, new_apk)

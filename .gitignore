@@ -2,6 +2,7 @@ codexbot.env
 .env.local
 .venv/
 data/jobs.sqlite
+jobs.sqlite
 data/artifacts/
 data/worktrees/
 data/*.json

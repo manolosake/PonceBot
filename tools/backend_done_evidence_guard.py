@@ -24,6 +24,14 @@ def validate_evidence(
 ) -> tuple[bool, dict[str, Any]]:
     artifacts_root = artifacts_dir.expanduser().resolve()
     summary_path = (artifacts_root / summary_name).resolve()
+    try:
+        summary_path.relative_to(artifacts_root)
+    except ValueError:
+        return False, {
+            "ok": False,
+            "reason": "summary_outside_dir",
+            "summary_path": str(summary_path),
+        }
     if not summary_path.is_file():
         return False, {
             "ok": False,

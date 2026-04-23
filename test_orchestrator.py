@@ -2328,6 +2328,77 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             env=self._git_env(),
         )
 
+    def test_autocommit_push_order_branch_forces_server_git_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+            self._git(repo, "config", "user.name", "manolosake")
+            self._git(repo, "config", "user.email", "manolosake@gmail.com")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "README.md")
+            self._git(repo, "commit", "-m", "initial")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            (repo / "change.txt").write_text("autonomous change\n", encoding="utf-8")
+            task = Task.new(
+                source="telegram",
+                role="implementer_local",
+                input_text="change",
+                request_type="task",
+                priority=1,
+                model="",
+                effort="",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                parent_job_id="order-identity-0001",
+                labels={"key": "identity"},
+                job_id="job-identity-0001",
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_AUTHOR_NAME": "PonceBot",
+                    "GIT_AUTHOR_EMAIL": "poncebot@local",
+                    "GIT_COMMITTER_NAME": "PonceBot",
+                    "GIT_COMMITTER_EMAIL": "poncebot@local",
+                },
+                clear=False,
+            ):
+                result = bot._autocommit_push_order_branch(
+                    worktree_dir=repo,
+                    order_branch="feature/order-identity",
+                    task=task,
+                )
+
+            self.assertEqual(str(result.get("status")), "ok")
+            log = subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(remote),
+                    "log",
+                    "-1",
+                    "--format=%an <%ae>",
+                    "refs/heads/feature/order-identity",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=self._git_env(),
+            )
+            self.assertEqual(log.stdout.strip(), "manolosake <manolosake@gmail.com>")
+
     def test_reconcile_order_branch_with_main_updates_remote_branch_before_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -4200,6 +4271,43 @@ class TestSkynetLocalRecovery(unittest.TestCase):
             job_id="aaaa1111-bbbb-cccc-dddd-eeeeffff0000",
         )
 
+    def test_autopilot_defers_proactive_order_with_pending_branch_to_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            q.update_trace(order_id, order_branch="feature/order-pending-branch", merged_to_main=False)
+            order_row = q.get_order(order_id, chat_id=1)
+            assert order_row is not None
+
+            created = bot._enqueue_order_autopilot_task(
+                cfg=cfg_obj,
+                orch_q=q,
+                profiles=self._profiles(),
+                order_row=order_row,
+                chat_id=1,
+                now=_time.time(),
+                reason="proactive_idle_watchdog",
+                min_idle_seconds=0.0,
+                cooldown_seconds=0.0,
+            )
+
+            self.assertFalse(created)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "active")
+            self.assertEqual(str(order.get("phase") or ""), "ready_for_merge")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("merge_ready", False)))
+            self.assertTrue(bool((root.trace or {}).get("autopilot_deferred_to_merge", False)))
+            autopilots = [
+                child
+                for child in q.jobs_by_parent(parent_job_id=order_id, limit=20)
+                if str((child.labels or {}).get("kind") or "").strip().lower() == "autopilot"
+            ]
+            self.assertEqual(autopilots, [])
+
     def test_blocked_controller_write_policy_violation_requests_local_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _cfg_obj, _q, order_id, repo_dir = self._seed_factory_order(td)
@@ -4290,6 +4398,295 @@ class TestSkynetLocalRecovery(unittest.TestCase):
                 and child.job_id != "aaaa1111-bbbb-cccc-dddd-eeeeffff0000"
             ]
             self.assertEqual(final_sweeps, [])
+
+    def test_final_sweep_auto_closes_proactive_terminal_only_order_after_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="attempt 1",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="failed",
+                    job_id="job-terminal-1",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="attempt 2",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-2",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "2",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(
+                    cfg=cfg_obj,
+                    orch_q=q,
+                    profiles=self._profiles(),
+                    now=now,
+                )
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("final_sweep_terminal_only_closed", False)))
+
+    def test_final_sweep_moves_terminal_only_proactive_order_with_branch_to_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            q.update_trace(order_id, order_branch="feature/order-pending-merge", merged_to_main=False)
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="attempt 1",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-branch-1",
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="attempt 2",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    job_id="job-terminal-branch-2",
+                )
+            )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD": "2",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                created = bot._jarvis_final_sweep_tick(
+                    cfg=cfg_obj,
+                    orch_q=q,
+                    profiles=self._profiles(),
+                    now=now,
+                )
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "active")
+            self.assertEqual(str(order.get("phase") or ""), "ready_for_merge")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("merge_ready", False)))
+            self.assertTrue(bool((root.trace or {}).get("final_sweep_terminal_only_ready_for_merge", False)))
+            self.assertFalse(bool((root.trace or {}).get("final_sweep_terminal_only_closed", False)))
+
+    def test_final_sweep_default_terminal_threshold_closes_at_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            for i in range(10):
+                q.submit_task(
+                    Task.new(
+                        source="telegram",
+                        role="implementer_local",
+                        input_text=f"attempt {i + 1}",
+                        request_type="task",
+                        priority=1,
+                        model="",
+                        effort="",
+                        mode_hint="rw",
+                        requires_approval=False,
+                        max_cost_window_usd=1.0,
+                        chat_id=1,
+                        parent_job_id=order_id,
+                        state="done",
+                        job_id=f"job-terminal-default-10-{i + 1}",
+                    )
+                )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                os.environ.pop("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", None)
+                created = bot._jarvis_final_sweep_tick(
+                    cfg=cfg_obj,
+                    orch_q=q,
+                    profiles=self._profiles(),
+                    now=now,
+                )
+
+            self.assertEqual(created, 0)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertTrue(bool((root.trace or {}).get("final_sweep_terminal_only_closed", False)))
+
+    def test_final_sweep_default_terminal_threshold_does_not_close_at_nine(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            for i in range(9):
+                q.submit_task(
+                    Task.new(
+                        source="telegram",
+                        role="implementer_local",
+                        input_text=f"attempt {i + 1}",
+                        request_type="task",
+                        priority=1,
+                        model="",
+                        effort="",
+                        mode_hint="rw",
+                        requires_approval=False,
+                        max_cost_window_usd=1.0,
+                        chat_id=1,
+                        parent_job_id=order_id,
+                        state="done",
+                        job_id=f"job-terminal-default-9-{i + 1}",
+                    )
+                )
+
+            now = _time.time()
+            stale_ts = now - 1200.0
+            with q._storage._conn() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE parent_job_id = ?",
+                    (float(stale_ts), float(stale_ts), order_id),
+                )
+                conn.commit()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_JARVIS_IDLE_ORDER_STALE_SECONDS": "120",
+                    "BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS": "1",
+                },
+                clear=False,
+            ):
+                os.environ.pop("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", None)
+                created = bot._jarvis_final_sweep_tick(
+                    cfg=cfg_obj,
+                    orch_q=q,
+                    profiles=self._profiles(),
+                    now=now,
+                )
+
+            self.assertEqual(created, 1)
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "active")
+            self.assertEqual(str(order.get("phase") or ""), "planning")
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            self.assertFalse(bool((root.trace or {}).get("final_sweep_terminal_only_closed", False)))
 
     def test_stale_blocked_controller_job_is_cancelled_for_local_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:

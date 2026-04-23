@@ -3190,8 +3190,12 @@ class TestDrainPendingUpdates(unittest.TestCase):
                 def get_updates(self, *, offset: int, timeout_seconds: int) -> list[dict]:
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with self.assertLogs("codexbot", level="WARNING") as cm:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 0)
+            joined = "\n".join(cm.output)
+            self.assertIn("WARNING:codexbot:Failed to drain pending Telegram updates; continuing without drain: boom", joined)
+            self.assertNotIn("Traceback", joined)
 
     def test_drain_returns_partial_offset_on_midway_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3207,8 +3211,12 @@ class TestDrainPendingUpdates(unittest.TestCase):
                         return [{"update_id": 41}, {"update_id": 42}]
                     raise RuntimeError("boom")
 
-            off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
+            with self.assertLogs("codexbot", level="INFO") as cm:
+                off = bot._drain_pending_updates(cfg, _API())  # type: ignore[arg-type]
             self.assertEqual(off, 43)
+            joined = "\n".join(cm.output)
+            self.assertIn("WARNING:codexbot:Failed to drain pending Telegram updates; continuing without drain: boom", joined)
+            self.assertIn("INFO:codexbot:Drained 2 pending Telegram updates; next offset=43", joined)
 
 
 class TestCodexConfigParsing(unittest.TestCase):
@@ -3293,6 +3301,17 @@ class TestDangerousBypassThreaded(unittest.TestCase):
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
             self.assertIn("--sandbox", cmd)
             self.assertIn("read-only", cmd)
+
+
+class TestBypassAwareEnforcement(unittest.TestCase):
+    def test_forced_mode_is_not_enforced_when_bypass_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_file = Path(td) / "state.json"
+            state_file.write_text("{}\n", encoding="utf-8")
+            cfg = TestStateHandling()._cfg(state_file)
+            with patch("bot._effective_bypass_sandbox", return_value=True):
+                forced = bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=123)  # type: ignore[attr-defined]
+            self.assertIsNone(forced)
 
 
 class TestThreadedImages(unittest.TestCase):
@@ -4121,6 +4140,7 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_SKYNET_FACTORY_LOCAL_ONLY", None)
             self.assertFalse(bot._skynet_factory_local_only_enabled())
+
 
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

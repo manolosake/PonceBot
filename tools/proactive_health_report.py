@@ -221,10 +221,13 @@ def order_autonomy_funnel(children, *, order_id: str, now: float, since: float) 
 
         if role == 'implementer_local':
             bucket['started'] = True
-            if state == 'done' and trace_local_patch_applied(trace):
+            no_change_done = (state == 'done' and trace_local_no_change(trace))
+            patch_applied_done = (state == 'done' and trace_local_patch_applied(trace))
+            patch_validated_done = (state == 'done' and trace_local_patch_validated(trace))
+            if patch_applied_done or no_change_done:
                 bucket['applied'] = True
                 latest_gate_ts = max(latest_gate_ts, updated_at)
-            if state == 'done' and trace_local_patch_applied(trace) and trace_local_patch_validated(trace):
+            if (patch_applied_done and patch_validated_done) or no_change_done:
                 bucket['validated'] = True
                 latest_gate_ts = max(latest_gate_ts, updated_at)
             continue

@@ -38,6 +38,17 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(payload["reason"], "summary_missing")
 
+    def test_validate_evidence_fails_when_summary_escapes_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir, summary_name="../escape.json"
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "summary_outside_dir")
+
     def test_validate_evidence_fails_when_referenced_artifact_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
