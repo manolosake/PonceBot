@@ -84,6 +84,25 @@ TELEGRAM_MSG_LIMIT = 4096
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
+
+def _normalize_order_branch(raw: str) -> str | None:
+    # Accepted input: plain branch names and refs/heads/<name>.
+    # Rejected input: empty values and unsupported refs (for example refs/tags/*, refs/remotes/*).
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    if candidate.startswith("refs/heads/"):
+        candidate = candidate[len("refs/heads/"):].strip()
+    elif candidate.startswith("refs/"):
+        return None
+    if not candidate:
+        return None
+    if candidate in (".", ".."):
+        return None
+    if any(ch.isspace() for ch in candidate):
+        return None
+    return candidate
+
 # Ticket card UX: keep one editable message per ticket (no spam).
 _TICKET_CARD_LOCK = threading.Lock()
 _TICKET_CARD_LAST_EDIT: dict[tuple[int, str], float] = {}
@@ -6443,7 +6462,16 @@ def _orchestrator_run_local_ollama(
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
     repo_role_worktree: Path | None = None
-    order_branch = (_resolve_order_branch_from_task(task, orch_q) or "").strip() or None
+    order_branch_raw = _resolve_order_branch_from_task(task, orch_q) or ""
+    order_branch = _normalize_order_branch(order_branch_raw)
+    if order_branch_raw and not order_branch:
+        logging.warning(
+            "order_branch_ignored_invalid_ref",
+            extra={
+                "job_id": str(task.job_id),
+                "order_branch_raw": str(order_branch_raw),
+            },
+        )
     if repo_base_dir is not None and (repo_base_dir / ".git").exists():
         try:
             role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
@@ -6452,8 +6480,6 @@ def _orchestrator_run_local_ollama(
             repo_role_worktree = (repo_root / role / "slot1").resolve()
             prepare_clean_workspace(repo_role_worktree)
             if order_branch:
-                if order_branch.startswith("refs/heads/"):
-                    order_branch = order_branch[len("refs/heads/"):]
                 ok_sync, sync_msg = _sync_worktree_to_order_branch(
                     base_repo=repo_base_dir,
                     worktree_dir=repo_role_worktree,
