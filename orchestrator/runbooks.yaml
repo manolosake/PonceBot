@@ -62,3 +62,31 @@
   prompt: |
     Lane: factory
     Proactive local seed for objective snapshot. Focus on actionable improvements only.
+
+- id: idle_no_open_jobs
+  role: sre
+  interval_seconds: 900
+  mode_hint: ro
+  priority: 2
+  enabled: true
+  prompt: |
+    Preflight guard and closure protocol for idle scheduler state (no open jobs).
+    Required commands (write outputs exactly to these files):
+    - python3 -m orchestrator.diagnostics.status_snapshot --json > ${ARTIFACTS_DIR}/idle_no_open_jobs/status_snapshot.json
+    - pgrep -af "python|codex|orchestrator|jarvis|skynet" > ${ARTIFACTS_DIR}/idle_no_open_jobs/process_liveness.txt
+    - python3 -m orchestrator.diagnostics.job_liveness --json > ${ARTIFACTS_DIR}/idle_no_open_jobs/job_liveness.txt
+    - python3 -m orchestrator.diagnostics.close_gate \
+        --status ${ARTIFACTS_DIR}/idle_no_open_jobs/status_snapshot.json \
+        --jobs ${ARTIFACTS_DIR}/idle_no_open_jobs/job_liveness.txt \
+        --out ${ARTIFACTS_DIR}/idle_no_open_jobs/close_gate.txt
+
+    PASS/NO-GO gate:
+    - PASS only if open_jobs==0
+    - NO-GO if any required artifact file is missing or empty
+    - NO-GO if any non-controller worker process is unexpectedly live
+
+    Required evidence filenames:
+    - idle_no_open_jobs/status_snapshot.json
+    - idle_no_open_jobs/process_liveness.txt
+    - idle_no_open_jobs/job_liveness.txt
+    - idle_no_open_jobs/close_gate.txt
