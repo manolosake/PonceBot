@@ -4349,6 +4349,76 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
 
 class TestDeployCheckoutSync(unittest.TestCase):
+    def test_git_ensure_branch_from_main_ignores_stale_remote_tracking_refs(self) -> None:
+        repo = Path("/tmp/factory-repo")
+        calls: list[list[str]] = []
+
+        def fake_run_git(target_repo: Path, args: list[str], *, check: bool = False, env=None):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        def fake_ref_exists(_repo: Path, ref: str) -> bool:
+            return ref in {
+                "refs/remotes/origin/feature/order-test",
+                "refs/heads/feature/order-test",
+            }
+
+        with patch("bot._run_git", side_effect=fake_run_git):
+            with patch("bot._git_ref_exists", side_effect=fake_ref_exists):
+                with patch("bot._git_remote_branch_exists", return_value=False):
+                    ok, msg = bot._git_ensure_branch_from_main(
+                        repo,
+                        "feature/order-test",
+                        default_branch="main",
+                    )
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "published_local_branch")
+        self.assertIn(
+            ["push", "origin", "refs/heads/feature/order-test:refs/heads/feature/order-test"],
+            calls,
+        )
+
+    def test_sync_worktree_to_order_branch_uses_local_branch_when_remote_fetch_has_only_stale_origin_ref(self) -> None:
+        base_repo = Path("/tmp/factory-repo")
+        worktree_dir = Path("/tmp/factory-repo/worker")
+        calls: list[tuple[Path, list[str]]] = []
+
+        def fake_run_git(target_repo: Path, args: list[str], *, check: bool = False, env=None):
+            calls.append((target_repo, list(args)))
+            if args[:2] == ["reset", "--hard"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        def fake_remote_ref(target_repo: Path, branch: str) -> str:
+            if target_repo == worktree_dir:
+                return "origin/feature/order-test"
+            return ""
+
+        def fake_local_ref(target_repo: Path, branch: str) -> str:
+            if target_repo == base_repo:
+                return "refs/heads/feature/order-test"
+            return ""
+
+        with patch("bot._git_ensure_branch_from_main", return_value=(True, "published_local_branch")):
+            with patch("bot._git_fetch_remote_branch", return_value=(False, "fatal: couldn't find remote ref feature/order-test")):
+                with patch("bot._git_remote_branch_ref", side_effect=fake_remote_ref):
+                    with patch("bot._git_local_branch_ref", side_effect=fake_local_ref):
+                        with patch("bot._run_git", side_effect=fake_run_git):
+                            ok, msg = bot._sync_worktree_to_order_branch(
+                                base_repo=base_repo,
+                                worktree_dir=worktree_dir,
+                                order_branch="feature/order-test",
+                                default_branch="main",
+                            )
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "synced")
+        self.assertIn(
+            (worktree_dir, ["reset", "--hard", "refs/heads/feature/order-test"]),
+            calls,
+        )
+
     def test_sync_repo_checkout_prefers_managed_deploy_worktree(self) -> None:
         repo = Path("/tmp/factory-repo")
         deploy_checkout = repo / "data" / "deploy_worktrees" / "main" / "deploy" / "slot1"
