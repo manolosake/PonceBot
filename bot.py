@@ -14497,6 +14497,20 @@ _CONTROLLER_LOCAL_RECOVERY_ACTIONS = frozenset(
 )
 
 
+def _local_slice_expected_validation_cmd(candidate_files: list[str]) -> str:
+    test_target = ""
+    for rel_path in candidate_files:
+        low = rel_path.lower()
+        if low.startswith("test") or "/test" in low or low.startswith("tests/"):
+            test_target = rel_path
+            break
+    if not test_target:
+        return f"python -m py_compile {' '.join(candidate_files[:2])}"
+    if Path(test_target).name.lower().startswith("test_") and test_target.lower().endswith(".py"):
+        return f"python3 -m unittest -q {test_target}"
+    return f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
+
+
 def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     if not isinstance(structured_digest, dict):
         return []
@@ -17400,17 +17414,7 @@ def _apply_autonomous_local_first_policy(
                 "- For `evidence_artifact_exists`, use `final_evidence.json` relative to `--artifacts-dir`.\n"
                 "- Treat this as authoritative for this slice; do not return BLOCKER for missing artifact-path specification.\n\n"
             )
-        test_target = ""
-        for rel_path in candidate_files:
-            low = rel_path.lower()
-            if low.startswith("test") or "/test" in low or low.startswith("tests/"):
-                test_target = rel_path
-                break
-        validation_cmd = (
-            f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
-            if test_target
-            else f"python -m py_compile {' '.join(candidate_files[:2])}"
-        )
+        validation_cmd = _local_slice_expected_validation_cmd(candidate_files)
         suffix_base = _sanitize_slice_token(latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
         direct_suffix = _sanitize_slice_token(
             f"{suffix_base}_direct_r{int(max(2, recent_non_actionable_arch_count + 1))}",
@@ -17504,17 +17508,7 @@ def _apply_autonomous_local_first_policy(
         candidate_files = non_doc_candidates[:3] if non_doc_candidates else existing_files[:2]
         if not candidate_files:
             return []
-        test_target = ""
-        for rel_path in candidate_files:
-            low = rel_path.lower()
-            if low.startswith("test") or "/test" in low or low.startswith("tests/"):
-                test_target = rel_path
-                break
-        validation_cmd = (
-            f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
-            if test_target
-            else f"python -m py_compile {' '.join(candidate_files[:2])}"
-        )
+        validation_cmd = _local_slice_expected_validation_cmd(candidate_files)
         suffix_base = _sanitize_slice_token(latest_arch_job_id or latest_impl_failed_slice_id, fallback=str(max(1, int(now))))
         direct_suffix = _sanitize_slice_token(
             f"{suffix_base}_ws_r{int(max(2, recent_non_actionable_arch_count + 1))}",
