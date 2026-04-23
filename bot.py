@@ -6458,7 +6458,14 @@ def _orchestrator_run_local_ollama(
                     order_branch=order_branch,
                     default_branch=repo_default_branch,
                 )
-                if not ok_sync:
+                if not ok_sync and logging.warning(
+                    "order_branch_sync_failed_continue_with_clean_role_worktree",
+                    extra={
+                        "order_branch": order_branch,
+                        "repo_role_worktree": str(repo_role_worktree),
+                        "sync_error": str(sync_msg or ""),
+                    },
+                ):
                     fallback_branch = repo_default_branch
                     fallback_ok, fallback_msg = _sync_worktree_to_order_branch(
                         base_repo=repo_base_dir,
