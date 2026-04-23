@@ -15680,7 +15680,11 @@ def _classify_local_slice_failure(
         "no valid patches in input",
         "corrupt patch at line",
     )
-    if "patch rejected by git apply --check" in blob and any(tok in blob for tok in malformed_patch_markers):
+    malformed_patch_detected = any(tok in blob for tok in malformed_patch_markers)
+    if (
+        ("patch rejected by git apply --check" in blob and malformed_patch_detected)
+        or "corrupt patch at line" in blob
+    ):
         return "blocked"
 
     patch_invalid_markers = (
