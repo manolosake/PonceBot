@@ -85,7 +85,7 @@ _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 
 
-def _normalize_order_branch(raw: str) -> str | None:
+def _normalize_order_branch(raw: str | None) -> str | None:
     # Accepted input: plain branch names and refs/heads/<name>.
     # Rejected input: empty values and unsupported refs (for example refs/tags/*, refs/remotes/*).
     candidate = (raw or "").strip()
@@ -98,6 +98,17 @@ def _normalize_order_branch(raw: str) -> str | None:
     if not candidate:
         return None
     if candidate in (".", ".."):
+        return None
+    # Keep accepted formats aligned with git ref-name safety guardrails.
+    if candidate.startswith(("/", "-")):
+        return None
+    if candidate.endswith(("/", ".")):
+        return None
+    if candidate.endswith(".lock"):
+        return None
+    if ".." in candidate or "@{" in candidate or "\\" in candidate:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in candidate):
         return None
     if any(ch.isspace() for ch in candidate):
         return None
