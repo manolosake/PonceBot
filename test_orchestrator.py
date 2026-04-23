@@ -2328,6 +2328,117 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             env=self._git_env(),
         )
 
+    def test_sync_worktree_to_order_branch_bootstraps_remote_from_local_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            worktree = td_path / "worker"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "shared.txt")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/order-local-only")
+            (repo / "shared.txt").write_text("feature-change\n", encoding="utf-8")
+            self._git(repo, "add", "shared.txt")
+            self._git(repo, "commit", "-m", "local feature change")
+            local_head = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            self._git(repo, "checkout", "main")
+            self._git(repo, "worktree", "add", "--detach", str(worktree), "origin/main")
+
+            ok, msg = bot._sync_worktree_to_order_branch(
+                base_repo=repo,
+                worktree_dir=worktree,
+                order_branch="feature/order-local-only",
+                default_branch="main",
+            )
+            self.assertTrue(ok, msg)
+
+            remote_branch = self._git(repo, "ls-remote", "--heads", "origin", "refs/heads/feature/order-local-only").stdout
+            self.assertIn("refs/heads/feature/order-local-only", remote_branch)
+            synced_head = self._git(worktree, "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual(synced_head, local_head)
+
+    def test_git_branch_integrated_into_main_false_for_local_only_unmerged_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "app.txt").write_text("v1\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/local-only")
+            (repo / "app.txt").write_text("v2\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "local only")
+            self._git(repo, "checkout", "main")
+
+            self.assertFalse(
+                bot._git_branch_integrated_into_main(
+                    repo=repo,
+                    branch="feature/local-only",
+                    default_branch="main",
+                )
+            )
+
+    def test_merge_order_branch_to_main_bootstraps_remote_from_local_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "app.txt").write_text("v1\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/local-only-merge")
+            (repo / "app.txt").write_text("v2\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "local only feature")
+            self._git(repo, "checkout", "main")
+
+            merged_ok, merged_msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/local-only-merge",
+                order_id="ord-local-only",
+                default_branch="main",
+            )
+            self.assertTrue(merged_ok, merged_msg)
+            self.assertEqual(merged_msg, "merged_to_main")
+            self.assertTrue(bool(merge_commit))
+
+            self._git(repo, "fetch", "origin", "--prune")
+            self.assertEqual(self._git(repo, "show", "origin/main:app.txt").stdout, "v2\n")
+            self.assertFalse(bool(self._git(repo, "ls-remote", "--heads", "origin", "refs/heads/feature/local-only-merge").stdout.strip()))
+
     def test_reconcile_order_branch_with_main_updates_remote_branch_before_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)

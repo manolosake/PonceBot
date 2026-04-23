@@ -7851,10 +7851,26 @@ def _git_remote_branch_ref(repo: Path, branch: str) -> str:
     if _git_ref_exists(repo, f"origin/{b}"):
         return f"origin/{b}"
     if _git_ref_exists(repo, f"refs/heads/{b}"):
-        return b
+        return f"refs/heads/{b}"
     if _git_ref_exists(repo, b):
         return b
     return ""
+
+
+def _git_publish_branch_ref(repo: Path, source_ref: str, branch: str) -> tuple[bool, str]:
+    src = str(source_ref or "").strip()
+    b = str(branch or "").strip()
+    if not src:
+        return False, "source_ref_missing"
+    if not b:
+        return False, "branch_missing"
+    push = _run_git(repo, ["push", "origin", f"{src}:refs/heads/{b}"], check=False)
+    if push.returncode == 0:
+        return True, "published"
+    detail = (push.stderr or push.stdout or "").strip()
+    if _git_remote_branch_exists(repo, b):
+        return True, "published_by_race"
+    return False, detail or "push_failed"
 
 
 def _git_ensure_branch_from_main(
@@ -7873,12 +7889,16 @@ def _git_ensure_branch_from_main(
         or _git_remote_branch_exists(repo, b)
     ):
         return True, "already_exists"
+    local_ref = _git_remote_branch_ref(repo, b)
+    if local_ref and not str(local_ref).startswith("origin/"):
+        published, publish_msg = _git_publish_branch_ref(repo, local_ref, b)
+        if published:
+            return True, "published_local_branch"
+        return False, publish_msg
     base = _git_pick_main_ref(repo, default_branch=default_branch)
-    src_ref = f"refs/heads/{b}"
-    p = _run_git(repo, ["push", "origin", f"{base}:{src_ref}"], check=False)
-    if p.returncode != 0:
-        msg = (p.stderr or p.stdout or "").strip()
-        return False, msg or "push_failed"
+    published, publish_msg = _git_publish_branch_ref(repo, base, b)
+    if not published:
+        return False, publish_msg
     return True, "created_from_main"
 
 
@@ -7899,13 +7919,19 @@ def _reconcile_order_branch_with_main(
 
     for attempt in range(max_push_attempts):
         _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-        remote_exists = (
-            _git_ref_exists(repo, f"refs/remotes/origin/{b}")
-            or _git_ref_exists(repo, f"origin/{b}")
-            or _git_remote_branch_exists(repo, b)
-        )
+        branch_ref = _git_remote_branch_ref(repo, b)
+        remote_exists = bool(branch_ref and str(branch_ref).startswith("origin/"))
         if not remote_exists:
-            return False, "branch_missing_remote", None
+            local_ref = branch_ref if branch_ref and not str(branch_ref).startswith("origin/") else ""
+            if local_ref:
+                published, publish_msg = _git_publish_branch_ref(repo, local_ref, b)
+                if not published:
+                    return False, publish_msg, None
+                _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+                branch_ref = _git_remote_branch_ref(repo, b)
+                remote_exists = bool(branch_ref and str(branch_ref).startswith("origin/"))
+            if not remote_exists:
+                return False, "branch_missing_remote", None
         if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
             fetched, ferr = _git_fetch_remote_branch(repo, b)
             if not fetched:
@@ -7967,13 +7993,14 @@ def _git_branch_integrated_into_main(
         return True
 
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-    if not _git_remote_branch_exists(repo, b):
-        # Branch missing remotely: assume already integrated/retired.
+    if _git_remote_branch_exists(repo, b):
+        _git_fetch_remote_branch(repo, b)
+    branch_ref = _git_remote_branch_ref(repo, b)
+    if not branch_ref:
+        # Branch missing both remotely and locally: assume already integrated/retired.
         return True
-
-    _git_fetch_remote_branch(repo, b)
     base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
-    anc = _run_git(repo, ["merge-base", "--is-ancestor", f"origin/{b}", base_ref], check=False)
+    anc = _run_git(repo, ["merge-base", "--is-ancestor", branch_ref, base_ref], check=False)
     return anc.returncode == 0
 
 
@@ -8225,12 +8252,18 @@ def _sync_worktree_to_order_branch(
 
     # Some repos use narrow fetch refspecs; fetch branch explicitly to guarantee local visibility.
     fetched, ferr = _git_fetch_remote_branch(worktree_dir, b)
+    target_ref = _git_remote_branch_ref(worktree_dir, b)
     if not fetched:
-        return False, f"fetch_failed:{ferr or 'unknown'}"
+        local_ref = target_ref or _git_remote_branch_ref(base_repo, b)
+        if not local_ref:
+            return False, f"fetch_failed:{ferr or 'unknown'}"
+        target_ref = local_ref
+    elif not target_ref:
+        target_ref = "FETCH_HEAD"
 
-    p = _run_git(worktree_dir, ["reset", "--hard", f"origin/{b}"], check=False)
+    p = _run_git(worktree_dir, ["reset", "--hard", target_ref], check=False)
     if p.returncode != 0:
-        # Fallback for detached/narrow cases where FETCH_HEAD is available but origin/<branch> is not.
+        # Fallback for detached/narrow cases where FETCH_HEAD is available but the selected ref is not.
         p2 = _run_git(worktree_dir, ["reset", "--hard", "FETCH_HEAD"], check=False)
         if p2.returncode != 0:
             err = (p2.stderr or p2.stdout or p.stderr or p.stdout or "").strip()
@@ -8338,14 +8371,20 @@ def _merge_order_branch_to_main(
     max_push_attempts = 2
     for attempt in range(max_push_attempts):
         _run_git(repo, ["fetch", "origin", "--prune"], check=False)
-        remote_exists = (
-            _git_ref_exists(repo, f"refs/remotes/origin/{b}")
-            or _git_ref_exists(repo, f"origin/{b}")
-            or _git_remote_branch_exists(repo, b)
-        )
+        branch_ref = _git_remote_branch_ref(repo, b)
+        remote_exists = bool(branch_ref and str(branch_ref).startswith("origin/"))
         if not remote_exists:
-            # If branch no longer exists remotely, treat as already integrated/closed.
-            return True, "branch_missing_remote", None
+            local_ref = branch_ref if branch_ref and not str(branch_ref).startswith("origin/") else ""
+            if local_ref:
+                published, publish_msg = _git_publish_branch_ref(repo, local_ref, b)
+                if not published:
+                    return False, publish_msg, None
+                _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+                branch_ref = _git_remote_branch_ref(repo, b)
+                remote_exists = bool(branch_ref and str(branch_ref).startswith("origin/"))
+            if not remote_exists:
+                # If branch no longer exists remotely or locally, treat as already integrated/closed.
+                return True, "branch_missing_remote", None
 
         # Guarantee local visibility for repos using narrow fetch refspecs.
         if not (_git_ref_exists(repo, f"refs/remotes/origin/{b}") or _git_ref_exists(repo, f"origin/{b}")):
