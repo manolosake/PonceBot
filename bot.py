@@ -4461,16 +4461,18 @@ def _extract_first_diff_block(text: str) -> str:
     return ""
 
 
-def _preflight_git_apply_check(diff_text: str) -> str:
+def _preflight_git_apply_check(diff_text: str, *, worktree_dir: Path | None = None) -> str:
     patch = str(diff_text or "").strip()
     if not patch:
         return ""
     normalized_patch = patch + "\n"
-    import os
+    if worktree_dir is None or not worktree_dir.is_dir():
+        return normalized_patch
+
     import subprocess
     check = subprocess.run(
         ["git", "apply", "--check", "--recount", "--whitespace=nowarn", "-"],
-        cwd=os.getcwd(),
+        cwd=str(worktree_dir),
         input=normalized_patch,
         capture_output=True,
         text=True,
