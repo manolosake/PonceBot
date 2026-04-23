@@ -581,6 +581,7 @@ def _activate_breakglass(
         ttl = 4 * 60 * 60
     exp = now + float(ttl)
     safe_reason = str(reason or "").strip()
+    safe_source = str(source or "telegram").strip() or "telegram"
 
     def _m(st: dict[str, Any]) -> None:
         st["breakglass"] = {
@@ -588,7 +589,7 @@ def _activate_breakglass(
             "enabled_at": now,
             "expires_at": exp,
             "reason": safe_reason,
-            "source": str(source or "telegram").strip() or "telegram",
+            "source": safe_source,
             "chat_id": int(chat_id),
             "user_id": int(user_id) if user_id is not None else None,
         }
@@ -600,19 +601,20 @@ def _activate_breakglass(
         details={
             "chat_id": int(chat_id),
             "user_id": int(user_id) if user_id is not None else None,
-            "source": str(source or "telegram").strip() or "telegram",
+            "source": safe_source,
             "ttl_seconds": int(ttl),
             "reason": safe_reason,
         },
     )
-    LOG.warning(
-        "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
-        str(source or "telegram").strip() or "telegram",
-        int(chat_id),
-        int(user_id) if user_id is not None else "",
-        int(ttl),
-        safe_reason,
-    )
+    if safe_source != "auto_env_refresh":
+        LOG.warning(
+            "BREAKGLASS ENABLED source=%s chat_id=%s user_id=%s ttl=%ss reason=%s",
+            safe_source,
+            int(chat_id),
+            int(user_id) if user_id is not None else "",
+            int(ttl),
+            safe_reason,
+        )
     return exp
 
 

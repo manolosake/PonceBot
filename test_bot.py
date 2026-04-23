@@ -3509,10 +3509,22 @@ class TestHardeningControls(unittest.TestCase):
             )
 
             bot._set_access_mode(cfg, "full", chat_id=1)
-            self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
+            with patch.object(bot.LOG, "warning") as warning_mock:
+                self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
+            warning_mock.assert_not_called()
             active, raw = bot._breakglass_is_active(cfg)
             self.assertTrue(active)
             self.assertEqual(str(raw.get("reason") or ""), "persistent_factory_runtime")
+            self.assertEqual(str(raw.get("source") or ""), "auto_env_refresh")
+            audit = bot._get_state(cfg).get("security_audit")
+            rows = list(audit) if isinstance(audit, list) else []
+            self.assertTrue(rows)
+            self.assertEqual(str(rows[-1].get("event") or ""), "breakglass.enabled")
+            details = rows[-1].get("details")
+            self.assertTrue(isinstance(details, dict))
+            details = details if isinstance(details, dict) else {}
+            self.assertEqual(str(details.get("source") or ""), "auto_env_refresh")
+            self.assertEqual(str(details.get("reason") or ""), "persistent_factory_runtime")
 
     def test_permissions_full_ack_reports_selected_mode_and_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as td:
