@@ -15676,8 +15676,12 @@ def _classify_local_slice_failure(
     if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
-    if "patch rejected by git apply --check" in blob and "no valid patches in input" in blob:
-        return "terminal"
+    malformed_patch_markers = (
+        "no valid patches in input",
+        "corrupt patch at line",
+    )
+    if "patch rejected by git apply --check" in blob and any(tok in blob for tok in malformed_patch_markers):
+        return "blocked"
 
     patch_invalid_markers = (
         "patch rejected by git apply --check",
