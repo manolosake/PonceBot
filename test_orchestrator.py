@@ -2837,6 +2837,87 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertEqual((runtime_dir / ".deployed_branch").read_text(encoding="utf-8").strip(), "poncebot/runtime/main")
             self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "workspace/dev")
 
+    def test_deploy_after_merge_uses_fresh_runtime_when_stable_runtime_is_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+            (repo / "scripts").mkdir(parents=True, exist_ok=True)
+            (repo / "scripts" / "deploy.sh").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "printf '%s' \"${PONCEBOT_DEPLOY_COMMIT}\" > .deployed_commit\n"
+                "git rev-parse --abbrev-ref HEAD > .deployed_branch\n",
+                encoding="utf-8",
+            )
+            (repo / "app.txt").write_text("v1\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            runtime_dir = (repo / "data" / "runtime_worktrees" / "main").resolve()
+            self._git(repo, "worktree", "add", "-B", "poncebot/runtime/main", str(runtime_dir), "origin/main")
+            (runtime_dir / "app.txt").write_text("dirty runtime\n", encoding="utf-8")
+
+            self._git(repo, "checkout", "-b", "feature/test-dirty-runtime")
+            (repo / "app.txt").write_text("v2\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "feature change")
+            self._git(repo, "push", "-u", "origin", "feature/test-dirty-runtime")
+            self._git(repo, "checkout", "-b", "workspace/dev")
+
+            merged_ok, merged_msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/test-dirty-runtime",
+                order_id="ord-deploy-dirty-runtime",
+                default_branch="main",
+            )
+            self.assertTrue(merged_ok, merged_msg)
+            assert merge_commit is not None
+
+            cfg = _cfg(td_path / "state.json", workdir=repo)
+            repo_record = {
+                "repo_id": "repo-main",
+                "path": str(repo),
+                "default_branch": "main",
+                "metadata": {
+                    "deploy": {
+                        "enabled": True,
+                        "source": "repo_script",
+                        "cwd": str(repo),
+                        "command": ["bash", "scripts/deploy.sh"],
+                        "background": False,
+                        "timeout_seconds": 30,
+                    }
+                },
+            }
+
+            result = bot._deploy_after_order_merge(
+                cfg=cfg,
+                repo_record=repo_record,
+                repo_dir=repo,
+                default_branch="main",
+                order_id="ord-deploy-dirty-runtime",
+                order_branch="feature/test-dirty-runtime",
+                merge_commit=merge_commit,
+            )
+
+            self.assertEqual(str(result.get("status") or ""), "ok")
+            self.assertEqual((runtime_dir / "app.txt").read_text(encoding="utf-8"), "dirty runtime\n")
+            fresh_dirs = sorted((repo / "data" / "runtime_worktrees").glob("main_deploy_*"))
+            deployed_dirs = [p for p in fresh_dirs if (p / ".deployed_commit").exists()]
+            self.assertEqual(len(deployed_dirs), 1)
+            deployed_dir = deployed_dirs[0]
+            self.assertEqual((deployed_dir / ".deployed_commit").read_text(encoding="utf-8"), str(merge_commit))
+            self.assertTrue((deployed_dir / ".deployed_branch").read_text(encoding="utf-8").strip().startswith("poncebot/runtime/main-deploy-"))
+
     def test_auto_merge_unsuspends_when_new_merge_ready_signal_arrives(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)

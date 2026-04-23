@@ -8335,6 +8335,14 @@ def _sync_repo_checkout_to_default_branch(
         branch_slug = _slug_token(branch) or "main"
         return (repo / "data" / "runtime_worktrees" / branch_slug).resolve()
 
+    def _fresh_runtime_worktree_dir() -> tuple[Path, str]:
+        branch_slug = _slug_token(branch) or "main"
+        suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        return (
+            (repo / "data" / "runtime_worktrees" / f"{branch_slug}_deploy_{suffix}").resolve(),
+            f"poncebot/runtime/{branch_slug}-deploy-{suffix}",
+        )
+
     head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     current_branch = str(head.stdout or "").strip() if head.returncode == 0 else ""
     if current_branch in ("", branch):
@@ -8360,7 +8368,16 @@ def _sync_repo_checkout_to_default_branch(
             if checkout.returncode != 0:
                 detail = (checkout.stderr or checkout.stdout or "").strip()
                 return False, detail or "runtime_worktree_checkout_failed", None, None
-    return _finalize_synced_checkout(worktree_dir)
+    synced = _finalize_synced_checkout(worktree_dir)
+    if synced[0] or str(synced[1]) != "tracked_changes_present":
+        return synced
+
+    fresh_dir, fresh_branch = _fresh_runtime_worktree_dir()
+    add = _run_git(repo, ["worktree", "add", "-B", fresh_branch, str(fresh_dir), f"origin/{branch}"], check=False)
+    if add.returncode != 0:
+        detail = (add.stderr or add.stdout or "").strip()
+        return False, detail or "fresh_runtime_worktree_add_failed", None, None
+    return _finalize_synced_checkout(fresh_dir)
 
 
 def _ensure_project_workspace(
@@ -11841,7 +11858,17 @@ def _discover_repo_deploy_metadata(cfg: "BotConfig", repo_path: Path) -> dict[st
         except Exception:
             delay_seconds = 5
         delay_seconds = max(2, min(60, int(delay_seconds)))
-        shell_cmd = f"sleep {int(delay_seconds)} && systemctl --user restart {shlex.quote(service_name)}"
+        current_link_raw = str(os.environ.get("BOT_SELF_DEPLOY_CURRENT_LINK") or "").strip()
+        current_link = (
+            Path(current_link_raw).expanduser()
+            if current_link_raw
+            else (repo_dir / "data" / "runtime_worktrees" / "current")
+        )
+        shell_cmd = (
+            f"mkdir -p {shlex.quote(str(current_link.parent))} && "
+            f"ln -sfnT \"$PONCEBOT_REPO_PATH\" {shlex.quote(str(current_link))} && "
+            f"sleep {int(delay_seconds)} && systemctl --user restart {shlex.quote(service_name)}"
+        )
         return {
             "deploy": {
                 "enabled": True,
@@ -11851,6 +11878,7 @@ def _discover_repo_deploy_metadata(cfg: "BotConfig", repo_path: Path) -> dict[st
                 "background": True,
                 "timeout_seconds": 30,
                 "service": service_name,
+                "current_link": str(current_link),
             }
         }
     return {}
