@@ -83,6 +83,7 @@ TELEGRAM_MSG_LIMIT = 4096
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+_APPLY_PATCH_FILE_DIRECTIVE_RE = re.compile(r"^\*\*\* (?:Add|Delete|Update) File:\s+\S.*$", re.MULTILINE)
 
 
 def _normalize_order_branch(raw: str | None) -> str | None:
@@ -4451,12 +4452,50 @@ def _extract_first_diff_block(text: str) -> str:
         if textwrap.dedent(str(block or "")).strip()
     ]
     if normalized_blocks:
-        return "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
+        patch = "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
+        return _preflight_git_apply_check(patch)
     plain = re.search(r"(^diff --git .*?$.*)", raw, flags=re.MULTILINE | re.DOTALL)
     if plain:
         patch = str(plain.group(1) or "").strip()
-        return (patch + "\n") if patch else ""
+        return _preflight_git_apply_check((patch + "\n") if patch else "")
     return ""
+
+
+def _preflight_git_apply_check(diff_text: str) -> str:
+    patch = str(diff_text or "").strip()
+    if not patch:
+        return ""
+    normalized_patch = patch + "\n"
+    import os
+    import subprocess
+    check = subprocess.run(
+        ["git", "apply", "--check", "--recount", "--whitespace=nowarn", "-"],
+        cwd=os.getcwd(),
+        input=normalized_patch,
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        stderr = (check.stderr or "").strip()
+        stdout = (check.stdout or "").strip()
+        detail = stderr or stdout or "unknown git apply --check failure"
+        raise ValueError(f"git apply --check failed: {detail}")
+    return normalized_patch
+
+
+def _validate_apply_patch_text(text: str) -> str:
+    patch = textwrap.dedent(str(text or "")).replace("\r\n", "\n").strip("\n")
+    if not patch.strip():
+        raise ValueError("apply_patch payload is empty")
+    lines = patch.splitlines()
+    if lines[0].strip() != "*** Begin Patch":
+        raise ValueError("apply_patch payload missing '*** Begin Patch' header")
+    if lines[-1].strip() != "*** End Patch":
+        raise ValueError("apply_patch payload missing '*** End Patch' footer")
+    body = "\n".join(lines[1:-1])
+    if not _APPLY_PATCH_FILE_DIRECTIVE_RE.search(body):
+        raise ValueError("apply_patch payload missing file directive")
+    return patch + "\n"
 
 
 def _extract_first_apply_patch_block(text: str) -> str:
@@ -4469,9 +4508,11 @@ def _extract_first_apply_patch_block(text: str) -> str:
         flags=re.DOTALL,
     )
     if not match:
+        if "*** Begin Patch" in raw or "*** End Patch" in raw:
+            raise ValueError("malformed apply_patch payload: missing full Begin/End block")
         return ""
-    patch = textwrap.dedent(str(match.group(1) or "")).strip()
-    return (patch + "\n") if patch else ""
+    patch = textwrap.dedent(str(match.group(1) or "")).strip("\n")
+    return _validate_apply_patch_text(patch)
 
 
 def _extract_structured_result_payload(text: str) -> dict[str, Any] | None:
@@ -7597,9 +7638,24 @@ def _orchestrator_role_is_valid(role: str, profiles: dict[str, dict[str, Any]]) 
     return normalized in _orchestrator_known_roles(profiles)
 
 
-def _coerce_orchestrator_mode(value: str) -> str:
+def _coerce_mode_hint(value: str) -> str:
     mode = (value or "").strip().lower()
-    return mode if mode in ("ro", "rw", "full") else "ro"
+    aliases = {
+        "read": "ro",
+        "readonly": "ro",
+        "read-only": "ro",
+        "write": "rw",
+        "readwrite": "rw",
+        "read-write": "rw",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in ("ro", "rw", "full"):
+        raise ValueError(f"unsupported MODE_HINT: {value!r}")
+    return mode
+
+
+def _coerce_orchestrator_mode(value: str) -> str:
+    return _coerce_mode_hint(value)
 
 
 def _default_orchestrator_profile(role: str) -> dict[str, Any]:
