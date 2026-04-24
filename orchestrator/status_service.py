@@ -757,8 +757,8 @@ class StatusService:
         if counts_ok and not no_open_jobs:
             for role in roles:
                 n = int(max_parallel.get(role) or 1)
-                running = self.orch_q.peek(role=role, state="running", limit=200, chat_id=chat_id)
-                queued = self.orch_q.peek(role=role, state="queued", limit=200, chat_id=chat_id)
+                running = self.orch_q.list_role_tasks_for_status(role=role, state="running", limit=200, chat_id=chat_id)
+                queued = self.orch_q.list_role_tasks_for_status(role=role, state="queued", limit=200, chat_id=chat_id)
 
                 # Sort queued by the scheduler's intended order (priority asc, created_at asc).
                 queued_sorted = sorted(queued, key=lambda t: (int(t.priority or 2), float(t.created_at)))
