@@ -12147,8 +12147,8 @@ def _auto_merge_ready_orders_tick(
         result_norm = str(result_text or "").strip().lower()
         merged_ok = False
         if ("failed" not in result_norm) and (
-            ("merged to main" in result_norm)
-            or ("auto-merged by jarvis to main" in result_norm)
+            ("merged to " in result_norm)
+            or ("auto-merged by jarvis to " in result_norm)
         ):
             merged_ok = True
         if not merged_ok:
@@ -12159,8 +12159,10 @@ def _auto_merge_ready_orders_tick(
                 terminal_no_delivery = str(after_trace.get("result_status") or "").strip().lower() in {
                     "merge_no_delta",
                 }
+                deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
                 merged_ok = (
                     not terminal_no_delivery
+                    and not deploy_failed_after_merge
                     and (
                         bool(after_trace.get("merged_to_main", False))
                         or str(after_order.get("status") or "").strip().lower() == "done"
@@ -12576,6 +12578,106 @@ def _repo_deploy_policy(
     }
 
 
+def _deploy_verify_retry_config(timeout_seconds: int) -> tuple[float, float, float]:
+    try:
+        window_s = float(os.environ.get("BOT_DEPLOY_VERIFY_RETRY_SECONDS", "90").strip() or "90")
+    except Exception:
+        window_s = 90.0
+    try:
+        interval_s = float(os.environ.get("BOT_DEPLOY_VERIFY_RETRY_INTERVAL_SECONDS", "4").strip() or "4")
+    except Exception:
+        interval_s = 4.0
+    try:
+        attempt_timeout_s = float(os.environ.get("BOT_DEPLOY_VERIFY_ATTEMPT_TIMEOUT_SECONDS", "20").strip() or "20")
+    except Exception:
+        attempt_timeout_s = 20.0
+
+    timeout_cap = max(5.0, float(timeout_seconds or 120))
+    window_s = max(1.0, min(300.0, float(window_s), timeout_cap))
+    interval_s = max(0.5, min(30.0, float(interval_s)))
+    attempt_timeout_s = max(3.0, min(120.0, float(attempt_timeout_s), timeout_cap))
+    return window_s, interval_s, attempt_timeout_s
+
+
+def _run_deploy_verify_with_retries(
+    *,
+    verify_command: list[str],
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    command = [str(piece) for piece in verify_command if str(piece).strip()]
+    verify_text = shlex.join(command)
+    if not command:
+        return {
+            "ok": True,
+            "attempts": 0,
+            "verify_command": "",
+            "stdout": "",
+            "stderr": "",
+            "detail": "",
+        }
+
+    window_s, interval_s, attempt_timeout_s = _deploy_verify_retry_config(timeout_seconds)
+    deadline = time.time() + window_s
+    attempts = 0
+    last_stdout = ""
+    last_stderr = ""
+    last_detail = ""
+    last_returncode: int | None = None
+
+    while True:
+        attempts += 1
+        try:
+            verify = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=attempt_timeout_s,
+                check=False,
+            )
+            last_returncode = int(verify.returncode)
+            last_stdout = _tail_text(str(verify.stdout or ""))
+            last_stderr = _tail_text(str(verify.stderr or ""))
+            last_detail = last_stdout or last_stderr
+            if verify.returncode == 0:
+                return {
+                    "ok": True,
+                    "attempts": attempts,
+                    "verify_command": verify_text,
+                    "stdout": last_stdout,
+                    "stderr": last_stderr,
+                    "detail": last_detail,
+                    "returncode": 0,
+                }
+        except subprocess.TimeoutExpired as exc:
+            last_returncode = None
+            last_stdout = _tail_text(str(exc.stdout or ""))
+            last_stderr = _tail_text(str(exc.stderr or ""))
+            last_detail = last_stderr or last_stdout or f"verify timed out after {attempt_timeout_s:.0f}s"
+        except Exception as exc:
+            last_returncode = None
+            last_stdout = ""
+            last_stderr = str(exc)
+            last_detail = str(exc)
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return {
+                "ok": False,
+                "attempts": attempts,
+                "verify_command": verify_text,
+                "stdout": last_stdout,
+                "stderr": last_stderr,
+                "detail": last_detail,
+                "returncode": last_returncode,
+            }
+        time.sleep(min(interval_s, max(0.1, remaining)))
+
+
 def _deploy_after_order_merge(
     *,
     cfg: BotConfig,
@@ -12710,27 +12812,23 @@ def _deploy_after_order_merge(
 
     verify_command = [str(piece) for piece in policy.get("verify_command") or [] if str(piece).strip()]
     if verify_command:
-        verify_text = shlex.join(verify_command)
-        verify = subprocess.run(
-            verify_command,
+        verify_result = _run_deploy_verify_with_retries(
+            verify_command=verify_command,
             cwd=cwd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=min(timeout_seconds, 120),
-            check=False,
+            timeout_seconds=timeout_seconds,
         )
-        if verify.returncode != 0:
+        if not bool(verify_result.get("ok", False)):
             return {
                 "status": "failed",
                 "reason": "verify_failed",
                 "summary": "Deploy completed but verification failed.",
                 "command": command_text,
-                "verify_command": verify_text,
+                "verify_command": verify_result.get("verify_command"),
+                "verify_attempts": verify_result.get("attempts"),
                 "stdout": stdout_tail,
-                "stderr": _tail_text(str(verify.stderr or "")),
-                "detail": _tail_text(str(verify.stdout or "") or str(verify.stderr or "")),
+                "stderr": verify_result.get("stderr"),
+                "detail": verify_result.get("detail"),
             }
 
     return {
@@ -12740,6 +12838,8 @@ def _deploy_after_order_merge(
         "command": command_text,
         "stdout": stdout_tail,
         "stderr": stderr_tail,
+        "verify_command": (shlex.join(verify_command) if verify_command else None),
+        "verify_attempts": (verify_result.get("attempts") if verify_command else None),
         "deployed_commit": (deployed_commit or merge_commit or None),
     }
 

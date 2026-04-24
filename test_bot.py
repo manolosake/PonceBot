@@ -5209,6 +5209,104 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(root.trace["operational_gate_reason"], "root_job_still_blocked")
         self.assertEqual(q.audit_events[-1]["details"]["source"], "maturity_sweep")
 
+    def test_deploy_verify_retries_transient_startup_failure(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **_kwargs: object):
+            calls.append(command)
+            if len(calls) < 3:
+                return SimpleNamespace(returncode=1, stdout="", stderr="service booting")
+            return SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr="")
+
+        with patch.object(bot.subprocess, "run", side_effect=fake_run), patch.object(bot.time, "sleep") as sleep:
+            result = bot._run_deploy_verify_with_retries(
+                verify_command=["curl", "-fsS", "http://127.0.0.1:8000/healthz"],
+                cwd=".",
+                env={},
+                timeout_seconds=60,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["attempts"], 3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_auto_merge_does_not_count_deploy_failure_as_success(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            state="done",
+            trace={"merge_ready": True, "proactive_improvement_closed": True, "order_branch": "feature/root"},
+            labels={},
+            created_at=90.0,
+            updated_at=100.0,
+        )
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.order = {
+                    "order_id": "root",
+                    "chat_id": 1,
+                    "status": "active",
+                    "phase": "ready_for_merge",
+                    "title": "Proactive Sprint: ExecutiveDashboard Reliability",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                }
+                self.statuses: list[str] = []
+                self.phases: list[str] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def is_paused_globally(self) -> bool:
+                return False
+
+            def list_orders_global(self, status: str, limit: int = 240):
+                return [dict(self.order)] if status == "active" else []
+
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return dict(self.order)
+
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return []
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.order["status"] = status
+                self.statuses.append(status)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.order["phase"] = phase
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+
+        def fake_merge(*_args: object, **_kwargs: object) -> str:
+            root.trace.update({"merged_to_main": True, "deploy_status": "failed"})
+            q.set_order_status("root", chat_id=1, status="active")
+            q.set_order_phase("root", chat_id=1, phase="review")
+            return "Order root auto-merged by Jarvis to codex/r530-main-clean-20260305-045022. Deploy failed: health check failed."
+
+        with patch.object(bot, "_jarvis_auto_approve_merge_enabled", return_value=True), patch.object(
+            bot, "_sync_order_phase_from_runtime", return_value=None
+        ), patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "codex/r530-main-clean-20260305-045022")), patch.object(
+            bot, "_order_trace_requires_merge", return_value=(True, "feature/root")
+        ), patch.object(bot, "_order_operational_maturity_gate", return_value=(True, "passed", {})), patch.object(
+            bot, "_order_command_text", side_effect=fake_merge
+        ), patch.object(bot, "_send_chunked_text", return_value=None):
+            merged = bot._auto_merge_ready_orders_tick(cfg=None, api=None, orch_q=q, now=123.0)
+
+        self.assertEqual(merged, 0)
+        self.assertEqual(q.statuses[-1], "active")
+        self.assertEqual(q.phases[-1], "review")
+        self.assertIn("Deploy failed", root.trace["merge_auto_error"])
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.auto_merge_failed")
+
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
