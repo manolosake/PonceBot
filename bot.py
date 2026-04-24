@@ -14302,10 +14302,27 @@ def _enqueue_operational_gate_reviewer_recovery(
 
     if not latest_impl_slice_id:
         try:
+            skip_reason = "missing_implementer_delivery_slice"
+            gate_reason_norm = str(gate_reason or "").strip()
+            try:
+                last_skip_at = float(root_trace.get("operational_gate_review_skipped_at", 0.0) or 0.0)
+            except Exception:
+                last_skip_at = 0.0
+            last_skip_reason = str(root_trace.get("operational_gate_review_skip_reason") or "").strip()
+            last_skip_gate_reason = str(root_trace.get("operational_gate_review_reason") or "").strip()
+            should_record_skip = (
+                last_skip_at <= 0.0
+                or (float(now) - last_skip_at) >= cooldown_s
+                or last_skip_reason != skip_reason
+                or last_skip_gate_reason != gate_reason_norm
+            )
+            if not should_record_skip:
+                return False
             orch_q.update_trace(
                 oid,
-                operational_gate_review_skip_reason="missing_implementer_delivery_slice",
-                operational_gate_review_reason=str(gate_reason or "").strip(),
+                operational_gate_review_skipped_at=float(now),
+                operational_gate_review_skip_reason=skip_reason,
+                operational_gate_review_reason=gate_reason_norm,
                 live_at=float(now),
             )
             orch_q.append_audit_event(
@@ -14313,8 +14330,8 @@ def _enqueue_operational_gate_reviewer_recovery(
                 actor="skynet",
                 details={
                     "order_id": oid,
-                    "reason": str(gate_reason or "").strip(),
-                    "skip_reason": "missing_implementer_delivery_slice",
+                    "reason": gate_reason_norm,
+                    "skip_reason": skip_reason,
                 },
             )
         except Exception:

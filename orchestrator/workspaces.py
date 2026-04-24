@@ -92,7 +92,12 @@ def _maybe_mark_managed_worktree(*, base_repo: Path, root: Path, wt_dir: Path, r
     except Exception:
         br = ""
     if br and br not in ("HEAD", expected_branch, legacy_branch):
-        return False
+        # Older pool bugs could leave a valid PonceBot worktree in the right slot
+        # but checked out to a sibling managed branch. Reclaim only same-namespace
+        # branches; arbitrary branches still fail closed.
+        expected_prefix = f"poncebot/{_managed_worktree_namespace(base_repo=base_repo, root=root)}/"
+        if not br.startswith(expected_prefix):
+            return False
 
     try:
         base_remote = _run(["git", "-C", str(base_repo), "config", "--get", "remote.origin.url"], check=False).stdout.strip()

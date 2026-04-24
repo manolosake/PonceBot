@@ -4969,6 +4969,45 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         )
         self.assertEqual(q.audit_events[-1]["event_type"], "order.operational_gate_review_skipped")
 
+    def test_operational_gate_reviewer_recovery_dedupes_missing_implementer_skip(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.submitted: list[bot.Task] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue()
+            enqueued = bot._enqueue_operational_gate_reviewer_recovery(
+                cfg=self._operational_gate_recovery_cfg(td),
+                orch_q=q,
+                profiles=None,
+                order_row={"order_id": "root"},
+                children=[],
+                root_trace={
+                    "operational_gate_review_skipped_at": 100.0,
+                    "operational_gate_review_skip_reason": "missing_implementer_delivery_slice",
+                    "operational_gate_review_reason": "root_job_terminal_failed_without_delivery",
+                },
+                chat_id=1,
+                now=200.0,
+                gate_reason="root_job_terminal_failed_without_delivery",
+            )
+
+        self.assertFalse(enqueued)
+        self.assertEqual(q.submitted, [])
+        self.assertEqual(q.trace_updates, [])
+        self.assertEqual(q.audit_events, [])
+
     def test_operational_gate_reviewer_recovery_targets_done_implementer_slice(self) -> None:
         class FakeQueue:
             def __init__(self) -> None:
@@ -5027,6 +5066,38 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.submitted[0].role, "reviewer_local")
         self.assertEqual(q.submitted[0].trace["slice_id"], "impl_delivery_slice")
         self.assertEqual(q.trace_updates[-1]["operational_gate_review_target_slice_id"], "impl_delivery_slice")
+
+    def test_worktree_pool_reclaims_same_namespace_legacy_branch(self) -> None:
+        from orchestrator import workspaces
+
+        def run(cmd: list[str], cwd: Path | None = None) -> str:
+            return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            pool = root / "pool"
+            repo.mkdir()
+            run(["git", "init", "-b", "main"], cwd=repo)
+            run(["git", "config", "user.email", "test@example.com"], cwd=repo)
+            run(["git", "config", "user.name", "test"], cwd=repo)
+            (repo / "README.md").write_text("test\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=repo)
+            run(["git", "commit", "-m", "Initial"], cwd=repo)
+
+            skynet_slot = pool / "skynet" / "slot1"
+            skynet_slot.parent.mkdir(parents=True)
+            sibling_branch = workspaces._managed_worktree_branch(base_repo=repo, root=pool, role="backend", slot=1)
+            expected_branch = workspaces._managed_worktree_branch(base_repo=repo, root=pool, role="skynet", slot=1)
+            run(["git", "worktree", "add", "-B", sibling_branch, str(skynet_slot), "main"], cwd=repo)
+            sentinel = skynet_slot / ".poncebot_managed_worktree"
+            self.assertFalse(sentinel.exists())
+
+            workspaces.ensure_worktree_pool(base_repo=repo, root=pool, role="skynet", slots=1)
+            self.assertTrue(sentinel.exists())
+
+            workspaces.prepare_clean_workspace(skynet_slot)
+            self.assertEqual(run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=skynet_slot), expected_branch)
 
     def test_operational_gate_blocks_running_root_even_when_merge_ready(self) -> None:
         with tempfile.TemporaryDirectory() as td:
