@@ -111,6 +111,35 @@ class TestProactiveBlockerReplay(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["job_id"], "j-compact-label")
 
+    def test_select_rows_escapes_like_wildcards_in_ticket_id(self) -> None:
+        con = _mk_db()
+        now = time.time()
+        for job_id, ticket in (
+            ("j-literal", "ticket_%"),
+            ("j-wildcard-decoy", "ticket-xx"),
+        ):
+            con.execute(
+                """
+                INSERT INTO jobs(job_id, role, state, depends_on, blocked_reason, updated_at, created_at, parent_job_id, labels)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    job_id,
+                    "qa",
+                    "queued",
+                    "[]",
+                    "",
+                    now,
+                    now,
+                    None,
+                    f'{{"ticket":"{ticket}","kind":"subtask"}}',
+                ),
+            )
+
+        rows, strategy = pbr._select_rows_for_ticket(con, "ticket_%")
+        self.assertEqual(strategy, "labels_ticket_fallback")
+        self.assertEqual([row["job_id"] for row in rows], ["j-literal"])
+
 
 if __name__ == "__main__":
     unittest.main()

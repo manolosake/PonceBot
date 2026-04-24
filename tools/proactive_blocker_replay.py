@@ -36,6 +36,10 @@ def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
 _ACTIVE_STATES = ("blocked", "blocked_approval", "waiting_deps", "running", "queued")
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[list[dict], str]:
     rows = [
         dict(r)
@@ -55,6 +59,7 @@ def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[li
         return rows, "parent_job_id"
 
     # Fallback for lanes where ticket lineage is stored in labels JSON.
+    escaped_ticket_id = _escape_like(str(ticket_id))
     rows = [
         dict(r)
         for r in con.execute(
@@ -62,13 +67,13 @@ def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[li
             SELECT job_id, role, state, COALESCE(depends_on,'[]') AS depends_on,
                    COALESCE(blocked_reason,'') AS blocked_reason, updated_at
             FROM jobs
-            WHERE (labels LIKE ? OR labels LIKE ?)
+            WHERE (labels LIKE ? ESCAPE '\\' OR labels LIKE ? ESCAPE '\\')
               AND state IN ({",".join("?" for _ in _ACTIVE_STATES)})
             ORDER BY created_at
             """,
             (
-                f'%"ticket": "{ticket_id}"%',
-                f'%"ticket":"{ticket_id}"%',
+                f'%"ticket": "{escaped_ticket_id}"%',
+                f'%"ticket":"{escaped_ticket_id}"%',
                 *_ACTIVE_STATES,
             ),
         ).fetchall()

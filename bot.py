@@ -12801,10 +12801,10 @@ def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
             "project_hint": "/home/aponce/codexbot",
             "goal": (
                 "Improve orchestration reliability, reduce noisy notifications, tighten evidence gates, "
-                "and strengthen end-to-end Telegram traceability."
+                "ship useful new workflow features, and strengthen end-to-end Telegram traceability."
             ),
             "success": (
-                "Ship one concrete reliability or workflow-quality improvement inside /home/aponce/codexbot, "
+                "Ship one concrete reliability, workflow-quality, or feature improvement inside /home/aponce/codexbot, "
                 "with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
             ),
         },
@@ -12814,11 +12814,11 @@ def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
             "lane": "dashboard",
             "project_hint": "/home/aponce/ExecutiveDashboard",
             "goal": (
-                "Improve executive readability, reduce visual friction, and strengthen live telemetry "
-                "and agent-trace usability for daily operations."
+                "Improve executive readability, reduce visual friction, add useful operator features, "
+                "and strengthen live telemetry and agent-trace usability for daily operations."
             ),
             "success": (
-                "Ship one operator-facing UX or observability improvement with screenshots, telemetry proof, "
+                "Ship one operator-facing UX, feature, or observability improvement with screenshots, telemetry proof, "
                 "or health evidence and no regression to auth/control paths."
             ),
         },
@@ -13152,17 +13152,18 @@ def _spawn_proactive_order(
             if repo_path
             else "- Work only inside this initiative scope; do not touch unrelated projects."
         ),
-        "- Avoid work-for-work's-sake: choose the smallest highest-impact bugfix, issue resolution, or improvement that can be validated today.",
+        "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, or refactor slice that can be validated today.",
         "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.",
         "- Task selection priority (deterministic):",
         "  1) repeated conversion failures in the local funnel,",
         "  2) reliability/evidence tests currently failing or flaky,",
-        "  3) debt that measurably reduces operational noise.",
+        "  3) useful operator/customer-facing features or UX improvements,",
+        "  4) debt/refactors that measurably reduce operational noise or unlock better delivery.",
         "- Do not seed a new local task for a role that already has open work on this ticket.",
         "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.",
         "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.",
-        "- If the best next move is a new capability, a drastic change, or a materially broader plan, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.",
-        "- If CEO approval is pending for a larger/drastic idea, do not delegate execution subtasks for that idea.",
+        "- New capabilities, deeper refactors, and ambitious product ideas are allowed; decompose them into reversible, reviewable, deployable phases.",
+        "- Ask the CEO first only for destructive/irreversible actions, credential or billing changes, public launches, high-risk data migrations, or external purchases.",
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
@@ -13388,7 +13389,18 @@ def _proactive_lane_tick(
     active_repo_ids.discard("")
     if repo_candidates:
         repo_candidates = sorted(repo_candidates, key=lambda row: (int(row.get("priority") or 2), str(row.get("path") or "")))
-        for repo in repo_candidates:
+        repo_index = 0
+        try:
+            state = _get_state(cfg)
+            repo_index = int(state.get("proactive_repo_index", 0) or 0)
+        except Exception:
+            repo_index = 0
+        if repo_index < 0:
+            repo_index = 0
+        start = repo_index % len(repo_candidates)
+        ordered_repo_candidates = repo_candidates[start:] + repo_candidates[:start]
+        repo_advances = 0
+        for repo in ordered_repo_candidates:
             if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
                 break
             if created >= max(1, int(cfg.proactive_lane_max_per_tick)):
@@ -13403,11 +13415,11 @@ def _proactive_lane_tick(
                 "lane": "factory",
                 "project_hint": str(repo.get("path") or ""),
                 "goal": (
-                    "Ship one bounded bugfix, issue-resolution, reliability, quality, maintenance, or delivery improvement inside this registered repo, "
-                    "with real evidence and no cross-repo writes."
+                    "Ship one bounded bugfix, issue-resolution, reliability, quality, maintenance, feature, UX/product, "
+                    "or refactor improvement inside this registered repo, with real evidence and no cross-repo writes."
                 ),
                 "success": (
-                    "Close one verified improvement for this repo with concrete evidence such as tests, validation logs, or a reviewed patch."
+                    "Close one verified repo improvement or feature slice with concrete evidence such as tests, validation logs, screenshots, or a reviewed patch."
                 ),
                 "expected_measurable_delta": (
                     "Increase validated improvements per repo while keeping local failure rate and queue pressure bounded."
@@ -13427,6 +13439,7 @@ def _proactive_lane_tick(
             )
             if ok:
                 created += 1
+                repo_advances += 1
                 active_repo_ids.add(repo_id)
                 countable_proactive_orders.append(
                     {
@@ -13434,6 +13447,14 @@ def _proactive_lane_tick(
                         "body": f"[proactive:{initiative.get('key')}] [repo:{repo_id}]",
                     }
                 )
+        if repo_advances > 0:
+            try:
+                def _m(st: dict[str, Any]) -> None:
+                    st["proactive_repo_index"] = int(repo_index + repo_advances)
+
+                _update_state(cfg, _m)
+            except Exception:
+                pass
         if created > 0:
             try:
                 orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
@@ -13998,8 +14019,9 @@ def _enqueue_order_autopilot_task(
             "Rules:\n"
             "- Only propose work that advances this order.\n"
             "- If the order looks complete, propose marking it DONE (do not create new projects).\n"
-            "- Avoid busywork: choose one high-impact improvement with explicit validation, not generic analysis.\n"
-            "- If the best next move is a larger strategic idea, a new capability, or a drastic change, do not execute it yet: ask the CEO first with next_action.type=ceo_approval_needed and include proposal_title, proposal_summary, scope, risks, questions, and fallback_work.\n"
+            "- Avoid busywork: choose one high-impact bugfix, feature, UX/product improvement, refactor slice, or reliability improvement with explicit validation.\n"
+            "- Larger strategic ideas, new capabilities, and drastic refactors are allowed when decomposed into reversible, reviewable, deployable phases.\n"
+            "- Ask the CEO first only for destructive/irreversible actions, credential or billing changes, public launches, high-risk data migrations, or external purchases.\n"
             "- Use Codex delivery roles (backend/frontend/qa/release_mgr/etc) as the primary executors for proactive work.\n"
             "- Local specialists are optional support only unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
             "- If a cycle stalls or returns low-signal output, slow down and re-plan a narrower Codex slice with stronger evidence requirements.\n"
