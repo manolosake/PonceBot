@@ -8553,6 +8553,7 @@ def _merge_order_branch_to_main(
                 # Hygiene: one branch per project/order, remove after successful merge.
                 _run_git(repo, ["push", "origin", "--delete", b], check=False)
                 _run_git(repo, ["branch", "-D", b], check=False)
+                _sync_repo_checkout_to_default_branch(repo=repo, default_branch=default_branch)
                 return True, "merged_to_main", (merge_commit or None)
 
             push_detail = (ps.stderr or ps.stdout or "").strip() or "push_main_failed"
@@ -24070,6 +24071,9 @@ def _orchestrator_run_codex(
                         live_workdir=str(worktree_dir),
                         live_workspace_slot=int(leased_slot),
                         live_branch=(order_branch or None),
+                        workspace_error=None,
+                        workspace_error_artifact=None,
+                        workspace_recovered_at=time.time(),
                         live_at=time.time(),
                     )
             except Exception:

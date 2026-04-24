@@ -4539,6 +4539,49 @@ class TestOrderBranchGitHelpers(unittest.TestCase):
             order_head = run(["git", "--git-dir", str(origin), "rev-parse", "refs/heads/feature/order-test"])
             self.assertEqual(order_head, latest_default)
 
+    def test_merge_order_branch_fast_forwards_base_checkout_after_push(self) -> None:
+        def run(cmd: list[str], cwd: Path | None = None) -> str:
+            return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            origin = root / "origin.git"
+            seed = root / "seed"
+            repo = root / "repo"
+
+            run(["git", "init", "--bare", str(origin)])
+            run(["git", "clone", str(origin), str(seed)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=seed)
+            run(["git", "config", "user.name", "test"], cwd=seed)
+            (seed / "README.md").write_text("main\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=seed)
+            run(["git", "commit", "-m", "main"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:main"], cwd=seed)
+
+            run(["git", "checkout", "-b", "feature/order-sync"], cwd=seed)
+            (seed / "feature.txt").write_text("feature\n", encoding="utf-8")
+            run(["git", "add", "feature.txt"], cwd=seed)
+            run(["git", "commit", "-m", "feature"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:feature/order-sync"], cwd=seed)
+
+            run(["git", "clone", "--branch", "main", str(origin), str(repo)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=repo)
+            run(["git", "config", "user.name", "test"], cwd=repo)
+            before = run(["git", "rev-parse", "HEAD"], cwd=repo)
+
+            ok, msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/order-sync",
+                order_id="order-sync",
+                default_branch="main",
+            )
+
+            self.assertTrue(ok, msg)
+            self.assertEqual(msg, "merged_to_main")
+            self.assertNotEqual(before, merge_commit)
+            self.assertEqual(run(["git", "rev-parse", "--short", "HEAD"], cwd=repo), merge_commit)
+            self.assertEqual(run(["git", "rev-parse", "--short", "origin/main"], cwd=repo), merge_commit)
+
 
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
     def test_skynet_factory_local_only_disabled_by_default(self) -> None:
