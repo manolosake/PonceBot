@@ -13,6 +13,26 @@ def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
+    if updated_at in (None, ""):
+        return 0.0
+    try:
+        return max(0.0, float(now_epoch) - float(updated_at))
+    except Exception:
+        pass
+
+    try:
+        raw = str(updated_at).strip()
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max(0.0, float(now_epoch) - parsed.timestamp())
+    except Exception:
+        return 0.0
+
+
 _ACTIVE_STATES = ("blocked", "blocked_approval", "waiting_deps", "running", "queued")
 
 
@@ -71,7 +91,7 @@ def main() -> int:
 
     now = time.time()
     for r in rows:
-        r["updated_age_s"] = round(now - float(r.get("updated_at") or now), 1)
+        r["updated_age_s"] = round(_updated_age_seconds(r.get("updated_at"), now), 1)
 
     blocked = [r for r in rows if str(r.get("state", "")).lower() in {"blocked", "blocked_approval", "waiting_deps"}]
     stale = [r for r in blocked if float(r.get("updated_age_s") or 0.0) > float(args.stale_seconds)]
