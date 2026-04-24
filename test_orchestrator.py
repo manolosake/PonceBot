@@ -2695,6 +2695,12 @@ class TestYamlLikeParsing(unittest.TestCase):
         assert isinstance(tools, list)
         self.assertIn("screenshot", [str(x) for x in tools])
 
+    def test_skynet_profile_uses_gpt55_high_effort(self) -> None:
+        profiles = load_agent_profiles(Path(__file__).resolve().parent / "orchestrator" / "agents.yaml")
+        skynet = profiles["skynet"]
+        self.assertEqual(skynet.get("model"), "gpt-5.5")
+        self.assertEqual(skynet.get("effort"), "high")
+
     def test_runbooks_yaml_parses_multiline_prompt(self) -> None:
         rbs = load_runbooks(Path(__file__).resolve().parent / "orchestrator" / "runbooks.yaml")
         self.assertGreaterEqual(len(rbs), 1)

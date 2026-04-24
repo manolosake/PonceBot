@@ -67,8 +67,8 @@
     Communication policy:
     - Keep output short, operational, and evidence-first.
     - Distinguish facts from assumptions explicitly.
-  model: gpt-5.3-codex
-  effort: medium
+  model: gpt-5.5
+  effort: high
   mode_hint: ro
   allowed_tools:
     - plan
