@@ -238,10 +238,10 @@ _GREETING_PREFIXES = (
 
 
 _CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
-# Only controller lanes are hard-forced into read-only runner mode.
-# Local specialists still rely on their task mode plus write-policy guards.
-_READ_ONLY_ENFORCED_ROLE_NAMES = frozenset({"jarvis", "skynet"})
 _NO_WRITE_ROLE_NAMES = frozenset({"jarvis", "skynet", "architect_local", "reviewer_local"})
+# Any role that is forbidden to land repo changes must also bypass global
+# breakglass/full-access defaults and run Codex in read-only mode.
+_READ_ONLY_ENFORCED_ROLE_NAMES = _NO_WRITE_ROLE_NAMES
 
 
 def _is_controller_role(role: str) -> bool:
@@ -254,11 +254,12 @@ def _role_requires_enforced_read_only(role: str) -> bool:
 
 def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: int) -> str | None:
     """
-    Enforce controller read-only mode only when dangerous bypass is not active.
-    This prevents forced `ro` from unintentionally disabling breakglass bypass.
+    Enforce read-only runner mode for advisory/controller roles.
+
+    Breakglass/full-access is for CEO/manual execution, not for autonomous
+    planning/review lanes that must delegate code changes.
     """
-    enforce = _role_requires_enforced_read_only(role) and not _effective_bypass_sandbox(cfg, chat_id=chat_id)
-    return "ro" if enforce else None
+    return "ro" if _role_requires_enforced_read_only(role) else None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
@@ -8386,6 +8387,73 @@ def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
         if path_part and path_part not in out:
             out.append(path_part)
     return out
+
+
+def _stash_read_only_write_violation(
+    repo_dir: Path,
+    *,
+    role: str,
+    job_id: str,
+    label: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    status_before = _git_status_porcelain(repo_dir)
+    changed_paths = _git_changed_paths_from_porcelain(status_before)
+    if not changed_paths:
+        return {
+            "repo_dir": str(repo_dir),
+            "label": str(label or "repo"),
+            "changed_paths": [],
+            "stash_created": False,
+            "status_after": "",
+        }
+
+    safe_label = _SAFE_FILENAME_RE.sub("-", str(label or "repo").strip().lower()).strip("-._") or "repo"
+    stash_msg = f"codexbot-read-only-violation-{str(role or 'role')}-{str(job_id or '')[:8]}-{safe_label}-{int(time.time())}"
+    proc = _run_git(
+        repo_dir,
+        ["stash", "push", "--include-untracked", "-m", stash_msg, "--", "."],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    status_after = _git_status_porcelain(repo_dir)
+    artifact = artifacts_dir / f"write_policy_{safe_label}_stash.txt"
+    artifact.write_text(
+        "\n".join(
+            [
+                f"repo_dir={repo_dir}",
+                f"role={role}",
+                f"job_id={job_id}",
+                f"label={safe_label}",
+                f"stash_message={stash_msg}",
+                "",
+                "status_before:",
+                status_before,
+                "",
+                f"stash_returncode={proc.returncode}",
+                "stash_stdout:",
+                str(proc.stdout or "").rstrip(),
+                "stash_stderr:",
+                str(proc.stderr or "").rstrip(),
+                "",
+                "status_after:",
+                status_after,
+            ]
+        ).rstrip()
+        + "\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "repo_dir": str(repo_dir),
+        "label": safe_label,
+        "changed_paths": changed_paths[:40],
+        "stash_created": proc.returncode == 0,
+        "stash_message": stash_msg,
+        "stash_returncode": int(proc.returncode or 0),
+        "status_after": status_after,
+        "artifact": str(artifact),
+    }
 
 
 def _merge_order_branch_to_main(
@@ -23727,21 +23795,63 @@ def _orchestrator_run_codex(
                 }
 
         if worktree_dir is not None and _role_disallows_repo_writes(role):
-            status_text = _git_status_porcelain(worktree_dir)
-            changed_paths = _git_changed_paths_from_porcelain(status_text)
-            if changed_paths:
+            targets: list[tuple[str, Path, str, list[str]]] = []
+            seen_target_dirs: set[str] = set()
+            for label, repo_dir in (
+                ("worktree", worktree_dir),
+                ("base_repo", repo_base_dir),
+            ):
+                if repo_dir is None:
+                    continue
+                try:
+                    target_dir = Path(repo_dir).resolve()
+                except Exception:
+                    target_dir = Path(repo_dir)
+                target_key = str(target_dir)
+                if target_key in seen_target_dirs:
+                    continue
+                seen_target_dirs.add(target_key)
+                status_text = _git_status_porcelain(target_dir)
+                changed_paths = _git_changed_paths_from_porcelain(status_text)
+                if changed_paths:
+                    targets.append((str(label), target_dir, status_text, changed_paths))
+            if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [
                     f"role={role}",
                     "reason=controller_write_policy_violation",
                     "Only local implementer execution may land repository changes in the Skynet factory lane.",
-                    "",
-                    "git status --porcelain:",
-                    status_text,
                 ]
-                if changed_paths:
-                    violation_lines.extend(["", "changed_paths:"])
+                cleanup_results: list[dict[str, Any]] = []
+                all_changed_paths: list[str] = []
+                for label, target_dir, status_text, changed_paths in targets:
+                    violation_lines.extend(["", f"{label}_repo={target_dir}", "git status --porcelain:", status_text])
+                    violation_lines.extend(["", f"{label}_changed_paths:"])
                     violation_lines.extend(f"- {path}" for path in changed_paths[:40])
+                    for path in changed_paths:
+                        scoped = f"{label}:{path}"
+                        if scoped not in all_changed_paths:
+                            all_changed_paths.append(scoped)
+                    try:
+                        cleanup = _stash_read_only_write_violation(
+                            target_dir,
+                            role=role,
+                            job_id=task.job_id,
+                            label=label,
+                            artifacts_dir=artifacts_dir,
+                        )
+                    except Exception as e:
+                        cleanup = {
+                            "repo_dir": str(target_dir),
+                            "label": label,
+                            "changed_paths": changed_paths[:40],
+                            "stash_created": False,
+                            "error": str(e),
+                        }
+                    cleanup_results.append(cleanup)
+                    artifact = str(cleanup.get("artifact") or "").strip()
+                    if artifact and artifact not in artifacts_text:
+                        artifacts_text.append(artifact)
                 violation_artifact.write_text("\n".join(violation_lines).rstrip() + "\n", encoding="utf-8", errors="replace")
                 violation_artifact_str = str(violation_artifact)
                 if violation_artifact_str not in artifacts_text:
@@ -23749,7 +23859,8 @@ def _orchestrator_run_codex(
                 structured["write_policy_violation"] = {
                     "role": role,
                     "reason": "controller_write_policy_violation",
-                    "changed_paths": changed_paths[:20],
+                    "changed_paths": all_changed_paths[:40],
+                    "cleanup": cleanup_results,
                     "status_artifact": violation_artifact_str,
                 }
                 return {

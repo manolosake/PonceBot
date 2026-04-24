@@ -258,12 +258,12 @@ class TestStateHandling(unittest.TestCase):
         self.assertTrue(bot._task_requires_fresh_threaded_session(proactive_trace, role="skynet"))
         self.assertFalse(bot._task_requires_fresh_threaded_session(architect, role="architect_local"))
 
-    def test_only_controller_roles_are_forced_read_only(self) -> None:
+    def test_no_write_roles_are_forced_read_only(self) -> None:
         self.assertTrue(bot._role_requires_enforced_read_only("skynet"))
         self.assertTrue(bot._role_requires_enforced_read_only("jarvis"))
-        self.assertFalse(bot._role_requires_enforced_read_only("architect_local"))
+        self.assertTrue(bot._role_requires_enforced_read_only("architect_local"))
         self.assertFalse(bot._role_requires_enforced_read_only("implementer_local"))
-        self.assertFalse(bot._role_requires_enforced_read_only("reviewer_local"))
+        self.assertTrue(bot._role_requires_enforced_read_only("reviewer_local"))
 
     def test_jsonl_stream_has_terminal_completion_detects_response_completed(self) -> None:
         payload = "\n".join(
@@ -2810,7 +2810,9 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(result["next_action"], "delegate_local_subtask")
             violation = result["structured_digest"].get("write_policy_violation")
             self.assertIsInstance(violation, dict)
-            self.assertIn("bot.py", violation.get("changed_paths", []))
+            self.assertTrue(any(str(path).endswith(":bot.py") for path in violation.get("changed_paths", [])))
+            worktree = bot._repo_worktree_root(cfg, repo_id=repo_id) / "skynet" / "slot1"
+            self.assertEqual(bot._git_status_porcelain(worktree), "")
             self.assertIn("Write policy violation", result["summary"])
 
 class _FakeTelegramAPI:
@@ -3426,14 +3428,44 @@ class TestDangerousBypassThreaded(unittest.TestCase):
 
 
 class TestBypassAwareEnforcement(unittest.TestCase):
-    def test_forced_mode_is_not_enforced_when_bypass_is_active(self) -> None:
+    def test_forced_mode_still_applies_when_bypass_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             state_file = Path(td) / "state.json"
             state_file.write_text("{}\n", encoding="utf-8")
             cfg = TestStateHandling()._cfg(state_file)
             with patch("bot._effective_bypass_sandbox", return_value=True):
                 forced = bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=123)  # type: ignore[attr-defined]
-            self.assertIsNone(forced)
+            self.assertEqual(forced, "ro")
+
+    def test_read_only_violation_stash_cleans_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            artifacts = Path(td) / "artifacts"
+            repo.mkdir()
+            artifacts.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "manolosake"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "manolosake@gmail.com"], check=True)
+            tracked = repo / "bot.py"
+            tracked.write_text("print('old')\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "bot.py"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            tracked.write_text("print('new')\n", encoding="utf-8")
+            (repo / "scratch.txt").write_text("temp\n", encoding="utf-8")
+
+            result = bot._stash_read_only_write_violation(
+                repo,
+                role="skynet",
+                job_id="12345678-aaaa",
+                label="worktree",
+                artifacts_dir=artifacts,
+            )
+
+            self.assertTrue(result["stash_created"])
+            self.assertEqual(bot._git_status_porcelain(repo), "")
+            self.assertIn("bot.py", result["changed_paths"])
+            self.assertTrue(Path(result["artifact"]).exists())
 
 
 class TestThreadedImages(unittest.TestCase):
