@@ -73,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 LOG = logging.getLogger("codexbot")
+_MODULE_DATA_DB = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
 
 _STATE_STORES_LOCK = threading.Lock()
 _STATE_STORES_BY_PATH: dict[str, StateStore] = {}
@@ -16035,8 +16036,10 @@ def _classify_local_slice_failure(
     if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
+    if "no valid patches in input" in blob:
+        return "terminal"
+
     malformed_patch_markers = (
-        "no valid patches in input",
         "corrupt patch at line",
     )
     # Treat malformed diff formatting as recoverable/blocking, not terminal.
@@ -16882,8 +16885,19 @@ def _apply_autonomous_local_first_policy(
     rid = str(root_ticket or "").strip() or "ticket"
 
     def _latest_meta(role_name: str, *, states: tuple[str, ...] = ("done",), limit: int = 20) -> list[dict[str, Any]]:
-        db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
-        if not db_path.exists():
+        db_path: Path | None = None
+        storage = getattr(orch_q, "_storage", None)
+        storage_path = getattr(storage, "path", None)
+        if storage_path is not None:
+            try:
+                db_path = Path(storage_path)
+            except Exception:
+                db_path = None
+        if db_path is None:
+            candidate = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+            if candidate != _MODULE_DATA_DB and candidate.exists():
+                db_path = candidate
+        if db_path is None or not db_path.exists():
             db_rows = []
         else:
             normalized_states = tuple(

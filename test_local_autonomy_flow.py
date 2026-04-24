@@ -489,7 +489,11 @@ class TestLocalAutonomyFlow(unittest.TestCase):
                 "    return 'blocked'\n",
                 encoding="utf-8",
             )
-            with patch.object(bot, "_local_role_worktree_dir", return_value=worktree):
+            with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}), patch.object(
+                bot,
+                "_local_role_worktree_dir",
+                return_value=worktree,
+            ):
                 planned = bot._apply_autonomous_local_first_policy(
                     specs=specs,
                     orch_q=q,
@@ -555,7 +559,11 @@ class TestLocalAutonomyFlow(unittest.TestCase):
                 "    return 'blocked'\n",
                 encoding="utf-8",
             )
-            with patch.object(bot, "_local_role_worktree_dir", return_value=worktree):
+            with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}), patch.object(
+                bot,
+                "_local_role_worktree_dir",
+                return_value=worktree,
+            ):
                 planned = bot._apply_autonomous_local_first_policy(
                     specs=specs,
                     orch_q=q,
@@ -620,7 +628,11 @@ class TestLocalAutonomyFlow(unittest.TestCase):
                 "    return 'blocked'\n",
                 encoding="utf-8",
             )
-            with patch.object(bot, "_local_role_worktree_dir", return_value=worktree):
+            with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}), patch.object(
+                bot,
+                "_local_role_worktree_dir",
+                return_value=worktree,
+            ):
                 planned = bot._apply_autonomous_local_first_policy(
                     specs=specs,
                     orch_q=q,
