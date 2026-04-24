@@ -14162,10 +14162,15 @@ def _enqueue_operational_gate_reviewer_recovery(
         for child in children
     ):
         return False
+    review_schema_version = 2
     try:
         last_enqueued_at = float(root_trace.get("operational_gate_review_enqueued_at", 0.0) or 0.0)
     except Exception:
         last_enqueued_at = 0.0
+    try:
+        last_schema_version = int(root_trace.get("operational_gate_review_schema_version", 0) or 0)
+    except Exception:
+        last_schema_version = 0
     try:
         cooldown_s = max(
             300.0,
@@ -14173,10 +14178,11 @@ def _enqueue_operational_gate_reviewer_recovery(
         )
     except Exception:
         cooldown_s = 1200.0
-    if last_enqueued_at > 0 and (float(now) - last_enqueued_at) < cooldown_s:
+    if last_schema_version >= review_schema_version and last_enqueued_at > 0 and (float(now) - last_enqueued_at) < cooldown_s:
         return False
 
     latest_impl_summary = ""
+    latest_impl_slice_id = ""
     latest_review_summary = ""
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
         role = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
@@ -14188,6 +14194,7 @@ def _enqueue_operational_gate_reviewer_recovery(
             summary = str(trace.get("result_summary") or "").strip()
         if (not latest_impl_summary) and role in {"backend", "frontend", "implementer_local"}:
             latest_impl_summary = str(summary or "").strip()
+            latest_impl_slice_id = _task_slice_id(child, root_ticket=oid)
         if (not latest_review_summary) and role in {"qa", "reviewer_local"}:
             latest_review_summary = str(summary or "").strip()
         if latest_impl_summary and latest_review_summary:
@@ -14195,6 +14202,7 @@ def _enqueue_operational_gate_reviewer_recovery(
 
     stamp = max(1, int(now))
     review_key = f"local_review_operational_gate_{stamp}"
+    target_slice_id = _sanitize_slice_token(latest_impl_slice_id, fallback=review_key)
     child_id = str(uuid.uuid4())
     role = "reviewer_local"
     profile = _orchestrator_profile(profiles, role)
@@ -14212,6 +14220,7 @@ def _enqueue_operational_gate_reviewer_recovery(
             f"Repo ID: {repo_id or '(unknown)'}\n"
             f"Repo path: {repo_path or '(unknown)'}\n"
             f"Order branch: {order_branch or '(unknown)'}\n\n"
+            f"Target slice_id: {target_slice_id}\n"
             "Goal: verify the latest implementer slice with real commands and decide if it is safe to merge.\n"
             "Do not modify files. Do not mark READY if any required validation is only implied or still pending.\n\n"
             "Latest implementer summary:\n"
@@ -14241,11 +14250,13 @@ def _enqueue_operational_gate_reviewer_recovery(
         artifacts_dir=str((cfg.artifacts_root / child_id).resolve()),
         trace={
             "source": "operational_maturity_gate",
-            "slice_id": review_key,
+            "slice_id": target_slice_id,
+            "review_task_key": review_key,
             "slice_status": "review",
             "quality_gate_status": "review",
             "failure_class": "review_required",
             "operational_gate_reason": str(gate_reason or "").strip(),
+            "operational_gate_review_schema_version": review_schema_version,
             "order_branch": order_branch,
             "repo_id": repo_id,
             "repo_path": repo_path,
@@ -14261,6 +14272,8 @@ def _enqueue_operational_gate_reviewer_recovery(
             merge_ready=False,
             operational_gate_review_enqueued_at=float(now),
             operational_gate_review_job_id=child_id,
+            operational_gate_review_schema_version=review_schema_version,
+            operational_gate_review_target_slice_id=target_slice_id,
             operational_gate_review_reason=str(gate_reason or "").strip(),
             live_at=float(now),
         )
