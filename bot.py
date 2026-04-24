@@ -14140,6 +14140,144 @@ def _enqueue_proactive_local_architect_reseed(
     return True
 
 
+def _enqueue_operational_gate_reviewer_recovery(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_row: dict[str, Any],
+    children: list[Task],
+    root_trace: dict[str, Any],
+    chat_id: int,
+    now: float,
+    gate_reason: str,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid:
+        return False
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(
+        _is_local_support_role_name(_coerce_orchestrator_role(str(getattr(child, "role", "") or "")))
+        and str(getattr(child, "state", "") or "").strip().lower() in active_states
+        for child in children
+    ):
+        return False
+    try:
+        last_enqueued_at = float(root_trace.get("operational_gate_review_enqueued_at", 0.0) or 0.0)
+    except Exception:
+        last_enqueued_at = 0.0
+    try:
+        cooldown_s = max(
+            300.0,
+            float(os.environ.get("BOT_OPERATIONAL_GATE_REVIEW_COOLDOWN_SECONDS", "1200").strip() or "1200"),
+        )
+    except Exception:
+        cooldown_s = 1200.0
+    if last_enqueued_at > 0 and (float(now) - last_enqueued_at) < cooldown_s:
+        return False
+
+    latest_impl_summary = ""
+    latest_review_summary = ""
+    for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
+        role = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        if str(getattr(child, "state", "") or "").strip().lower() != "done":
+            continue
+        summary = _task_local_specialist_response(child, max_chars=5000)
+        if not summary:
+            trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
+            summary = str(trace.get("result_summary") or "").strip()
+        if (not latest_impl_summary) and role in {"backend", "frontend", "implementer_local"}:
+            latest_impl_summary = str(summary or "").strip()
+        if (not latest_review_summary) and role in {"qa", "reviewer_local"}:
+            latest_review_summary = str(summary or "").strip()
+        if latest_impl_summary and latest_review_summary:
+            break
+
+    stamp = max(1, int(now))
+    review_key = f"local_review_operational_gate_{stamp}"
+    child_id = str(uuid.uuid4())
+    role = "reviewer_local"
+    profile = _orchestrator_profile(profiles, role)
+    model = _orchestrator_model_for_profile(cfg, profile)
+    effort = _orchestrator_effort_for_profile(profile, cfg)
+    order_branch = str(root_trace.get("order_branch") or "").strip()
+    repo_id = str(root_trace.get("repo_id") or "").strip()
+    repo_path = str(root_trace.get("repo_path") or "").strip()
+    task = Task.new(
+        source="telegram",
+        role=role,
+        input_text=(
+            f"Operational gate recovery review for ticket {oid}.\n"
+            f"Gate blocked merge because: {str(gate_reason or '').strip() or 'unknown'}.\n"
+            f"Repo ID: {repo_id or '(unknown)'}\n"
+            f"Repo path: {repo_path or '(unknown)'}\n"
+            f"Order branch: {order_branch or '(unknown)'}\n\n"
+            "Goal: verify the latest implementer slice with real commands and decide if it is safe to merge.\n"
+            "Do not modify files. Do not mark READY if any required validation is only implied or still pending.\n\n"
+            "Latest implementer summary:\n"
+            f"{latest_impl_summary or '(missing)'}\n\n"
+            "Latest review summary:\n"
+            f"{latest_review_summary or '(missing)'}\n\n"
+            "Required output:\n"
+            "- READY only if the branch has a concrete validated improvement and all requested validation has actually run or has a grounded equivalent.\n"
+            "- NEEDS_REWORK with exact failing command and next implementer instruction if anything remains unverified.\n"
+            "- BLOCKED_WITH_ROOT_CAUSE only for an external blocker that cannot be fixed in this repo."
+        ),
+        request_type="task",
+        priority=2,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id=oid,
+        owner="scheduler",
+        depends_on=[],
+        ttl_seconds=1800,
+        max_retries=0,
+        labels={"ticket": oid, "kind": "subtask", "key": review_key, "order": oid, "recovery": "operational_gate"},
+        artifacts_dir=str((cfg.artifacts_root / child_id).resolve()),
+        trace={
+            "source": "operational_maturity_gate",
+            "slice_id": review_key,
+            "slice_status": "review",
+            "quality_gate_status": "review",
+            "failure_class": "review_required",
+            "operational_gate_reason": str(gate_reason or "").strip(),
+            "order_branch": order_branch,
+            "repo_id": repo_id,
+            "repo_path": repo_path,
+        },
+        job_id=child_id,
+    )
+    orch_q.submit_task(task)
+    try:
+        orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+        orch_q.update_trace(
+            oid,
+            merge_ready=False,
+            operational_gate_review_enqueued_at=float(now),
+            operational_gate_review_job_id=child_id,
+            operational_gate_review_reason=str(gate_reason or "").strip(),
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.operational_gate_review_enqueued",
+            actor="skynet",
+            details={
+                "order_id": oid,
+                "job_id": child_id,
+                "reason": str(gate_reason or "").strip(),
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _enqueue_order_autopilot_task(
     *,
     cfg: BotConfig,
@@ -14195,7 +14333,58 @@ def _enqueue_order_autopilot_task(
             )
         except Exception:
             merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
+            repo_dir = Path(str(root_trace.get("repo_path") or ".")).expanduser()
+            default_branch = str(root_trace.get("repo_default_branch") or "main").strip() or "main"
         if merge_required or bool(root_trace.get("merge_ready", False)):
+            try:
+                gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=int(chat_id),
+                    repo_dir=repo_dir,
+                    default_branch=default_branch,
+                    merge_required=bool(merge_required),
+                    now=float(now),
+                )
+            except Exception as exc:
+                gate_ok = False
+                gate_reason = f"operational_gate_exception:{type(exc).__name__}"
+                gate_payload = {"operational_gate_checked_at": float(now)}
+            if not gate_ok:
+                try:
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+                    orch_q.update_trace(
+                        oid,
+                        merge_ready=False,
+                        autopilot_deferred_to_merge=False,
+                        autopilot_merge_gate_blocked_reason=str(gate_reason),
+                        operational_gate_status="blocked",
+                        operational_gate_reason=str(gate_reason),
+                        live_at=float(now),
+                        **gate_payload,
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.autopilot_merge_defer_blocked",
+                        actor="skynet",
+                        details={
+                            "order_id": oid,
+                            "reason": str(gate_reason),
+                        },
+                    )
+                except Exception:
+                    pass
+                return _enqueue_operational_gate_reviewer_recovery(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    profiles=profiles,
+                    order_row=order_row,
+                    children=list(children or []),
+                    root_trace=dict(root_trace),
+                    chat_id=int(chat_id),
+                    now=float(now),
+                    gate_reason=str(gate_reason),
+                )
             try:
                 orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
                 orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="ready_for_merge")
@@ -14205,7 +14394,10 @@ def _enqueue_order_autopilot_task(
                     merge_ready_at=float(now),
                     autopilot_deferred_to_merge=True,
                     autopilot_deferred_to_merge_at=float(now),
+                    operational_gate_status="passed",
+                    operational_gate_reason=str(gate_reason),
                     live_at=float(now),
+                    **gate_payload,
                     **_merge_ready_trace_reset_payload(now=float(now)),
                 )
                 orch_q.append_audit_event(
