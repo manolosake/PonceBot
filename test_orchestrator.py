@@ -3689,10 +3689,11 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             root = q.get_job(order_id)
             assert order is not None and root is not None
             trace = dict(root.trace or {})
-            self.assertEqual(str(order.get("phase") or ""), "review")
-            self.assertEqual(str(root.state), "blocked")
-            self.assertEqual(str(root.blocked_reason or ""), "merge_no_delta")
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            self.assertEqual(str(root.state), "failed")
             self.assertFalse(bool(trace.get("merge_ready", False)))
+            self.assertTrue(bool(trace.get("merge_no_delta_active", False)))
             self.assertEqual(str(trace.get("result_status") or ""), "merge_no_delta")
 
     def test_merge_conflict_enqueues_skynet_resolution_job(self) -> None:

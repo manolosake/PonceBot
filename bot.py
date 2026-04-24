@@ -10881,7 +10881,7 @@ def _order_command_text(
             if no_delta:
                 orch_q.update_state(
                     root_id,
-                    "blocked",
+                    "failed",
                     blocked_reason="merge_no_delta",
                     merge_ready=False,
                     merge_error=err_txt,
@@ -10896,8 +10896,8 @@ def _order_command_text(
                     ),
                     result_next_action="Replan the order or retire the no-delta branch.",
                 )
-                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
-                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
         except Exception:
             pass
         try:
@@ -11888,7 +11888,16 @@ def _auto_merge_ready_orders_tick(
                 after_order = orch_q.get_order(oid, chat_id=chat_for_order) or {}
                 after_root = orch_q.get_job(oid)
                 after_trace = dict((after_root.trace or {}) if after_root else {})
-                merged_ok = bool(after_trace.get("merged_to_main", False)) or str(after_order.get("status") or "").strip().lower() == "done"
+                terminal_no_delivery = str(after_trace.get("result_status") or "").strip().lower() in {
+                    "merge_no_delta",
+                }
+                merged_ok = (
+                    not terminal_no_delivery
+                    and (
+                        bool(after_trace.get("merged_to_main", False))
+                        or str(after_order.get("status") or "").strip().lower() == "done"
+                    )
+                )
             except Exception:
                 merged_ok = False
 
