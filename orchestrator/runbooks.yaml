@@ -58,10 +58,12 @@
   interval_seconds: 3600
   mode_hint: ro
   priority: 2
-  enabled: true
+  enabled: false
   prompt: |
     Lane: factory
-    Proactive local seed for objective snapshot. Focus on actionable improvements only.
+    Disabled: root-level local seed work produced patches without the Skynet
+    order/review/merge/deploy path. Proactivity should flow through
+    Skynet/Jarvis orders so changes are reviewed, merged, and deployed.
 
 - id: idle_no_open_jobs
   role: sre
