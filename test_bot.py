@@ -4594,6 +4594,61 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
         self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
 
+    def test_recovery_funnel_closes_after_root_verified_signal_and_qa_ready(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="blocked",
+            trace={
+                "result_status": "blocked",
+                "structured_digest": {
+                    "summary": "VERIFIED_IMPROVEMENT: hardened CSV ingestion and added regression coverage.",
+                },
+            },
+            labels={},
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_recover_csv_overflow"},
+                trace={
+                    "result_summary": "Applied bounded fix with validation evidence.",
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {"changed_files": ["server/csv_data.py", "test_csv_data.py"], "validation_ok": True},
+                },
+                created_at=110.0,
+                updated_at=120.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_review_recover_csv_overflow"},
+                trace={"result_summary": "READY: validation passed and the recovery slice is scoped."},
+                created_at=125.0,
+                updated_at=130.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return list(children) if parent_job_id == "root" else []
+
+        funnel = bot._collect_order_local_autonomy_funnel(orch_q=FakeQueue(), root_ticket="root", now=140.0)
+
+        self.assertEqual(funnel["quality_gate_status"], "closed")
+        self.assertEqual(funnel["slices_closed"], 1)
+        self.assertTrue(funnel["improvement_verified"])
+        self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
     def test_sync_order_phase_keeps_proactive_order_in_review_when_qa_needs_rework(self) -> None:
         root = SimpleNamespace(
             job_id="root",

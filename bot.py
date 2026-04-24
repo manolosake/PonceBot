@@ -15803,7 +15803,7 @@ def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
     key_norm = str(key or "").strip().lower()
     if not key_norm:
         return _sanitize_slice_token(fallback, fallback="slice")
-    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground)_(.+)$", key_norm)
+    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground|recover)_(.+)$", key_norm)
     if m:
         return _sanitize_slice_token(m.group(1), fallback=fallback)
     for suffix in (
@@ -15881,6 +15881,8 @@ def _summary_has_verified_improvement_signal(text: str) -> bool:
     if not blob:
         return False
     compact = re.sub(r"\s+", " ", blob)
+    if re.search(r"^verified[_ ]improvement\s*[:\-]", compact):
+        return True
     if re.search(r"^(pass|status|decision)\s*:\s*verified[_ ]improvement\b", compact):
         return True
     return bool(re.search(r"\bpass\b.{0,80}\bverified[_ ]improvement\b", compact))
@@ -16099,6 +16101,31 @@ def _collect_order_local_autonomy_funnel(
     implementer_failures = 0
     loop_breaker_count = 0
     controller_verifications_no_slice: list[float] = []
+
+    try:
+        root_job = orch_q.get_job(rid)
+    except Exception:
+        root_job = None
+    root_trace = dict((getattr(root_job, "trace", {}) or {}) if root_job and isinstance(getattr(root_job, "trace", {}), dict) else {})
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    root_summary = str(root_trace.get("result_summary") or "").strip()
+    root_digest = root_trace.get("structured_digest")
+    root_digest_summary = ""
+    if isinstance(root_digest, dict):
+        root_digest_summary = str(root_digest.get("summary") or "").strip()
+    root_has_verified_signal = bool(
+        root_state in {"done", "blocked"}
+        and (
+            bool(root_trace.get("improvement_verified", False))
+            or _summary_has_verified_improvement_signal(root_summary)
+            or _summary_has_verified_improvement_signal(root_digest_summary)
+        )
+    )
+    if root_has_verified_signal:
+        # A controller write-policy recovery can leave the root blocked after it
+        # identifies the improvement. Once backend + QA validate the replayed
+        # slice, this root signal acts as the controller verification.
+        controller_verifications_no_slice.append(now_ts)
 
     for child in children:
         role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
