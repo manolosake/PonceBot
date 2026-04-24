@@ -4999,6 +4999,73 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(reason, "passed")
         self.assertEqual(payload["operational_gate_root_state"], "done")
 
+    def test_operational_maturity_sweep_corrects_late_ready_writer(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="blocked",
+            trace={"merge_ready": True, "order_branch": "feature/order-root"},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.phases: list[str] = []
+                self.statuses: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def list_orders_global(self, status: str, limit: int = 240):
+                return [
+                    {
+                        "order_id": "root",
+                        "chat_id": 1,
+                        "status": "active",
+                        "phase": "ready_for_merge",
+                        "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                        "body": "AUTONOMOUS PROACTIVE SPRINT",
+                    }
+                ]
+
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return self.list_orders_global(status="active")[0]
+
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return []
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+        with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+            bot, "_order_trace_requires_merge", return_value=(True, "feature/order-root")
+        ):
+            corrected = bot._operational_maturity_sweep_tick(cfg=None, orch_q=q, now=123.0)
+
+        self.assertEqual(corrected, 1)
+        self.assertEqual(q.statuses[-1], "active")
+        self.assertEqual(q.phases[-1], "review")
+        self.assertFalse(root.trace["merge_ready"])
+        self.assertEqual(root.trace["operational_gate_reason"], "root_job_still_blocked")
+        self.assertEqual(q.audit_events[-1]["details"]["source"], "maturity_sweep")
+
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:

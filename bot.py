@@ -12246,6 +12246,106 @@ def _auto_merge_ready_orders_tick(
     return merged_count
 
 
+def _operational_maturity_sweep_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    now: float,
+) -> int:
+    """
+    Final fail-closed sweep for readiness states.
+
+    Multiple autonomous loops can write ready_for_merge. This sweep runs late in
+    the scheduler cycle so unsafe readiness cannot survive just because another
+    tick wrote it after the normal phase sync or auto-merge guard.
+    """
+    try:
+        rows = list(orch_q.list_orders_global(status="active", limit=240) or [])
+    except Exception:
+        return 0
+    corrected = 0
+    for row in rows:
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        try:
+            root = orch_q.get_job(oid)
+            trace = dict((root.trace or {}) if root else {})
+        except Exception:
+            root = None
+            trace = {}
+        phase = str(row.get("phase") or "").strip().lower()
+        if phase != "ready_for_merge" and not bool(trace.get("merge_ready", False)):
+            continue
+        try:
+            _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+            )
+            merge_required, _branch = _order_trace_requires_merge(
+                trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=bool(merge_required),
+                now=float(now),
+            )
+        except Exception as exc:
+            gate_ok = False
+            gate_reason = f"operational_gate_exception:{type(exc).__name__}"
+            gate_payload = {"operational_gate_checked_at": float(now)}
+        if gate_ok:
+            try:
+                orch_q.update_trace(
+                    oid,
+                    operational_gate_status="passed",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=float(now),
+                    **gate_payload,
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                oid,
+                merge_ready=False,
+                operational_gate_status="blocked",
+                operational_gate_reason=str(gate_reason),
+                live_at=float(now),
+                **gate_payload,
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_blocked",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "reason": str(gate_reason),
+                    "source": "maturity_sweep",
+                },
+            )
+            corrected += 1
+        except Exception:
+            pass
+    return corrected
+
+
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 
@@ -30320,6 +30420,14 @@ def main() -> None:
                         )
                     except Exception:
                         LOG.exception("Active-order watchdog tick failed")
+                    try:
+                        _operational_maturity_sweep_tick(
+                            cfg=cfg,
+                            orch_q=orchestrator_queue,
+                            now=time.time(),
+                        )
+                    except Exception:
+                        LOG.exception("Operational maturity sweep tick failed")
 
                 if notify_chat_id is None:
                     return
