@@ -11642,6 +11642,125 @@ def _jarvis_auto_approve_merge_enabled() -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+_OPERATIONAL_GATE_LIVE_STATES = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+_OPERATIONAL_GATE_BAD_TERMINAL_STATES = {"failed", "cancelled", "canceled"}
+
+
+def _operational_gate_is_live_state(state: str) -> bool:
+    return str(state or "").strip().lower() in _OPERATIONAL_GATE_LIVE_STATES
+
+
+def _git_dirty_status_lines(repo_dir: Path, *, limit: int = 20) -> list[str]:
+    try:
+        repo = Path(repo_dir)
+    except Exception:
+        return []
+    if not (repo / ".git").exists():
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            text=True,
+            capture_output=True,
+            timeout=8,
+        )
+    except Exception as exc:
+        return [f"git_status_error:{type(exc).__name__}"]
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return [f"git_status_failed:{err[0][:160] if err else proc.returncode}"]
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    return lines[: max(1, int(limit))]
+
+
+def _order_operational_maturity_gate(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    repo_dir: Path,
+    default_branch: str,
+    merge_required: bool,
+    now: float,
+) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Fail closed before Jarvis auto-merges or marks an order done.
+
+    This gate intentionally centralizes the high-risk operational checks that
+    previously lived as scattered assumptions in the sync/merge flow.
+    """
+    oid = str(order_id or "").strip()
+    payload: dict[str, Any] = {
+        "operational_gate_checked_at": float(now),
+        "operational_gate_default_branch": str(default_branch or "").strip() or "main",
+    }
+    if not oid:
+        return False, "missing_order_id", payload
+    try:
+        order = orch_q.get_order(oid, chat_id=int(chat_id)) or {}
+    except Exception:
+        order = {}
+    if not isinstance(order, dict) or not order:
+        return False, "missing_order_record", payload
+
+    try:
+        root = orch_q.get_job(oid)
+    except Exception:
+        root = None
+    if root is None:
+        return False, "missing_root_job", payload
+
+    root_state = str(getattr(root, "state", "") or "").strip().lower()
+    payload["operational_gate_root_state"] = root_state
+    if _operational_gate_is_live_state(root_state):
+        return False, f"root_job_still_{root_state}", payload
+
+    trace = dict((getattr(root, "trace", None) or {}) if root is not None else {})
+    if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES:
+        delivered = bool(trace.get("merged_to_main", False)) or bool(trace.get("proactive_blocked_with_root_cause", False))
+        if not delivered:
+            return False, f"root_job_terminal_{root_state}_without_delivery", payload
+
+    try:
+        children = list(orch_q.jobs_by_parent(parent_job_id=oid, limit=600) or [])
+    except Exception:
+        children = []
+    live_children = [
+        str(getattr(child, "job_id", "") or "") or str(getattr(child, "role", "") or "child")
+        for child in children
+        if _operational_gate_is_live_state(str(getattr(child, "state", "") or ""))
+    ]
+    if live_children:
+        payload["operational_gate_live_children"] = live_children[:12]
+        return False, "child_jobs_still_active", payload
+
+    if str(trace.get("deploy_status") or "").strip().lower() == "failed":
+        return False, "deploy_failed", payload
+
+    if not merge_required:
+        return True, "passed_no_merge_required", payload
+
+    if not bool(trace.get("merge_ready", False)):
+        return False, "merge_not_ready", payload
+
+    if _is_proactive_order_record(order):
+        closed = (
+            bool(trace.get("merged_to_main", False))
+            or bool(trace.get("proactive_improvement_closed", False))
+            or bool(trace.get("proactive_no_change_validated", False))
+            or bool(trace.get("proactive_blocked_with_root_cause", False))
+        )
+        if not closed:
+            return False, "proactive_quality_gate_not_closed", payload
+
+    dirty = _git_dirty_status_lines(repo_dir)
+    if dirty:
+        payload["operational_gate_dirty_paths"] = dirty
+        return False, "repo_dirty_before_merge", payload
+
+    return True, "passed", payload
+
+
 def _auto_merge_ready_orders_tick(
     *,
     cfg: BotConfig,
@@ -11796,10 +11915,60 @@ def _auto_merge_ready_orders_tick(
             )
             refreshed = orch_q.get_order(oid, chat_id=int(chat_for_order)) or {}
             phase = str(refreshed.get("phase") or phase).strip().lower()
+            root = orch_q.get_job(oid)
+            trace = dict((root.trace or {}) if root else {})
+            merge_required_now, _branch = _order_trace_requires_merge(
+                trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
         except Exception:
             pass
         if phase != "ready_for_merge":
             continue
+        gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+            orch_q=orch_q,
+            order_id=oid,
+            chat_id=int(chat_for_order),
+            repo_dir=repo_dir,
+            default_branch=default_branch,
+            merge_required=bool(merge_required_now),
+            now=float(now),
+        )
+        if not gate_ok:
+            try:
+                orch_q.set_order_status(oid, chat_id=chat_for_order, status="active")
+                orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="review")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=float(now),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="jarvis",
+                    details={
+                        "order_id": oid,
+                        "reason": str(gate_reason),
+                        "payload": gate_payload,
+                    },
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            orch_q.update_trace(
+                oid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=float(now),
+                **gate_payload,
+            )
+        except Exception:
+            pass
         deploy_failed = str(trace.get("deploy_status") or "").strip().lower() == "failed"
         if bool(trace.get("merged_to_main", False)) and not merge_required_now and (not deploy_failed):
             try:

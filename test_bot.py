@@ -4744,6 +4744,163 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.phases[-1], "review")
         self.assertFalse(any(update.get("merge_ready") is True for update in q.trace_updates))
 
+    def _operational_gate_queue(
+        self,
+        *,
+        root_state: str = "done",
+        root_trace: dict[str, object] | None = None,
+        children: list[SimpleNamespace] | None = None,
+    ):
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state=root_state,
+            trace=dict(root_trace or {}),
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+
+        class FakeQueue:
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return {
+                    "order_id": order_id,
+                    "chat_id": chat_id,
+                    "status": "active",
+                    "phase": "ready_for_merge",
+                    "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                }
+
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return list(children or []) if parent_job_id == "root" else []
+
+        return FakeQueue()
+
+    def _init_git_repo(self, repo: Path, *, clean_commit: bool) -> None:
+        subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if clean_commit:
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            (repo / "README.md").write_text("test\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "commit", "-m", "Initial test commit"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def test_operational_gate_blocks_running_root_even_when_merge_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            q = self._operational_gate_queue(
+                root_state="running",
+                root_trace={"merge_ready": True, "proactive_improvement_closed": True},
+            )
+
+            ok, reason, payload = bot._order_operational_maturity_gate(
+                orch_q=q,
+                order_id="root",
+                chat_id=1,
+                repo_dir=Path(td),
+                default_branch="main",
+                merge_required=True,
+                now=123.0,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "root_job_still_running")
+        self.assertEqual(payload["operational_gate_root_state"], "running")
+
+    def test_operational_gate_blocks_failed_root_with_pass_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            q = self._operational_gate_queue(
+                root_state="failed",
+                root_trace={
+                    "merge_ready": True,
+                    "proactive_improvement_closed": True,
+                    "result_summary": "PASS: verified improvement.",
+                },
+            )
+
+            ok, reason, _payload = bot._order_operational_maturity_gate(
+                orch_q=q,
+                order_id="root",
+                chat_id=1,
+                repo_dir=Path(td),
+                default_branch="main",
+                merge_required=True,
+                now=123.0,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "root_job_terminal_failed_without_delivery")
+
+    def test_operational_gate_blocks_dirty_repo_before_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._init_git_repo(repo, clean_commit=False)
+            (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            q = self._operational_gate_queue(
+                root_state="done",
+                root_trace={"merge_ready": True, "proactive_improvement_closed": True},
+            )
+
+            ok, reason, payload = bot._order_operational_maturity_gate(
+                orch_q=q,
+                order_id="root",
+                chat_id=1,
+                repo_dir=repo,
+                default_branch="main",
+                merge_required=True,
+                now=123.0,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(reason, "repo_dirty_before_merge")
+        self.assertTrue(any("dirty.txt" in line for line in payload["operational_gate_dirty_paths"]))
+
+    def test_operational_gate_passes_closed_proactive_clean_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._init_git_repo(repo, clean_commit=True)
+            q = self._operational_gate_queue(
+                root_state="done",
+                root_trace={"merge_ready": True, "proactive_improvement_closed": True},
+            )
+
+            ok, reason, payload = bot._order_operational_maturity_gate(
+                orch_q=q,
+                order_id="root",
+                chat_id=1,
+                repo_dir=repo,
+                default_branch="main",
+                merge_required=True,
+                now=123.0,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "passed")
+        self.assertEqual(payload["operational_gate_root_state"], "done")
+
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
