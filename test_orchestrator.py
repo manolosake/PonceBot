@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import bot
@@ -2942,6 +2943,63 @@ class TestRetryScheduling(unittest.TestCase):
             assert refreshed is not None
             self.assertEqual(refreshed.state, "queued")
             self.assertEqual(refreshed.retry_count, 1)
+            self.assertIsNotNone(refreshed.due_at)
+
+    def test_worker_requeues_failed_job_without_structured_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = _cfg(Path(td) / "state.json", workdir=Path(td))
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            task = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="unstable backend task",
+                request_type="task",
+                priority=1,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                retry_count=0,
+                max_retries=2,
+                job_id="retry-no-structured-digest-job",
+            )
+            job_id = q.submit_task(task)
+            stop_event = threading.Event()
+
+            class API:
+                def send_message(
+                    self, _chat_id: int, _text: str, *, reply_to_message_id: int | None = None
+                ) -> None:
+                    return None
+
+            def _fake_run(_task: Task, *, executor: object, cfg: object) -> SimpleNamespace:
+                stop_event.set()
+                return SimpleNamespace(
+                    status="failed",
+                    summary="worker runtime failed before structured payload",
+                    next_action="manual_requeue_if_needed",
+                    artifacts=[],
+                    logs="runtime exploded",
+                )
+
+            with patch.object(bot, "run_orchestrator_task", side_effect=_fake_run):
+                bot.orchestrator_worker_loop(
+                    cfg=cfg,
+                    api=API(),  # type: ignore[arg-type]
+                    orch_q=q,
+                    stop_event=stop_event,
+                    profiles={},
+                )
+
+            refreshed = q.get_job(job_id)
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.state, "queued")
+            self.assertEqual(int(refreshed.retry_count or 0), 1)
             self.assertIsNotNone(refreshed.due_at)
 
 

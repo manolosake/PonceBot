@@ -25305,6 +25305,10 @@ def orchestrator_worker_loop(
             # Retry/backoff: if task fails and retries remain, requeue with due_at.
             retry_policy = str(next_action or "").strip().lower()
             retry_allowed = retry_policy in ("retry", "retry_transient", "retry_controlled", "")
+            # Some runtime failures return no structured digest and a generic/manual next_action.
+            # Keep retries alive in that case when max_retries still allows another attempt.
+            if orch_state == "failed" and (not isinstance(structured_digest, (dict, list))):
+                retry_allowed = True
             failure_class = str(result_meta.get("failure_class") or "").strip().lower()
             retry_cap = int(task.max_retries or 0)
             if role_norm_task == "implementer_local":
