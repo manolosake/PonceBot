@@ -14200,6 +14200,27 @@ def _enqueue_operational_gate_reviewer_recovery(
         if latest_impl_summary and latest_review_summary:
             break
 
+    if not latest_impl_slice_id:
+        try:
+            orch_q.update_trace(
+                oid,
+                operational_gate_review_skip_reason="missing_implementer_delivery_slice",
+                operational_gate_review_reason=str(gate_reason or "").strip(),
+                live_at=float(now),
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_review_skipped",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "reason": str(gate_reason or "").strip(),
+                    "skip_reason": "missing_implementer_delivery_slice",
+                },
+            )
+        except Exception:
+            pass
+        return False
+
     stamp = max(1, int(now))
     review_key = f"local_review_operational_gate_{stamp}"
     target_slice_id = _sanitize_slice_token(latest_impl_slice_id, fallback=review_key)

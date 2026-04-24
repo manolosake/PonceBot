@@ -4907,6 +4907,127 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
 
+    def _operational_gate_recovery_cfg(self, td: str) -> bot.BotConfig:
+        base = TestStateHandling()._cfg(Path(td) / "state.json")
+        return bot.BotConfig(**{**base.__dict__, "artifacts_root": Path(td) / "artifacts"})
+
+    def test_operational_gate_reviewer_recovery_skips_without_implementer_delivery_slice(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.submitted: list[bot.Task] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        children = [
+            SimpleNamespace(
+                job_id="qa",
+                role="reviewer_local",
+                state="done",
+                labels={"key": "local_review_operational_gate_123"},
+                trace={"result_summary": "READY. Validation passed."},
+                created_at=120.0,
+                updated_at=130.0,
+            ),
+            SimpleNamespace(
+                job_id="arch",
+                role="architect_local",
+                state="done",
+                labels={"key": "local_arch_guard_plan"},
+                trace={"result_summary": "Planned recovery."},
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue()
+            enqueued = bot._enqueue_operational_gate_reviewer_recovery(
+                cfg=self._operational_gate_recovery_cfg(td),
+                orch_q=q,
+                profiles=None,
+                order_row={"order_id": "root"},
+                children=children,
+                root_trace={},
+                chat_id=1,
+                now=123.0,
+                gate_reason="root_job_still_running",
+            )
+
+        self.assertFalse(enqueued)
+        self.assertEqual(q.submitted, [])
+        self.assertTrue(
+            any(update.get("operational_gate_review_skip_reason") == "missing_implementer_delivery_slice" for update in q.trace_updates)
+        )
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.operational_gate_review_skipped")
+
+    def test_operational_gate_reviewer_recovery_targets_done_implementer_slice(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.submitted: list[bot.Task] = []
+                self.statuses: list[str] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="implementer_local",
+                state="done",
+                labels={"key": "local_impl_guard_slice1"},
+                trace={
+                    "slice_id": "impl_delivery_slice",
+                    "result_summary": "Implemented reliability fix and ran focused unittest.",
+                },
+                created_at=100.0,
+                updated_at=120.0,
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue()
+            enqueued = bot._enqueue_operational_gate_reviewer_recovery(
+                cfg=self._operational_gate_recovery_cfg(td),
+                orch_q=q,
+                profiles=None,
+                order_row={"order_id": "root"},
+                children=children,
+                root_trace={},
+                chat_id=1,
+                now=123.0,
+                gate_reason="root_job_still_running",
+            )
+
+        self.assertTrue(enqueued)
+        self.assertEqual(len(q.submitted), 1)
+        self.assertEqual(q.submitted[0].role, "reviewer_local")
+        self.assertEqual(q.submitted[0].trace["slice_id"], "impl_delivery_slice")
+        self.assertEqual(q.trace_updates[-1]["operational_gate_review_target_slice_id"], "impl_delivery_slice")
+
     def test_operational_gate_blocks_running_root_even_when_merge_ready(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             q = self._operational_gate_queue(
