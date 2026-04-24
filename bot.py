@@ -18675,6 +18675,67 @@ def _sync_order_phase_from_runtime(
 
     proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
 
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    root_blocked_with_root_cause = (
+        proactive_order
+        and root_state == "blocked"
+        and _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
+    )
+    if _operational_gate_is_live_state(root_state) and not root_blocked_with_root_cause:
+        try:
+            next_phase = "executing" if root_state == "running" else "delegated" if root_state in ("queued", "waiting_deps") else "review"
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase=next_phase)
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                operational_gate_status="blocked",
+                operational_gate_reason=f"root_job_still_{root_state}",
+                operational_gate_root_state=root_state,
+                operational_gate_checked_at=time.time(),
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_blocked",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "reason": f"root_job_still_{root_state}",
+                    "source": "phase_sync",
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES and not (
+        merged_to_main or bool(root_trace.get("proactive_blocked_with_root_cause", False))
+    ):
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                operational_gate_status="blocked",
+                operational_gate_reason=f"root_job_terminal_{root_state}_without_delivery",
+                operational_gate_root_state=root_state,
+                operational_gate_checked_at=time.time(),
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_blocked",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "reason": f"root_job_terminal_{root_state}_without_delivery",
+                    "source": "phase_sync",
+                },
+            )
+        except Exception:
+            pass
+        return
+
     if (
         proactive_order
         and (not any_live)
@@ -18697,10 +18758,56 @@ def _sync_order_phase_from_runtime(
             pass
         return
 
-    if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live:
+    proactive_has_pending_closure = bool(
+        proactive_order
+        and (not any_live)
+        and (
+            proactive_verified_no_change
+            or proactive_improvement_verified
+            or _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
+        )
+    )
+    if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live and not proactive_has_pending_closure:
         try:
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=True,
+                now=time.time(),
+            )
+            if not gate_ok:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=time.time(),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "reason": str(gate_reason),
+                        "source": "phase_sync",
+                    },
+                )
+                return
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            orch_q.update_trace(
+                rid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=time.time(),
+                **gate_payload,
+            )
             if not root_trace.get("merge_ready_at"):
                 orch_q.update_trace(rid, merge_ready_at=time.time(), live_at=time.time())
         except Exception:

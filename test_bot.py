@@ -4744,6 +4744,104 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.phases[-1], "review")
         self.assertFalse(any(update.get("merge_ready") is True for update in q.trace_updates))
 
+    def test_sync_order_phase_blocks_ready_for_merge_when_root_still_blocked(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            state="blocked",
+            trace={"order_branch": "feature/order-root", "merge_ready": True},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_guard_slice1"},
+                trace={
+                    "result_summary": "Implemented bounded fix with tests and evidence.",
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {"changed_files": ["bot.py"], "validation_ok": True},
+                },
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_impl_guard_slice1_qa"},
+                trace={"result_summary": "READY. Validation passed."},
+                created_at=120.0,
+                updated_at=130.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.phases: list[str] = []
+                self.statuses: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return {
+                    "order_id": order_id,
+                    "chat_id": chat_id,
+                    "status": "active",
+                    "phase": "ready_for_merge",
+                    "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                }
+
+            def get_job(self, job_id: str):
+                return root
+
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600):
+                return children
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+        with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+            bot, "_order_trace_requires_merge", return_value=(True, "feature/order-root")
+        ), patch.object(bot, "_order_has_meaningful_improvement", return_value=True), patch.object(
+            bot,
+            "_collect_order_local_autonomy_funnel",
+            return_value={
+                "slices_started": 1,
+                "slices_applied": 1,
+                "slices_validated": 1,
+                "slices_closed": 1,
+                "implementer_fail_rate": 0.0,
+                "mean_time_to_validated_improvement": None,
+                "loop_breaker_count": 0,
+                "quality_gate_status": "closed",
+                "improvement_verified": True,
+            },
+        ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False):
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
+
+        self.assertEqual(q.statuses[-1], "active")
+        self.assertEqual(q.phases[-1], "review")
+        self.assertTrue(any(update.get("merge_ready") is False for update in q.trace_updates))
+        self.assertTrue(any(update.get("operational_gate_reason") == "root_job_still_blocked" for update in q.trace_updates))
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.operational_gate_blocked")
+
     def _operational_gate_queue(
         self,
         *,
