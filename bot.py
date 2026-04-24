@@ -10883,6 +10883,12 @@ def _order_command_text(
                     root_id,
                     "blocked",
                     blocked_reason="merge_no_delta",
+                    merge_ready=False,
+                    merge_error=err_txt,
+                    merge_auto_error=err_txt,
+                    merge_auto_failed_at=failed_at,
+                    merge_no_delta_active=True,
+                    merge_no_delta_detected_at=failed_at,
                     result_status="merge_no_delta",
                     result_summary=(
                         "Merge refused: order branch has no diff against main; "
@@ -10890,6 +10896,8 @@ def _order_command_text(
                     ),
                     result_next_action="Replan the order or retire the no-delta branch.",
                 )
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="review")
         except Exception:
             pass
         try:

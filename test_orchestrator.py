@@ -3613,6 +3613,88 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertEqual(str(order.get("phase")), "done")
             self.assertEqual(str((root.trace or {}).get("deploy_status") or ""), "ok")
 
+    def test_merge_no_delta_blocks_order_without_retry_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            cfg = _cfg(td_path / "state.json", workdir=td_path / "base-repo")
+            cfg.codex_workdir.mkdir(parents=True, exist_ok=True)
+            repo_path = td_path / "repo-secondary"
+            repo_path.mkdir(parents=True, exist_ok=True)
+
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            q.upsert_repo(
+                repo_id="repo-secondary",
+                path=str(repo_path),
+                default_branch="main",
+                autonomy_enabled=True,
+                priority=1,
+                runtime_mode="ceo-bounded",
+                daily_budget=0.0,
+                status="active",
+                metadata={},
+            )
+            order_id = "ord-merge-no-delta"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Repo scoped no delta",
+                body="[repo:repo-secondary]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                phase="ready_for_merge",
+                project_id="proj-1",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="jarvis",
+                    input_text="root",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={
+                        "order_branch": "feature/repo-secondary",
+                        "repo_id": "repo-secondary",
+                        "repo_path": str(repo_path),
+                        "merge_ready": True,
+                    },
+                    job_id=order_id,
+                )
+            )
+
+            with patch.object(
+                bot,
+                "_merge_order_branch_to_main",
+                return_value=(False, "branch_has_no_delta_vs_main", None),
+            ):
+                msg = bot._order_command_text(
+                    cfg,
+                    q,
+                    chat_id=1,
+                    payload=f"merge {order_id}",
+                    user_id=2,
+                    actor="jarvis",
+                )
+
+            self.assertIn("branch_has_no_delta_vs_main", msg)
+            order = q.get_order(order_id, chat_id=1)
+            root = q.get_job(order_id)
+            assert order is not None and root is not None
+            trace = dict(root.trace or {})
+            self.assertEqual(str(order.get("phase") or ""), "review")
+            self.assertEqual(str(root.state), "blocked")
+            self.assertEqual(str(root.blocked_reason or ""), "merge_no_delta")
+            self.assertFalse(bool(trace.get("merge_ready", False)))
+            self.assertEqual(str(trace.get("result_status") or ""), "merge_no_delta")
+
     def test_merge_conflict_enqueues_skynet_resolution_job(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
