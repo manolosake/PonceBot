@@ -267,7 +267,8 @@ class TestStateHandling(unittest.TestCase):
 
     def test_no_write_forced_mode_can_be_overridden_for_host_sandbox_failures(self) -> None:
         cfg = self._cfg(Path(tempfile.gettempdir()) / "state.json")
-        self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "full"}):
             self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "workspace-write"}):
@@ -1693,27 +1694,28 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             original_file = globals_map.get("__file__")
             globals_map["__file__"] = str(repo_root / "bot.py")
             try:
-                specs = bot._apply_autonomous_local_first_policy(
-                    cfg=cfg,
-                    specs=[
-                        bot.TaskSpec(
-                            key="local_impl_guard_slice1_retry",
-                            role="implementer_local",
-                            text="Direct unblock implementation for ticket ticket-1 in bot.py",
-                            mode_hint="ro",
-                            priority=1,
-                            depends_on=[],
-                            requires_approval=False,
-                            acceptance_criteria=["Return a concrete diff."],
-                            definition_of_done=["Controller can apply the patch."],
-                            eta_minutes=30,
-                            sla_tier="high",
-                        )
-                    ],
-                    orch_q=_FakeQueue(),
-                    root_ticket="ticket-1",
-                    now=100.0,
-                )
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[
+                            bot.TaskSpec(
+                                key="local_impl_guard_slice1_retry",
+                                role="implementer_local",
+                                text="Direct unblock implementation for ticket ticket-1 in bot.py",
+                                mode_hint="ro",
+                                priority=1,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Return a concrete diff."],
+                                definition_of_done=["Controller can apply the patch."],
+                                eta_minutes=30,
+                                sla_tier="high",
+                            )
+                        ],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
             finally:
                 if original_file is not None:
                     globals_map["__file__"] = original_file
@@ -1841,44 +1843,45 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             original_file = globals_map.get("__file__")
             globals_map["__file__"] = str(repo_root / "bot.py")
             try:
-                specs = bot._apply_autonomous_local_first_policy(
-                    cfg=cfg,
-                    specs=[
-                        bot.TaskSpec(
-                            key="auto_architect_local_slice1",
-                            role="architect_local",
-                            text="Define a minimal verification checklist for the current slice.",
-                            mode_hint="ro",
-                            priority=2,
-                            depends_on=[],
-                            requires_approval=False,
-                            acceptance_criteria=["Return one checklist."],
-                            definition_of_done=["Checklist returned."],
-                            eta_minutes=5,
-                            sla_tier="normal",
-                        ),
-                        bot.TaskSpec(
-                            key="auto_implementer_local_slice1",
-                            role="implementer_local",
-                            text=(
-                                "Run verify-only slice: capture line evidence for _skill_segment_ok and execute one targeted parser test; no code changes.\n\n"
-                                "PRIMARY_ARCHITECT_HANDOFF:\n"
-                                f"{arch_summary}\n"
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[
+                            bot.TaskSpec(
+                                key="auto_architect_local_slice1",
+                                role="architect_local",
+                                text="Define a minimal verification checklist for the current slice.",
+                                mode_hint="ro",
+                                priority=2,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Return one checklist."],
+                                definition_of_done=["Checklist returned."],
+                                eta_minutes=5,
+                                sla_tier="normal",
                             ),
-                            mode_hint="ro",
-                            priority=2,
-                            depends_on=[],
-                            requires_approval=False,
-                            acceptance_criteria=["Return evidence only."],
-                            definition_of_done=["Validation completed."],
-                            eta_minutes=10,
-                            sla_tier="normal",
-                        ),
-                    ],
-                    orch_q=_FakeQueue(),
-                    root_ticket="ticket-1",
-                    now=100.0,
-                )
+                            bot.TaskSpec(
+                                key="auto_implementer_local_slice1",
+                                role="implementer_local",
+                                text=(
+                                    "Run verify-only slice: capture line evidence for _skill_segment_ok and execute one targeted parser test; no code changes.\n\n"
+                                    "PRIMARY_ARCHITECT_HANDOFF:\n"
+                                    f"{arch_summary}\n"
+                                ),
+                                mode_hint="ro",
+                                priority=2,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Return evidence only."],
+                                definition_of_done=["Validation completed."],
+                                eta_minutes=10,
+                                sla_tier="normal",
+                            ),
+                        ],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
             finally:
                 if original_file is not None:
                     globals_map["__file__"] = original_file
@@ -2027,13 +2030,14 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             original_file = globals_map.get("__file__")
             globals_map["__file__"] = str(repo_root / "bot.py")
             try:
-                specs = bot._apply_autonomous_local_first_policy(
-                    cfg=cfg,
-                    specs=[],
-                    orch_q=_FakeQueue(),
-                    root_ticket="ticket-1",
-                    now=100.0,
-                )
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
             finally:
                 if original_file is not None:
                     globals_map["__file__"] = original_file
@@ -2140,27 +2144,28 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             original_file = globals_map.get("__file__")
             globals_map["__file__"] = str(repo_root / "bot.py")
             try:
-                specs = bot._apply_autonomous_local_first_policy(
-                    cfg=cfg,
-                    specs=[
-                        bot.TaskSpec(
-                            key="auto_architect_local_slice1",
-                            role="architect_local",
-                            text="Plan another small slice.",
-                            mode_hint="ro",
-                            priority=2,
-                            depends_on=[],
-                            requires_approval=False,
-                            acceptance_criteria=["Return one plan."],
-                            definition_of_done=["Plan returned."],
-                            eta_minutes=10,
-                            sla_tier="normal",
-                        )
-                    ],
-                    orch_q=_FakeQueue(),
-                    root_ticket="ticket-1",
-                    now=100.0,
-                )
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[
+                            bot.TaskSpec(
+                                key="auto_architect_local_slice1",
+                                role="architect_local",
+                                text="Plan another small slice.",
+                                mode_hint="ro",
+                                priority=2,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Return one plan."],
+                                definition_of_done=["Plan returned."],
+                                eta_minutes=10,
+                                sla_tier="normal",
+                            )
+                        ],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
             finally:
                 if original_file is not None:
                     globals_map["__file__"] = original_file
@@ -3564,7 +3569,7 @@ class TestBypassAwareEnforcement(unittest.TestCase):
             state_file = Path(td) / "state.json"
             state_file.write_text("{}\n", encoding="utf-8")
             cfg = TestStateHandling()._cfg(state_file)
-            with patch("bot._effective_bypass_sandbox", return_value=True):
+            with patch.dict(os.environ, {}, clear=True), patch("bot._effective_bypass_sandbox", return_value=True):
                 forced = bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=123)  # type: ignore[attr-defined]
             self.assertEqual(forced, "ro")
 
@@ -4358,27 +4363,28 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
             original_file = globals_map.get("__file__")
             globals_map["__file__"] = str(repo_root / "bot.py")
             try:
-                specs = bot._apply_autonomous_local_first_policy(
-                    cfg=cfg,
-                    specs=[
-                        bot.TaskSpec(
-                            key="auto_architect_local_slice1",
-                            role="architect_local",
-                            text="Plan the next minimal bounded slice.",
-                            mode_hint="ro",
-                            priority=2,
-                            depends_on=[],
-                            requires_approval=False,
-                            acceptance_criteria=["Return one plan."],
-                            definition_of_done=["Plan returned."],
-                            eta_minutes=10,
-                            sla_tier="normal",
-                        )
-                    ],
-                    orch_q=_FakeQueue(),
-                    root_ticket="ticket-1",
-                    now=100.0,
-                )
+                with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}, clear=False):
+                    specs = bot._apply_autonomous_local_first_policy(
+                        cfg=cfg,
+                        specs=[
+                            bot.TaskSpec(
+                                key="auto_architect_local_slice1",
+                                role="architect_local",
+                                text="Plan the next minimal bounded slice.",
+                                mode_hint="ro",
+                                priority=2,
+                                depends_on=[],
+                                requires_approval=False,
+                                acceptance_criteria=["Return one plan."],
+                                definition_of_done=["Plan returned."],
+                                eta_minutes=10,
+                                sla_tier="normal",
+                            )
+                        ],
+                        orch_q=_FakeQueue(),
+                        root_ticket="ticket-1",
+                        now=100.0,
+                    )
             finally:
                 if original_file is not None:
                     globals_map["__file__"] = original_file
@@ -4477,6 +4483,61 @@ class TestImplementerFailureSelection(unittest.TestCase):
                 summary="FAILED_VALIDATION_OUTPUT: SyntaxError in tools/visual_preview_audit.py",
             )
         )
+
+
+class TestOrderBranchGitHelpers(unittest.TestCase):
+    def test_ensure_branch_fetches_default_branch_outside_narrow_refspec(self) -> None:
+        def run(cmd: list[str], cwd: Path | None = None) -> str:
+            return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            origin = root / "origin.git"
+            seed = root / "seed"
+            repo = root / "repo"
+
+            run(["git", "init", "--bare", str(origin)])
+            run(["git", "clone", str(origin), str(seed)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=seed)
+            run(["git", "config", "user.name", "test"], cwd=seed)
+            (seed / "marker.txt").write_text("main\n", encoding="utf-8")
+            run(["git", "add", "marker.txt"], cwd=seed)
+            run(["git", "commit", "-m", "main"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:main"], cwd=seed)
+
+            run(["git", "checkout", "-b", "codex/codexbot-workflow-v2"], cwd=seed)
+            (seed / "marker.txt").write_text("old default\n", encoding="utf-8")
+            run(["git", "commit", "-am", "old default"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:codex/codexbot-workflow-v2"], cwd=seed)
+
+            run(["git", "clone", "--branch", "main", str(origin), str(repo)])
+            run(["git", "config", "--replace-all", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"], cwd=repo)
+            run(
+                [
+                    "git",
+                    "fetch",
+                    "origin",
+                    "refs/heads/codex/codexbot-workflow-v2:refs/remotes/origin/codex/codexbot-workflow-v2",
+                ],
+                cwd=repo,
+            )
+            stale_default = run(["git", "rev-parse", "refs/remotes/origin/codex/codexbot-workflow-v2"], cwd=repo)
+
+            (seed / "marker.txt").write_text("new default\n", encoding="utf-8")
+            run(["git", "commit", "-am", "new default"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:codex/codexbot-workflow-v2"], cwd=seed)
+            latest_default = run(["git", "rev-parse", "HEAD"], cwd=seed)
+            self.assertNotEqual(stale_default, latest_default)
+
+            ok, msg = bot._git_ensure_branch_from_main(
+                repo,
+                "feature/order-test",
+                default_branch="codex/codexbot-workflow-v2",
+            )
+
+            self.assertTrue(ok, msg)
+            order_head = run(["git", "--git-dir", str(origin), "rev-parse", "refs/heads/feature/order-test"])
+            self.assertEqual(order_head, latest_default)
 
 
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):

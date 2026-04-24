@@ -73,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 LOG = logging.getLogger("codexbot")
+_MODULE_DATA_DB = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
 
 _STATE_STORES_LOCK = threading.Lock()
 _STATE_STORES_BY_PATH: dict[str, StateStore] = {}
@@ -7861,6 +7862,12 @@ def _git_fetch_remote_branch(repo: Path, branch: str) -> tuple[bool, str]:
     return False, detail or "branch_fetch_failed"
 
 
+def _git_refresh_default_branch_ref(repo: Path, default_branch: str) -> None:
+    b = str(default_branch or "").strip()
+    if b and b != "HEAD":
+        _git_fetch_remote_branch(repo, b)
+
+
 def _git_is_non_fast_forward_push_error(detail: str) -> bool:
     blob = str(detail or "").strip().lower()
     if not blob:
@@ -7953,6 +7960,7 @@ def _git_ensure_branch_from_main(
     if not b:
         return False, "branch_missing"
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    _git_refresh_default_branch_ref(repo, default_branch)
     if (
         _git_ref_exists(repo, f"refs/remotes/origin/{b}")
         or _git_ref_exists(repo, f"origin/{b}")
@@ -7985,6 +7993,7 @@ def _reconcile_order_branch_with_main(
 
     for attempt in range(max_push_attempts):
         _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        _git_refresh_default_branch_ref(repo, default_branch)
         remote_exists = (
             _git_ref_exists(repo, f"refs/remotes/origin/{b}")
             or _git_ref_exists(repo, f"origin/{b}")
@@ -16035,8 +16044,10 @@ def _classify_local_slice_failure(
     if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
+    if "no valid patches in input" in blob:
+        return "terminal"
+
     malformed_patch_markers = (
-        "no valid patches in input",
         "corrupt patch at line",
     )
     # Treat malformed diff formatting as recoverable/blocking, not terminal.
@@ -16882,8 +16893,19 @@ def _apply_autonomous_local_first_policy(
     rid = str(root_ticket or "").strip() or "ticket"
 
     def _latest_meta(role_name: str, *, states: tuple[str, ...] = ("done",), limit: int = 20) -> list[dict[str, Any]]:
-        db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
-        if not db_path.exists():
+        db_path: Path | None = None
+        storage = getattr(orch_q, "_storage", None)
+        storage_path = getattr(storage, "path", None)
+        if storage_path is not None:
+            try:
+                db_path = Path(storage_path)
+            except Exception:
+                db_path = None
+        if db_path is None:
+            candidate = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+            if candidate != _MODULE_DATA_DB and candidate.exists():
+                db_path = candidate
+        if db_path is None or not db_path.exists():
             db_rows = []
         else:
             normalized_states = tuple(
