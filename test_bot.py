@@ -4826,12 +4826,12 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 "slices_started": 1,
                 "slices_applied": 1,
                 "slices_validated": 1,
-                "slices_closed": 1,
+                "slices_closed": 0,
                 "implementer_fail_rate": 0.0,
                 "mean_time_to_validated_improvement": None,
                 "loop_breaker_count": 0,
-                "quality_gate_status": "closed",
-                "improvement_verified": True,
+                "quality_gate_status": "review",
+                "improvement_verified": False,
             },
         ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False):
             bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
@@ -4934,7 +4934,6 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 root_state="failed",
                 root_trace={
                     "merge_ready": True,
-                    "proactive_improvement_closed": True,
                     "result_summary": "PASS: verified improvement.",
                 },
             )
@@ -4951,6 +4950,29 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertEqual(reason, "root_job_terminal_failed_without_delivery")
+
+    def test_operational_gate_allows_blocked_root_after_recovered_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            self._init_git_repo(repo, clean_commit=True)
+            q = self._operational_gate_queue(
+                root_state="blocked",
+                root_trace={"merge_ready": True, "proactive_improvement_closed": True},
+            )
+
+            ok, reason, payload = bot._order_operational_maturity_gate(
+                orch_q=q,
+                order_id="root",
+                chat_id=1,
+                repo_dir=repo,
+                default_branch="main",
+                merge_required=True,
+                now=123.0,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(reason, "passed")
+        self.assertEqual(payload["operational_gate_root_state"], "blocked")
 
     def test_operational_gate_blocks_dirty_repo_before_merge(self) -> None:
         with tempfile.TemporaryDirectory() as td:

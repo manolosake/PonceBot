@@ -11712,13 +11712,19 @@ def _order_operational_maturity_gate(
 
     root_state = str(getattr(root, "state", "") or "").strip().lower()
     payload["operational_gate_root_state"] = root_state
-    if _operational_gate_is_live_state(root_state):
-        return False, f"root_job_still_{root_state}", payload
-
     trace = dict((getattr(root, "trace", None) or {}) if root is not None else {})
+    root_delivery_closed = (
+        bool(trace.get("merged_to_main", False))
+        or bool(trace.get("proactive_improvement_closed", False))
+        or bool(trace.get("proactive_no_change_validated", False))
+        or bool(trace.get("proactive_blocked_with_root_cause", False))
+    )
+    if _operational_gate_is_live_state(root_state):
+        if not (root_state == "blocked" and root_delivery_closed):
+            return False, f"root_job_still_{root_state}", payload
+
     if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES:
-        delivered = bool(trace.get("merged_to_main", False)) or bool(trace.get("proactive_blocked_with_root_cause", False))
-        if not delivered:
+        if not root_delivery_closed:
             return False, f"root_job_terminal_{root_state}_without_delivery", payload
 
     try:
@@ -18781,7 +18787,13 @@ def _sync_order_phase_from_runtime(
         and root_state == "blocked"
         and _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
     )
-    if _operational_gate_is_live_state(root_state) and not root_blocked_with_root_cause:
+    root_has_recovered_delivery = bool(
+        proactive_order
+        and root_state == "blocked"
+        and (not any_live)
+        and (proactive_verified_no_change or proactive_improvement_verified)
+    )
+    if _operational_gate_is_live_state(root_state) and not root_blocked_with_root_cause and not root_has_recovered_delivery:
         try:
             next_phase = "executing" if root_state == "running" else "delegated" if root_state in ("queued", "waiting_deps") else "review"
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
