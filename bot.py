@@ -18957,13 +18957,14 @@ def _sync_order_phase_from_runtime(
 
     latest_controller_terminal_summary = str(root_trace.get("result_summary") or "").strip()
     latest_controller_terminal_ts = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
-    any_controller_verified_improvement = bool(
-        _controller_verified_slice_for_closure(
-            orch_q=orch_q,
-            root_ticket=rid,
-            trace=root_trace,
-        )
-    ) and bool(root_trace.get("improvement_verified", False))
+    root_verified_slice = _controller_verified_slice_for_closure(
+        orch_q=orch_q,
+        root_ticket=rid,
+        trace=root_trace,
+    )
+    any_controller_verified_improvement = bool(root_verified_slice) and (
+        bool(root_trace.get("improvement_verified", False)) or proactive_order
+    )
     for child in phase_children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
