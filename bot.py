@@ -18469,6 +18469,28 @@ def _sync_order_phase_from_runtime(
 
     proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
 
+    if (
+        proactive_order
+        and (not any_live)
+        and (not proactive_verified_no_change)
+        and (not proactive_improvement_verified)
+        and (not _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary))
+    ):
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                proactive_quality_gate_blocked=True,
+                proactive_quality_gate_blocked_at=time.time(),
+                proactive_improvement_missing=(not proactive_evidence_ok),
+                live_at=time.time(),
+            )
+        except Exception:
+            pass
+        return
+
     if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live:
         try:
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")

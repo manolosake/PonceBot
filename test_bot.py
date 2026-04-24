@@ -4594,6 +4594,95 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
         self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
 
+    def test_sync_order_phase_keeps_proactive_order_in_review_when_qa_needs_rework(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            trace={"order_branch": "feature/order-root", "merge_ready": True},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_guard_slice1"},
+                trace={
+                    "result_summary": "Implemented bounded fix with tests and evidence.",
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {"changed_files": ["bot.py"], "validation_ok": True},
+                },
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+            SimpleNamespace(
+                role="qa",
+                state="done",
+                labels={"key": "local_impl_guard_slice1_qa"},
+                trace={"result_summary": "Verdict: NEEDS_REWORK. Blocking issue remains."},
+                created_at=120.0,
+                updated_at=130.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.phases: list[str] = []
+                self.statuses: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return {
+                    "order_id": order_id,
+                    "chat_id": chat_id,
+                    "status": "active",
+                    "phase": "review",
+                    "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                }
+
+            def get_job(self, job_id: str):
+                return root
+
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600):
+                return children
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+        q = FakeQueue()
+        with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+            bot, "_order_trace_requires_merge", return_value=(True, "feature/order-root")
+        ), patch.object(bot, "_order_has_meaningful_improvement", return_value=True), patch.object(
+            bot,
+            "_collect_order_local_autonomy_funnel",
+            return_value={
+                "slices_started": 1,
+                "slices_applied": 1,
+                "slices_validated": 1,
+                "slices_closed": 0,
+                "implementer_fail_rate": 0.0,
+                "mean_time_to_validated_improvement": None,
+                "loop_breaker_count": 0,
+                "quality_gate_status": "review",
+                "improvement_verified": False,
+            },
+        ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False):
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
+
+        self.assertEqual(q.statuses[-1], "active")
+        self.assertEqual(q.phases[-1], "review")
+        self.assertFalse(any(update.get("merge_ready") is True for update in q.trace_updates))
+
 
 class TestVoiceNormalization(unittest.TestCase):
     def test_normalize_tts_strips_sender_prefix(self) -> None:
