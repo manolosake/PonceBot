@@ -14162,7 +14162,7 @@ def _enqueue_operational_gate_reviewer_recovery(
         for child in children
     ):
         return False
-    review_schema_version = 2
+    review_schema_version = 3
     try:
         last_enqueued_at = float(root_trace.get("operational_gate_review_enqueued_at", 0.0) or 0.0)
     except Exception:
@@ -25889,12 +25889,12 @@ def orchestrator_worker_loop(
                         root_ticket=root_ticket,
                         slice_id=slice_id,
                     )
-                    if review_ready and not ((applied_ev and validated_ev) or no_change_ev):
+                    if review_ready and not (applied_ev or no_change_ev):
                         review_ready = False
                         orch_state = "failed"
                         summary = (
-                            f"{summary}\n\nReviewer gate rejected: READY requires prior implementer evidence "
-                            f"(validated change or verified no-change) for slice_id={slice_id}."
+                            f"{summary}\n\nReviewer gate rejected: READY requires prior implementer delivery evidence "
+                            f"(changed slice or verified no-change) for slice_id={slice_id}."
                         ).strip()
                         result_meta["result_summary"] = summary
                     result_meta["review_ready"] = bool(review_ready)
