@@ -77,6 +77,31 @@ class TestProactiveBlockerReplay(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["job_id"], "j-label")
 
+    def test_select_rows_falls_back_to_compact_label_json(self) -> None:
+        con = _mk_db()
+        now = time.time()
+        con.execute(
+            """
+            INSERT INTO jobs(job_id, role, state, depends_on, blocked_reason, updated_at, created_at, parent_job_id, labels)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "j-compact-label",
+                "qa",
+                "queued",
+                "[]",
+                "",
+                now,
+                now,
+                None,
+                '{"ticket":"t-compact","kind":"subtask"}',
+            ),
+        )
+        rows, strategy = pbr._select_rows_for_ticket(con, "t-compact")
+        self.assertEqual(strategy, "labels_ticket_fallback")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["job_id"], "j-compact-label")
+
 
 if __name__ == "__main__":
     unittest.main()

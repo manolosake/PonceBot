@@ -42,11 +42,15 @@ def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[li
             SELECT job_id, role, state, COALESCE(depends_on,'[]') AS depends_on,
                    COALESCE(blocked_reason,'') AS blocked_reason, updated_at
             FROM jobs
-            WHERE labels LIKE ?
+            WHERE (labels LIKE ? OR labels LIKE ?)
               AND state IN ({",".join("?" for _ in _ACTIVE_STATES)})
             ORDER BY created_at
             """,
-            (f'%"ticket": "{ticket_id}"%', *_ACTIVE_STATES),
+            (
+                f'%"ticket": "{ticket_id}"%',
+                f'%"ticket":"{ticket_id}"%',
+                *_ACTIVE_STATES,
+            ),
         ).fetchall()
     ]
     return rows, "labels_ticket_fallback"

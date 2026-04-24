@@ -181,7 +181,7 @@ class TestStateHandling(unittest.TestCase):
 
     def test_local_slice_expected_validation_cmd_keeps_py_compile_for_non_test_targets(self) -> None:
         cmd = bot._local_slice_expected_validation_cmd(["bot.py", "tools/health.py", "README.md"])
-        self.assertEqual(cmd, "python -m py_compile bot.py tools/health.py")
+        self.assertEqual(cmd, "python3 -m py_compile bot.py tools/health.py")
 
     def test_sync_github_pat_git_credentials_writes_store_and_global_config(self) -> None:
         with tempfile.TemporaryDirectory() as td:

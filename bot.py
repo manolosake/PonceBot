@@ -14716,7 +14716,7 @@ def _local_slice_expected_validation_cmd(candidate_files: list[str]) -> str:
             test_target = rel_path
             break
     if not test_target:
-        return f"python -m py_compile {' '.join(candidate_files[:2])}"
+        return f"python3 -m py_compile {' '.join(candidate_files[:2])}"
     if Path(test_target).name.lower().startswith("test_") and test_target.lower().endswith(".py"):
         return f"python3 -m unittest -q {test_target}"
     return f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
