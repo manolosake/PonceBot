@@ -265,6 +265,17 @@ class TestStateHandling(unittest.TestCase):
         self.assertFalse(bot._role_requires_enforced_read_only("implementer_local"))
         self.assertTrue(bot._role_requires_enforced_read_only("reviewer_local"))
 
+    def test_no_write_forced_mode_can_be_overridden_for_host_sandbox_failures(self) -> None:
+        cfg = self._cfg(Path(tempfile.gettempdir()) / "state.json")
+        self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+        with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "full"}):
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
+        with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "workspace-write"}):
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="reviewer_local", chat_id=1), "rw")
+        with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "invalid"}):
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="jarvis", chat_id=1), "ro")
+        self.assertIsNone(bot._orchestrator_forced_mode_for_role(cfg, role="backend", chat_id=1))
+
     def test_jsonl_stream_has_terminal_completion_detects_response_completed(self) -> None:
         payload = "\n".join(
             [

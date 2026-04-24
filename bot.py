@@ -239,8 +239,9 @@ _GREETING_PREFIXES = (
 
 _CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
 _NO_WRITE_ROLE_NAMES = frozenset({"jarvis", "skynet", "architect_local", "reviewer_local"})
-# Any role that is forbidden to land repo changes must also bypass global
-# breakglass/full-access defaults and run Codex in read-only mode.
+# Any role that is forbidden to land repo changes must also bypass the normal
+# autonomous mode hint. Default to read-only, but allow an operator override on
+# hosts where Codex's read-only sandbox cannot start (write policy still gates).
 _READ_ONLY_ENFORCED_ROLE_NAMES = _NO_WRITE_ROLE_NAMES
 
 
@@ -252,14 +253,27 @@ def _role_requires_enforced_read_only(role: str) -> bool:
     return (role or "").strip().lower() in _READ_ONLY_ENFORCED_ROLE_NAMES
 
 
+def _no_write_role_forced_mode() -> str:
+    raw = str(os.getenv("BOT_NO_WRITE_ROLE_FORCED_MODE", "ro") or "").strip().lower()
+    if raw in ("read-only", "readonly"):
+        return "ro"
+    if raw in ("workspace-write", "write"):
+        return "rw"
+    if raw in ("danger-full-access", "danger", "bypass"):
+        return "full"
+    return raw if raw in ("ro", "rw", "full") else "ro"
+
+
 def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: int) -> str | None:
     """
-    Enforce read-only runner mode for advisory/controller roles.
+    Enforce operator-selected runner mode for advisory/controller roles.
 
     Breakglass/full-access is for CEO/manual execution, not for autonomous
-    planning/review lanes that must delegate code changes.
+    planning/review lanes that must delegate code changes. If a host cannot
+    start Codex's read-only sandbox, BOT_NO_WRITE_ROLE_FORCED_MODE may opt into
+    a less restrictive runner mode while post-run write policy remains active.
     """
-    return "ro" if _role_requires_enforced_read_only(role) else None
+    return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
