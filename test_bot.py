@@ -4629,7 +4629,13 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 role="qa",
                 state="done",
                 labels={"key": "local_review_recover_csv_overflow"},
-                trace={"result_summary": "READY: validation passed and the recovery slice is scoped."},
+                trace={
+                    "result_summary": (
+                        "READY for the newest implementer recovery slice.\n"
+                        "Expected command failed due a workspace path prefix mismatch.\n"
+                        "Equivalent local compile passed and the unittest suite passed."
+                    ),
+                },
                 created_at=125.0,
                 updated_at=130.0,
             ),

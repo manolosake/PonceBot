@@ -15856,6 +15856,8 @@ def _summary_has_ready_signal(text: str) -> bool:
     blob = str(text or "").strip().lower()
     if not blob:
         return False
+    if _summary_has_explicit_ready_verdict(blob):
+        return True
     if _text_has_no_go_signal(blob):
         return False
     ready_tokens = (
@@ -15867,6 +15869,14 @@ def _summary_has_ready_signal(text: str) -> bool:
         "verified",
     )
     return any(tok in blob for tok in ready_tokens)
+
+
+def _summary_has_explicit_ready_verdict(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    compact = re.sub(r"\s+", " ", blob)
+    return bool(re.match(r"^(?:(?:verdict|status|decision)\s*:\s*)?ready\b", compact))
 
 
 def _summary_has_blocked_with_root_cause_signal(text: str) -> bool:
@@ -15991,10 +16001,10 @@ def _task_has_skynet_review_ready_evidence(task: Task | None, *, trace: dict[str
     summary = str(trace_obj.get("result_summary") or "").strip()
     if role_norm == "reviewer_local":
         return bool(trace_obj.get("review_ready", False) or _summary_has_ready_signal(summary))
-    if _text_has_no_go_signal(summary):
-        return False
     if bool(trace_obj.get("review_ready", False)) or _summary_has_ready_signal(summary):
         return True
+    if _text_has_no_go_signal(summary):
+        return False
     return bool(
         _summary_has_validation_signal(summary)
         and (_trace_has_nontrivial_artifacts(trace_obj) or len(summary) >= 80)
