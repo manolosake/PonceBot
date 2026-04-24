@@ -3598,6 +3598,18 @@ class TestBypassAwareEnforcement(unittest.TestCase):
             self.assertIn("bot.py", result["changed_paths"])
             self.assertTrue(Path(result["artifact"]).exists())
 
+    def test_git_changed_paths_ignores_codexbot_temp_artifacts(self) -> None:
+        status = "\n".join(
+            [
+                " M .codexbot_tmp/adb.1000.log",
+                " D .codexbot_tmp/android-aponce/RECOVERY_NOTE.txt",
+                "?? .codexbot_tmp/new.log",
+                " M bot.py",
+            ]
+        )
+
+        self.assertEqual(bot._git_changed_paths_from_porcelain(status), ["bot.py"])
+
 
 class TestThreadedImages(unittest.TestCase):
     def test_threaded_new_includes_image_flags(self) -> None:

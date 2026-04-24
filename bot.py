@@ -8398,6 +8398,8 @@ def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
             path_part = parts[-1] if parts else path_part
         if path_part == ".poncebot_managed_worktree":
             continue
+        if path_part == ".codexbot_tmp" or path_part.startswith(".codexbot_tmp/"):
+            continue
         if path_part and path_part not in out:
             out.append(path_part)
     return out
