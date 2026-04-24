@@ -3450,6 +3450,39 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertEqual(merged_msg, "merged_to_main")
             self.assertTrue(bool(merge_commit))
 
+    def test_merge_order_branch_to_main_rejects_no_delta_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "app.txt").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", "app.txt")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/order-no-delta")
+            self._git(repo, "push", "-u", "origin", "feature/order-no-delta")
+            self._git(repo, "checkout", "main")
+
+            merged_ok, merged_msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/order-no-delta",
+                order_id="ord-no-delta",
+                default_branch="main",
+            )
+
+            self.assertFalse(merged_ok)
+            self.assertEqual(merged_msg, "branch_has_no_delta_vs_main")
+            self.assertIsNone(merge_commit)
+
     def test_reconcile_order_branch_with_main_reports_conflict_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)

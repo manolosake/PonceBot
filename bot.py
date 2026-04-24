@@ -7868,6 +7868,10 @@ def _merge_error_is_conflict_like(detail: str) -> bool:
     )
 
 
+def _merge_error_is_no_delta(detail: str) -> bool:
+    return "branch_has_no_delta_vs_main" in str(detail or "").strip().lower()
+
+
 def _merge_ready_trace_reset_payload(*, now: float | None = None) -> dict[str, Any]:
     ts = float(time.time() if now is None else now)
     return {
@@ -8433,6 +8437,12 @@ def _merge_order_branch_to_main(
         tmp_branch = f"poncebot/merge/{str(order_id or 'order')[:8]}-{int(time.time())}-{attempt + 1}"
         base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
         branch_ref = _git_remote_branch_ref(repo, b) or f"origin/{b}"
+        diff_check = _run_git(repo, ["diff", "--quiet", f"{base_ref}..{branch_ref}", "--"], check=False)
+        if diff_check.returncode == 0:
+            return False, "branch_has_no_delta_vs_main", None
+        if diff_check.returncode != 1:
+            detail = (diff_check.stderr or diff_check.stdout or "").strip()
+            return False, detail or "branch_diff_check_failed", None
 
         try:
             add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), branch_ref], check=False)
@@ -10852,19 +10862,34 @@ def _order_command_text(
         try:
             err_txt = str(merged_msg or "")
             conflict_like = _merge_error_is_conflict_like(err_txt)
+            no_delta = _merge_error_is_no_delta(err_txt)
             failed_at = time.time()
             orch_q.set_order_status(root_id, chat_id=int(chat_id), status="active")
             orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase=("planning" if conflict_like else "review"))
             orch_q.update_trace(
                 root_id,
-                merge_ready=(False if conflict_like else True),
+                merge_ready=(False if (conflict_like or no_delta) else True),
                 merge_error=err_txt,
                 merge_failed_at=failed_at,
                 merge_auto_failed_at=failed_at,
                 merge_auto_error=err_txt,
                 merge_conflict_active=bool(conflict_like),
                 merge_conflict_detected_at=(failed_at if conflict_like else None),
+                merge_no_delta_active=bool(no_delta),
+                merge_no_delta_detected_at=(failed_at if no_delta else None),
             )
+            if no_delta:
+                orch_q.update_state(
+                    root_id,
+                    "blocked",
+                    blocked_reason="merge_no_delta",
+                    result_status="merge_no_delta",
+                    result_summary=(
+                        "Merge refused: order branch has no diff against main; "
+                        "not marking this as delivered."
+                    ),
+                    result_next_action="Replan the order or retire the no-delta branch.",
+                )
         except Exception:
             pass
         try:
