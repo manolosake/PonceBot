@@ -2815,6 +2815,126 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(bot._git_status_porcelain(worktree), "")
             self.assertIn("Write policy violation", result["summary"])
 
+    def test_orchestrator_run_codex_ignores_preexisting_dirty_base_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "bot.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "bot.py").write_text("VALUE = 99\n", encoding="utf-8")
+
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            cfg = bot.dataclasses.replace(
+                cfg,
+                codex_workdir=repo,
+                worktree_root=Path(td) / "worktrees",
+                artifacts_root=Path(td) / "artifacts_root",
+                orchestrator_sessions_enabled=False,
+                orchestrator_live_update_seconds=0,
+                codex_timeout_seconds=5,
+            )
+            cfg.artifacts_root.mkdir(parents=True, exist_ok=True)
+            cfg.worktree_root.mkdir(parents=True, exist_ok=True)
+
+            repo_id = "codexbot-12345678"
+
+            class _FakeQueue:
+                def lease_workspace(self, *, role: str, job_id: str, slots: int = 1) -> int:
+                    return 1
+
+                def release_workspace(self, *, job_id: str) -> None:
+                    return None
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    return None
+
+                def get_repo(self, repo_id: str) -> dict[str, object] | None:
+                    if repo_id != "codexbot-12345678":
+                        return None
+                    return {
+                        "repo_id": repo_id,
+                        "path": str(repo),
+                        "default_branch": "main",
+                        "autonomy_enabled": True,
+                        "priority": 2,
+                        "runtime_mode": "ceo-bounded",
+                        "daily_budget": 0.0,
+                        "status": "active",
+                        "metadata": {},
+                    }
+
+            task = bot.Task.new(
+                job_id="job-skynet-preexisting-dirty",
+                source="test",
+                role="skynet",
+                input_text="Drive one bounded proactive tick.",
+                request_type="maintenance",
+                priority=1,
+                model="gpt-5.4",
+                effort="high",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                state="running",
+                artifacts_dir=str((cfg.artifacts_root / "job-skynet-preexisting-dirty").resolve()),
+                trace={
+                    "repo_id": repo_id,
+                    "repo_path": str(repo),
+                    "repo_default_branch": "main",
+                    "proactive_lane": True,
+                },
+            )
+
+            class _FakeProc:
+                def __init__(self) -> None:
+                    self.pid = 12345
+                    self.returncode = 0
+
+                def poll(self) -> int:
+                    return 0
+
+                def wait(self, timeout: float | None = None) -> int:
+                    return 0
+
+            def _fake_start(self, *, argv: list[str], mode_hint: str):  # type: ignore[no-untyped-def]
+                stdout_path = Path(td) / "codex_stdout.jsonl"
+                stderr_path = Path(td) / "codex_stderr.log"
+                last_msg_path = Path(td) / "codex_last.txt"
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("", encoding="utf-8")
+                last_msg_path.write_text("Skynet delegated no direct repo changes.\n", encoding="utf-8")
+                return bot.CodexRunner.Running(
+                    proc=_FakeProc(),
+                    start_time=0.0,
+                    cmd=["codex", "exec"],
+                    last_msg_path=last_msg_path,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+
+            with patch.object(bot.CodexRunner, "start", _fake_start), patch.object(
+                bot, "_orchestrator_min_evidence_gate", return_value=(True, "", {})
+            ):
+                result = bot._orchestrator_run_codex(
+                    cfg,
+                    task,
+                    stop_event=threading.Event(),
+                    orch_q=_FakeQueue(),
+                    profiles={"skynet": {"execution_backend": "codex", "model": "gpt-5.4", "effort": "high"}},
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertNotIn("write_policy_violation", result["structured_digest"])
+            self.assertIn("VALUE = 99", (repo / "bot.py").read_text(encoding="utf-8"))
+            self.assertIn("bot.py", bot._git_status_porcelain(repo))
+            stash = subprocess.run(["git", "stash", "list"], cwd=str(repo), check=True, capture_output=True, text=True)
+            self.assertEqual(stash.stdout.strip(), "")
+
 class _FakeTelegramAPI:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, int | None]] = []

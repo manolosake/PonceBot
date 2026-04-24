@@ -23429,6 +23429,30 @@ def _orchestrator_run_codex(
 
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
     forced_mode = _orchestrator_forced_mode_for_role(eff_cfg, role=role, chat_id=int(task.chat_id))
+    read_only_repo_baselines: dict[str, dict[str, Any]] = {}
+    if worktree_dir is not None and _role_disallows_repo_writes(role):
+        seen_target_dirs: set[str] = set()
+        for label, repo_dir in (
+            ("worktree", worktree_dir),
+            ("base_repo", repo_base_dir),
+        ):
+            if repo_dir is None:
+                continue
+            try:
+                target_dir = Path(repo_dir).resolve()
+            except Exception:
+                target_dir = Path(repo_dir)
+            target_key = str(target_dir)
+            if target_key in seen_target_dirs:
+                continue
+            seen_target_dirs.add(target_key)
+            status_text = _git_status_porcelain(target_dir)
+            read_only_repo_baselines[target_key] = {
+                "label": str(label),
+                "status": status_text,
+                "changed_paths": _git_changed_paths_from_porcelain(status_text),
+            }
+
     runner = CodexRunner(
         eff_cfg,
         chat_id=task.chat_id,
@@ -23835,8 +23859,20 @@ def _orchestrator_run_codex(
                 seen_target_dirs.add(target_key)
                 status_text = _git_status_porcelain(target_dir)
                 changed_paths = _git_changed_paths_from_porcelain(status_text)
-                if changed_paths:
-                    targets.append((str(label), target_dir, status_text, changed_paths))
+                baseline = read_only_repo_baselines.get(target_key) or {}
+                baseline_paths = {
+                    str(path)
+                    for path in (baseline.get("changed_paths") or [])
+                    if str(path or "").strip()
+                }
+                if str(label) == "base_repo" and baseline_paths:
+                    # The controller runs in an isolated worktree. A dirty base
+                    # checkout can predate this job; do not stash or block the
+                    # sprint for unrelated operator/work-in-progress changes.
+                    continue
+                new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+                if new_changed_paths:
+                    targets.append((str(label), target_dir, status_text, new_changed_paths))
             if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [
