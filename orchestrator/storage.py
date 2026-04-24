@@ -2903,6 +2903,35 @@ class SQLiteTaskStorage:
             ).fetchall()
             return [self._row_to_task(r) for r in q]
 
+    def list_role_tasks_for_status(
+        self,
+        *,
+        role: str,
+        state: str,
+        chat_id: int | None = None,
+        limit: int = 200,
+    ) -> list[Task]:
+        """
+        List tasks for worker status snapshots.
+
+        When chat_id is provided, only tasks for that chat are returned.
+        """
+        r = str(role or "").strip().lower()
+        st = str(state or "").strip().lower()
+        if not r or not st:
+            return []
+        lim = max(1, min(1000, int(limit)))
+        with self._conn() as conn:
+            sql = "SELECT * FROM jobs WHERE role = ? AND state = ?"
+            params: list[Any] = [r, st]
+            if chat_id is not None:
+                sql += " AND chat_id = ?"
+                params.append(int(chat_id))
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(lim)
+            rows = conn.execute(sql, params).fetchall()
+            return [self._row_to_task(rw) for rw in rows]
+
     def queued_count(self, *, chat_id: int | None = None) -> int:
         with self._conn() as conn:
             sql = "SELECT COUNT(1) as c FROM jobs WHERE state = 'queued'"

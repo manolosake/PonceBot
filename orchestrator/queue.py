@@ -155,6 +155,16 @@ class OrchestratorQueue:
     ) -> list[Task]:
         return self._storage.peek(role=role, state=state, chat_id=chat_id, limit=limit)
 
+    def list_role_tasks_for_status(
+        self,
+        *,
+        role: str,
+        state: str,
+        chat_id: int | None = None,
+        limit: int = 200,
+    ) -> list[Task]:
+        return self._storage.list_role_tasks_for_status(role=role, state=state, chat_id=chat_id, limit=limit)
+
     def dequeue_with_budget(
         self,
         role: str | None = None,

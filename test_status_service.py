@@ -149,6 +149,129 @@ class TestStatusService(unittest.TestCase):
             self.assertIsNotNone(workers2[0]["next"])
             self.assertEqual(workers2[0]["next"]["job_id"], t2.job_id)
 
+    def test_snapshot_worker_current_next_are_chat_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 2}})
+
+            order1 = "aaaa1111-1111-1111-1111-111111111111"
+            order2 = "bbbb2222-2222-2222-2222-222222222222"
+            q.upsert_order(order_id=order1, chat_id=1, title="Order1", body="Body", status="active", priority=2)
+            q.upsert_order(order_id=order2, chat_id=2, title="Order2", body="Body", status="active", priority=2)
+
+            run_chat1 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat1 running",
+                request_type="task",
+                priority=2,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="running",
+                parent_job_id=order1,
+                trace={"live_workspace_slot": 1},
+                job_id="11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+            run_chat2 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat2 running",
+                request_type="task",
+                priority=2,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=2,
+                state="running",
+                parent_job_id=order2,
+                trace={"live_workspace_slot": 1},
+                job_id="22222222-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            )
+            next_chat1 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat1 queued",
+                request_type="task",
+                priority=1,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="queued",
+                parent_job_id=order1,
+                job_id="33333333-cccc-cccc-cccc-cccccccccccc",
+            )
+            next_chat2 = Task.new(
+                source="telegram",
+                role="backend",
+                input_text="Chat2 queued",
+                request_type="task",
+                priority=1,
+                model="gpt-5.2",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=2,
+                state="queued",
+                parent_job_id=order2,
+                job_id="44444444-dddd-dddd-dddd-dddddddddddd",
+            )
+            q.submit_task(run_chat1)
+            q.submit_task(run_chat2)
+            q.submit_task(next_chat1)
+            q.submit_task(next_chat2)
+            q.update_state(run_chat1.job_id, "running", live_workspace_slot=1)
+            q.update_state(run_chat2.job_id, "running", live_workspace_slot=1)
+
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 2}}, cache_ttl_seconds=0)
+
+            snap1 = svc.snapshot(chat_id=1)
+            workers1 = [w for w in snap1["workers"] if w["role"] == "backend"]
+            self.assertEqual(len(workers1), 2)
+            slot1_chat1 = next(w for w in workers1 if w["slot"] == 1)
+            slot2_chat1 = next(w for w in workers1 if w["slot"] == 2)
+            self.assertIsNotNone(slot1_chat1["current"])
+            self.assertEqual(slot1_chat1["current"]["job_id"], run_chat1.job_id)
+            self.assertIsNotNone(slot2_chat1["next"])
+            self.assertEqual(slot2_chat1["next"]["job_id"], next_chat1.job_id)
+
+            exposed_ids_chat1 = {
+                (slot1_chat1.get("current") or {}).get("job_id"),
+                (slot1_chat1.get("next") or {}).get("job_id"),
+                (slot2_chat1.get("current") or {}).get("job_id"),
+                (slot2_chat1.get("next") or {}).get("job_id"),
+            }
+            self.assertNotIn(run_chat2.job_id, exposed_ids_chat1)
+            self.assertNotIn(next_chat2.job_id, exposed_ids_chat1)
+
+            snap2 = svc.snapshot(chat_id=2)
+            workers2 = [w for w in snap2["workers"] if w["role"] == "backend"]
+            self.assertEqual(len(workers2), 2)
+            slot1_chat2 = next(w for w in workers2 if w["slot"] == 1)
+            slot2_chat2 = next(w for w in workers2 if w["slot"] == 2)
+            self.assertIsNotNone(slot1_chat2["current"])
+            self.assertEqual(slot1_chat2["current"]["job_id"], run_chat2.job_id)
+            self.assertIsNotNone(slot2_chat2["next"])
+            self.assertEqual(slot2_chat2["next"]["job_id"], next_chat2.job_id)
+
+            exposed_ids_chat2 = {
+                (slot1_chat2.get("current") or {}).get("job_id"),
+                (slot1_chat2.get("next") or {}).get("job_id"),
+                (slot2_chat2.get("current") or {}).get("job_id"),
+                (slot2_chat2.get("next") or {}).get("job_id"),
+            }
+            self.assertNotIn(run_chat1.job_id, exposed_ids_chat2)
+            self.assertNotIn(next_chat1.job_id, exposed_ids_chat2)
+
     def test_snapshot_includes_pending_decisions_from_decision_log(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
