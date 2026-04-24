@@ -33,6 +33,7 @@ class TestProactiveBlockerReplay(unittest.TestCase):
         iso = datetime.fromtimestamp(now - 42.0, UTC).isoformat().replace("+00:00", "Z")
 
         self.assertEqual(pbr._updated_age_seconds(now - 5.0, now), 5.0)
+        self.assertEqual(pbr._updated_age_seconds((now - 7.0) * 1000.0, now), 7.0)
         self.assertEqual(round(pbr._updated_age_seconds(iso, now), 1), 42.0)
         self.assertEqual(pbr._updated_age_seconds("not-a-date", now), 0.0)
 

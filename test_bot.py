@@ -4485,6 +4485,61 @@ class TestImplementerFailureSelection(unittest.TestCase):
         )
 
 
+class TestOrderBranchGitHelpers(unittest.TestCase):
+    def test_ensure_branch_fetches_default_branch_outside_narrow_refspec(self) -> None:
+        def run(cmd: list[str], cwd: Path | None = None) -> str:
+            return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            origin = root / "origin.git"
+            seed = root / "seed"
+            repo = root / "repo"
+
+            run(["git", "init", "--bare", str(origin)])
+            run(["git", "clone", str(origin), str(seed)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=seed)
+            run(["git", "config", "user.name", "test"], cwd=seed)
+            (seed / "marker.txt").write_text("main\n", encoding="utf-8")
+            run(["git", "add", "marker.txt"], cwd=seed)
+            run(["git", "commit", "-m", "main"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:main"], cwd=seed)
+
+            run(["git", "checkout", "-b", "codex/codexbot-workflow-v2"], cwd=seed)
+            (seed / "marker.txt").write_text("old default\n", encoding="utf-8")
+            run(["git", "commit", "-am", "old default"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:codex/codexbot-workflow-v2"], cwd=seed)
+
+            run(["git", "clone", "--branch", "main", str(origin), str(repo)])
+            run(["git", "config", "--replace-all", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"], cwd=repo)
+            run(
+                [
+                    "git",
+                    "fetch",
+                    "origin",
+                    "refs/heads/codex/codexbot-workflow-v2:refs/remotes/origin/codex/codexbot-workflow-v2",
+                ],
+                cwd=repo,
+            )
+            stale_default = run(["git", "rev-parse", "refs/remotes/origin/codex/codexbot-workflow-v2"], cwd=repo)
+
+            (seed / "marker.txt").write_text("new default\n", encoding="utf-8")
+            run(["git", "commit", "-am", "new default"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:codex/codexbot-workflow-v2"], cwd=seed)
+            latest_default = run(["git", "rev-parse", "HEAD"], cwd=seed)
+            self.assertNotEqual(stale_default, latest_default)
+
+            ok, msg = bot._git_ensure_branch_from_main(
+                repo,
+                "feature/order-test",
+                default_branch="codex/codexbot-workflow-v2",
+            )
+
+            self.assertTrue(ok, msg)
+            order_head = run(["git", "--git-dir", str(origin), "rev-parse", "refs/heads/feature/order-test"])
+            self.assertEqual(order_head, latest_default)
+
+
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
     def test_skynet_factory_local_only_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

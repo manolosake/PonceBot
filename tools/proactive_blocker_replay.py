@@ -17,7 +17,10 @@ def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
     if updated_at in (None, ""):
         return 0.0
     try:
-        return max(0.0, float(now_epoch) - float(updated_at))
+        raw_ts = float(updated_at)
+        if raw_ts > 1e11:
+            raw_ts = raw_ts / 1000.0
+        return max(0.0, float(now_epoch) - raw_ts)
     except Exception:
         pass
 

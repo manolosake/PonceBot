@@ -7862,6 +7862,12 @@ def _git_fetch_remote_branch(repo: Path, branch: str) -> tuple[bool, str]:
     return False, detail or "branch_fetch_failed"
 
 
+def _git_refresh_default_branch_ref(repo: Path, default_branch: str) -> None:
+    b = str(default_branch or "").strip()
+    if b and b != "HEAD":
+        _git_fetch_remote_branch(repo, b)
+
+
 def _git_is_non_fast_forward_push_error(detail: str) -> bool:
     blob = str(detail or "").strip().lower()
     if not blob:
@@ -7954,6 +7960,7 @@ def _git_ensure_branch_from_main(
     if not b:
         return False, "branch_missing"
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    _git_refresh_default_branch_ref(repo, default_branch)
     if (
         _git_ref_exists(repo, f"refs/remotes/origin/{b}")
         or _git_ref_exists(repo, f"origin/{b}")
@@ -7986,6 +7993,7 @@ def _reconcile_order_branch_with_main(
 
     for attempt in range(max_push_attempts):
         _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        _git_refresh_default_branch_ref(repo, default_branch)
         remote_exists = (
             _git_ref_exists(repo, f"refs/remotes/origin/{b}")
             or _git_ref_exists(repo, f"origin/{b}")
