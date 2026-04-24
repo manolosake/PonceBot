@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from tools.proactive_health_report import order_autonomy_funnel
+from tools.proactive_health_report import classify_open_job_mode, is_blocked_without_open_jobs
 
 
 class TestProactiveHealthReport(unittest.TestCase):
@@ -86,6 +87,19 @@ class TestProactiveHealthReport(unittest.TestCase):
         self.assertEqual(funnel["slices_closed"], 1)
         self.assertEqual(funnel["quality_gate_status"], "closed")
         self.assertTrue(funnel["improvement_verified"])
+    def test_classify_open_job_mode_respects_open_jobs_semantics(self) -> None:
+        self.assertEqual(classify_open_job_mode({}, 0), "idle")
+        self.assertEqual(classify_open_job_mode({"skynet": 1}, 1), "controller")
+        self.assertEqual(classify_open_job_mode({"architect_local": 1}, 1), "local")
+        self.assertEqual(classify_open_job_mode({"backend": 1}, 1), "cli")
+        self.assertEqual(classify_open_job_mode({"backend": 1, "reviewer_local": 1}, 2), "mixed")
+
+    def test_is_blocked_without_open_jobs_detects_stall_condition(self) -> None:
+        self.assertTrue(is_blocked_without_open_jobs("blocked", 0))
+        self.assertTrue(is_blocked_without_open_jobs("blocked_waiting_only", 0))
+        self.assertTrue(is_blocked_without_open_jobs("blocked_approval", 0))
+        self.assertFalse(is_blocked_without_open_jobs("blocked", 1))
+        self.assertFalse(is_blocked_without_open_jobs("review", 0))
 
 
 if __name__ == "__main__":

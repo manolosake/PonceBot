@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure a python3 executable with pytest is available in clean-shell contexts.
-# The fallback is repo-local only (.venv), avoiding host-global preconfiguration.
+# Canonical deterministic pytest bootstrap for clean-shell replay.
+# Usage example:
+#   env -i PATH=/usr/bin:/bin HOME="$HOME" ./scripts/bootstrap_pytest_python3.sh -m pytest --version
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${ROOT_DIR}/.venv"
+ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+PY_BIN="${BOOTSTRAP_PYTEST_PYTHON_BIN:-python3}"
+VENV_DIR="${BOOTSTRAP_PYTEST_VENV_DIR:-$ROOT_DIR/.codexbot_tmp/pytest_python3_venv}"
+VENV_PY="$VENV_DIR/bin/python"
 
-if [[ $# -eq 0 ]]; then
-  echo "Usage: $0 -m pytest [args...]" >&2
-  exit 2
+mkdir -p "$(dirname "$VENV_DIR")"
+
+if [[ ! -x "$VENV_PY" ]]; then
+  "$PY_BIN" -m venv "$VENV_DIR"
 fi
 
-if ! python3 -m pytest --version >/dev/null 2>&1; then
-  if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
-    python3 -m venv "${VENV_DIR}"
-  fi
-  if ! "${VENV_DIR}/bin/python" -m pytest --version >/dev/null 2>&1; then
-    "${VENV_DIR}/bin/python" -m pip install --quiet --upgrade pip pytest
-  fi
-  export PATH="${VENV_DIR}/bin:${PATH:-/usr/bin:/bin}"
+# Keep bootstrap idempotent for pre-provisioned envs (for example .venv):
+# only install pytest tooling when it is actually missing.
+if ! "$VENV_PY" -m pytest --version >/dev/null 2>&1; then
+  "$VENV_PY" -m pip install --upgrade pip pytest >/dev/null
 fi
 
-exec python3 "$@"
+if [[ "$#" -eq 0 ]]; then
+  set -- -m pytest --version
+fi
+
+exec "$VENV_PY" "$@"

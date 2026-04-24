@@ -43,6 +43,28 @@ def worst_status(*values: str) -> str:
     return best
 
 
+def classify_open_job_mode(counts_by_role: dict, open_jobs: int) -> str:
+    """Classify order mode without reporting idle when open jobs still exist."""
+    if int(open_jobs or 0) <= 0:
+        return 'idle'
+    has_local = any(role in LOCAL_ROLES for role in counts_by_role)
+    has_cli = any(role in CLI_ROLES for role in counts_by_role)
+    if has_local and has_cli:
+        return 'mixed'
+    if has_cli:
+        return 'cli'
+    if has_local:
+        return 'local'
+    return 'controller'
+
+
+def is_blocked_without_open_jobs(phase: str, open_jobs: int) -> bool:
+    phase_norm = str(phase or '').strip().lower()
+    if int(open_jobs or 0) > 0:
+        return False
+    return phase_norm in {'blocked', 'blocked_waiting_only', 'blocked_approval'}
+
+
 def load_json(raw: str):
     try:
         return json.loads(raw or '{}')
@@ -418,6 +440,9 @@ def main() -> int:
     if not DB.exists():
         return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
+    if not DB.exists():
+        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
+
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -476,15 +501,7 @@ def main() -> int:
                     'age_s': age_s,
                     'key': str(label_data.get('key') or ''),
                 })
-        mode = 'idle'
-        has_local = any(role in LOCAL_ROLES for role in counts_by_role)
-        has_cli = any(role in CLI_ROLES for role in counts_by_role)
-        if has_local and has_cli:
-            mode = 'mixed'
-        elif has_cli:
-            mode = 'cli'
-        elif has_local:
-            mode = 'local'
+        mode = classify_open_job_mode(counts_by_role, len(open_children))
         autonomy_funnel = order_autonomy_funnel(children, order_id=order_id, now=now, since=since)
         delivery_ok = bool(int(autonomy_funnel.get('slices_applied', 0) or 0) > 0)
         validation_ok = bool(int(autonomy_funnel.get('slices_validated', 0) or 0) > 0)
@@ -499,6 +516,13 @@ def main() -> int:
         if ready_with_open:
             anomalies.append({
                 'type': 'ready_with_open_work',
+                'order_id': order_id,
+                'phase': order.get('phase'),
+                'open_jobs': len(open_children),
+            })
+        if is_blocked_without_open_jobs(phase, len(open_children)):
+            anomalies.append({
+                'type': 'blocked_without_open_jobs',
                 'order_id': order_id,
                 'phase': order.get('phase'),
                 'open_jobs': len(open_children),

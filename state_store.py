@@ -83,6 +83,14 @@ class StateStore:
 
 
     def _write_unlocked(self, data: dict[str, Any]) -> None:
+        def _normalize_json_keys(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {str(k): _normalize_json_keys(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_normalize_json_keys(v) for v in value]
+            return value
+
+        safe_data = _normalize_json_keys(data)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_f = tempfile.NamedTemporaryFile(
             mode="w",
@@ -95,7 +103,7 @@ class StateStore:
         tmp_path = Path(tmp_f.name)
         write_ok = False
         try:
-            tmp_f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+            tmp_f.write(json.dumps(safe_data, indent=2, sort_keys=True) + "\n")
             tmp_f.flush()
             os.fsync(tmp_f.fileno())
             write_ok = True
@@ -103,14 +111,15 @@ class StateStore:
             tmp_f.close()
             if not write_ok:
                 try:
-                    tmp_path.unlink()
+                    tmp_path.unlink(missing_ok=True)
                 except Exception:
                     pass
         try:
             tmp_path.replace(self._path)
         except Exception:
+            # Best-effort cleanup while preserving the original replace error.
             try:
-                tmp_path.unlink()
+                tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
             raise

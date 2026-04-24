@@ -3602,12 +3602,15 @@ class TestHardeningControls(unittest.TestCase):
                 chat_id=1,
                 user_id=2,
                 message_id=10,
-                username="u",
-                text="/breakglass on 1 emergency fix",
-            )
-            resp, job = bot._parse_job(cfg, msg)
+                    username="u",
+                    text="/breakglass on 1 emergency fix",
+                )
+            with patch.object(bot.LOG, "warning") as warn_mock:
+                resp, job = bot._parse_job(cfg, msg)
             self.assertIsNone(job)
             self.assertIn("breakglass enabled", resp)
+            warn_mock.assert_called_once()
+            self.assertIn("BREAKGLASS ENABLED", str(warn_mock.call_args.args[0]))
 
             bot._set_access_mode(cfg, "full", chat_id=1)
             self.assertTrue(bot._effective_bypass_sandbox(cfg, chat_id=1))
@@ -3871,7 +3874,7 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
         self.assertNotIn("implementer_local", roles)
         self.assertNotIn("reviewer_local", roles)
 
-    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane(self) -> None:
+    def test_inject_local_specialists_skips_proactive_lane_by_default_codex_first(self) -> None:
         specs = [
             bot.TaskSpec(
                 key="backend_fix",
@@ -3897,6 +3900,38 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
             proactive_lane=True,
             allow_delegation=False,
         )
+        roles = [str(x.role or "").strip().lower() for x in out]
+        self.assertNotIn("architect_local", roles)
+        self.assertNotIn("implementer_local", roles)
+        self.assertNotIn("reviewer_local", roles)
+
+    def test_inject_local_specialists_adds_all_three_roles_for_proactive_lane_when_local_only(self) -> None:
+        specs = [
+            bot.TaskSpec(
+                key="backend_fix",
+                role="backend",
+                text="Fix API contract mismatch.",
+                mode_hint="rw",
+                priority=2,
+            ),
+            bot.TaskSpec(
+                key="frontend_touchup",
+                role="frontend",
+                text="Adjust card spacing and typography.",
+                mode_hint="rw",
+                priority=2,
+            ),
+        ]
+        with patch.dict(os.environ, {"BOT_SKYNET_FACTORY_LOCAL_ONLY": "1"}, clear=False):
+            out = bot._inject_local_specialist_specs(
+                specs=specs,
+                root_ticket="ticket-123",
+                existing_keys=set(),
+                request_type="task",
+                is_top_level_manual=False,
+                proactive_lane=True,
+                allow_delegation=False,
+            )
         roles = [str(x.role or "").strip().lower() for x in out]
         self.assertIn("architect_local", roles)
         self.assertIn("implementer_local", roles)

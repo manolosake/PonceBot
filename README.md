@@ -177,7 +177,7 @@ make verify
 - syntax/lint-style checks (`py_compile`)
 - security guardrail checks (`tools/security_check.py --strict`)
 - unit tests (`python -m unittest -q`)
-- coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.65`)
+- coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.70`)
 
 ## Deployment Notes
 

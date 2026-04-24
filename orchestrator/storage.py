@@ -33,6 +33,14 @@ def _coalesce_value(value: Any, default: Any) -> Any:
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "f", "no", "n", "off"}:
+            return False
     try:
         return bool(int(value))
     except Exception:
@@ -1418,6 +1426,10 @@ class SQLiteTaskStorage:
                     return False
                 ok = self._update_state_in_conn(conn, job_id=resolved, state=str(state), metadata=metadata)
                 if ok:
+                    # Promote waiting dependency jobs immediately when a dependency
+                    # reaches terminal state, instead of waiting for the next claim loop.
+                    if str(state) in ("done", "failed", "cancelled"):
+                        self._reconcile_waiting_jobs_in_conn(conn, now=time.time())
                     conn.commit()
                 return ok
 

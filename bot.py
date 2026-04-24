@@ -83,6 +83,37 @@ TELEGRAM_MSG_LIMIT = 4096
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _SKILL_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+_APPLY_PATCH_FILE_DIRECTIVE_RE = re.compile(r"^\*\*\* (?:Add|Delete|Update) File:\s+\S.*$", re.MULTILINE)
+
+
+def _normalize_order_branch(raw: str | None) -> str | None:
+    # Accepted input: plain branch names and refs/heads/<name>.
+    # Rejected input: empty values and unsupported refs (for example refs/tags/*, refs/remotes/*).
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    if candidate.startswith("refs/heads/"):
+        candidate = candidate[len("refs/heads/"):].strip()
+    elif candidate.startswith("refs/"):
+        return None
+    if not candidate:
+        return None
+    if candidate in (".", ".."):
+        return None
+    # Keep accepted formats aligned with git ref-name safety guardrails.
+    if candidate.startswith(("/", "-")):
+        return None
+    if candidate.endswith(("/", ".")):
+        return None
+    if candidate.endswith(".lock"):
+        return None
+    if ".." in candidate or "@{" in candidate or "\\" in candidate:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in candidate):
+        return None
+    if any(ch.isspace() for ch in candidate):
+        return None
+    return candidate
 
 # Ticket card UX: keep one editable message per ticket (no spam).
 _TICKET_CARD_LOCK = threading.Lock()
@@ -4432,12 +4463,52 @@ def _extract_first_diff_block(text: str) -> str:
         if textwrap.dedent(str(block or "")).strip()
     ]
     if normalized_blocks:
-        return "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
+        patch = "\n\n".join(block.rstrip() for block in normalized_blocks) + "\n"
+        return _preflight_git_apply_check(patch)
     plain = re.search(r"(^diff --git .*?$.*)", raw, flags=re.MULTILINE | re.DOTALL)
     if plain:
         patch = str(plain.group(1) or "").strip()
-        return (patch + "\n") if patch else ""
+        return _preflight_git_apply_check((patch + "\n") if patch else "")
     return ""
+
+
+def _preflight_git_apply_check(diff_text: str, *, worktree_dir: Path | None = None) -> str:
+    patch = str(diff_text or "").strip()
+    if not patch:
+        return ""
+    normalized_patch = patch + "\n"
+    if worktree_dir is None or not worktree_dir.is_dir():
+        return normalized_patch
+
+    import subprocess
+    check = subprocess.run(
+        ["git", "apply", "--check", "--recount", "--whitespace=nowarn", "-"],
+        cwd=str(worktree_dir),
+        input=normalized_patch,
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        stderr = (check.stderr or "").strip()
+        stdout = (check.stdout or "").strip()
+        detail = stderr or stdout or "unknown git apply --check failure"
+        raise ValueError(f"git apply --check failed: {detail}")
+    return normalized_patch
+
+
+def _validate_apply_patch_text(text: str) -> str:
+    patch = textwrap.dedent(str(text or "")).replace("\r\n", "\n").strip("\n")
+    if not patch.strip():
+        raise ValueError("apply_patch payload is empty")
+    lines = patch.splitlines()
+    if lines[0].strip() != "*** Begin Patch":
+        raise ValueError("apply_patch payload missing '*** Begin Patch' header")
+    if lines[-1].strip() != "*** End Patch":
+        raise ValueError("apply_patch payload missing '*** End Patch' footer")
+    body = "\n".join(lines[1:-1])
+    if not _APPLY_PATCH_FILE_DIRECTIVE_RE.search(body):
+        raise ValueError("apply_patch payload missing file directive")
+    return patch + "\n"
 
 
 def _extract_first_apply_patch_block(text: str) -> str:
@@ -4450,9 +4521,11 @@ def _extract_first_apply_patch_block(text: str) -> str:
         flags=re.DOTALL,
     )
     if not match:
+        if "*** Begin Patch" in raw or "*** End Patch" in raw:
+            raise ValueError("malformed apply_patch payload: missing full Begin/End block")
         return ""
-    patch = textwrap.dedent(str(match.group(1) or "")).strip()
-    return (patch + "\n") if patch else ""
+    patch = textwrap.dedent(str(match.group(1) or "")).strip("\n")
+    return _validate_apply_patch_text(patch)
 
 
 def _extract_structured_result_payload(text: str) -> dict[str, Any] | None:
@@ -4966,6 +5039,34 @@ def _extract_blocker_response(text: str) -> str:
     if "```" in blocker:
         blocker = blocker.split("```", 1)[0].strip()
     return blocker[:2000].strip()
+
+
+_LOCAL_EXCERPT_BLOCKER_MARKERS: tuple[str, ...] = (
+    "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
+    "missing excerpt for bot.py around _classify_local_slice_failure",
+    "please provide the full function body for `_classify_local_slice_failure`",
+    "please provide the full function body for _classify_local_slice_failure",
+    "need full body of _classify_local_slice_failure",
+    "provide the exact current function body",
+    "exact current function body of _classify_local_slice_failure",
+    "missing current excerpt for `bot.py` around `_classify_local_slice_failure`",
+    "missing current excerpt for bot.py around _classify_local_slice_failure",
+    "need exact current excerpt for `bot.py` around `_classify_local_slice_failure`",
+)
+
+
+def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    if any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS):
+        return True
+    # Fallback: keep matcher resilient to punctuation/phrasing drift when the same
+    # target symbol is explicitly requested with excerpt/body wording.
+    if "_classify_local_slice_failure" in blob:
+        if any(token in blob for token in ("full body", "current excerpt", "missing excerpt", "exact current function body")):
+            return True
+    return False
 
 
 def _extract_file_rewrite_blocks(text: str) -> list[dict[str, str]]:
@@ -5529,7 +5630,9 @@ def _focused_workspace_symbol_excerpt(
         if not snippet_body:
             continue
         snippet = (
-            f"# [FOCUSED_EXACT_TARGET_CONTEXT {rel_path}:{start + 1}-{end} symbol={token}]\n"
+            "# [FOCUSED_EXACT_TARGET_SYMBOL_CONTEXT]\n"
+            f"# [FOCUSED_EXACT_TARGET_CONTEXT {rel_path}:{start + 1}-{end}]\n"
+            f"# path={rel_path}:{start + 1}-{end} symbol={token}\n"
             + snippet_body
         )
         if snippets and total_chars + len(snippet) > max_chars:
@@ -5664,13 +5767,17 @@ def _augment_local_specialist_prompt_with_workspace_context(
                         excerpt = raw.rstrip()
                     else:
                         head = raw[:24000].rstrip()
-                        tail = raw[-24000:].lstrip()
-                        excerpt = (
-                            head
-                            + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
-                            + "# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]\n"
-                            + tail
-                        )
+                        explicit_symbol_tokens = re.findall(r"\b_[A-Za-z][A-Za-z0-9_]{3,}\b", "\n".join(context_texts))
+                        if explicit_symbol_tokens:
+                            excerpt = head + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
+                        else:
+                            tail = raw[-12000:].lstrip()
+                            excerpt = (
+                                head
+                                + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT]\n"
+                                + tail
+                                + "\n# [TRUNCATED_EXACT_TARGET_CONTEXT_TAIL]\n"
+                            )
             elif focused_excerpt:
                 excerpt = focused_excerpt
             else:
@@ -5678,9 +5785,22 @@ def _augment_local_specialist_prompt_with_workspace_context(
                 if len(excerpt) > excerpt_chars_cap:
                     excerpt = excerpt[:excerpt_chars_cap].rstrip()
         else:
-            excerpt = "\n".join(lines[:excerpt_lines_cap])
-            if len(excerpt) > excerpt_chars_cap:
-                excerpt = excerpt[:excerpt_chars_cap].rstrip()
+            focused_excerpt = ""
+            if role == "implementer_local" and (len(lines) > excerpt_lines_cap or len(raw) > excerpt_chars_cap):
+                focused_excerpt = _focused_workspace_symbol_excerpt(
+                    raw=raw,
+                    rel_path=rel_path,
+                    context_texts=context_texts,
+                    max_snippets=2,
+                    context_lines=14,
+                    max_chars=8000,
+                )
+            if focused_excerpt:
+                excerpt = focused_excerpt
+            else:
+                excerpt = "\n".join(lines[:excerpt_lines_cap])
+                if len(excerpt) > excerpt_chars_cap:
+                    excerpt = excerpt[:excerpt_chars_cap].rstrip()
         chunks.extend([
             "",
             f"FILE: {rel_path}",
@@ -5857,19 +5977,41 @@ def _finalize_local_implementer_change(
 
     validation_lines: list[str] = []
     changed_py = [p for p in changed_files if p.endswith(".py")]
+    existing_changed_py: list[str] = []
+    missing_changed_py: list[str] = []
+    worktree_root = worktree_dir.resolve()
+    for rel_path in changed_py:
+        disk_path = (worktree_dir / rel_path).resolve()
+        try:
+            inside_worktree = disk_path.is_relative_to(worktree_root)
+        except AttributeError:
+            inside_worktree = str(disk_path).startswith(str(worktree_root))
+        if inside_worktree and disk_path.is_file():
+            existing_changed_py.append(rel_path)
+        else:
+            missing_changed_py.append(rel_path)
+
     validation_ok = True
-    if changed_py:
+    if existing_changed_py:
         py_compile = subprocess.run(
-            ["python3", "-m", "py_compile", *changed_py],
+            ["python3", "-m", "py_compile", *existing_changed_py],
             cwd=str(worktree_dir),
             capture_output=True,
             text=True,
             timeout=180,
         )
-        validation_lines.append("$ python3 -m py_compile " + " ".join(changed_py))
+        validation_lines.append("$ python3 -m py_compile " + " ".join(existing_changed_py))
         validation_lines.append((py_compile.stdout or "").strip())
         validation_lines.append((py_compile.stderr or "").strip())
         validation_ok = py_compile.returncode == 0
+        if missing_changed_py:
+            validation_lines.append(
+                "Skipped missing changed Python files: " + ", ".join(missing_changed_py)
+            )
+    elif changed_py:
+        validation_lines.append(
+            "All changed Python files were missing under the worktree (likely deleted/renamed); skipped py_compile."
+        )
     else:
         validation_lines.append("No Python files changed; skipped py_compile.")
     validation_text = "\n".join(line for line in validation_lines if line).strip()
@@ -6385,7 +6527,16 @@ def _orchestrator_run_local_ollama(
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
     repo_role_worktree: Path | None = None
-    order_branch = _resolve_order_branch_from_task(task, orch_q)
+    order_branch_raw = _resolve_order_branch_from_task(task, orch_q) or ""
+    order_branch = _normalize_order_branch(order_branch_raw)
+    if order_branch_raw and not order_branch:
+        logging.warning(
+            "order_branch_ignored_invalid_ref",
+            extra={
+                "job_id": str(task.job_id),
+                "order_branch_raw": str(order_branch_raw),
+            },
+        )
     if repo_base_dir is not None and (repo_base_dir / ".git").exists():
         try:
             role_repo_id = repo_id or _factory_repo_id(repo_base_dir)
@@ -6401,7 +6552,49 @@ def _orchestrator_run_local_ollama(
                     default_branch=repo_default_branch,
                 )
                 if not ok_sync:
-                    raise RuntimeError(f"order branch sync failed: {sync_msg}")
+                    logging.warning(
+                        "order_branch_sync_failed_continue_with_clean_role_worktree",
+                        extra={
+                            "order_branch": order_branch,
+                            "repo_role_worktree": str(repo_role_worktree),
+                            "sync_error": str(sync_msg or ""),
+                        },
+                    )
+                    fallback_branch = repo_default_branch
+                    fallback_ok, fallback_msg = _sync_worktree_to_order_branch(
+                        base_repo=repo_base_dir,
+                        worktree_dir=repo_role_worktree,
+                        order_branch=fallback_branch,
+                        default_branch=repo_default_branch,
+                    )
+                    sync_warning = (
+                        "order branch sync fallback "
+                        f"order_branch={order_branch} "
+                        f"fallback_branch={fallback_branch} "
+                        f"sync_msg={sync_msg} "
+                        f"fallback_ok={fallback_ok} "
+                        f"fallback_msg={fallback_msg}"
+                    )
+                    try:
+                        task_context = getattr(task, "context", None)
+                        if isinstance(task_context, dict):
+                            task_context["order_branch_sync_warning"] = sync_warning
+                            task_context["order_branch_sync_warning_msg"] = str(sync_msg)
+                    except Exception:
+                        pass
+                    try:
+                        run_context = getattr(orch_q, "run_context", None)
+                        if isinstance(run_context, dict):
+                            run_context["order_branch_sync_warning"] = sync_warning
+                            run_context["order_branch_sync_warning_msg"] = str(sync_msg)
+                    except Exception:
+                        pass
+                    try:
+                        setattr(task, "order_branch_sync_warning", sync_warning)
+                        setattr(task, "order_branch_sync_warning_msg", str(sync_msg))
+                    except Exception:
+                        pass
+                    print(sync_warning, flush=True)
         except Exception:
             repo_role_worktree = None
     shared_local_worktree = _local_role_worktree_dir(
@@ -7463,9 +7656,24 @@ def _orchestrator_role_is_valid(role: str, profiles: dict[str, dict[str, Any]]) 
     return normalized in _orchestrator_known_roles(profiles)
 
 
-def _coerce_orchestrator_mode(value: str) -> str:
+def _coerce_mode_hint(value: str) -> str:
     mode = (value or "").strip().lower()
-    return mode if mode in ("ro", "rw", "full") else "ro"
+    aliases = {
+        "read": "ro",
+        "readonly": "ro",
+        "read-only": "ro",
+        "write": "rw",
+        "readwrite": "rw",
+        "read-write": "rw",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in ("ro", "rw", "full"):
+        raise ValueError(f"unsupported MODE_HINT: {value!r}")
+    return mode
+
+
+def _coerce_orchestrator_mode(value: str) -> str:
+    return _coerce_mode_hint(value)
 
 
 _ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
@@ -14185,6 +14393,9 @@ def _inject_local_specialist_specs(
         return specs
     if not (bool(is_top_level_manual) or bool(proactive_lane) or bool(allow_delegation)):
         return specs
+    # Proactive lane stays Codex-delivery-first by default.
+    if bool(proactive_lane) and (not _skynet_factory_local_only_enabled()):
+        return specs
 
     roles_present = {str(s.role or "").strip().lower() for s in specs}
     delivery_roles = {
@@ -15672,14 +15883,22 @@ def _classify_local_slice_failure(
         "cannot safely implement",
         "handoff is still not actionable",
         "provide the exact file path",
-        "missing excerpt for `bot.py` around `_classify_local_slice_failure`",
-        "please provide the full function body for `_classify_local_slice_failure`",
     )
-    if any(tok in blob for tok in blocker_markers):
+    if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
-    if "patch rejected by git apply --check" in blob and "no valid patches in input" in blob:
-        return "terminal"
+    malformed_patch_markers = (
+        "no valid patches in input",
+        "corrupt patch at line",
+    )
+    # Treat malformed diff formatting as recoverable/blocking, not terminal.
+    if "corrupt patch at line" in blob:
+        return "blocked"
+    if (
+        "patch rejected by git apply --check" in blob
+        and any(tok in blob for tok in malformed_patch_markers)
+    ):
+        return "blocked"
 
     patch_invalid_markers = (
         "patch rejected by git apply --check",
@@ -16501,7 +16720,7 @@ def _recent_ticket_role_activity(
 
 def _apply_autonomous_local_first_policy(
     *,
-    cfg: BotConfig | None,
+    cfg: BotConfig | None = None,
     specs: list[TaskSpec],
     orch_q: OrchestratorQueue,
     root_ticket: str,
@@ -17396,7 +17615,17 @@ def _apply_autonomous_local_first_policy(
             if len(candidate_files) >= 3:
                 break
         if not candidate_files:
-            return []
+            excerpt_blocker_text = blocker_payload or arch_payload
+            if _local_blocker_requests_grounded_excerpt(excerpt_blocker_text):
+                bot_file = (worktree / "bot.py").resolve()
+                try:
+                    inside = str(bot_file).startswith(str(worktree))
+                except Exception:
+                    inside = False
+                if inside and bot_file.is_file():
+                    candidate_files = ["bot.py"]
+            if not candidate_files:
+                return []
         # Keep direct unblock scope tight: prefer executable/source files over docs.
         non_doc_candidates = [p for p in candidate_files if not str(p).lower().endswith(".md")]
         if non_doc_candidates:
@@ -17760,6 +17989,10 @@ def _apply_autonomous_local_first_policy(
         if latest_arch_response and _response_signals_no_code_change(latest_arch_response) and not active_reviewer_open:
             return _no_change_review_specs()
         if impl_failure_requires_replan and not active_arch_open and not active_implementer_open and not active_reviewer_open:
+            if _local_blocker_requests_grounded_excerpt(latest_impl_failed_blocker):
+                direct_specs = _direct_blocker_implementer_specs()
+                if direct_specs:
+                    return direct_specs
             if int(recent_non_actionable_arch_count) >= 2:
                 direct_specs = _direct_blocker_implementer_specs()
                 if (not direct_specs) and _response_signals_repo_access_blocker(latest_arch_response):
@@ -17841,6 +18074,10 @@ def _apply_autonomous_local_first_policy(
         and not active_implementer_open
         and not active_reviewer_open
     ):
+        if _local_blocker_requests_grounded_excerpt(latest_impl_failed_blocker):
+            direct_specs = _direct_blocker_implementer_specs()
+            if direct_specs:
+                return direct_specs
         if int(recent_non_actionable_arch_count) >= 2:
             direct_specs = _direct_blocker_implementer_specs()
             if direct_specs:
@@ -19146,6 +19383,68 @@ def _blocked_pressure_tick(
     return created
 
 
+def _final_sweep_requests_root_cause_close(result_summary: str) -> bool:
+    """
+    Parse FINAL SWEEP close intent conservatively:
+    - close when summary explicitly carries blocked_with_root_cause signal, or
+    - close when NO-GO and close-order language are both present.
+    Avoid false closures on GO/negated text (e.g. "GO ... do not close").
+    """
+    text = str(result_summary or "").strip().lower()
+    if not text:
+        return False
+    norm = text.replace("_", " ")
+
+    if "blocked with root cause" in norm:
+        return True
+
+    no_go = bool(re.search(r"\bno[\s-]?go\b", norm))
+    close_signal = any(
+        sig in norm
+        for sig in (
+            "close this order",
+            "close order",
+            "close the order",
+            "mark order done",
+            "set order done",
+        )
+    )
+    if not (no_go and close_signal):
+        return False
+
+    if any(neg in norm for neg in ("do not close", "don't close", "dont close", "no cerrar")):
+        return False
+    return True
+
+
+def _final_sweep_blocker_count(*, children: Sequence[Task], open_states: set[str] | None = None) -> int:
+    """
+    Count close-gate blockers for FINAL SWEEP.
+
+    Real delivery work in open states blocks closure; controller/review overhead does not.
+    """
+    states = open_states or {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    non_blocking_roles = {
+        "skynet",
+        "jarvis",
+        "orchestrator",
+        "controller",
+        "reviewer_local",
+        "architect_local",
+        "qa",
+    }
+    blockers = 0
+    for c in children:
+        st = str(c.state or "").strip().lower()
+        if st not in states:
+            continue
+        role = str(c.role or "").strip().lower()
+        if role in non_blocking_roles:
+            continue
+        blockers += 1
+    return blockers
+
+
 def _jarvis_final_sweep_tick(
     *,
     cfg: BotConfig,
@@ -19154,23 +19453,18 @@ def _jarvis_final_sweep_tick(
     now: float,
 ) -> int:
     """
-    End-of-cycle guardrail: if a ticket is only blocked/waiting (no runnable work),
-    or it remains active with no live child jobs, force a Jarvis sweep so leftovers
-    are either discarded, closed explicitly, or replanned.
+    Guardrail for idle active orders:
+    when an order has no live children or only terminal/no-progress children, move
+    the lane forward without closing mergeable proactive work prematurely.
     """
     try:
-        # Avoid meta-loop thrash from very short sweep intervals, but honor test overrides.
-        cooldown_s = float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "900").strip() or "900")
-        if cooldown_s < 0:
-            cooldown_s = 0.0
+        stale_after_s = max(60.0, float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "120").strip() or "120"))
     except Exception:
-        cooldown_s = 900.0
+        stale_after_s = 120.0
     try:
-        idle_order_stale_s = float(os.environ.get("BOT_JARVIS_IDLE_ORDER_STALE_SECONDS", "300").strip() or "300")
-        if idle_order_stale_s < 0:
-            idle_order_stale_s = 0.0
+        cooldown_s = max(0.0, float(os.environ.get("BOT_JARVIS_FINAL_SWEEP_COOLDOWN_SECONDS", "600").strip() or "600"))
     except Exception:
-        idle_order_stale_s = 300.0
+        cooldown_s = 600.0
     try:
         idle_terminal_close_threshold = int(os.environ.get("BOT_JARVIS_IDLE_TERMINAL_CLOSE_THRESHOLD", "10").strip() or "10")
         if idle_terminal_close_threshold < 1:
@@ -19182,54 +19476,52 @@ def _jarvis_final_sweep_tick(
     except Exception:
         max_per_tick = 3
 
+    open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    terminal_states = {"done", "failed", "cancelled"}
+    created = 0
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
     except Exception:
-        return 0
-    if not orders:
-        return 0
+        orders = orch_q.list_orders(chat_id=1, status="active", limit=100)
 
-    active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
-    meta_active_kinds = ("delivery_replan", "blocked_replan", "stalled_replan", "sla_replan", "final_sweep")
-    terminal_states = ("done", "failed", "cancelled")
-    terminal_phases = {"ready_for_merge", "done", "failed", "cancelled", "merged"}
-    created = 0
+    def _first_valid_ts(*vals: Any) -> float:
+        for v in vals:
+            try:
+                f = float(v)
+                if math.isfinite(f) and f > 0:
+                    return f
+            except Exception:
+                continue
+        return float(now)
 
-    for row in orders:
+    for o in orders:
         if created >= max_per_tick:
             break
-
-        order_id = str(row.get("order_id") or "").strip()
-        if not order_id:
+        oid = str(o.get("order_id") or "").strip()
+        if not oid:
             continue
-        try:
-            chat_id = int(row.get("chat_id") or 0)
-        except Exception:
-            chat_id = 0
-        if chat_id <= 0:
-            continue
-
-        children = orch_q.jobs_by_parent(parent_job_id=order_id, limit=500)
-        if not children:
-            continue
-        proactive_order = bool(_is_proactive_order_record(row))
+        chat_id = int(o.get("chat_id") or 0) or 1
+        children = orch_q.jobs_by_parent(parent_job_id=oid, limit=500)
+        root = orch_q.get_job(oid)
+        root_trace = dict((root.trace if root else {}) or {})
+        proactive_order = bool(_is_proactive_order_record(o)) or bool(root_trace.get("proactive_lane", False))
 
         if proactive_order and _order_has_verified_no_change_resolution(
             orch_q=orch_q,
-            root_ticket=order_id,
+            root_ticket=oid,
             now=now,
         ):
             active_local = any(
                 _coerce_orchestrator_role(str(c.role or "")) in {"architect_local", "implementer_local", "reviewer_local"}
-                and str(c.state or "").strip().lower() in active_states
+                and str(c.state or "").strip().lower() in open_states
                 for c in children
             )
             if not active_local:
                 try:
-                    orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done")
-                    orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done")
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
                     orch_q.update_trace(
-                        order_id,
+                        oid,
                         proactive_no_change_validated=True,
                         proactive_no_change_validated_at=float(now),
                         proactive_no_change_resolution="reviewer_validated_existing_implementation",
@@ -19239,7 +19531,7 @@ def _jarvis_final_sweep_tick(
                         event_type="order.proactive_no_change_closed",
                         actor="skynet",
                         details={
-                            "order_id": order_id,
+                            "order_id": oid,
                             "chat_id": int(chat_id),
                             "reason": "reviewer_validated_existing_implementation",
                             "closed_by": "final_sweep_guard",
@@ -19249,246 +19541,240 @@ def _jarvis_final_sweep_tick(
                     pass
                 continue
 
-        # Avoid concurrent meta-sweeps for the same ticket.
-        if any(
-            str((c.labels or {}).get("kind") or "").strip().lower() in meta_active_kinds
-            and str(c.state or "").strip().lower() in active_states
-            for c in children
-        ):
+        if _final_sweep_blocker_count(children=children, open_states=open_states) > 0:
             continue
 
-        running_n = 0
-        queued_n = 0
-        waiting_n = 0
-        blocked_n = 0
-        terminal_n = 0
-        latest_child_activity = 0.0
-        latest_non_meta_child_activity = 0.0
+        recent_sweep = False
         for c in children:
-            st = str(c.state or "").strip().lower()
-            updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
-            if updated_at > latest_child_activity:
-                latest_child_activity = updated_at
-            kind = str((c.labels or {}).get("kind") or "").strip().lower()
-            if kind not in meta_active_kinds and updated_at > latest_non_meta_child_activity:
-                latest_non_meta_child_activity = updated_at
-            recoverable_controller_blocked = st in ("blocked", "blocked_approval") and _task_requests_local_controller_recovery(
-                c,
-                orch_state=st,
-            )
-            if st == "running":
-                running_n += 1
-            elif st == "queued":
-                queued_n += 1
-            elif st == "waiting_deps":
-                waiting_n += 1
-            elif st in ("blocked", "blocked_approval") and not recoverable_controller_blocked:
-                blocked_n += 1
-            elif st in terminal_states or recoverable_controller_blocked:
-                terminal_n += 1
-
-        phase = str(row.get("phase") or "").strip().lower()
-        active_total = running_n + queued_n + waiting_n + blocked_n
-        sweep_reason = ""
-        prompt_body = ""
-        extra_trace: dict[str, Any] = {}
-
-        if (blocked_n + waiting_n) > 0 and (running_n + queued_n) == 0:
-            sweep_reason = "blocked_waiting_only"
-            prompt_body = (
-                f"Blocked jobs: {blocked_n}\n"
-                f"Waiting dependencies: {waiting_n}\n"
-                "Action required:\n"
-                "- Verify if remaining blockers are still valid.\n"
-                "- Discard/cancel stale or superseded leftovers.\n"
-                "- Re-plan an executable path for unresolved blockers.\n"
-                "- Keep execution aligned with ticket policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
-                "- Keep iterating until this ticket has no blocked/waiting leftovers.\n"
-            )
-            extra_trace = {
-                "blocked_count": int(blocked_n),
-                "waiting_count": int(waiting_n),
-            }
-        elif active_total == 0:
-            if phase in terminal_phases:
+            if str((c.labels or {}).get("kind") or "").strip().lower() != "final_sweep":
                 continue
-            idle_age_s = max(0.0, float(now) - latest_child_activity) if latest_child_activity > 0 else float(idle_order_stale_s)
-            if idle_age_s < float(idle_order_stale_s):
-                continue
+            age_s = max(0.0, float(now) - float(c.updated_at or c.created_at or now))
+            if age_s < cooldown_s:
+                recent_sweep = True
+                break
+        if recent_sweep:
+            continue
 
-            # High-signal guardrail for proactive lanes:
-            # if an order has only terminal children for a long time and keeps reseeding,
-            # move it forward without generating another sweep loop. If an order branch
-            # exists, never close directly: hand it to the merge/deploy lane.
-            if proactive_order and terminal_n >= int(idle_terminal_close_threshold):
-                root_job = orch_q.get_job(order_id)
-                root_trace = dict((root_job.trace if root_job else {}) or {})
+        terminal_sweeps_done = [
+            c
+            for c in children
+            if str((c.labels or {}).get("kind") or "").strip().lower() == "final_sweep"
+            and str(c.state or "").strip().lower() == "done"
+        ]
+        if terminal_sweeps_done:
+            try:
+                terminal_sweeps_done.sort(
+                    key=lambda t: float(getattr(t, "updated_at", 0.0) or getattr(t, "created_at", 0.0) or 0.0),
+                    reverse=True,
+                )
+            except Exception:
+                pass
+            latest_summary = str(((terminal_sweeps_done[0].trace or {}).get("result_summary") or "")).strip()
+            if _final_sweep_requests_root_cause_close(latest_summary):
                 try:
-                    _repo_record, repo_dir, default_branch = _repo_context_for_order(
-                        cfg=cfg,
-                        orch_q=orch_q,
-                        order_id=order_id,
-                        chat_id=int(chat_id),
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                    orch_q.update_trace(
+                        oid,
+                        final_sweep_root_cause_closed=True,
+                        final_sweep_root_cause_closed_at=float(now),
+                        final_sweep_root_cause_closed_summary=(latest_summary[:400] if latest_summary else ""),
                     )
-                    merge_required, _merge_branch = _order_trace_requires_merge(
-                        root_trace,
-                        repo=(repo_dir if (repo_dir / ".git").exists() else None),
-                        default_branch=default_branch,
+                    orch_q.append_audit_event(
+                        event_type="order.final_sweep_root_cause_closed",
+                        actor="scheduler",
+                        details={
+                            "order_id": oid,
+                            "reason": "final_sweep_root_cause_close_signal",
+                        },
                     )
-                except Exception:
-                    merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
-
-                if merge_required:
-                    ready_succeeded = False
-                    try:
-                        status_ok = bool(orch_q.set_order_status(order_id, chat_id=int(chat_id), status="active"))
-                        phase_ok = bool(orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="ready_for_merge"))
-                        ready_succeeded = bool(status_ok and phase_ok)
-                    except Exception:
-                        pass
-                    if ready_succeeded:
-                        try:
-                            orch_q.update_trace(
-                                order_id,
-                                final_sweep_terminal_only_ready_for_merge=True,
-                                final_sweep_terminal_only_ready_for_merge_at=float(now),
-                                final_sweep_terminal_only_closed=False,
-                                final_sweep_terminal_only_closed_count=int(terminal_n),
-                                final_sweep_terminal_only_closed_idle_age_s=float(idle_age_s),
-                                merge_ready=True,
-                                merge_ready_at=float(now),
-                                live_at=float(now),
-                                **_merge_ready_trace_reset_payload(now=float(now)),
-                            )
-                            orch_q.append_audit_event(
-                                event_type="order.final_sweep_terminal_only_ready_for_merge",
-                                actor="skynet",
-                                details={
-                                    "order_id": order_id,
-                                    "terminal_child_count": int(terminal_n),
-                                    "idle_age_s": float(idle_age_s),
-                                    "threshold": int(idle_terminal_close_threshold),
-                                    "reason": "pending_order_branch",
-                                },
-                            )
-                        except Exception:
-                            pass
-                    continue
-
-                try:
-                    verified_terminal_outcome = bool(
-                        _order_has_meaningful_improvement(orch_q=orch_q, root_ticket=order_id)
-                        or _order_has_verified_no_change_resolution(orch_q=orch_q, root_ticket=order_id, now=now)
-                    )
-                except Exception:
-                    verified_terminal_outcome = False
-
-                close_succeeded = False
-                try:
-                    status_ok = bool(orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done"))
-                    phase_ok = bool(orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done"))
-                    close_succeeded = bool(status_ok and phase_ok)
                 except Exception:
                     pass
-                if not close_succeeded:
-                    try:
-                        refreshed = orch_q.get_order(order_id, chat_id=int(chat_id))
-                    except Exception:
-                        refreshed = None
-                    if refreshed is not None:
-                        refreshed_status = str(refreshed.get("status") or "").strip().lower()
-                        refreshed_phase = str(refreshed.get("phase") or "").strip().lower()
-                        close_succeeded = refreshed_status == "done" and refreshed_phase == "done"
-                if close_succeeded:
+                continue
+
+        order_updated = o.get("updated_at")
+        order_created = o.get("created_at")
+        if root is None:
+            root_like_ts = _first_valid_ts(order_updated, order_created, now)
+        else:
+            root_like_ts = _first_valid_ts(root.updated_at, root.created_at, order_updated, order_created, now)
+        root_age_s = max(0.0, float(now) - float(root_like_ts))
+        if root_age_s < stale_after_s:
+            continue
+
+        terminal_children = [c for c in children if str(c.state or "").strip().lower() in terminal_states]
+        last_child_ts = 0.0
+        for c in terminal_children:
+            try:
+                last_child_ts = max(last_child_ts, float(c.updated_at or c.created_at or 0.0))
+            except Exception:
+                continue
+        child_idle_s = int(max(0.0, float(now) - last_child_ts)) if last_child_ts > 0 else int(root_age_s)
+
+        if proactive_order and len(terminal_children) >= int(idle_terminal_close_threshold):
+            try:
+                _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=int(chat_id),
+                )
+                merge_required, _merge_branch = _order_trace_requires_merge(
+                    root_trace,
+                    repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                    default_branch=default_branch,
+                )
+            except Exception:
+                merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
+
+            if merge_required:
+                ready_succeeded = False
+                try:
+                    status_ok = bool(orch_q.set_order_status(oid, chat_id=int(chat_id), status="active"))
+                    phase_ok = bool(orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="ready_for_merge"))
+                    ready_succeeded = bool(status_ok and phase_ok)
+                except Exception:
+                    pass
+                if ready_succeeded:
                     try:
                         orch_q.update_trace(
-                            order_id,
-                            final_sweep_terminal_only_closed=True,
-                            final_sweep_terminal_only_closed_at=float(now),
-                            final_sweep_terminal_only_closed_count=int(terminal_n),
-                            final_sweep_terminal_only_closed_idle_age_s=float(idle_age_s),
-                            proactive_blocked_with_root_cause=(not verified_terminal_outcome),
-                            proactive_blocked_with_root_cause_at=(float(now) if not verified_terminal_outcome else None),
-                            proactive_blocked_with_root_cause_summary=(
-                                "Terminal-only proactive loop stopped after repeated terminal jobs "
-                                "without a mergeable branch or verified improvement evidence."
-                                if not verified_terminal_outcome
-                                else None
-                            ),
+                            oid,
+                            final_sweep_terminal_only_ready_for_merge=True,
+                            final_sweep_terminal_only_ready_for_merge_at=float(now),
+                            final_sweep_terminal_only_closed=False,
+                            final_sweep_terminal_only_closed_count=int(len(terminal_children)),
+                            final_sweep_terminal_only_closed_idle_age_s=float(child_idle_s),
+                            merge_ready=True,
+                            merge_ready_at=float(now),
                             live_at=float(now),
+                            **_merge_ready_trace_reset_payload(now=float(now)),
                         )
                         orch_q.append_audit_event(
-                            event_type="order.final_sweep_auto_closed_terminal_only",
+                            event_type="order.final_sweep_terminal_only_ready_for_merge",
                             actor="skynet",
                             details={
-                                "order_id": order_id,
-                                "terminal_child_count": int(terminal_n),
-                                "idle_age_s": float(idle_age_s),
+                                "order_id": oid,
+                                "terminal_child_count": int(len(terminal_children)),
+                                "idle_age_s": float(child_idle_s),
                                 "threshold": int(idle_terminal_close_threshold),
-                                "reason": "idle_no_open_jobs",
-                                "verified_terminal_outcome": bool(verified_terminal_outcome),
+                                "reason": "pending_order_branch",
                             },
                         )
                     except Exception:
                         pass
+                continue
+
+            try:
+                verified_terminal_outcome = bool(
+                    _order_has_meaningful_improvement(orch_q=orch_q, root_ticket=oid)
+                    or _order_has_verified_no_change_resolution(orch_q=orch_q, root_ticket=oid, now=now)
+                )
+            except Exception:
+                verified_terminal_outcome = False
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                orch_q.update_trace(
+                    oid,
+                    final_sweep_terminal_only_closed=True,
+                    final_sweep_terminal_only_closed_at=float(now),
+                    final_sweep_terminal_only_closed_count=int(len(terminal_children)),
+                    final_sweep_terminal_only_closed_idle_age_s=float(child_idle_s),
+                    proactive_blocked_with_root_cause=(not verified_terminal_outcome),
+                    proactive_blocked_with_root_cause_at=(float(now) if not verified_terminal_outcome else None),
+                    proactive_blocked_with_root_cause_summary=(
+                        "Terminal-only proactive loop stopped after repeated terminal jobs "
+                        "without a mergeable branch or verified improvement evidence."
+                        if not verified_terminal_outcome
+                        else None
+                    ),
+                    live_at=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.final_sweep_auto_closed_terminal_only",
+                    actor="skynet",
+                    details={
+                        "order_id": oid,
+                        "terminal_child_count": int(len(terminal_children)),
+                        "idle_child_age_s": float(child_idle_s),
+                        "threshold": int(idle_terminal_close_threshold),
+                        "verified_terminal_outcome": bool(verified_terminal_outcome),
+                    },
+                )
+            except Exception:
+                pass
+            continue
+
+        latest_done_final_sweep_at = 0.0
+        proactive_lane = False
+        for c in children:
+            labels = getattr(c, "labels", {}) if isinstance(getattr(c, "labels", {}), dict) else {}
+            trace = getattr(c, "trace", {}) if isinstance(getattr(c, "trace", {}), dict) else {}
+            kind = str(labels.get("kind") or "").strip().lower()
+            child_updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
+            if bool(trace.get("proactive_lane", False)):
+                proactive_lane = True
+            if kind == "final_sweep" and str(c.state or "").strip().lower() == "done":
+                if child_updated_at > latest_done_final_sweep_at:
+                    latest_done_final_sweep_at = child_updated_at
+
+        if proactive_lane and latest_done_final_sweep_at > 0.0 and (now - latest_done_final_sweep_at) >= cooldown_s:
+            post_sweep_non_final_activity = False
+            for c in children:
+                labels = getattr(c, "labels", {}) if isinstance(getattr(c, "labels", {}), dict) else {}
+                kind = str(labels.get("kind") or "").strip().lower()
+                if kind == "final_sweep":
                     continue
+                child_updated_at = float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0)
+                if child_updated_at > latest_done_final_sweep_at:
+                    post_sweep_non_final_activity = True
+                    break
+            if not post_sweep_non_final_activity:
+                try:
+                    close_reason = "final_sweep_no_followup_closed"
+                    orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+                    orch_q.update_trace(
+                        oid,
+                        final_sweep_no_followup_closed_reason=close_reason,
+                        final_sweep_no_followup_closed_at=float(now),
+                        final_sweep_no_followup_last_done_sweep_at=float(latest_done_final_sweep_at),
+                        final_sweep_no_followup_cooldown_s=float(cooldown_s),
+                        live_at=float(now),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.final_sweep_no_followup_closed",
+                        actor="scheduler",
+                        details={
+                            "order_id": oid,
+                            "reason": close_reason,
+                            "latest_done_final_sweep_at": float(latest_done_final_sweep_at),
+                            "cooldown_s": float(cooldown_s),
+                        },
+                    )
+                except Exception:
+                    pass
+                continue
 
-            sweep_reason = "idle_no_open_jobs"
-            prompt_body = (
-                f"Terminal child jobs: {terminal_n}\n"
-                f"Last child activity age (s): {int(max(0.0, idle_age_s))}\n"
-                "Action required:\n"
-                "- Do not leave this order active with zero live jobs.\n"
-                "- Either close the order explicitly with evidence, or delegate the next highest-impact executable work now.\n"
-                "- Re-plan using the ticket execution policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
-                "- Require validation/evidence before any final wrap-up.\n"
-            )
-            extra_trace = {
-                "terminal_child_count": int(terminal_n),
-                "idle_child_age_s": float(idle_age_s),
-            }
-        else:
-            continue
-
-        root_job = orch_q.get_job(order_id)
-        root_trace = dict((root_job.trace if root_job else {}) or {})
-        try:
-            last_sweep_at = float(root_trace.get("final_sweep_last_at", 0.0) or 0.0)
-        except Exception:
-            last_sweep_at = 0.0
-        # Cooldown should only reset when *non-meta* work moved after the previous
-        # sweep. Otherwise repeated sweep jobs can keep resetting themselves.
-        if latest_non_meta_child_activity > 0 and latest_non_meta_child_activity > (last_sweep_at + 5.0):
-            last_sweep_at = 0.0
-        if last_sweep_at > 0 and (float(now) - last_sweep_at) < float(cooldown_s):
-            continue
-
-        if proactive_order and _enqueue_reviewer_local_rework_if_due(
-            cfg=cfg,
-            orch_q=orch_q,
-            profiles=profiles,
-            order_row=row,
-            chat_id=int(chat_id),
-            now=float(now),
-        ):
-            created += 1
-            continue
-
-        controller_role = "skynet" if proactive_order else _controller_role_for_root_ticket(orch_q=orch_q, root_ticket=order_id)
+        sweep_reason = "idle_no_open_jobs"
+        prompt_body = (
+            f"Terminal child jobs: {len(terminal_children)}\n"
+            f"Last child activity age (s): {int(max(0, child_idle_s))}\n"
+            "Action required:\n"
+            "- Do not leave this order active with zero live jobs.\n"
+            "- Either close the order explicitly with evidence, or delegate the next highest-impact executable work now.\n"
+            "- Re-plan using the ticket execution policy; proactive tickets should stay Codex-first unless BOT_SKYNET_FACTORY_LOCAL_ONLY=1.\n"
+            "- Require validation/evidence before any final wrap-up.\n"
+        )
+        controller_role = "skynet" if proactive_order else "jarvis"
         profile = _orchestrator_profile(profiles, controller_role)
         model = _orchestrator_model_for_profile(cfg, profile) or _MODEL_JARVIS_PLAN
         effort = _orchestrator_effort_for_profile(profile, cfg) or _EFFORT_JARVIS_PLAN
-
         sweep_id = str(uuid.uuid4())
         sweep = Task.new(
             source="telegram",
             role=controller_role,
-            input_text=(
-                "FINAL SWEEP\n"
-                f"Order/Ticket: {order_id}\n"
-                f"Reason: {sweep_reason}\n"
-                + prompt_body
-            ),
+            input_text=("FINAL SWEEP\n" f"Order/Ticket: {oid}\n" f"Reason: {sweep_reason}\n" + prompt_body),
             request_type="maintenance",
             priority=1,
             model=model,
@@ -19497,51 +19783,44 @@ def _jarvis_final_sweep_tick(
             requires_approval=False,
             max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
             chat_id=int(chat_id),
-            user_id=None,
-            reply_to_message_id=None,
             is_autonomous=True,
-            parent_job_id=order_id,
+            parent_job_id=oid,
             owner="scheduler",
-            labels={"ticket": order_id, "kind": "final_sweep"},
+            labels={"ticket": oid, "kind": "final_sweep"},
             artifacts_dir=str((cfg.artifacts_root / sweep_id).resolve()),
             trace={
                 "source": "scheduler",
                 "allow_delegation": True,
-                "order_id": order_id,
+                "order_id": oid,
                 "final_sweep_reason": sweep_reason,
+                "terminal_child_count": int(len(terminal_children)),
+                "idle_child_age_s": float(child_idle_s),
                 "profile_name": str(profile.get("name") or controller_role),
                 "profile_role": controller_role,
                 "max_runtime_seconds": int(profile.get("max_runtime_seconds") or 0),
-                **extra_trace,
             },
             job_id=sweep_id,
         )
         orch_q.submit_task(sweep)
         created += 1
-
         try:
             orch_q.update_trace(
-                order_id,
+                oid,
                 final_sweep_last_at=float(now),
                 final_sweep_job_id=sweep_id,
                 final_sweep_reason=sweep_reason,
                 live_at=float(now),
-                **extra_trace,
+                terminal_child_count=int(len(terminal_children)),
+                idle_child_age_s=float(child_idle_s),
             )
-            orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="planning")
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="planning")
             orch_q.append_audit_event(
                 event_type="order.final_sweep_enqueued",
                 actor=controller_role,
-                details={
-                    "order_id": order_id,
-                    "job_id": sweep_id,
-                    "reason": sweep_reason,
-                    **extra_trace,
-                },
+                details={"order_id": oid, "job_id": sweep_id, "reason": sweep_reason},
             )
         except Exception:
             pass
-
     return created
 
 def _running_watchdog_tick(

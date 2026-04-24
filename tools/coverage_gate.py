@@ -15,6 +15,7 @@ import unittest
 TARGETS = [
     pathlib.Path("state_store.py"),
 ]
+DEFAULT_TEST_PATTERNS = ["test_state_store.py"]
 
 
 def _code_line_numbers(code: types.CodeType) -> set[int]:
@@ -31,12 +32,28 @@ def _candidate_lines(path: pathlib.Path) -> set[int]:
     return _code_line_numbers(code)
 
 
+def _discover_suite(*, patterns: list[str]) -> unittest.TestSuite:
+    suite = unittest.TestSuite()
+    for pattern in patterns:
+        suite.addTests(unittest.defaultTestLoader.discover(".", pattern=pattern))
+    return suite
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Minimal coverage gate for hardening-critical modules")
-    ap.add_argument("--min", dest="min_cov", type=float, default=0.65)
+    ap.add_argument("--min", dest="min_cov", type=float, default=0.70)
+    ap.add_argument(
+        "--pattern",
+        action="append",
+        default=[],
+        help="test discovery pattern; repeat to include multiple patterns (default: test_state_store.py)",
+    )
     args = ap.parse_args()
 
-    suite = unittest.defaultTestLoader.discover(".", pattern="test_*.py")
+    patterns = [str(p or "").strip() for p in (args.pattern or []) if str(p or "").strip()]
+    if not patterns:
+        patterns = list(DEFAULT_TEST_PATTERNS)
+    suite = _discover_suite(patterns=patterns)
     tracer = trace.Trace(count=True, trace=False, ignoredirs=[sys.prefix, sys.exec_prefix])
     runner = unittest.TextTestRunner(verbosity=0)
     result = tracer.runfunc(runner.run, suite)
