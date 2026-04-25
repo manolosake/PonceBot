@@ -171,6 +171,79 @@ class TestStateHandling(unittest.TestCase):
             self.assertIn(str(repo_b.resolve()), repo_paths)
             self.assertFalse(any("node_modules" in path for path in repo_paths))
 
+    def test_factory_repo_autonomy_blocker_rejects_branch_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "manolosake"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "manolosake@gmail.com"], cwd=str(repo), check=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "feature/voice-out"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            reason = bot._factory_repo_autonomy_blocker(repo, default_branch="main")
+
+        self.assertIn("feature/voice-out", reason)
+        self.assertIn("default_branch 'main'", reason)
+
+    def test_spawn_proactive_order_blocks_mismatched_repo_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "manolosake"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "manolosake@gmail.com"], cwd=str(repo), check=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "feature/voice-out"], cwd=str(repo), check=True, capture_output=True, text=True)
+            cfg = self._cfg(root / "state.json")
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.statuses: list[tuple[str, str]] = []
+                    self.events: list[dict[str, object]] = []
+
+                def set_repo_status(self, *, repo_id: str, status: str) -> None:
+                    self.statuses.append((repo_id, status))
+
+                def append_audit_event(self, **kwargs: object) -> None:
+                    self.events.append(dict(kwargs))
+
+                def submit_task(self, *_args: object, **_kwargs: object) -> None:
+                    raise AssertionError("blocked repo must not submit a proactive task")
+
+            q = _FakeQueue()
+            created = bot._spawn_proactive_order(
+                cfg=cfg,
+                orch_q=q,  # type: ignore[arg-type]
+                profiles={},
+                chat_id=1,
+                now=123.0,
+                initiative={"key": "repo_voice", "title": "Voice Sprint"},
+                repo_record={
+                    "repo_id": "voice-12345678",
+                    "path": str(repo),
+                    "default_branch": "main",
+                    "autonomy_enabled": True,
+                    "priority": 2,
+                    "runtime_mode": "ceo-bounded",
+                    "daily_budget": 0.0,
+                    "status": "active",
+                    "metadata": {},
+                },
+            )
+
+        self.assertFalse(created)
+        self.assertEqual(q.statuses, [("voice-12345678", "blocked")])
+        self.assertEqual(q.events[0]["event_type"], "factory.repo_autonomy_blocked")
+        self.assertIn("feature/voice-out", str(q.events[0]["details"]))
+
     def test_local_slice_expected_validation_cmd_prefers_unittest_for_test_module_files(self) -> None:
         cmd = bot._local_slice_expected_validation_cmd(["tests/test_scheduler.py", "bot.py"])
         self.assertEqual(cmd, "python3 -m unittest -q tests/test_scheduler.py")

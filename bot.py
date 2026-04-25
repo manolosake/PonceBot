@@ -2574,6 +2574,51 @@ def _git_default_branch(repo: Path) -> str:
     return "main"
 
 
+def _factory_repo_autonomy_blocker(repo: Path, *, default_branch: str) -> str:
+    try:
+        repo = repo.expanduser().resolve()
+    except Exception:
+        repo = repo.expanduser()
+    if not (repo / ".git").exists():
+        return f"repo path is not a git checkout: {repo}"
+
+    status = _run_git(repo, ["status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        err = (status.stderr or status.stdout or "").strip()
+        return f"git status failed for registered repo: {err[:300] or 'unknown error'}"
+    dirty_lines = [line for line in str(status.stdout or "").splitlines() if line.strip()]
+    if dirty_lines:
+        preview = "; ".join(dirty_lines[:5])
+        extra = "" if len(dirty_lines) <= 5 else f"; +{len(dirty_lines) - 5} more"
+        return f"repo checkout has uncommitted changes ({preview}{extra})"
+
+    branch_proc = _run_git(repo, ["branch", "--show-current"], check=False)
+    current_branch = str(branch_proc.stdout or "").strip()
+    expected_branch = str(default_branch or "").strip() or _git_default_branch(repo)
+    expected_branch = expected_branch or "main"
+    if not current_branch:
+        head = _run_git(repo, ["rev-parse", "--short", "HEAD"], check=False)
+        return f"repo checkout is detached at {(head.stdout or '').strip() or 'unknown HEAD'}"
+    if current_branch != expected_branch:
+        try:
+            _git_refresh_default_branch_ref(repo, expected_branch)
+        except Exception:
+            pass
+        base_ref = _git_pick_main_ref(repo, default_branch=expected_branch)
+        divergence = ""
+        if base_ref and base_ref != "HEAD":
+            counts = _run_git(repo, ["rev-list", "--left-right", "--count", f"{current_branch}...{base_ref}"], check=False)
+            if counts.returncode == 0:
+                parts = str(counts.stdout or "").strip().split()
+                if len(parts) >= 2:
+                    divergence = f" (ahead={parts[0]}, behind={parts[1]} vs {base_ref})"
+        return (
+            f"repo checkout branch '{current_branch}' differs from configured default_branch "
+            f"'{expected_branch}'{divergence}"
+        )
+    return ""
+
+
 def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
     roots = _factory_repo_roots()
     all_skip_prefixes: list[Path] = []
@@ -13501,6 +13546,28 @@ def _spawn_proactive_order(
 
     order_branch = _order_branch_name(order_id, title)
     branch_repo = Path(repo_path).expanduser().resolve() if repo_path else cfg.codex_workdir
+    if repo_id and repo_path:
+        blocker = _factory_repo_autonomy_blocker(branch_repo, default_branch=str(repo_default_branch or "main"))
+        if blocker:
+            try:
+                orch_q.set_repo_status(repo_id=repo_id, status="blocked")
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="factory.repo_autonomy_blocked",
+                    actor=controller_role,
+                    details={
+                        "repo_id": repo_id,
+                        "repo_path": repo_path,
+                        "default_branch": str(repo_default_branch or "main"),
+                        "reason": blocker,
+                        "initiative": key,
+                    },
+                )
+            except Exception:
+                pass
+            return False
     ok_branch, branch_msg = _git_ensure_branch_from_main(
         branch_repo,
         str(order_branch),
