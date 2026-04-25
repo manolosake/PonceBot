@@ -11792,7 +11792,16 @@ def _order_operational_maturity_gate(
     if not merge_required:
         return True, "passed_no_merge_required", payload
 
-    if not bool(trace.get("merge_ready", False)):
+    pending_order_branch = bool(str(trace.get("order_branch") or "").strip())
+    proactive_pending_order_branch = bool(
+        _is_proactive_order_record(order)
+        and pending_order_branch
+        and not bool(trace.get("merged_to_main", False))
+        and not bool(trace.get("merge_cancelled", False))
+        and not str(trace.get("superseded_by") or "").strip()
+    )
+
+    if not bool(trace.get("merge_ready", False)) and not proactive_pending_order_branch:
         return False, "merge_not_ready", payload
 
     if _is_proactive_order_record(order):
@@ -11802,7 +11811,7 @@ def _order_operational_maturity_gate(
             or bool(trace.get("proactive_no_change_validated", False))
             or bool(trace.get("proactive_blocked_with_root_cause", False))
         )
-        if not closed:
+        if not closed and not proactive_pending_order_branch:
             return False, "proactive_quality_gate_not_closed", payload
 
     dirty = _git_dirty_status_lines(repo_dir)
@@ -19212,6 +19221,15 @@ def _sync_order_phase_from_runtime(
             latest_controller_terminal_summary = summary
 
     proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
+    proactive_pending_merge_intent = bool(
+        proactive_order
+        and merge_required
+        and _order_branch
+        and (
+            bool(root_trace.get("merge_ready", False))
+            or str(order.get("phase") or "").strip().lower() in ("ready_for_merge", "merge_ready")
+        )
+    )
 
     root_state = str(getattr(root_job, "state", "") or "").strip().lower()
     root_blocked_with_root_cause = (
@@ -19308,6 +19326,7 @@ def _sync_order_phase_from_runtime(
         and (not any_live)
         and (not proactive_verified_no_change)
         and (not proactive_improvement_verified)
+        and (not proactive_pending_merge_intent)
         and (not _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary))
     ):
         try:
