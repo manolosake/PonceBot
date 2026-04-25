@@ -11728,6 +11728,8 @@ def _order_operational_maturity_gate(
     default_branch: str,
     merge_required: bool,
     now: float,
+    require_merge_ready: bool = True,
+    require_proactive_closure: bool = True,
 ) -> tuple[bool, str, dict[str, Any]]:
     """
     Fail closed before Jarvis auto-merges or marks an order done.
@@ -11792,10 +11794,10 @@ def _order_operational_maturity_gate(
     if not merge_required:
         return True, "passed_no_merge_required", payload
 
-    if not bool(trace.get("merge_ready", False)):
+    if require_merge_ready and not bool(trace.get("merge_ready", False)):
         return False, "merge_not_ready", payload
 
-    if _is_proactive_order_record(order):
+    if require_proactive_closure and _is_proactive_order_record(order):
         closed = (
             bool(trace.get("merged_to_main", False))
             or bool(trace.get("proactive_improvement_closed", False))
@@ -14564,6 +14566,8 @@ def _enqueue_order_autopilot_task(
                     default_branch=default_branch,
                     merge_required=bool(merge_required),
                     now=float(now),
+                    require_merge_ready=False,
+                    require_proactive_closure=False,
                 )
             except Exception as exc:
                 gate_ok = False
@@ -19298,6 +19302,53 @@ def _sync_order_phase_from_runtime(
                     "reason": f"root_job_terminal_{root_state}_without_delivery",
                     "source": "phase_sync",
                 },
+            )
+        except Exception:
+            pass
+        return
+
+    current_phase = str(order.get("phase") or "").strip().lower()
+    if merge_required and bool(root_trace.get("merge_ready", False)) and current_phase == "ready_for_merge" and not any_live:
+        try:
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=True,
+                now=time.time(),
+                require_proactive_closure=False,
+            )
+            if not gate_ok:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=time.time(),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "reason": str(gate_reason),
+                        "source": "phase_sync",
+                    },
+                )
+                return
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            orch_q.update_trace(
+                rid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=time.time(),
+                **gate_payload,
             )
         except Exception:
             pass
