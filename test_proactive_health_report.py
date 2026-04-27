@@ -11,9 +11,80 @@ from pathlib import Path
 
 from tools.proactive_health_report import order_autonomy_funnel
 from tools.proactive_health_report import classify_open_job_mode, is_blocked_without_open_jobs
+from tools.proactive_health_report import AUTONOMY_MINIMUM_SLO, IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS
 
 
 class TestProactiveHealthReport(unittest.TestCase):
+    def _run_report(self, root: Path, db: Path, out_dir: Path) -> subprocess.CompletedProcess[str]:
+        env = {**dict(os.environ)}
+        env["CODEXBOT_ORCH_DB"] = str(db)
+        env["CODEXBOT_STATE_FILE"] = str(root / "state.json")
+        env["CODEXBOT_PROACTIVE_HEALTH_OUT_DIR"] = str(out_dir)
+        return subprocess.run(
+            ["python3", "tools/proactive_health_report.py"],
+            cwd=str(Path(__file__).resolve().parent),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def _create_report_db(self, db: Path, *, implementer_states: list[str]) -> None:
+        now = time.time()
+        with sqlite3.connect(db) as con:
+            con.execute(
+                """
+                CREATE TABLE ceo_orders (
+                    order_id TEXT,
+                    status TEXT,
+                    phase TEXT,
+                    title TEXT,
+                    body TEXT,
+                    updated_at REAL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT,
+                    parent_job_id TEXT,
+                    state TEXT,
+                    role TEXT,
+                    labels TEXT,
+                    trace TEXT,
+                    updated_at REAL,
+                    created_at REAL
+                )
+                """
+            )
+            con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+            con.execute(
+                """
+                INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("order-fail-rate", "active", "planning", "Proactive Sprint: reliability", "", now),
+            )
+            con.executemany(
+                """
+                INSERT INTO jobs(job_id, parent_job_id, state, role, labels, trace, updated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f"impl-{idx}",
+                        "order-fail-rate",
+                        state,
+                        "implementer_local",
+                        "{}",
+                        json.dumps({"slice_id": f"slice_{idx}", "result_summary": "attempt finished"}),
+                        now - idx,
+                        now - idx - 1,
+                    )
+                    for idx, state in enumerate(implementer_states)
+                ],
+            )
+
     def test_missing_db_writes_error_report(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -35,6 +106,54 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads(latest.read_text(encoding="utf-8"))
             self.assertEqual(payload.get("operational_status"), "CRITICAL")
             self.assertEqual(payload.get("error"), "db_missing")
+
+    def test_high_implementer_fail_rate_sets_trend_warn(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            self._create_report_db(
+                db,
+                implementer_states=["failed", "cancelled", "done", "done", "done"],
+            )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("trend_status"), "WARN")
+            self.assertEqual(payload.get("status"), "WARN")
+            flags = payload.get("trend_flags") or []
+            flag = next((item for item in flags if item.get("type") == "high_implementer_fail_rate"), None)
+            self.assertIsNotNone(flag)
+            self.assertEqual(flag.get("attempts"), 5)
+            self.assertEqual(flag.get("failures"), 2)
+            self.assertEqual(flag.get("fail_rate"), 0.4)
+            self.assertEqual(flag.get("threshold"), AUTONOMY_MINIMUM_SLO["implementer_fail_rate_lte"])
+            self.assertEqual(flag.get("minimum_attempts"), IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS)
+            self.assertEqual(
+                payload["autonomy_funnel"]["implementer_fail_rate_trend_min_attempts"],
+                IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
+            )
+
+    def test_implementer_fail_rate_trend_ignores_low_sample_size(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            self._create_report_db(db, implementer_states=["failed", "done"])
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("trend_status"), "OK")
+            self.assertEqual(payload.get("status"), "OK")
+            flags = payload.get("trend_flags") or []
+            self.assertFalse(any(item.get("type") == "high_implementer_fail_rate" for item in flags))
+            self.assertEqual(payload["metrics"]["implementer_attempts"], 2)
+            self.assertEqual(payload["metrics"]["implementer_failures"], 1)
+            self.assertEqual(payload["metrics"]["implementer_fail_rate"], 0.5)
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:

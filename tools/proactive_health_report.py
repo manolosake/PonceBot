@@ -28,6 +28,11 @@ IGNORE_ARTIFACT_TOKENS = (
 )
 STALE_LOCAL_S = 15 * 60
 LOOKBACK_S = 24 * 3600
+AUTONOMY_MINIMUM_SLO = {
+    'implementer_fail_rate_lte': 0.35,
+    'closed_over_started_gte': 0.50,
+}
+IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS = 5
 
 
 def worst_status(*values: str) -> str:
@@ -633,6 +638,8 @@ def main() -> int:
         'slices_applied': int(funnel_totals['slices_applied']),
         'slices_validated': int(funnel_totals['slices_validated']),
         'slices_closed': int(funnel_totals['slices_closed']),
+        'implementer_attempts': int(funnel_totals['implementer_attempts']),
+        'implementer_failures': int(funnel_totals['implementer_failures']),
         'implementer_fail_rate': round(float(implementer_fail_rate), 4),
         'mean_time_to_validated_improvement': mean_time_to_validated_improvement,
         'loop_breaker_count': int(funnel_totals['loop_breaker_count']),
@@ -701,6 +708,19 @@ def main() -> int:
             'type': 'high_model_fallbacks',
             'count': metrics['factory_model_fallback_24h'],
         })
+    implementer_fail_rate_threshold = float(AUTONOMY_MINIMUM_SLO['implementer_fail_rate_lte'])
+    if (
+        int(metrics['implementer_attempts']) >= IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS
+        and float(metrics['implementer_fail_rate']) > implementer_fail_rate_threshold
+    ):
+        trend_flags.append({
+            'type': 'high_implementer_fail_rate',
+            'fail_rate': metrics['implementer_fail_rate'],
+            'attempts': metrics['implementer_attempts'],
+            'failures': metrics['implementer_failures'],
+            'threshold': implementer_fail_rate_threshold,
+            'minimum_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
+        })
     trend_status = 'WARN' if trend_flags else 'OK'
     status = worst_status(operational_status, trend_status)
 
@@ -725,13 +745,13 @@ def main() -> int:
             'slices_applied': metrics['slices_applied'],
             'slices_validated': metrics['slices_validated'],
             'slices_closed': metrics['slices_closed'],
+            'implementer_attempts': metrics['implementer_attempts'],
+            'implementer_failures': metrics['implementer_failures'],
             'implementer_fail_rate': metrics['implementer_fail_rate'],
             'mean_time_to_validated_improvement': metrics['mean_time_to_validated_improvement'],
             'loop_breaker_count': metrics['loop_breaker_count'],
-            'autonomy_minimum_slo': {
-                'implementer_fail_rate_lte': 0.35,
-                'closed_over_started_gte': 0.50,
-            },
+            'autonomy_minimum_slo': AUTONOMY_MINIMUM_SLO,
+            'implementer_fail_rate_trend_min_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
         },
         'orders': order_reports,
         'anomalies': anomalies,
