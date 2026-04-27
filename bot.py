@@ -8387,6 +8387,7 @@ def _autocommit_push_order_branch(
     b = str(order_branch or "").strip()
     if not b:
         return {"status": "skipped", "reason": "no_branch"}
+    _purge_internal_worktree_marker(worktree_dir)
     st = _run_git(worktree_dir, ["status", "--porcelain"], check=False)
     status_out = str(st.stdout or "").strip()
     if not status_out:
@@ -8397,6 +8398,7 @@ def _autocommit_push_order_branch(
     add = _run_git(worktree_dir, ["add", "-A"], check=False, env=env)
     if add.returncode != 0:
         return {"status": "error", "reason": "git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+    _purge_internal_worktree_marker(worktree_dir)
 
     key = str((task.labels or {}).get("key") or "").strip() or "work"
     msg = f"order:{(task.parent_job_id or task.job_id)[:8]} job:{task.job_id[:8]} role:{task.role} key:{key}"
@@ -8436,6 +8438,20 @@ def _autocommit_push_order_branch(
 def _git_status_porcelain(repo_dir: Path) -> str:
     proc = _run_git(repo_dir, ["status", "--porcelain"], check=False)
     return str(proc.stdout or "").rstrip()
+
+
+def _purge_internal_worktree_marker(repo_dir: Path) -> None:
+    marker_name = ".poncebot_managed_worktree"
+    marker = repo_dir / marker_name
+    tracked = _run_git(repo_dir, ["ls-files", "--error-unmatch", "--", marker_name], check=False)
+    if tracked.returncode == 0:
+        _run_git(repo_dir, ["rm", "-f", "--", marker_name], check=False)
+        return
+    try:
+        if marker.is_file() or marker.is_symlink():
+            marker.unlink()
+    except Exception:
+        pass
 
 
 def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
@@ -14499,6 +14515,72 @@ def _enqueue_operational_gate_reviewer_recovery(
     return True
 
 
+def _close_proactive_terminal_root_failure(
+    *,
+    orch_q: OrchestratorQueue,
+    order_row: dict[str, Any],
+    root_job: Task | None,
+    children: list[Task],
+    chat_id: int,
+    now: float,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid or not _is_proactive_order_record(order_row) or root_job is None:
+        return False
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    if root_state not in _OPERATIONAL_GATE_BAD_TERMINAL_STATES:
+        return False
+    root_trace = dict((getattr(root_job, "trace", None) or {}) if root_job is not None else {})
+    if bool(root_trace.get("merged_to_main", False)) or bool(root_trace.get("proactive_improvement_closed", False)):
+        return False
+    if bool(root_trace.get("proactive_no_change_validated", False)) or bool(root_trace.get("proactive_blocked_with_root_cause", False)):
+        return False
+
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(str(getattr(child, "state", "") or "").strip().lower() in active_states for child in children):
+        return False
+    if any(str(getattr(child, "state", "") or "").strip().lower() == "done" for child in children):
+        return False
+
+    try:
+        last_closed_at = float(root_trace.get("proactive_terminal_failure_closed_at", 0.0) or 0.0)
+    except Exception:
+        last_closed_at = 0.0
+    if last_closed_at > 0.0:
+        return False
+
+    reason = f"root_job_terminal_{root_state}_without_delivery"
+    summary = str(root_trace.get("workspace_error") or root_trace.get("result_summary") or "").strip()
+    try:
+        orch_q.set_order_status(oid, chat_id=int(chat_id), status="failed")
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="failed")
+        orch_q.update_trace(
+            oid,
+            merge_ready=False,
+            proactive_terminal_failure_closed=True,
+            proactive_terminal_failure_closed_at=float(now),
+            proactive_terminal_failure_reason=reason,
+            operational_gate_status="failed",
+            operational_gate_reason=reason,
+            operational_gate_root_state=root_state,
+            operational_gate_checked_at=float(now),
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.proactive_terminal_failure_closed",
+            actor="skynet",
+            details={
+                "order_id": oid,
+                "reason": reason,
+                "root_state": root_state,
+                "summary": summary[:500],
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _enqueue_order_autopilot_task(
     *,
     cfg: BotConfig,
@@ -14539,6 +14621,15 @@ def _enqueue_order_autopilot_task(
     root_job = orch_q.get_job(oid)
     root_trace = dict((root_job.trace if root_job else {}) or {})
     is_proactive = _is_proactive_order_record(order_row)
+    if _close_proactive_terminal_root_failure(
+        orch_q=orch_q,
+        order_row=order_row,
+        root_job=root_job,
+        children=list(children or []),
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return False
     if is_proactive:
         try:
             _repo_record, repo_dir, default_branch = _repo_context_for_order(
@@ -19144,6 +19235,15 @@ def _sync_order_phase_from_runtime(
             latest_local_done_at_by_identity=latest_local_done_at_by_identity,
         )
     ]
+    if _close_proactive_terminal_root_failure(
+        orch_q=orch_q,
+        order_row=order,
+        root_job=root_job,
+        children=list(children or []),
+        chat_id=int(chat_id),
+        now=time.time(),
+    ):
+        return
     if not phase_children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return

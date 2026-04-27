@@ -3688,6 +3688,56 @@ class TestBypassAwareEnforcement(unittest.TestCase):
 
         self.assertEqual(bot._git_changed_paths_from_porcelain(status), ["bot.py"])
 
+    def test_autocommit_removes_internal_worktree_marker_before_push(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            origin = root / "origin.git"
+            repo = root / "repo"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "clone", str(origin), str(repo)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "manolosake"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "manolosake@gmail.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "main"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            (repo / ".poncebot_managed_worktree").write_text("accidentally tracked\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md", ".poncebot_managed_worktree"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(repo), "push", "origin", "main"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-b", "feature/order-marker"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            (repo / "app.txt").write_text("real change\n", encoding="utf-8")
+            task = bot.Task.new(
+                job_id="job-marker-cleanup",
+                source="test",
+                role="backend",
+                input_text="Implement change.",
+                request_type="task",
+                priority=1,
+                model="gpt-5.5",
+                effort="high",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=1,
+                labels={"key": "marker_cleanup"},
+            )
+
+            result = bot._autocommit_push_order_branch(
+                worktree_dir=repo,
+                order_branch="feature/order-marker",
+                task=task,
+            )
+
+            self.assertEqual(result["status"], "ok")
+            tree = subprocess.run(
+                ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "origin/feature/order-marker"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertIn("app.txt", tree)
+            self.assertNotIn(".poncebot_managed_worktree", tree)
+
 
 class TestThreadedImages(unittest.TestCase):
     def test_threaded_new_includes_image_flags(self) -> None:
@@ -5210,7 +5260,8 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
             self.assertFalse(sentinel.exists())
 
             workspaces.ensure_worktree_pool(base_repo=repo, root=pool, role="skynet", slots=1)
-            self.assertTrue(sentinel.exists())
+            self.assertTrue(workspaces._managed_metadata_path(skynet_slot).exists())
+            self.assertFalse(sentinel.exists())
 
             workspaces.prepare_clean_workspace(skynet_slot)
             self.assertEqual(run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=skynet_slot), expected_branch)
@@ -5395,6 +5446,62 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertFalse(root.trace["merge_ready"])
         self.assertEqual(root.trace["operational_gate_reason"], "root_job_still_blocked")
         self.assertEqual(q.audit_events[-1]["details"]["source"], "maturity_sweep")
+
+    def test_terminal_root_failure_closes_proactive_order_as_failed(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="failed",
+            trace={"workspace_error": "checkout failed"},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.statuses: list[str] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+        closed = bot._close_proactive_terminal_root_failure(
+            orch_q=q,
+            order_row={
+                "order_id": "root",
+                "status": "active",
+                "phase": "review",
+                "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                "body": "AUTONOMOUS PROACTIVE SPRINT",
+            },
+            root_job=root,
+            children=[],
+            chat_id=1,
+            now=123.0,
+        )
+
+        self.assertTrue(closed)
+        self.assertEqual(q.statuses[-1], "failed")
+        self.assertEqual(q.phases[-1], "failed")
+        self.assertTrue(root.trace["proactive_terminal_failure_closed"])
+        self.assertEqual(root.trace["operational_gate_status"], "failed")
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.proactive_terminal_failure_closed")
 
     def test_deploy_verify_retries_transient_startup_failure(self) -> None:
         calls: list[list[str]] = []

@@ -3062,6 +3062,15 @@ class TestCeoOrders(unittest.TestCase):
             assert got2 is not None
             self.assertEqual(str(got2["status"]), "paused")
 
+            ok_failed = st.set_order_status(oid[:8], chat_id=1, status="failed")
+            self.assertTrue(ok_failed)
+            failed = st.get_order(oid, chat_id=1)
+            self.assertIsNotNone(failed)
+            assert failed is not None
+            self.assertEqual(str(failed["status"]), "failed")
+            self.assertEqual(str(failed["phase"]), "failed")
+            self.assertEqual(len(st.list_orders(chat_id=1, status="failed", limit=10)), 1)
+
             bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
             self.assertFalse(bad)
 
