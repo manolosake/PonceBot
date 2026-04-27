@@ -14036,9 +14036,24 @@ def _enqueue_reviewer_local_rework_if_due(
     except Exception:
         return False
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+
+    def _child_key(child: Any) -> str:
+        labels = getattr(child, "labels", {}) or {}
+        if not isinstance(labels, dict):
+            return ""
+        return str(labels.get("key") or "").strip().lower()
+
+    def _is_rework_lane_child(child: Any) -> bool:
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if _is_local_support_role_name(role_norm):
+            return True
+        if role_norm in {"backend", "qa"} and key.startswith(("local_impl_recover_", "local_review_recover_")):
+            return True
+        return False
+
     if any(
-        _is_local_support_role_name(_coerce_orchestrator_role(str(getattr(child, "role", "") or "")))
-        and str(getattr(child, "state", "") or "").strip().lower() in active_states
+        _is_rework_lane_child(child) and str(getattr(child, "state", "") or "").strip().lower() in active_states
         for child in children
     ):
         return False
@@ -14046,15 +14061,18 @@ def _enqueue_reviewer_local_rework_if_due(
     latest_review = None
     latest_review_summary = ""
     latest_review_ts = 0.0
+    latest_review_role = ""
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
-        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "reviewer_local":
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if role_norm != "reviewer_local" and not (role_norm == "qa" and key.startswith("local_review_recover_")):
             continue
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
         if ts <= 0 or (float(now) - ts) > 3600.0:
             continue
-        summary = _task_local_specialist_response(child, max_chars=5000)
+        summary = _task_local_specialist_response(child, max_chars=5000) if role_norm == "reviewer_local" else ""
         if not summary:
             trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
             summary = str(trace.get("result_summary") or "").strip()
@@ -14063,6 +14081,7 @@ def _enqueue_reviewer_local_rework_if_due(
         latest_review = child
         latest_review_summary = summary[:5000]
         latest_review_ts = ts
+        latest_review_role = role_norm
         break
     if latest_review is None or not latest_review_summary:
         return False
@@ -14070,8 +14089,11 @@ def _enqueue_reviewer_local_rework_if_due(
     latest_impl = None
     latest_impl_ts = 0.0
     latest_impl_no_change_ts = 0.0
+    latest_impl_role = ""
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
-        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "implementer_local":
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if role_norm != "implementer_local" and not (role_norm == "backend" and key.startswith("local_impl_recover_")):
             continue
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
@@ -14084,6 +14106,7 @@ def _enqueue_reviewer_local_rework_if_due(
         if _trace_has_validated_slice_evidence(trace):
             latest_impl = child
             latest_impl_ts = ts
+            latest_impl_role = role_norm
             break
     if max(latest_impl_ts, latest_impl_no_change_ts) > (latest_review_ts + 5.0):
         return False
@@ -14093,6 +14116,8 @@ def _enqueue_reviewer_local_rework_if_due(
     review_suffix = ""
     if review_key_raw.startswith("local_review_guard_"):
         review_suffix = review_key_raw[len("local_review_guard_") :].strip()
+    elif review_key_raw.startswith("local_review_recover_"):
+        review_suffix = review_key_raw[len("local_review_recover_") :].strip()
     if not review_suffix:
         review_suffix = str(getattr(latest_review, "job_id", "") or "").split("-", 1)[0].strip()
     used_keys = {
@@ -14101,11 +14126,19 @@ def _enqueue_reviewer_local_rework_if_due(
         if str(((getattr(child, "labels", {}) or {}) if isinstance(getattr(child, "labels", {}), dict) else {}).get("key") or "").strip()
     }
     base_suffix = review_suffix or str(max(1, int(now)))
-    impl_key = f"local_impl_guard_{base_suffix}_r2"
+    use_cli_roles = latest_review_role == "qa" or latest_impl_role == "backend" or review_key_raw.startswith("local_review_recover_")
+    impl_prefix = "local_impl_recover" if use_cli_roles else "local_impl_guard"
+    review_prefix = "local_review_recover" if use_cli_roles else "local_review_guard"
+    impl_key = f"{impl_prefix}_{base_suffix}_r2"
     retry_n = 2
     while impl_key in used_keys:
         retry_n += 1
-        impl_key = f"local_impl_guard_{base_suffix}_r{retry_n}"
+        impl_key = f"{impl_prefix}_{base_suffix}_r{retry_n}"
+    review_key = f"{review_prefix}_{base_suffix}_r{retry_n}"
+    review_retry_n = retry_n
+    while review_key in used_keys or review_key == impl_key:
+        review_retry_n += 1
+        review_key = f"{review_prefix}_{base_suffix}_r{review_retry_n}"
 
     impl_trace = dict((getattr(latest_impl, "trace", {}) or {}) if latest_impl and isinstance(getattr(latest_impl, "trace", {}), dict) else {})
     impl_summary = _task_local_specialist_response(latest_impl, max_chars=7000) if latest_impl is not None else ""
@@ -14136,7 +14169,7 @@ def _enqueue_reviewer_local_rework_if_due(
 
     spec = TaskSpec(
         key=impl_key,
-        role="implementer_local",
+        role="backend" if use_cli_roles else "implementer_local",
         text=(
             f"Reviewer-directed rework for ticket {oid}.\n"
             f"Reviewer job: {str(getattr(latest_review, "job_id", "") or "").strip() or "(unknown)"}\n"
@@ -14153,22 +14186,24 @@ def _enqueue_reviewer_local_rework_if_due(
             "- If the reviewer is only missing validation/file evidence and the existing code is already correct, do not invent a diff. Say explicitly that no code change is required, provide exact file evidence, and add EXPECTED_VALIDATION.\n"
             "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
         ),
-        mode_hint="ro",
+        mode_hint="rw" if use_cli_roles else "ro",
         priority=1,
         depends_on=[],
         requires_approval=False,
         acceptance_criteria=[
-            "Address the reviewer_local blocking issue directly without widening scope.",
+            "Address the reviewer blocking issue directly without widening scope.",
             "Return one bounded patch plus a targeted validation command.",
         ],
         definition_of_done=[
-            "A corrected implementer slice is ready for reviewer_local re-check.",
+            "A corrected implementer slice is ready for review re-check.",
         ],
         eta_minutes=40,
         sla_tier="high",
     )
 
-    child_profile = _orchestrator_profile(profiles, "implementer_local")
+    child_role = "backend" if use_cli_roles else "implementer_local"
+    review_role = "qa" if use_cli_roles else ""
+    child_profile = _orchestrator_profile(profiles, child_role)
     model = _orchestrator_model_for_profile(cfg, child_profile)
     effort = _orchestrator_effort_for_profile(child_profile, cfg)
     mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
@@ -14179,9 +14214,9 @@ def _enqueue_reviewer_local_rework_if_due(
         "source": "scheduler",
         "delegated_by": str(getattr(latest_review, "job_id", "") or "").strip() or oid,
         "delegated_key": spec.key,
-        "requested_role": "implementer_local",
-        "profile_name": str(child_profile.get("name") or "implementer_local"),
-        "profile_role": "implementer_local",
+        "requested_role": child_role,
+        "profile_name": str(child_profile.get("name") or child_role),
+        "profile_role": child_role,
         "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
         "acceptance_criteria": list(spec.acceptance_criteria or []),
         "definition_of_done": list(spec.definition_of_done or []),
@@ -14193,8 +14228,9 @@ def _enqueue_reviewer_local_rework_if_due(
         "failure_class": "retriable",
         "attempt_n": int(retry_n),
         "improvement_verified": False,
-        "execution_policy": "local_only",
     }
+    if not use_cli_roles:
+        trace["execution_policy"] = "local_only"
     order_branch = ""
     try:
         root_job = orch_q.get_job(oid)
@@ -14206,7 +14242,7 @@ def _enqueue_reviewer_local_rework_if_due(
         trace["order_branch"] = str(order_branch)
     child = Task.new(
         source="telegram",
-        role="implementer_local",
+        role=child_role,
         input_text=contract_text,
         request_type="task",
         priority=int(spec.priority),
@@ -14228,12 +14264,88 @@ def _enqueue_reviewer_local_rework_if_due(
         job_id=child_id,
     )
     orch_q.submit_task(child)
+    review_child_id = ""
+    if review_role:
+        review_child_id = str(uuid.uuid4())
+        review_profile = _orchestrator_profile(profiles, review_role)
+        review_spec = TaskSpec(
+            key=review_key,
+            role=review_role,
+            text=(
+                f"QA re-check for reviewer-directed rework on ticket {oid}.\n"
+                f"Rework job: {child_id}\n"
+                f"Previous reviewer job: {str(getattr(latest_review, 'job_id', '') or '').strip() or '(unknown)'}\n\n"
+                "Verify the rework resolved the exact blocker below without widening scope.\n\n"
+                "PREVIOUS_REVIEWER_FINDINGS:\n"
+                f"{latest_review_summary}\n\n"
+                "Rules:\n"
+                "- Wait for the rework dependency to finish.\n"
+                "- Check changed files and validation evidence.\n"
+                "- Return READY only if the blocker is fixed and validation is credible.\n"
+                "- Otherwise return NEEDS_REWORK with one concrete next step.\n"
+            ),
+            mode_hint="ro",
+            priority=1,
+            depends_on=[impl_key],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Review verdict references the rework slice only.",
+                "Validation evidence is checked before READY.",
+            ],
+            definition_of_done=[
+                "QA returns READY or NEEDS_REWORK with explicit rationale.",
+            ],
+            eta_minutes=20,
+            sla_tier="high",
+        )
+        review_trace: dict[str, str | int | float | bool | list[str]] = {
+            "source": "scheduler",
+            "delegated_by": child_id,
+            "delegated_key": review_key,
+            "requested_role": review_role,
+            "profile_name": str(review_profile.get("name") or review_role),
+            "profile_role": review_role,
+            "max_runtime_seconds": int(review_profile.get("max_runtime_seconds") or 0),
+            "acceptance_criteria": list(review_spec.acceptance_criteria or []),
+            "definition_of_done": list(review_spec.definition_of_done or []),
+            "eta_minutes": int(review_spec.eta_minutes or 0),
+            "sla_tier": str(review_spec.sla_tier or "normal"),
+            "rework_for_job_id": child_id,
+            "previous_review_job_id": str(getattr(latest_review, "job_id", "") or "").strip(),
+        }
+        if order_branch:
+            review_trace["order_branch"] = str(order_branch)
+        review_child = Task.new(
+            source="telegram",
+            role=review_role,
+            input_text=_compose_subtask_instruction(review_spec, root_ticket=oid),
+            request_type="task",
+            priority=int(review_spec.priority),
+            model=_orchestrator_model_for_profile(cfg, review_profile),
+            effort=_orchestrator_effort_for_profile(review_profile, cfg),
+            mode_hint=_coerce_orchestrator_mode(review_spec.mode_hint or str(review_profile.get("mode_hint") or "ro")),
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            is_autonomous=True,
+            parent_job_id=oid,
+            owner="scheduler",
+            depends_on=[child_id],
+            ttl_seconds=int(_ttl_seconds_from_spec(review_spec)),
+            max_retries=1,
+            labels={"ticket": oid, "kind": "subtask", "key": review_key},
+            artifacts_dir=str((cfg.artifacts_root / review_child_id).resolve()),
+            trace=review_trace,
+            job_id=review_child_id,
+        )
+        orch_q.submit_task(review_child)
     try:
         orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="executing")
         orch_q.update_trace(
             oid,
             local_rework_seeded_at=float(now),
             local_rework_seeded_job_id=child_id,
+            local_rework_review_job_id=review_child_id or None,
             local_rework_seeded_from_review=str(getattr(latest_review, 'job_id', '') or '').strip() or None,
             live_at=float(now),
         )
@@ -14243,6 +14355,9 @@ def _enqueue_reviewer_local_rework_if_due(
             details={
                 "order_id": oid,
                 "job_id": child_id,
+                "review_job_id": review_child_id or None,
+                "role": child_role,
+                "review_role": review_role or None,
                 "from_review_job_id": str(getattr(latest_review, 'job_id', '') or '').strip() or None,
                 "validation_cmd": validation_cmd,
             },
@@ -14821,6 +14936,15 @@ def _enqueue_order_autopilot_task(
             reason=str(reason or "").strip() or "forced_local_architect_reseed",
         ):
             return True
+    if _enqueue_reviewer_local_rework_if_due(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        order_row=order_row,
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return True
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     latest_activity = 0.0
     for index, candidate in enumerate([root_job, *children]):

@@ -5298,6 +5298,84 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.submitted[0].trace["slice_id"], "impl_delivery_slice")
         self.assertEqual(q.trace_updates[-1]["operational_gate_review_target_slice_id"], "impl_delivery_slice")
 
+    def test_qa_needs_rework_seeds_backend_rework_and_qa_recheck(self) -> None:
+        class FakeQueue:
+            def __init__(self, children: list[SimpleNamespace]) -> None:
+                self.children = children
+                self.submitted: list[bot.Task] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 400):
+                return list(self.children)
+
+            def get_job(self, job_id: str):
+                return SimpleNamespace(job_id=job_id, trace={"order_branch": "feature/order-root"})
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_recover_casefix"},
+                trace={
+                    "result_summary": "Applied patch. Validation passed.",
+                    "patch_info": {
+                        "changed_files": ["server/refresh.py", "test_refresh.py"],
+                        "validation_ok": True,
+                    },
+                },
+                artifacts_dir="/tmp/impl-artifacts",
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_review_recover_casefix"},
+                trace={
+                    "result_summary": "NEEDS_REWORK: restore .poncebot_managed_worktree and rerun tests.",
+                    "result_status": "done",
+                },
+                artifacts_dir="/tmp/qa-artifacts",
+                created_at=111.0,
+                updated_at=120.0,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue(children)
+            enqueued = bot._enqueue_reviewer_local_rework_if_due(
+                cfg=self._operational_gate_recovery_cfg(td),
+                orch_q=q,
+                profiles=None,
+                order_row={"order_id": "root", "title": "Proactive Sprint: ExecutiveDashboard Reliability"},
+                chat_id=1,
+                now=130.0,
+            )
+
+        self.assertTrue(enqueued)
+        self.assertEqual([task.role for task in q.submitted], ["backend", "qa"])
+        self.assertEqual(q.submitted[0].labels["key"], "local_impl_recover_casefix_r2")
+        self.assertEqual(q.submitted[1].labels["key"], "local_review_recover_casefix_r2")
+        self.assertEqual(q.submitted[1].depends_on, [q.submitted[0].job_id])
+        self.assertEqual(q.phases[-1], "executing")
+        self.assertEqual(q.trace_updates[-1]["local_rework_review_job_id"], q.submitted[1].job_id)
+
     def test_worktree_pool_reclaims_same_namespace_legacy_branch(self) -> None:
         from orchestrator import workspaces
 
