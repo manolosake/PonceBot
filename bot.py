@@ -6684,6 +6684,9 @@ def _orchestrator_run_local_ollama(
         live_stream_path.write_text("", encoding="utf-8", errors="replace")
     except Exception:
         pass
+    attempt_errors: list[str] = []
+    candidate_models: list[str] = []
+    used_fallback = False
 
     if stop_event.is_set():
         return {
@@ -6791,16 +6794,15 @@ def _orchestrator_run_local_ollama(
                 on_request=(lambda body: _write_local_prompt(model_name=model_name, request_body=body if isinstance(body, dict) else {})),
             )
 
-        used_fallback = False
-        attempt_errors: list[str] = []
         out: dict[str, Any] = {}
         content = ""
-        for idx, candidate_model in enumerate(_candidate_local_models()):
+        candidate_models = _candidate_local_models()
+        for idx, candidate_model in enumerate(candidate_models):
+            model = candidate_model
+            used_fallback = idx > 0
             try:
                 out = _run_local_once(candidate_model)
                 content = str(out.get("content") or "").strip()
-                model = candidate_model
-                used_fallback = idx > 0
                 if content:
                     break
                 attempt_errors.append(f"{candidate_model}: empty response")
@@ -6903,6 +6905,23 @@ def _orchestrator_run_local_ollama(
             err_path.write_text(err_text, encoding="utf-8", errors="replace")
         except Exception:
             pass
+        attempts_path = artifacts_dir / "local_ollama_attempts.json"
+        attempts_payload = {
+            "backend": "local_ollama",
+            "role": role,
+            "requested_model": requested_model,
+            "model": model,
+            "attempt_errors": attempt_errors[:10],
+            "duration_s": round(max(0.0, time.time() - started), 3),
+            "fallback_candidate_count": len(candidate_models),
+            "candidate_models": candidate_models[:10],
+            "fallback_used": bool(used_fallback),
+            "error": str(e),
+        }
+        try:
+            attempts_path.write_text(json.dumps(attempts_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
         if orch_q is not None:
             try:
                 orch_q.update_trace(
@@ -6920,10 +6939,30 @@ def _orchestrator_run_local_ollama(
         return {
             "status": "error",
             "summary": f"Local Ollama execution failed: {e}",
-            "artifacts": [x for x in (str(err_path), str(live_response_path), str(live_stream_path), str(prompt_path)) if x and Path(x).exists()],
+            "artifacts": [
+                x
+                for x in (
+                    str(err_path),
+                    str(attempts_path),
+                    str(live_response_path),
+                    str(live_stream_path),
+                    str(prompt_path),
+                )
+                if x and Path(x).exists()
+            ],
             "logs": err_text,
             "next_action": "retry",
-            "structured_digest": {"role": role, "backend": "local_ollama", "model": model},
+            "structured_digest": {
+                "role": role,
+                "backend": "local_ollama",
+                "model": model,
+                "requested_model": requested_model,
+                "duration_s": round(max(0.0, time.time() - started), 3),
+                "fallback_used": bool(used_fallback),
+                "fallback_candidate_count": len(candidate_models),
+                "attempt_errors": attempt_errors[:10],
+                "attempts_artifact": str(attempts_path) if attempts_path.exists() else "",
+            },
         }
 
 
@@ -14629,6 +14668,30 @@ def _enqueue_order_autopilot_task(
         chat_id=int(chat_id),
         now=float(now),
     ):
+        return False
+    root_state_norm = str(getattr(root_job, "state", "") or "").strip().lower() if root_job is not None else ""
+    if is_proactive and _operational_gate_is_live_state(root_state_norm):
+        try:
+            last_wait_at = float(root_trace.get("proactive_root_live_wait_at", 0.0) or 0.0)
+        except Exception:
+            last_wait_at = 0.0
+        if last_wait_at <= 0.0 or (float(now) - last_wait_at) >= 300.0:
+            next_phase = "executing" if root_state_norm == "running" else "delegated" if root_state_norm in ("queued", "waiting_deps") else "review"
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase=next_phase)
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    proactive_root_live_wait_at=float(now),
+                    operational_gate_status="waiting",
+                    operational_gate_reason=f"root_job_still_{root_state_norm}",
+                    operational_gate_root_state=root_state_norm,
+                    operational_gate_checked_at=float(now),
+                    live_at=float(now),
+                )
+            except Exception:
+                pass
         return False
     if is_proactive:
         try:
