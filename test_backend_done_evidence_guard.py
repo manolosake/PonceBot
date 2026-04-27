@@ -69,6 +69,50 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertEqual(payload["reason"], "artifact_missing")
             self.assertEqual(len(payload["missing_artifacts"]), 1)
 
+    def test_validate_evidence_fails_when_referenced_artifact_is_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof_dir = artifacts_dir / "proof"
+            proof_dir.mkdir()
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof"],
+                        "next_action": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "artifact_not_file")
+            self.assertEqual(payload["not_file_artifacts"], [str(proof_dir.resolve())])
+
+    def test_validate_evidence_fails_when_referenced_artifact_is_empty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof = artifacts_dir / "proof.log"
+            proof.write_text("", encoding="utf-8")
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof.log"],
+                        "next_action": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "artifact_empty")
+            self.assertEqual(payload["empty_artifacts"], [str(proof.resolve())])
+
     def test_validate_evidence_fails_when_artifacts_list_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)

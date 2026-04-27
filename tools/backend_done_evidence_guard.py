@@ -82,6 +82,8 @@ def validate_evidence(
 
     missing_files: list[str] = []
     outside_dir: list[str] = []
+    non_files: list[str] = []
+    empty_files: list[str] = []
     resolved_artifacts: list[str] = []
     for raw_path in artifacts:
         resolved = _resolve_artifact_path(artifacts_dir=artifacts_root, raw_path=raw_path)
@@ -93,6 +95,12 @@ def validate_evidence(
             continue
         if not allow_missing_files and not resolved.exists():
             missing_files.append(str(resolved))
+            continue
+        if resolved.exists() and not resolved.is_file():
+            non_files.append(str(resolved))
+            continue
+        if resolved.is_file() and resolved.stat().st_size == 0:
+            empty_files.append(str(resolved))
 
     if outside_dir:
         return False, {
@@ -108,6 +116,22 @@ def validate_evidence(
             "reason": "artifact_missing",
             "summary_path": str(summary_path),
             "missing_artifacts": missing_files,
+        }
+
+    if non_files:
+        return False, {
+            "ok": False,
+            "reason": "artifact_not_file",
+            "summary_path": str(summary_path),
+            "not_file_artifacts": non_files,
+        }
+
+    if empty_files:
+        return False, {
+            "ok": False,
+            "reason": "artifact_empty",
+            "summary_path": str(summary_path),
+            "empty_artifacts": empty_files,
         }
 
     return True, {
