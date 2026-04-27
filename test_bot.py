@@ -5503,6 +5503,69 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(root.trace["operational_gate_status"], "failed")
         self.assertEqual(q.audit_events[-1]["event_type"], "order.proactive_terminal_failure_closed")
 
+    def test_autopilot_waits_silently_while_root_job_runs(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="running",
+            trace={},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.statuses: list[str] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 200):
+                return []
+
+            def get_job(self, job_id: str):
+                return root
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+        with patch.object(bot, "_order_has_pending_factory_ceo_strategy_proposal", return_value=False):
+            enqueued = bot._enqueue_order_autopilot_task(
+                cfg=None,
+                orch_q=q,
+                profiles=None,
+                order_row={
+                    "order_id": "root",
+                    "status": "active",
+                    "phase": "review",
+                    "title": "Proactive Sprint: codexbot Reliability + Delivery",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                },
+                chat_id=1,
+                now=123.0,
+                reason="tick",
+            )
+
+        self.assertFalse(enqueued)
+        self.assertEqual(q.statuses[-1], "active")
+        self.assertEqual(q.phases[-1], "executing")
+        self.assertEqual(root.trace["operational_gate_status"], "waiting")
+        self.assertEqual(q.audit_events, [])
+
     def test_deploy_verify_retries_transient_startup_failure(self) -> None:
         calls: list[list[str]] = []
 

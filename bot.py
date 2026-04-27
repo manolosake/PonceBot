@@ -14630,6 +14630,30 @@ def _enqueue_order_autopilot_task(
         now=float(now),
     ):
         return False
+    root_state_norm = str(getattr(root_job, "state", "") or "").strip().lower() if root_job is not None else ""
+    if is_proactive and _operational_gate_is_live_state(root_state_norm):
+        try:
+            last_wait_at = float(root_trace.get("proactive_root_live_wait_at", 0.0) or 0.0)
+        except Exception:
+            last_wait_at = 0.0
+        if last_wait_at <= 0.0 or (float(now) - last_wait_at) >= 300.0:
+            next_phase = "executing" if root_state_norm == "running" else "delegated" if root_state_norm in ("queued", "waiting_deps") else "review"
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase=next_phase)
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    proactive_root_live_wait_at=float(now),
+                    operational_gate_status="waiting",
+                    operational_gate_reason=f"root_job_still_{root_state_norm}",
+                    operational_gate_root_state=root_state_norm,
+                    operational_gate_checked_at=float(now),
+                    live_at=float(now),
+                )
+            except Exception:
+                pass
+        return False
     if is_proactive:
         try:
             _repo_record, repo_dir, default_branch = _repo_context_for_order(
