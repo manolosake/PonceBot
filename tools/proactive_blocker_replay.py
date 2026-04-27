@@ -43,6 +43,19 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _coerce_depends_on_list(depends_on: object) -> tuple[list[str], bool]:
+    try:
+        raw_deps = json.loads(str(depends_on or "[]"))
+    except Exception:
+        return [], True
+
+    if not isinstance(raw_deps, list):
+        return [], True
+
+    deps = [dep.strip() for dep in raw_deps if isinstance(dep, str) and dep.strip()]
+    return deps, False
+
+
 def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[list[dict], str]:
     rows = [
         dict(r)
@@ -109,11 +122,8 @@ def main() -> int:
     for r in blocked:
         if str(r.get("state", "")).lower() != "waiting_deps":
             continue
-        try:
-            deps = json.loads(str(r.get("depends_on") or "[]"))
-        except Exception:
-            deps = []
-        if not deps or not any(str(d) in ids for d in deps):
+        deps, malformed_deps = _coerce_depends_on_list(r.get("depends_on"))
+        if malformed_deps or not deps or not any(d in ids for d in deps):
             invalid_wait.append(str(r.get("job_id") or ""))
 
     payload = {
