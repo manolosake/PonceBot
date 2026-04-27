@@ -73,7 +73,14 @@ if [[ "$CHECK_ONLY" == "1" ]]; then
 fi
 
 export PYTHONUNBUFFERED=1
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+if [[ -z "${JAVA_HOME:-}" && -x "$HOME/.local/jdks/jdk-17/bin/java" ]]; then
+  export JAVA_HOME="$HOME/.local/jdks/jdk-17"
+fi
+if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
+  export PATH="$JAVA_HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+else
+  export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+fi
 
 PYTHON_BIN="${CODEXBOT_PYTHON_BIN:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
