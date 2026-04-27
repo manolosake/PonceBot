@@ -15867,6 +15867,14 @@ def _local_slice_expected_validation_cmd(candidate_files: list[str]) -> str:
     return f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
 
 
+def _normalize_controller_write_policy_changed_path(path: Any) -> str:
+    rel_path = str(path).strip()
+    for scope in ("worktree:", "base_repo:"):
+        if rel_path.startswith(scope):
+            return rel_path[len(scope) :].strip()
+    return rel_path
+
+
 def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     if not isinstance(structured_digest, dict):
         return []
@@ -15878,7 +15886,11 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
 
     write_policy = structured_digest.get("write_policy_violation") if isinstance(structured_digest.get("write_policy_violation"), dict) else {}
     changed_paths_raw = write_policy.get("changed_paths") if isinstance(write_policy, dict) else []
-    changed_paths = [str(p).strip() for p in (changed_paths_raw or []) if str(p).strip()]
+    changed_paths = [
+        rel_path
+        for p in (changed_paths_raw or [])
+        if (rel_path := _normalize_controller_write_policy_changed_path(p))
+    ]
     if not changed_paths:
         return []
 

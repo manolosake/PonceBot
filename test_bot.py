@@ -674,6 +674,23 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("python3 -m unittest -q test_status_http", specs[0].text)
         self.assertEqual(specs[1].depends_on, [specs[0].key])
 
+    def test_controller_local_recovery_specs_normalizes_scoped_write_policy_paths(self) -> None:
+        specs = bot._controller_local_recovery_specs(
+            {
+                "summary": "Prepared a bounded controller recovery patch.",
+                "write_policy_violation": {
+                    "changed_paths": ["worktree:", "worktree:bot.py", "base_repo:tools/health.py"],
+                },
+            }
+        )
+        self.assertEqual([spec.role for spec in specs], ["implementer_local", "reviewer_local"])
+        self.assertIn("- `bot.py`", specs[0].text)
+        self.assertIn("- `tools/health.py`", specs[0].text)
+        self.assertNotIn("worktree:", specs[0].text)
+        self.assertNotIn("base_repo:", specs[0].text)
+        self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[0].text)
+        self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[1].text)
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
