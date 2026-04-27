@@ -551,13 +551,24 @@ def main() -> int:
                 'order_id': order_id,
                 'count': len(stale_local),
             })
+        order_status = str(order.get('status') or '').strip().lower()
         if (not open_children) and (not improvement) and (last_activity_age_s is not None) and last_activity_age_s >= 900:
-            anomalies.append({
-                'type': 'idle_without_improvement',
-                'order_id': order_id,
-                'phase': order.get('phase'),
-                'last_activity_age_s': last_activity_age_s,
-            })
+            if order_status == 'paused':
+                anomalies.append({
+                    'type': 'paused_idle_backlog',
+                    'order_id': order_id,
+                    'phase': order.get('phase'),
+                    'open_jobs': len(open_children),
+                    'last_activity_age_s': last_activity_age_s,
+                    'recommended_action': 'resume_or_close_stale_order',
+                })
+            else:
+                anomalies.append({
+                    'type': 'idle_without_improvement',
+                    'order_id': order_id,
+                    'phase': order.get('phase'),
+                    'last_activity_age_s': last_activity_age_s,
+                })
         funnel_totals['slices_started'] += int(autonomy_funnel.get('slices_started', 0) or 0)
         funnel_totals['slices_applied'] += int(autonomy_funnel.get('slices_applied', 0) or 0)
         funnel_totals['slices_validated'] += int(autonomy_funnel.get('slices_validated', 0) or 0)

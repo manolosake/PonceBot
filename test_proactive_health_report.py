@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -33,6 +35,80 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads(latest.read_text(encoding="utf-8"))
             self.assertEqual(payload.get("operational_status"), "CRITICAL")
             self.assertEqual(payload.get("error"), "db_missing")
+
+    def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            stale = now - 1200
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE ceo_orders (
+                        order_id TEXT,
+                        status TEXT,
+                        phase TEXT,
+                        title TEXT,
+                        body TEXT,
+                        updated_at REAL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT,
+                        parent_job_id TEXT,
+                        state TEXT,
+                        role TEXT,
+                        labels TEXT,
+                        trace TEXT,
+                        updated_at REAL,
+                        created_at REAL
+                    )
+                    """
+                )
+                con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+                con.executemany(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("active-idle-order", "active", "planning", "Proactive Sprint: active", "", stale),
+                        ("paused-idle-order", "paused", "planning", "Proactive Sprint: paused", "", stale),
+                    ],
+                )
+
+            env = {**dict(os.environ)}
+            env["CODEXBOT_ORCH_DB"] = str(db)
+            env["CODEXBOT_STATE_FILE"] = str(root / "state.json")
+            env["CODEXBOT_PROACTIVE_HEALTH_OUT_DIR"] = str(out_dir)
+            proc = subprocess.run(
+                ["python3", "tools/proactive_health_report.py"],
+                cwd=str(Path(__file__).resolve().parent),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            anomalies = payload.get("anomalies") or []
+            by_order = {item.get("order_id"): item for item in anomalies}
+            self.assertEqual(by_order["active-idle-order"].get("type"), "idle_without_improvement")
+            paused = by_order["paused-idle-order"]
+            self.assertEqual(paused.get("type"), "paused_idle_backlog")
+            self.assertEqual(paused.get("phase"), "planning")
+            self.assertEqual(paused.get("open_jobs"), 0)
+            self.assertGreaterEqual(int(paused.get("last_activity_age_s") or 0), 900)
+            self.assertEqual(paused.get("recommended_action"), "resume_or_close_stale_order")
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("paused_idle_backlog", markdown)
+            self.assertIn("resume_or_close_stale_order", markdown)
 
     def test_order_autonomy_funnel_no_code_change_slice_can_close(self) -> None:
         order_id = "order-nochange-1234"
