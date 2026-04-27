@@ -93,9 +93,10 @@ def _maybe_mark_managed_worktree(*, base_repo: Path, root: Path, wt_dir: Path, r
     if br and br not in ("HEAD", expected_branch, legacy_branch):
         # Older pool bugs could leave a valid PonceBot worktree in the right slot
         # but checked out to a sibling managed branch. Reclaim only same-namespace
-        # branches; arbitrary branches still fail closed.
+        # branches. Some older jobs also left exact pool slots on order branches;
+        # reclaim those only when Git proves the slot belongs to this same repo.
         expected_prefix = f"poncebot/{_managed_worktree_namespace(base_repo=base_repo, root=root)}/"
-        if not br.startswith(expected_prefix):
+        if not br.startswith(expected_prefix) and not _same_git_common_dir(base_repo, wt_dir):
             return False
 
     try:
@@ -125,6 +126,26 @@ def _maybe_mark_managed_worktree(*, base_repo: Path, root: Path, wt_dir: Path, r
         return True
     except Exception:
         return False
+
+
+def _same_git_common_dir(left: Path, right: Path) -> bool:
+    try:
+        left_common = _git_common_dir(left)
+        right_common = _git_common_dir(right)
+        return bool(left_common and right_common and left_common == right_common)
+    except Exception:
+        return False
+
+
+def _git_common_dir(path: Path) -> Path | None:
+    proc = _run(["git", "-C", str(path), "rev-parse", "--git-common-dir"], check=False)
+    raw = str(proc.stdout or "").strip()
+    if proc.returncode != 0 or not raw:
+        return None
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (path.resolve() / common).resolve()
+    return common.resolve()
 
 
 def _managed_worktree_branch(*, base_repo: Path, root: Path, role: str, slot: int) -> str:

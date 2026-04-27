@@ -214,6 +214,52 @@ class TestWorkspaces(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertTrue(_metadata_path(pool / "backend" / "slot1").exists())
 
+    def test_ensure_worktree_pool_reclaims_same_repo_order_branch_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "base"
+            pool = Path(td) / "pool"
+            base.mkdir(parents=True, exist_ok=True)
+
+            _run(["git", "init", "-b", "main"], cwd=base)
+            _run(["git", "config", "user.email", "test@example.com"], cwd=base)
+            _run(["git", "config", "user.name", "test"], cwd=base)
+
+            (base / ".gitignore").write_text(_SENTINEL + "\n", encoding="utf-8")
+            (base / "README.md").write_text("hi\n", encoding="utf-8")
+            _run(["git", "add", ".gitignore", "README.md"], cwd=base)
+            _run(["git", "commit", "-m", "init"], cwd=base)
+
+            ensure_worktree_pool(base_repo=base, root=pool, role="sre", slots=1)
+            wt = pool / "sre" / "slot1"
+            metadata = _metadata_path(wt)
+            self.assertTrue(metadata.exists())
+
+            _run(["git", "checkout", "-B", "feature/order-stale-sre"], cwd=wt)
+            (wt / _SENTINEL).write_text('{"branch":"feature/order-stale-sre"}\n', encoding="utf-8")
+            _run(["git", "add", "-f", _SENTINEL], cwd=wt)
+            _run(["git", "commit", "-m", "track stale legacy marker"], cwd=wt)
+            metadata.unlink()
+
+            ensure_worktree_pool(base_repo=base, root=pool, role="sre", slots=1)
+            prepare_clean_workspace(wt)
+
+            branch = subprocess.run(
+                ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            status = subprocess.run(
+                ["git", "-C", str(wt), "status", "--short"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            self.assertEqual(branch, workspaces._managed_worktree_branch(base_repo=base, root=pool, role="sre", slot=1))
+            self.assertEqual(status, "")
+            self.assertTrue(metadata.exists())
+
     def test_prepare_clean_workspace_survives_tracked_legacy_marker_on_base(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "base"
