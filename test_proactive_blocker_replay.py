@@ -95,7 +95,11 @@ def _run_replay_for_wait_dep(depends_on: str, ticket_id: str, job_id: str) -> tu
         os.unlink(db_path)
 
 
-def _run_replay(db_path: str, ticket_id: str = "t-1") -> tuple[int, dict]:
+def _run_replay(
+    db_path: str,
+    ticket_id: str = "t-1",
+    stale_seconds: float | None = None,
+) -> tuple[int, dict]:
     out = io.StringIO()
     argv = [
         "proactive_blocker_replay.py",
@@ -104,6 +108,8 @@ def _run_replay(db_path: str, ticket_id: str = "t-1") -> tuple[int, dict]:
         "--ticket-id",
         ticket_id,
     ]
+    if stale_seconds is not None:
+        argv.extend(["--stale-seconds", str(stale_seconds)])
     with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out):
         rc = pbr.main()
 
@@ -293,6 +299,102 @@ class TestProactiveBlockerReplay(unittest.TestCase):
 
         self.assertEqual(rc, 2)
         self.assertEqual(payload["invalid_wait_job_ids"], ["waiting-object-json"])
+
+    def test_main_reports_actionable_stale_blocker_details(self) -> None:
+        with tempfile.NamedTemporaryFile(delete=False) as db_file:
+            db_path = db_file.name
+
+        try:
+            con = sqlite3.connect(db_path)
+            try:
+                con.row_factory = sqlite3.Row
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT PRIMARY KEY,
+                        role TEXT,
+                        state TEXT,
+                        depends_on TEXT,
+                        blocked_reason TEXT,
+                        updated_at REAL,
+                        created_at REAL,
+                        parent_job_id TEXT,
+                        labels TEXT
+                    )
+                    """
+                )
+                now = 1_700_000_000.0
+                jobs = [
+                    (
+                        "stale-backend",
+                        "backend",
+                        "blocked",
+                        "[]",
+                        "waiting_for_controller_decision",
+                        now - 601.25,
+                        now - 900.0,
+                    ),
+                    (
+                        "stale-qa",
+                        "qa",
+                        "waiting_deps",
+                        '["stale-backend"]',
+                        "dependencies_pending:stale-backend",
+                        now - 900.0,
+                        now - 800.0,
+                    ),
+                    (
+                        "fresh-blocked",
+                        "frontend",
+                        "blocked_approval",
+                        "[]",
+                        "recent_approval_hold",
+                        now - 30.0,
+                        now - 700.0,
+                    ),
+                ]
+                for job in jobs:
+                    con.execute(
+                        """
+                        INSERT INTO jobs(job_id, role, state, depends_on, blocked_reason, updated_at, created_at, parent_job_id, labels)
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                        """,
+                        (*job, "t-stale", "{}"),
+                    )
+                con.commit()
+            finally:
+                con.close()
+
+            with mock.patch.object(pbr.time, "time", return_value=1_700_000_000.0):
+                rc, payload = _run_replay(db_path, "t-stale", stale_seconds=300.0)
+
+            self.assertEqual(rc, 2)
+            self.assertEqual(payload["stale_blocked_count"], 2)
+            self.assertEqual(payload["stale_blocked_job_ids"], ["stale-backend", "stale-qa"])
+            self.assertEqual(
+                payload["stale_blocked_jobs"],
+                [
+                    {
+                        "job_id": "stale-backend",
+                        "role": "backend",
+                        "state": "blocked",
+                        "updated_age_s": 601.2,
+                        "updated_at": now - 601.25,
+                        "blocked_reason": "waiting_for_controller_decision",
+                    },
+                    {
+                        "job_id": "stale-qa",
+                        "role": "qa",
+                        "state": "waiting_deps",
+                        "updated_age_s": 900.0,
+                        "updated_at": now - 900.0,
+                        "blocked_reason": "dependencies_pending:stale-backend",
+                    },
+                ],
+            )
+            self.assertEqual(payload["recommendation"], "cancel_or_reseed_invalid_or_stale_blockers")
+        finally:
+            os.unlink(db_path)
 
 
 if __name__ == "__main__":

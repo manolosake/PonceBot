@@ -67,6 +67,17 @@ def _coerce_depends_on_list(depends_on: object) -> tuple[list[str], bool]:
     return deps, False
 
 
+def _stale_blocker_detail(row: dict) -> dict:
+    return {
+        "job_id": str(row.get("job_id") or ""),
+        "role": str(row.get("role") or ""),
+        "state": str(row.get("state") or ""),
+        "updated_age_s": float(row.get("updated_age_s") or 0.0),
+        "updated_at": row.get("updated_at"),
+        "blocked_reason": str(row.get("blocked_reason") or ""),
+    }
+
+
 def _error_payload(ticket_id: str, db_path: Path, error: str, recommendation: str) -> dict:
     return {
         "generated_at": _utc_now(),
@@ -181,6 +192,7 @@ def main() -> int:
 
     blocked = [r for r in rows if str(r.get("state", "")).lower() in {"blocked", "blocked_approval", "waiting_deps"}]
     stale = [r for r in blocked if float(r.get("updated_age_s") or 0.0) > float(args.stale_seconds)]
+    stale_details = [_stale_blocker_detail(r) for r in stale]
     ids = {str(r.get("job_id") or "") for r in rows}
 
     invalid_wait = []
@@ -199,6 +211,8 @@ def main() -> int:
         "blocked_or_waiting_count": len(blocked),
         "stale_threshold_seconds": float(args.stale_seconds),
         "stale_blocked_count": len(stale),
+        "stale_blocked_job_ids": [detail["job_id"] for detail in stale_details],
+        "stale_blocked_jobs": stale_details,
         "invalid_wait_dependency_count": len(invalid_wait),
         "invalid_wait_job_ids": invalid_wait,
         "recommendation": (
