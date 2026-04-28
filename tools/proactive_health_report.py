@@ -52,8 +52,16 @@ def classify_open_job_mode(counts_by_role: dict, open_jobs: int) -> str:
     """Classify order mode without reporting idle when open jobs still exist."""
     if int(open_jobs or 0) <= 0:
         return 'idle'
-    has_local = any(role in LOCAL_ROLES for role in counts_by_role)
-    has_cli = any(role in CLI_ROLES for role in counts_by_role)
+    active_roles = set()
+    for role, raw_count in (counts_by_role or {}).items():
+        try:
+            count = int(raw_count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            active_roles.add(role)
+    has_local = any(role in LOCAL_ROLES for role in active_roles)
+    has_cli = any(role in CLI_ROLES for role in active_roles)
     if has_local and has_cli:
         return 'mixed'
     if has_cli:

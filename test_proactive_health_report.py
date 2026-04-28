@@ -438,6 +438,9 @@ class TestProactiveHealthReport(unittest.TestCase):
         self.assertEqual(classify_open_job_mode({"architect_local": 1}, 1), "local")
         self.assertEqual(classify_open_job_mode({"backend": 1}, 1), "cli")
         self.assertEqual(classify_open_job_mode({"backend": 1, "reviewer_local": 1}, 2), "mixed")
+        self.assertEqual(classify_open_job_mode({"backend": 0, "architect_local": 0, "skynet": 1}, 1), "controller")
+        self.assertEqual(classify_open_job_mode({"backend": "0", "reviewer_local": "nope", "skynet": 1}, 1), "controller")
+        self.assertEqual(classify_open_job_mode({"backend": "2", "reviewer_local": None}, 2), "cli")
 
     def test_is_blocked_without_open_jobs_detects_stall_condition(self) -> None:
         self.assertTrue(is_blocked_without_open_jobs("blocked", 0))
