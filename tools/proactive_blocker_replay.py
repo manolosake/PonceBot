@@ -37,6 +37,17 @@ def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
 
 
 _ACTIVE_STATES = ("blocked", "blocked_approval", "waiting_deps", "running", "queued")
+_REQUIRED_JOB_COLUMNS = {
+    "job_id",
+    "role",
+    "state",
+    "depends_on",
+    "blocked_reason",
+    "updated_at",
+    "created_at",
+    "parent_job_id",
+    "labels",
+}
 
 
 def _escape_like(value: str) -> str:
@@ -54,6 +65,30 @@ def _coerce_depends_on_list(depends_on: object) -> tuple[list[str], bool]:
 
     deps = [dep.strip() for dep in raw_deps if isinstance(dep, str) and dep.strip()]
     return deps, False
+
+
+def _error_payload(ticket_id: str, db_path: Path, error: str, recommendation: str) -> dict:
+    return {
+        "generated_at": _utc_now(),
+        "ticket_id": str(ticket_id),
+        "db_path": str(db_path),
+        "error": error,
+        "recommendation": recommendation,
+    }
+
+
+def _schema_error(con: sqlite3.Connection) -> str | None:
+    table_row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("jobs",),
+    ).fetchone()
+    if table_row is None:
+        return "schema_missing"
+
+    columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
+    if not _REQUIRED_JOB_COLUMNS.issubset(columns):
+        return "schema_missing"
+    return None
 
 
 def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[list[dict], str]:
@@ -105,8 +140,38 @@ def main() -> int:
     args = ap.parse_args()
 
     db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(
+            json.dumps(
+                _error_payload(
+                    str(args.ticket_id),
+                    db_path,
+                    "db_missing",
+                    "provide_existing_jobs_sqlite_path",
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
+    schema_error = _schema_error(con)
+    if schema_error is not None:
+        print(
+            json.dumps(
+                _error_payload(
+                    str(args.ticket_id),
+                    db_path,
+                    schema_error,
+                    "run_against_jobs_database_with_required_jobs_schema",
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     rows, selector_strategy = _select_rows_for_ticket(con, str(args.ticket_id))
 
