@@ -5211,6 +5211,13 @@ _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS: tuple[str, ...] = (
     "exact current function body",
 )
 
+_LOCAL_EXCERPT_BLOCKER_SYMBOL_RE = re.compile(
+    r"(?:`[_a-zA-Z][_a-zA-Z0-9.]*`|\b[_a-zA-Z][_a-zA-Z0-9]*_[a-zA-Z0-9_]*\b)"
+)
+_LOCAL_EXCERPT_BLOCKER_PATH_RE = re.compile(
+    r"\b[\w.-]+(?:/[\w.-]+)+\.[a-zA-Z0-9]{1,8}\b"
+)
+
 
 def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
     blob = str(text or "").strip().lower()
@@ -5218,11 +5225,16 @@ def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
         return False
     if any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS):
         return True
-    # Fallback: keep matcher resilient to punctuation/phrasing drift when the same
-    # target symbol is explicitly requested with excerpt/body wording.
-    if _LOCAL_EXCERPT_BLOCKER_TARGET in blob:
-        if any(token in blob for token in _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS):
-            return True
+    # Fallback: keep matcher resilient to punctuation/phrasing drift when an
+    # explicit code target is requested with current-source/excerpt/body wording.
+    if not any(token in blob for token in _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS):
+        return False
+    if (
+        _LOCAL_EXCERPT_BLOCKER_TARGET in blob
+        or _LOCAL_EXCERPT_BLOCKER_SYMBOL_RE.search(blob)
+        or _LOCAL_EXCERPT_BLOCKER_PATH_RE.search(blob)
+    ):
+        return True
     return False
 
 
@@ -18978,7 +18990,15 @@ def _apply_autonomous_local_first_policy(
                 break
         if not candidate_files:
             excerpt_blocker_text = blocker_payload or arch_payload
-            if _local_blocker_requests_grounded_excerpt(excerpt_blocker_text):
+            excerpt_blocker_lc = str(excerpt_blocker_text or "").lower()
+            excerpt_blocker_names_known_bot_target = (
+                "bot.py" in excerpt_blocker_lc
+                or _LOCAL_EXCERPT_BLOCKER_TARGET in excerpt_blocker_lc
+            )
+            if (
+                excerpt_blocker_names_known_bot_target
+                and _local_blocker_requests_grounded_excerpt(excerpt_blocker_text)
+            ):
                 bot_file = (worktree / "bot.py").resolve()
                 try:
                     inside = str(bot_file).startswith(str(worktree))

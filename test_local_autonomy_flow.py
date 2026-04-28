@@ -403,6 +403,17 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "blocked")
 
+    def test_local_blocker_requests_grounded_excerpt_detects_other_symbol_definition(self) -> None:
+        msg = "Please send the current definition for `_some_other_helper` before I patch it."
+        self.assertTrue(bot._local_blocker_requests_grounded_excerpt(msg))
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_local_blocker_requests_grounded_excerpt_detects_current_implementation_variant(self) -> None:
         self.assertTrue(
             bot._local_blocker_requests_grounded_excerpt(
@@ -412,6 +423,17 @@ class TestLocalAutonomyFlow(unittest.TestCase):
 
     def test_failure_class_current_implementation_variant_is_blocked(self) -> None:
         msg = "Need the current implementation of _classify_local_slice_failure to make the fix safely."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_local_blocker_requests_grounded_excerpt_detects_file_path_implementation(self) -> None:
+        msg = "Need the current implementation in tools/proactive_blocker_replay.py before patching."
+        self.assertTrue(bot._local_blocker_requests_grounded_excerpt(msg))
         klass = bot._classify_local_slice_failure(
             role_norm="implementer_local",
             orch_state="failed",
@@ -431,6 +453,13 @@ class TestLocalAutonomyFlow(unittest.TestCase):
                 "I can patch _classify_local_slice_failure, but need the failing test output first."
             )
         )
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary="I can patch _classify_local_slice_failure, but need the failing test output first.",
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "retriable")
 
     def test_grounded_excerpt_marker_parity_between_helper_and_classifier(self) -> None:
         summary = "Need full body of _classify_local_slice_failure to proceed."
@@ -683,6 +712,72 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         self.assertEqual(planned[0].role, "implementer_local")
         self.assertIn("- bot.py", planned[0].text)
         self.assertIn("python3 -m py_compile bot.py", planned[0].text)
+
+    def test_apply_local_first_policy_symbol_only_excerpt_blocker_requires_replan(self) -> None:
+        td, q = self._queue()
+        self.addCleanup(td.cleanup)
+        order_id = "58555555-5555-5555-5555-555555555555"
+        summary = "Please send the current definition for `_some_other_helper` before I patch it."
+        impl = _new_task(
+            role="implementer_local",
+            parent_job_id=order_id,
+            key="local_impl_guard_slice_symbol_only",
+            trace={
+                "slice_id": "slice_symbol_only",
+                "slice_status": "blocked",
+                "quality_gate_status": "blocked",
+                "failure_class": "blocked",
+                "attempt_n": 1,
+            },
+        )
+        q.submit_task(impl)
+        q.update_state(
+            impl.job_id,
+            "blocked",
+            result_summary=summary,
+            slice_id="slice_symbol_only",
+            slice_status="blocked",
+            quality_gate_status="blocked",
+            failure_class="blocked",
+            attempt_n=1,
+        )
+
+        specs = [
+            bot.TaskSpec(
+                key="backend_followup_symbol_only",
+                role="backend",
+                text="Investigate the local autonomy blocker.",
+                mode_hint="ro",
+                priority=2,
+                acceptance_criteria=["Produce one next step."],
+                definition_of_done=["One next step is identified."],
+                eta_minutes=15,
+                sla_tier="medium",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as worktree_td:
+            worktree = Path(worktree_td)
+            (worktree / "bot.py").write_text(
+                "def _classify_local_slice_failure(*, role_norm: str, orch_state: str, summary: str, attempt_n: int) -> str:\n"
+                "    return 'blocked'\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"BOT_AUTONOMOUS_LOCAL_FIRST": "1"}), patch.object(
+                bot,
+                "_local_role_worktree_dir",
+                return_value=worktree,
+            ):
+                planned = bot._apply_autonomous_local_first_policy(
+                    specs=specs,
+                    orch_q=q,
+                    root_ticket=order_id,
+                    now=time.time(),
+                )
+
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].role, "architect_local")
+        self.assertNotIn("MANDATORY_FILE_SCOPE", planned[0].text)
+        self.assertNotIn("- bot.py", planned[0].text)
 
     def test_structured_handoff_actionable_requires_sections(self) -> None:
         good = (
