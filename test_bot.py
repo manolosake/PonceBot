@@ -2389,6 +2389,106 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
             self.assertIn("_SKILL_SEGMENT_RE.fullmatch(s)", target.read_text(encoding="utf-8"))
 
+    def test_finalize_codex_implementer_change_strips_stale_file_mode_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "tools" / "proactive_blocker_replay.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n\nVALUE = \"old\"\n", encoding="utf-8")
+            target.chmod(0o644)
+            subprocess.run(["git", "add", "tools/proactive_blocker_replay.py"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            diff_text = (
+                "diff --git a/tools/proactive_blocker_replay.py b/tools/proactive_blocker_replay.py\n"
+                "old mode 100755\n"
+                "new mode 100644\n"
+                "index 1111111..2222222 100755\n"
+                "--- a/tools/proactive_blocker_replay.py\n"
+                "+++ b/tools/proactive_blocker_replay.py\n"
+                "@@ -1,3 +1,3 @@\n"
+                " #!/usr/bin/env python3\n"
+                " \n"
+                "-VALUE = \"old\"\n"
+                "+VALUE = \"new\"\n"
+            )
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            body = f"```diff\n{diff_text}```\n"
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertIn("tools/proactive_blocker_replay.py", patch_info.get("changed_files", []))
+            self.assertTrue(bool(patch_info.get("validation_ok", False)))
+            self.assertTrue(bool(patch_info.get("patch_repaired", False)))
+            patch_artifact = Path(str(patch_info.get("patch_artifact") or ""))
+            applied_patch_text = patch_artifact.read_text(encoding="utf-8")
+            self.assertNotIn("old mode 100755", applied_patch_text)
+            self.assertNotIn("new mode 100644", applied_patch_text)
+            self.assertIn("index 1111111..2222222\n", applied_patch_text)
+            self.assertIn("VALUE = \"new\"", target.read_text(encoding="utf-8"))
+
+    def test_finalize_codex_implementer_change_preserves_valid_content_and_mode_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target = repo / "script.sh"
+            target.write_text("#!/bin/sh\nprintf 'old\\n'\n", encoding="utf-8")
+            target.chmod(0o644)
+            subprocess.run(["git", "add", "script.sh"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            target.write_text("#!/bin/sh\nprintf 'new\\n'\n", encoding="utf-8")
+            target.chmod(0o755)
+            diff_text = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--unified=3"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            target.write_text("#!/bin/sh\nprintf 'old\\n'\n", encoding="utf-8")
+            target.chmod(0o644)
+
+            artifacts_dir = Path(td) / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            body = f"```diff\n{diff_text}```\n"
+
+            artifacts, patch_info, patch_error = bot._finalize_codex_implementer_change(
+                task=SimpleNamespace(),
+                artifacts_dir=artifacts_dir,
+                content=body,
+                worktree_dir=repo,
+            )
+
+            self.assertIsNone(patch_error)
+            self.assertIn("script.sh", patch_info.get("changed_files", []))
+            self.assertTrue(bool(patch_info.get("validation_ok", False)))
+            self.assertFalse(bool(patch_info.get("patch_repaired", False)))
+            self.assertFalse(bool(patch_info.get("mode_metadata_stripped", False)))
+            self.assertTrue(os.access(target, os.X_OK))
+            self.assertIn("printf 'new\\n'", target.read_text(encoding="utf-8"))
+            patch_artifact = Path(str(patch_info.get("patch_artifact") or ""))
+            applied_patch_text = patch_artifact.read_text(encoding="utf-8")
+            self.assertIn("old mode 100644", applied_patch_text)
+            self.assertIn("new mode 100755", applied_patch_text)
+            self.assertTrue(any(path.endswith("local_ollama_git_diff.patch") for path in artifacts))
+
     def test_finalize_codex_implementer_change_applies_begin_patch_update(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"

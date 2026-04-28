@@ -5089,6 +5089,53 @@ def _repair_unified_diff_text(text: str) -> tuple[str, bool]:
     return repaired, changed
 
 
+def _strip_unified_diff_file_mode_metadata(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False
+    lines = raw.splitlines()
+    repaired_lines: list[str] = []
+    changed = False
+    section_lines: list[str] = []
+    mode_line_re = re.compile(r"^(?:old|new) mode [0-7]{6}$")
+    index_mode_re = re.compile(r"^(index [0-9a-fA-F]+\.\.[0-9a-fA-F]+) [0-7]{6}$")
+
+    def _flush_section() -> None:
+        nonlocal changed
+        if not section_lines:
+            return
+        has_content_hunk = any(line.startswith("@@ ") for line in section_lines)
+        for section_line in section_lines:
+            if has_content_hunk and mode_line_re.match(section_line):
+                changed = True
+                continue
+            index_match = index_mode_re.match(section_line) if has_content_hunk else None
+            if index_match:
+                repaired_lines.append(index_match.group(1))
+                changed = True
+                continue
+            repaired_lines.append(section_line)
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            _flush_section()
+            section_lines = [line]
+            continue
+        section_lines.append(line)
+    _flush_section()
+    repaired = "\n".join(repaired_lines)
+    if raw.endswith("\n"):
+        repaired += "\n"
+    return repaired, changed
+
+
+def _git_apply_error_indicates_file_mode_mismatch(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    return bool(re.search(r"\bhas type [0-7]{6}, expected [0-7]{6}\b", blob))
+
+
 def _extract_blocker_response(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -5995,6 +6042,7 @@ def _finalize_local_implementer_change(
     apply_mode: str,
     already_applied: bool = False,
     patch_repaired: bool = False,
+    mode_metadata_stripped: bool = False,
     patch_artifact: str = "",
     rewrite_files: list[str] | None = None,
     changed_files_hint: list[str] | None = None,
@@ -6115,6 +6163,9 @@ def _finalize_local_implementer_change(
         info["patch_artifact"] = str(patch_artifact)
     if patch_artifact:
         info["patch_repaired"] = bool(patch_repaired)
+    if mode_metadata_stripped:
+        info["mode_metadata_stripped"] = True
+        info["patch_repair_reason"] = "file_mode_metadata_mismatch"
     if rewrite_files:
         info["rewrite_files"] = [str(path) for path in rewrite_files if str(path).strip()]
     if hinted_files:
@@ -6331,6 +6382,7 @@ def _apply_local_implementer_patch(
     repaired_patch_text, patch_repaired = _repair_unified_diff_text(patch_text)
     if repaired_patch_text.strip():
         patch_text = repaired_patch_text
+    mode_metadata_stripped = False
     patch_path = artifacts_dir / "local_ollama_patch.diff"
     patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
     artifacts: list[str] = [str(patch_path)]
@@ -6372,34 +6424,65 @@ def _apply_local_implementer_patch(
         recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(patch_path)])
         if recount_check.returncode == 0:
             apply_check = recount_check
+    def _retry_after_mode_metadata_strip() -> bool:
+        nonlocal patch_text, patch_repaired, mode_metadata_stripped, apply_check
+        stripped_patch_text, stripped = _strip_unified_diff_file_mode_metadata(patch_text)
+        if not stripped or not stripped_patch_text.strip():
+            return False
+        stripped_path = artifacts_dir / "local_ollama_patch.mode-stripped.diff"
+        stripped_path.write_text(stripped_patch_text, encoding="utf-8", errors="replace")
+        stripped_check = _run_patch_cmd(["git", "apply", "--check", str(stripped_path)])
+        if stripped_check.returncode != 0:
+            stripped_recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(stripped_path)])
+            if stripped_recount_check.returncode == 0:
+                stripped_check = stripped_recount_check
+        if stripped_check.returncode != 0:
+            stripped_err_path = artifacts_dir / "local_ollama_patch_mode_strip_error.txt"
+            stripped_err_body = (
+                stripped_check.stderr or stripped_check.stdout or ""
+            ).strip() or "git apply --check failed after stripping file mode metadata"
+            stripped_err_path.write_text(stripped_err_body + "\n", encoding="utf-8", errors="replace")
+            artifacts.append(str(stripped_err_path))
+            return False
+        patch_text = stripped_patch_text
+        patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
+        patch_repaired = True
+        mode_metadata_stripped = True
+        apply_check = stripped_check
+        return True
+
+    apply_check_text = (apply_check.stderr or apply_check.stdout or "").strip()
+    if apply_check.returncode == 0 and _git_apply_error_indicates_file_mode_mismatch(apply_check_text):
+        _retry_after_mode_metadata_strip()
     already_applied = False
     if apply_check.returncode != 0:
         reverse_check = _run_patch_cmd(["git", "apply", "--reverse", "--check", str(patch_path)])
         if reverse_check.returncode == 0:
             already_applied = True
         else:
-            err_path = artifacts_dir / "local_ollama_patch_error.txt"
             err_body = (apply_check.stderr or apply_check.stdout or "").strip() or "git apply --check failed"
-            err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
-            artifacts.append(str(err_path))
-            if rewrite_blocks:
-                fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
-                fallback_note.write_text(
-                    "Patch apply failed; falling back to rewrite blocks.\n"
-                    + err_body
-                    + "\n",
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                artifacts.append(str(fallback_note))
-                return _apply_local_implementer_rewrites(
-                    task=task,
-                    artifacts_dir=artifacts_dir,
-                    content=content,
-                    worktree_dir=worktree_dir,
-                    artifacts=artifacts,
-                )
-            raise RuntimeError(f"implementer_local patch rejected by git apply --check: {err_body}")
+            if not (_git_apply_error_indicates_file_mode_mismatch(err_body) and _retry_after_mode_metadata_strip()):
+                err_path = artifacts_dir / "local_ollama_patch_error.txt"
+                err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
+                artifacts.append(str(err_path))
+                if rewrite_blocks:
+                    fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
+                    fallback_note.write_text(
+                        "Patch apply failed; falling back to rewrite blocks.\n"
+                        + err_body
+                        + "\n",
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    artifacts.append(str(fallback_note))
+                    return _apply_local_implementer_rewrites(
+                        task=task,
+                        artifacts_dir=artifacts_dir,
+                        content=content,
+                        worktree_dir=worktree_dir,
+                        artifacts=artifacts,
+                    )
+                raise RuntimeError(f"implementer_local patch rejected by git apply --check: {err_body}")
 
     if not already_applied:
         applied = _run_patch_cmd(["git", "apply", str(patch_path)])
@@ -6437,6 +6520,7 @@ def _apply_local_implementer_patch(
         apply_mode="patch",
         already_applied=already_applied,
         patch_repaired=patch_repaired,
+        mode_metadata_stripped=mode_metadata_stripped,
         patch_artifact=str(patch_path),
         changed_files_hint=_extract_changed_files_from_patch_text(patch_text),
     )
