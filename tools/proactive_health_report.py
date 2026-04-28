@@ -27,6 +27,7 @@ IGNORE_ARTIFACT_TOKENS = (
     'local_ollama_prompt',
 )
 STALE_LOCAL_S = 15 * 60
+STALE_HEARTBEAT_DETAIL_LIMIT = 25
 LOOKBACK_S = 24 * 3600
 AUTONOMY_MINIMUM_SLO = {
     'implementer_fail_rate_lte': 0.35,
@@ -613,9 +614,13 @@ def main() -> int:
         (since, '%empty response from local ollama model%'),
     ).fetchone()['n']
     enabled_repos = [row for row in repo_rows if str(row.get('status') or '').strip().lower() == 'active' and bool(int(row.get('autonomy_enabled') or 0))]
-    enabled_repo_ids = {str(row.get('repo_id') or '').strip() for row in enabled_repos}
-    enabled_repo_ids.discard('')
-    stale_heartbeats = 0
+    enabled_repo_by_id = {
+        str(row.get('repo_id') or '').strip(): row
+        for row in enabled_repos
+        if str(row.get('repo_id') or '').strip()
+    }
+    enabled_repo_ids = set(enabled_repo_by_id.keys())
+    stale_heartbeat_details = []
     for hb in heartbeat_rows:
         repo_id = str(hb.get('repo_id') or '').strip()
         if repo_id not in enabled_repo_ids:
@@ -625,7 +630,25 @@ def main() -> int:
         except Exception:
             heartbeat_at = 0.0
         if heartbeat_at <= 0 or (now - heartbeat_at) >= STALE_LOCAL_S:
-            stale_heartbeats += 1
+            repo = enabled_repo_by_id.get(repo_id) or {}
+            stale_heartbeat_details.append({
+                'repo_id': repo_id,
+                'repo_path': str(repo.get('path') or ''),
+                'agent_key': str(hb.get('agent_key') or ''),
+                'role': str(hb.get('role') or ''),
+                'heartbeat_at': heartbeat_at if heartbeat_at > 0 else None,
+                'heartbeat_age_s': max(0, int(now - heartbeat_at)) if heartbeat_at > 0 else None,
+                'updated_at': hb.get('updated_at'),
+                'reason': 'missing_heartbeat' if heartbeat_at <= 0 else 'stale_heartbeat',
+            })
+    stale_heartbeat_details.sort(key=lambda item: (
+        str(item.get('repo_id') or ''),
+        str(item.get('role') or ''),
+        str(item.get('agent_key') or ''),
+    ))
+    stale_heartbeat_count = len(stale_heartbeat_details)
+    stale_heartbeat_details_limited = stale_heartbeat_details[:STALE_HEARTBEAT_DETAIL_LIMIT]
+    stale_heartbeat_details_truncated = stale_heartbeat_count > len(stale_heartbeat_details_limited)
 
     def audit_count(event_type: str) -> int:
         return int(
@@ -663,7 +686,7 @@ def main() -> int:
         'factory_repo_orders_24h': audit_count('factory.repo_order.created'),
         'factory_enabled_repos': len(enabled_repos),
         'factory_registered_repos': len(repo_rows),
-        'factory_stale_heartbeats': int(stale_heartbeats),
+        'factory_stale_heartbeats': int(stale_heartbeat_count),
     }
 
     operational_status = 'OK'
@@ -694,6 +717,9 @@ def main() -> int:
         anomalies.append({
             'type': 'factory_stale_heartbeats',
             'count': metrics['factory_stale_heartbeats'],
+            'details': stale_heartbeat_details_limited,
+            'details_truncated': stale_heartbeat_details_truncated,
+            'detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
         })
         operational_status = worst_status(operational_status, 'WARN')
 
@@ -747,7 +773,10 @@ def main() -> int:
             'soft_pause_until': soft_pause_until if factory_soft_pause_active else None,
             'registered_repos': len(repo_rows),
             'enabled_repos': len(enabled_repos),
-            'stale_heartbeats': int(stale_heartbeats),
+            'stale_heartbeats': int(stale_heartbeat_count),
+            'stale_heartbeat_details': stale_heartbeat_details_limited,
+            'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
+            'stale_heartbeat_detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
         },
         'metrics': metrics,
         'autonomy_funnel': {

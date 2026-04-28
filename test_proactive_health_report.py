@@ -12,6 +12,7 @@ from pathlib import Path
 from tools.proactive_health_report import order_autonomy_funnel
 from tools.proactive_health_report import classify_open_job_mode, is_blocked_without_open_jobs
 from tools.proactive_health_report import AUTONOMY_MINIMUM_SLO, IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS
+from tools.proactive_health_report import STALE_HEARTBEAT_DETAIL_LIMIT
 
 
 class TestProactiveHealthReport(unittest.TestCase):
@@ -90,7 +91,7 @@ class TestProactiveHealthReport(unittest.TestCase):
         db: Path,
         *,
         repos: list[tuple[str, str, int]],
-        heartbeats: list[tuple[str, float]],
+        heartbeats: list[tuple[str, float | None]],
         include_active_order: bool = False,
     ) -> None:
         now = time.time()
@@ -266,6 +267,7 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(payload["metrics"]["factory_registered_repos"], 3)
             self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 0)
             self.assertEqual(payload["factory"]["stale_heartbeats"], 0)
+            self.assertEqual(payload["factory"]["stale_heartbeat_details"], [])
             anomalies = payload.get("anomalies") or []
             self.assertFalse(any(item.get("type") == "factory_stale_heartbeats" for item in anomalies))
             self.assertEqual(payload.get("operational_status"), "OK")
@@ -280,11 +282,13 @@ class TestProactiveHealthReport(unittest.TestCase):
                 db,
                 repos=[
                     ("enabled-repo", "active", 1),
+                    ("enabled-missing", "active", 1),
                     ("disabled-repo", "active", 0),
                     ("blocked-repo", "blocked", 1),
                 ],
                 heartbeats=[
                     ("enabled-repo", stale),
+                    ("enabled-missing", None),
                     ("disabled-repo", stale),
                     ("blocked-repo", stale),
                 ],
@@ -295,14 +299,30 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
             payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
-            self.assertEqual(payload["metrics"]["factory_enabled_repos"], 1)
-            self.assertEqual(payload["metrics"]["factory_registered_repos"], 3)
-            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 1)
-            self.assertEqual(payload["factory"]["stale_heartbeats"], 1)
+            self.assertEqual(payload["metrics"]["factory_enabled_repos"], 2)
+            self.assertEqual(payload["metrics"]["factory_registered_repos"], 4)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 2)
+            self.assertEqual(payload["factory"]["stale_heartbeats"], 2)
+            self.assertEqual(payload["factory"]["stale_heartbeat_detail_limit"], STALE_HEARTBEAT_DETAIL_LIMIT)
+            self.assertFalse(payload["factory"]["stale_heartbeat_details_truncated"])
+            details = payload["factory"]["stale_heartbeat_details"]
+            self.assertEqual([item["repo_id"] for item in details], ["enabled-missing", "enabled-repo"])
+            self.assertEqual(details[0]["agent_key"], "enabled-missing-1")
+            self.assertEqual(details[0]["role"], "skynet")
+            self.assertIsNone(details[0]["heartbeat_at"])
+            self.assertIsNone(details[0]["heartbeat_age_s"])
+            self.assertEqual(details[0]["reason"], "missing_heartbeat")
+            self.assertEqual(details[1]["agent_key"], "enabled-repo-0")
+            self.assertEqual(details[1]["role"], "skynet")
+            self.assertGreaterEqual(details[1]["heartbeat_age_s"], 3600)
+            self.assertEqual(details[1]["reason"], "stale_heartbeat")
             anomalies = payload.get("anomalies") or []
             stale_anomaly = next((item for item in anomalies if item.get("type") == "factory_stale_heartbeats"), None)
             self.assertIsNotNone(stale_anomaly)
-            self.assertEqual(stale_anomaly.get("count"), 1)
+            self.assertEqual(stale_anomaly.get("count"), 2)
+            self.assertEqual(stale_anomaly.get("details"), details)
+            self.assertFalse(stale_anomaly.get("details_truncated"))
+            self.assertEqual(stale_anomaly.get("detail_limit"), STALE_HEARTBEAT_DETAIL_LIMIT)
             self.assertEqual(payload.get("operational_status"), "WARN")
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
