@@ -2574,6 +2574,42 @@ def _git_default_branch(repo: Path) -> str:
     return "main"
 
 
+_FACTORY_TEMPORARY_DEFAULT_BRANCH_PREFIXES = (
+    "feature/order-",
+    "poncebot/",
+    "codex/r530-main-clean-",
+)
+
+
+def _factory_is_temporary_default_branch(branch: str) -> bool:
+    token = str(branch or "").strip()
+    return bool(token and any(token.startswith(prefix) for prefix in _FACTORY_TEMPORARY_DEFAULT_BRANCH_PREFIXES))
+
+
+def _factory_repo_default_branch_for_sync(
+    *,
+    existing: dict[str, Any],
+    discovered: dict[str, Any],
+    metadata: dict[str, Any],
+    now: float,
+) -> str:
+    discovered_branch = str(discovered.get("default_branch") or "").strip() or "main"
+    existing_branch = str(existing.get("default_branch") or "").strip()
+    canonical_branch = str(metadata.get("canonical_branch") or "").strip()
+    if canonical_branch:
+        return canonical_branch
+    if bool(metadata.get("default_branch_pinned", False)):
+        return existing_branch or discovered_branch
+    if existing_branch and existing_branch != discovered_branch and _factory_is_temporary_default_branch(existing_branch):
+        metadata["canonical_branch"] = discovered_branch
+        metadata["previous_default_branch"] = existing_branch
+        metadata["default_branch_migrated_at"] = float(now)
+        metadata["default_branch_migrated_by"] = "factory_sync"
+        metadata.pop("proactive_branch_note", None)
+        return discovered_branch
+    return existing_branch or discovered_branch
+
+
 def _factory_repo_autonomy_blocker(repo: Path, *, default_branch: str) -> str:
     try:
         repo = repo.expanduser().resolve()
@@ -13095,10 +13131,17 @@ def _factory_sync_repo_registry(
         metadata = dict(existing.get("metadata") or {})
         metadata.update(dict(row.get("metadata") or {}))
         metadata["last_seen_at"] = float(now)
+        previous_default_branch = str(existing.get("default_branch") or "").strip()
+        default_branch = _factory_repo_default_branch_for_sync(
+            existing=existing,
+            discovered=row,
+            metadata=metadata,
+            now=float(now),
+        )
         orch_q.upsert_repo(
             repo_id=repo_id,
             path=str(row.get("path") or ""),
-            default_branch=str(existing.get("default_branch") or row.get("default_branch") or "main"),
+            default_branch=default_branch,
             autonomy_enabled=bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True))),
             priority=int(existing.get("priority") or row.get("priority") or 2),
             runtime_mode=str(existing.get("runtime_mode") or row.get("runtime_mode") or "ceo-bounded"),
@@ -13106,6 +13149,21 @@ def _factory_sync_repo_registry(
             status=str(existing.get("status") or row.get("status") or "active"),
             metadata=metadata,
         )
+        if previous_default_branch and default_branch != previous_default_branch:
+            try:
+                orch_q.append_audit_event(
+                    event_type="repo.default_branch_reconciled",
+                    actor="factory_sync",
+                    details={
+                        "repo_id": repo_id,
+                        "repo_path": str(row.get("path") or ""),
+                        "previous_default_branch": previous_default_branch,
+                        "default_branch": default_branch,
+                        "discovered_default_branch": str(row.get("default_branch") or "").strip() or "main",
+                    },
+                )
+            except Exception:
+                pass
     for repo_id, existing in existing_rows.items():
         if not repo_id or repo_id in discovered_ids:
             continue

@@ -171,6 +171,38 @@ class TestStateHandling(unittest.TestCase):
             self.assertIn(str(repo_b.resolve()), repo_paths)
             self.assertFalse(any("node_modules" in path for path in repo_paths))
 
+    def test_factory_repo_default_branch_sync_reconciles_temporary_branch(self) -> None:
+        metadata = {
+            "repo_name": "ExecutiveDashboard",
+            "proactive_branch_note": "Use the live deploy branch; origin/main is divergent on this host.",
+        }
+
+        branch = bot._factory_repo_default_branch_for_sync(
+            existing={"default_branch": "codex/r530-main-clean-20260305-045022"},
+            discovered={"default_branch": "main"},
+            metadata=metadata,
+            now=123.0,
+        )
+
+        self.assertEqual(branch, "main")
+        self.assertEqual(metadata["canonical_branch"], "main")
+        self.assertEqual(metadata["previous_default_branch"], "codex/r530-main-clean-20260305-045022")
+        self.assertEqual(metadata["default_branch_migrated_by"], "factory_sync")
+        self.assertNotIn("proactive_branch_note", metadata)
+
+    def test_factory_repo_default_branch_sync_preserves_pinned_branch(self) -> None:
+        metadata = {"default_branch_pinned": True}
+
+        branch = bot._factory_repo_default_branch_for_sync(
+            existing={"default_branch": "codex/codexbot-workflow-v2"},
+            discovered={"default_branch": "main"},
+            metadata=metadata,
+            now=123.0,
+        )
+
+        self.assertEqual(branch, "codex/codexbot-workflow-v2")
+        self.assertNotIn("canonical_branch", metadata)
+
     def test_factory_repo_autonomy_blocker_rejects_branch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
