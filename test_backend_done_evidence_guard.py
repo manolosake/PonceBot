@@ -151,6 +151,35 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(payload["reason"], "artifact_outside_dir")
 
+    def test_validate_evidence_fails_when_windows_artifact_path_escapes_dir(self) -> None:
+        unsafe_paths = [
+            "..\\escape.log",
+            "C:/temp/proof.log",
+            "C:\\temp\\proof.log",
+            "\\\\server\\share\\proof.log",
+        ]
+        for unsafe_path in unsafe_paths:
+            with self.subTest(unsafe_path=unsafe_path), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                (artifacts_dir / "final_evidence.json").write_text(
+                    json.dumps(
+                        {
+                            "summary": "verified improvement",
+                            "artifacts": [unsafe_path],
+                            "next_action": None,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    allow_missing_files=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], "artifact_outside_dir")
+
     def test_validate_evidence_fails_when_absolute_artifact_escapes_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside_td:
             artifacts_dir = Path(td)

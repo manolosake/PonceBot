@@ -3,13 +3,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import sys
 from pathlib import Path
 from typing import Any
 
 
+def _is_absolute_artifact_path(raw_path: str) -> bool:
+    # Use both local-path semantics and Windows semantics so checks are platform-agnostic.
+    return Path(raw_path).is_absolute() or ntpath.isabs(raw_path)
+
+
+def _artifact_candidate_path(raw_path: str) -> Path:
+    # Interpret Windows-style separators consistently for platform-agnostic safety checks.
+    return Path(raw_path.replace("\\", "/"))
+
+
 def _resolve_artifact_path(*, artifacts_dir: Path, raw_path: str) -> Path:
-    candidate = Path(str(raw_path or "").strip()).expanduser()
+    candidate = _artifact_candidate_path(str(raw_path or "").strip()).expanduser()
     if candidate.is_absolute():
         return candidate.resolve()
     return (artifacts_dir / candidate).resolve()
@@ -86,6 +97,9 @@ def validate_evidence(
     empty_files: list[str] = []
     resolved_artifacts: list[str] = []
     for raw_path in artifacts:
+        if _is_absolute_artifact_path(raw_path):
+            outside_dir.append(raw_path)
+            continue
         resolved = _resolve_artifact_path(artifacts_dir=artifacts_root, raw_path=raw_path)
         resolved_artifacts.append(str(resolved))
         try:
