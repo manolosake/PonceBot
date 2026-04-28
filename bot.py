@@ -5115,6 +5115,19 @@ _LOCAL_EXCERPT_BLOCKER_MARKERS: tuple[str, ...] = (
     "need exact current excerpt for `bot.py` around `_classify_local_slice_failure`",
 )
 
+_LOCAL_EXCERPT_BLOCKER_TARGET = "_classify_local_slice_failure"
+
+_LOCAL_EXCERPT_BLOCKER_TARGET_TERMS: tuple[str, ...] = (
+    "current definition",
+    "current implementation",
+    "current source",
+    "current function",
+    "full body",
+    "current excerpt",
+    "missing excerpt",
+    "exact current function body",
+)
+
 
 def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
     blob = str(text or "").strip().lower()
@@ -5124,8 +5137,8 @@ def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
         return True
     # Fallback: keep matcher resilient to punctuation/phrasing drift when the same
     # target symbol is explicitly requested with excerpt/body wording.
-    if "_classify_local_slice_failure" in blob:
-        if any(token in blob for token in ("full body", "current excerpt", "missing excerpt", "exact current function body")):
+    if _LOCAL_EXCERPT_BLOCKER_TARGET in blob:
+        if any(token in blob for token in _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS):
             return True
     return False
 

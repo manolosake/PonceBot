@@ -386,10 +386,49 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "blocked")
 
+    def test_local_blocker_requests_grounded_excerpt_detects_current_definition_variant(self) -> None:
+        self.assertTrue(
+            bot._local_blocker_requests_grounded_excerpt(
+                "Please send the current definition for `_classify_local_slice_failure` before I patch it."
+            )
+        )
+
+    def test_failure_class_current_definition_variant_is_blocked(self) -> None:
+        msg = "Please send the current definition for `_classify_local_slice_failure` before I patch it."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_local_blocker_requests_grounded_excerpt_detects_current_implementation_variant(self) -> None:
+        self.assertTrue(
+            bot._local_blocker_requests_grounded_excerpt(
+                "Need the current implementation of _classify_local_slice_failure to make the fix safely."
+            )
+        )
+
+    def test_failure_class_current_implementation_variant_is_blocked(self) -> None:
+        msg = "Need the current implementation of _classify_local_slice_failure to make the fix safely."
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_local_blocker_requests_grounded_excerpt_ignores_generic_blockers(self) -> None:
         self.assertFalse(
             bot._local_blocker_requests_grounded_excerpt(
                 "BLOCKER: please provide failing test output for release_governance."
+            )
+        )
+        self.assertFalse(
+            bot._local_blocker_requests_grounded_excerpt(
+                "I can patch _classify_local_slice_failure, but need the failing test output first."
             )
         )
 
