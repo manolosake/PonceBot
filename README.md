@@ -179,6 +179,8 @@ make verify
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.70`)
 
+`make pytest` runs deterministic pytest replay through `./scripts/bootstrap_pytest_python3.sh`.
+
 ## Deployment Notes
 
 - Keep 24/7 operation under systemd (`systemd/INSTALL.md`).

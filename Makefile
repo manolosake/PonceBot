@@ -1,4 +1,4 @@
-.PHONY: verify test lint security coverage
+.PHONY: verify test pytest lint security coverage
 
 PYTHON ?= python3
 
@@ -12,6 +12,9 @@ security:
 
 test:
 	$(PYTHON) -m unittest -q
+
+pytest:
+	./scripts/bootstrap_pytest_python3.sh -m pytest
 
 coverage:
 	$(PYTHON) tools/coverage_gate.py --min 0.70
