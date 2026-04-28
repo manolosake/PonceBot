@@ -442,6 +442,28 @@ class TestLocalAutonomyFlow(unittest.TestCase):
         )
         self.assertEqual(klass, "blocked")
 
+    def test_local_blocker_requests_grounded_excerpt_detects_path_current_contents(self) -> None:
+        msg = "Please provide the current contents of tools/proactive_blocker_replay.py before patching."
+        self.assertTrue(bot._local_blocker_requests_grounded_excerpt(msg))
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
+    def test_local_blocker_requests_grounded_excerpt_detects_symbol_source_code(self) -> None:
+        msg = "Please send the source code for `_some_other_helper` before I patch it."
+        self.assertTrue(bot._local_blocker_requests_grounded_excerpt(msg))
+        klass = bot._classify_local_slice_failure(
+            role_norm="implementer_local",
+            orch_state="failed",
+            summary=msg,
+            attempt_n=1,
+        )
+        self.assertEqual(klass, "blocked")
+
     def test_local_blocker_requests_grounded_excerpt_ignores_generic_blockers(self) -> None:
         self.assertFalse(
             bot._local_blocker_requests_grounded_excerpt(

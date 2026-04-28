@@ -5201,11 +5201,17 @@ _LOCAL_EXCERPT_BLOCKER_MARKERS: tuple[str, ...] = (
 _LOCAL_EXCERPT_BLOCKER_TARGET = "_classify_local_slice_failure"
 
 _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS: tuple[str, ...] = (
+    "current contents",
+    "current code",
     "current definition",
     "current implementation",
+    "current snippet",
     "current source",
     "current function",
     "full body",
+    "relevant snippet",
+    "source code",
+    "source excerpt",
     "current excerpt",
     "missing excerpt",
     "exact current function body",
