@@ -409,6 +409,8 @@ class TestProactiveBlockerReplay(unittest.TestCase):
                     },
                 ],
             )
+            self.assertEqual(payload["stale_blocked_by_role"], {"backend": 1, "qa": 1})
+            self.assertEqual(payload["stale_blocked_top_reason"], "dependencies_pending:stale-backend")
             self.assertEqual(payload["recommendation"], "cancel_or_reseed_invalid_or_stale_blockers")
         finally:
             os.unlink(db_path)

@@ -88,6 +88,26 @@ def _stale_blocker_action(*, ticket_id: str, detail: dict) -> dict:
     }
 
 
+def _stale_blocker_by_role(stale_details: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for detail in stale_details:
+        role = str(detail.get("role") or "").strip() or "unknown"
+        counts[role] = int(counts.get(role, 0)) + 1
+    return counts
+
+
+def _stale_blocker_top_reason(stale_details: list[dict]) -> str:
+    counts: dict[str, int] = {}
+    for detail in stale_details:
+        reason = str(detail.get("blocked_reason") or "").strip()
+        if not reason:
+            continue
+        counts[reason] = int(counts.get(reason, 0)) + 1
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
 def _error_payload(ticket_id: str, db_path: Path, error: str, recommendation: str) -> dict:
     return {
         "generated_at": _utc_now(),
@@ -204,6 +224,8 @@ def main() -> int:
     stale = [r for r in blocked if float(r.get("updated_age_s") or 0.0) > float(args.stale_seconds)]
     stale_details = [_stale_blocker_detail(r) for r in stale]
     stale_actions = [_stale_blocker_action(ticket_id=str(args.ticket_id), detail=detail) for detail in stale_details]
+    stale_by_role = _stale_blocker_by_role(stale_details)
+    stale_top_reason = _stale_blocker_top_reason(stale_details)
     ids = {str(r.get("job_id") or "") for r in rows}
 
     invalid_wait = []
@@ -225,6 +247,8 @@ def main() -> int:
         "stale_blocked_job_ids": [detail["job_id"] for detail in stale_details],
         "stale_blocked_jobs": stale_details,
         "stale_blocker_actions": stale_actions,
+        "stale_blocked_by_role": stale_by_role,
+        "stale_blocked_top_reason": stale_top_reason,
         "invalid_wait_dependency_count": len(invalid_wait),
         "invalid_wait_job_ids": invalid_wait,
         "recommendation": (
