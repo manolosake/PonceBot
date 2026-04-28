@@ -85,6 +85,89 @@ class TestProactiveHealthReport(unittest.TestCase):
                 ],
             )
 
+    def _create_factory_report_db(
+        self,
+        db: Path,
+        *,
+        repos: list[tuple[str, str, int]],
+        heartbeats: list[tuple[str, float]],
+        include_active_order: bool = False,
+    ) -> None:
+        now = time.time()
+        with sqlite3.connect(db) as con:
+            con.execute(
+                """
+                CREATE TABLE ceo_orders (
+                    order_id TEXT,
+                    status TEXT,
+                    phase TEXT,
+                    title TEXT,
+                    body TEXT,
+                    updated_at REAL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT,
+                    parent_job_id TEXT,
+                    state TEXT,
+                    role TEXT,
+                    labels TEXT,
+                    trace TEXT,
+                    updated_at REAL,
+                    created_at REAL
+                )
+                """
+            )
+            con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+            con.execute(
+                """
+                CREATE TABLE repo_registry (
+                    repo_id TEXT,
+                    path TEXT,
+                    priority INTEGER,
+                    updated_at REAL,
+                    status TEXT,
+                    autonomy_enabled INTEGER
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE agent_runtime_state (
+                    agent_key TEXT,
+                    repo_id TEXT,
+                    role TEXT,
+                    heartbeat_at REAL,
+                    updated_at REAL
+                )
+                """
+            )
+            if include_active_order:
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("order-factory-active", "active", "planning", "Proactive Sprint: factory", "", now),
+                )
+            con.executemany(
+                """
+                INSERT INTO repo_registry(repo_id, path, priority, updated_at, status, autonomy_enabled)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [(repo_id, f"/tmp/{repo_id}", idx, now - idx, status, autonomy_enabled) for idx, (repo_id, status, autonomy_enabled) in enumerate(repos)],
+            )
+            con.executemany(
+                """
+                INSERT INTO agent_runtime_state(agent_key, repo_id, role, heartbeat_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [(f"{repo_id}-{idx}", repo_id, "skynet", heartbeat_at, now - idx) for idx, (repo_id, heartbeat_at) in enumerate(heartbeats)],
+            )
+
     def test_missing_db_writes_error_report(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -154,6 +237,73 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(payload["metrics"]["implementer_attempts"], 2)
             self.assertEqual(payload["metrics"]["implementer_failures"], 1)
             self.assertEqual(payload["metrics"]["implementer_fail_rate"], 0.5)
+
+    def test_factory_stale_heartbeats_excludes_disabled_and_blocked_repos(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            stale = time.time() - 3600
+            self._create_factory_report_db(
+                db,
+                repos=[
+                    ("disabled-repo", "active", 0),
+                    ("blocked-repo", "blocked", 1),
+                    ("inactive-repo", "disabled", 1),
+                ],
+                heartbeats=[
+                    ("disabled-repo", stale),
+                    ("blocked-repo", stale),
+                    ("inactive-repo", stale),
+                ],
+            )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["factory_enabled_repos"], 0)
+            self.assertEqual(payload["metrics"]["factory_registered_repos"], 3)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 0)
+            self.assertEqual(payload["factory"]["stale_heartbeats"], 0)
+            anomalies = payload.get("anomalies") or []
+            self.assertFalse(any(item.get("type") == "factory_stale_heartbeats" for item in anomalies))
+            self.assertEqual(payload.get("operational_status"), "OK")
+
+    def test_factory_stale_heartbeats_includes_active_autonomy_enabled_repos(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            stale = time.time() - 3600
+            self._create_factory_report_db(
+                db,
+                repos=[
+                    ("enabled-repo", "active", 1),
+                    ("disabled-repo", "active", 0),
+                    ("blocked-repo", "blocked", 1),
+                ],
+                heartbeats=[
+                    ("enabled-repo", stale),
+                    ("disabled-repo", stale),
+                    ("blocked-repo", stale),
+                ],
+                include_active_order=True,
+            )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["factory_enabled_repos"], 1)
+            self.assertEqual(payload["metrics"]["factory_registered_repos"], 3)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 1)
+            self.assertEqual(payload["factory"]["stale_heartbeats"], 1)
+            anomalies = payload.get("anomalies") or []
+            stale_anomaly = next((item for item in anomalies if item.get("type") == "factory_stale_heartbeats"), None)
+            self.assertIsNotNone(stale_anomaly)
+            self.assertEqual(stale_anomaly.get("count"), 1)
+            self.assertEqual(payload.get("operational_status"), "WARN")
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:

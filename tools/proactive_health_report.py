@@ -445,9 +445,6 @@ def main() -> int:
     if not DB.exists():
         return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
-    if not DB.exists():
-        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
-
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -608,8 +605,13 @@ def main() -> int:
         (since, '%empty response from local ollama model%'),
     ).fetchone()['n']
     enabled_repos = [row for row in repo_rows if str(row.get('status') or '').strip().lower() == 'active' and bool(int(row.get('autonomy_enabled') or 0))]
+    enabled_repo_ids = {str(row.get('repo_id') or '').strip() for row in enabled_repos}
+    enabled_repo_ids.discard('')
     stale_heartbeats = 0
     for hb in heartbeat_rows:
+        repo_id = str(hb.get('repo_id') or '').strip()
+        if repo_id not in enabled_repo_ids:
+            continue
         try:
             heartbeat_at = float(hb.get('heartbeat_at') or 0.0)
         except Exception:
