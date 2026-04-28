@@ -392,6 +392,23 @@ class TestProactiveBlockerReplay(unittest.TestCase):
                     },
                 ],
             )
+            self.assertEqual(
+                payload["stale_blocker_actions"],
+                [
+                    {
+                        "job_id": "stale-backend",
+                        "action": "cancel_or_reseed",
+                        "cancel_hint": "cancel job stale-backend for ticket t-stale",
+                        "reseed_hint": "spawn replacement slice for ticket t-stale key:proactive_cli_seed_r1",
+                    },
+                    {
+                        "job_id": "stale-qa",
+                        "action": "cancel_or_reseed",
+                        "cancel_hint": "cancel job stale-qa for ticket t-stale",
+                        "reseed_hint": "spawn replacement slice for ticket t-stale key:proactive_cli_seed_r1",
+                    },
+                ],
+            )
             self.assertEqual(payload["recommendation"], "cancel_or_reseed_invalid_or_stale_blockers")
         finally:
             os.unlink(db_path)

@@ -78,6 +78,16 @@ def _stale_blocker_detail(row: dict) -> dict:
     }
 
 
+def _stale_blocker_action(*, ticket_id: str, detail: dict) -> dict:
+    job_id = str(detail.get("job_id") or "").strip()
+    return {
+        "job_id": job_id,
+        "action": "cancel_or_reseed",
+        "cancel_hint": f"cancel job {job_id} for ticket {ticket_id}",
+        "reseed_hint": f"spawn replacement slice for ticket {ticket_id} key:proactive_cli_seed_r1",
+    }
+
+
 def _error_payload(ticket_id: str, db_path: Path, error: str, recommendation: str) -> dict:
     return {
         "generated_at": _utc_now(),
@@ -193,6 +203,7 @@ def main() -> int:
     blocked = [r for r in rows if str(r.get("state", "")).lower() in {"blocked", "blocked_approval", "waiting_deps"}]
     stale = [r for r in blocked if float(r.get("updated_age_s") or 0.0) > float(args.stale_seconds)]
     stale_details = [_stale_blocker_detail(r) for r in stale]
+    stale_actions = [_stale_blocker_action(ticket_id=str(args.ticket_id), detail=detail) for detail in stale_details]
     ids = {str(r.get("job_id") or "") for r in rows}
 
     invalid_wait = []
@@ -213,6 +224,7 @@ def main() -> int:
         "stale_blocked_count": len(stale),
         "stale_blocked_job_ids": [detail["job_id"] for detail in stale_details],
         "stale_blocked_jobs": stale_details,
+        "stale_blocker_actions": stale_actions,
         "invalid_wait_dependency_count": len(invalid_wait),
         "invalid_wait_job_ids": invalid_wait,
         "recommendation": (
