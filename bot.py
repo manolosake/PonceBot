@@ -19675,8 +19675,16 @@ def _sync_order_phase_from_runtime(
             pass
         return
 
+    terminal_root_recovered_by_local_delivery = bool(
+        proactive_order
+        and root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES
+        and (not any_live)
+        and proactive_improvement_verified
+    )
     if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES and not (
-        merged_to_main or bool(root_trace.get("proactive_blocked_with_root_cause", False))
+        merged_to_main
+        or bool(root_trace.get("proactive_blocked_with_root_cause", False))
+        or terminal_root_recovered_by_local_delivery
     ):
         try:
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
