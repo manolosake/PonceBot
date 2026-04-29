@@ -448,14 +448,14 @@ class TestStateHandling(unittest.TestCase):
         self.assertFalse(bot._role_requires_enforced_read_only("implementer_local"))
         self.assertTrue(bot._role_requires_enforced_read_only("reviewer_local"))
 
-    def test_no_write_forced_mode_never_allows_full_bypass(self) -> None:
+    def test_no_write_forced_mode_can_use_full_when_host_sandbox_is_broken(self) -> None:
         cfg = self._cfg(Path(tempfile.gettempdir()) / "state.json")
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "full"}):
-            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "danger-full-access"}):
-            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "workspace-write"}):
             self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="reviewer_local", chat_id=1), "rw")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "invalid"}):
@@ -4848,6 +4848,22 @@ class TestLocalSpecialistDelegation(unittest.TestCase):
         normalized = bot._normalize_task_spec_contract(spec, root_ticket="ticket-123")
         self.assertEqual(normalized.mode_hint, "ro")
         self.assertFalse(normalized.requires_approval)
+
+    def test_normalize_contract_promotes_write_enabled_roles_to_rw(self) -> None:
+        spec = bot.TaskSpec(
+            key="backend_impl",
+            role="backend",
+            text="Implement a bounded feature.",
+            mode_hint="ro",
+            priority=1,
+            requires_approval=False,
+            acceptance_criteria=["Patch is produced"],
+            definition_of_done=["Tests run"],
+            eta_minutes=45,
+            sla_tier="high",
+        )
+        normalized = bot._normalize_task_spec_contract(spec, root_ticket="ticket-123")
+        self.assertEqual(normalized.mode_hint, "rw")
 
     def test_autonomous_local_first_hard_enforcement_keeps_only_local_roles_even_if_flag_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -240,6 +240,9 @@ _GREETING_PREFIXES = (
 
 _CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
 _NO_WRITE_ROLE_NAMES = frozenset({"jarvis", "skynet", "architect_local", "reviewer_local"})
+_WRITE_ENABLED_DELEGATED_ROLE_NAMES = frozenset(
+    {"backend", "frontend", "sre", "product_ops", "release_mgr", "security", "qa", "implementer_local"}
+)
 # Any role that is forbidden to land repo changes must also bypass the normal
 # autonomous mode hint. Default to read-only, but allow an operator override on
 # hosts where Codex's read-only sandbox cannot start (write policy still gates).
@@ -256,6 +259,10 @@ def _role_requires_enforced_read_only(role: str) -> bool:
 
 def _no_write_role_forced_mode() -> str:
     raw = str(os.getenv("BOT_NO_WRITE_ROLE_FORCED_MODE", "ro") or "").strip().lower()
+    if raw in ("danger-full-access", "danger", "bypass"):
+        return "full"
+    if raw == "full":
+        return "full"
     if raw in ("workspace-write", "write"):
         return "rw"
     if raw == "rw":
@@ -267,16 +274,25 @@ def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: 
     """
     Enforce operator-selected runner mode for advisory/controller roles.
 
-    Breakglass/full-access is for CEO/manual execution, not for autonomous
-    planning/review lanes that must delegate code changes. If a host cannot
-    start Codex's read-only sandbox, BOT_NO_WRITE_ROLE_FORCED_MODE may opt into
-    workspace-write, but never full bypass, while post-run write policy remains active.
+    Breakglass/full-access is normally for CEO/manual execution, not for
+    autonomous planning/review lanes that must delegate code changes. Some hosts
+    cannot start Codex's bwrap sandbox; BOT_NO_WRITE_ROLE_FORCED_MODE may opt
+    into workspace-write or full bypass, while controller prompts plus post-run
+    base-repo/worktree guards still enforce no-write policy.
     """
     return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
     return (role or "").strip().lower() in _NO_WRITE_ROLE_NAMES
+
+
+def _delegated_mode_hint_for_role(role: str, mode_hint: str) -> str:
+    mode = _coerce_orchestrator_mode(mode_hint)
+    role_norm = _coerce_orchestrator_role(role)
+    if role_norm in _WRITE_ENABLED_DELEGATED_ROLE_NAMES and mode == "ro":
+        return "rw"
+    return mode
 
 
 def _role_allows_branch_sync(role: str) -> bool:
@@ -6018,7 +6034,8 @@ def _build_local_specialist_user_prompt(
             str(user_prompt or "").rstrip()
             + "\n\nCONTROLLER_WRITE_POLICY:\n"
             + f"- This role ({role}) is read-only for repository content and git state.\n"
-            + f"- Assigned worktree for inspection only: {worktree_dir}\n"
+            + f"- Use this assigned worktree for inspection only: {worktree_dir}\n"
+            + "- Treat any registered repo root in the ticket as metadata; do not run shell commands from that base checkout.\n"
             + "- Never edit files, create commits, create branches, checkout/switch/reset branches, push, merge, or deploy from this lane.\n"
             + "- Delegate implementation to write-enabled local specialist roles, then review their evidence.\n"
             + "- VERIFIED_IMPROVEMENT is valid only after prior delegated implementer evidence plus review/QA evidence; controller-only analysis or direct diffs do not qualify.\n"
@@ -14595,7 +14612,7 @@ def _enqueue_reviewer_local_rework_if_due(
     child_profile = _orchestrator_profile(profiles, child_role)
     model = _orchestrator_model_for_profile(cfg, child_profile)
     effort = _orchestrator_effort_for_profile(child_profile, cfg)
-    mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+    mode_hint = _delegated_mode_hint_for_role(child_role, spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
     requires_approval = False
     child_id = str(uuid.uuid4())
     contract_text = _compose_subtask_instruction(spec, root_ticket=oid)
@@ -14704,7 +14721,7 @@ def _enqueue_reviewer_local_rework_if_due(
         }
         if order_branch:
             review_trace["order_branch"] = str(order_branch)
-        review_child = Task.new(
+            review_child = Task.new(
             source="telegram",
             role=review_role,
             input_text=_compose_subtask_instruction(review_spec, root_ticket=oid),
@@ -14712,7 +14729,7 @@ def _enqueue_reviewer_local_rework_if_due(
             priority=int(review_spec.priority),
             model=_orchestrator_model_for_profile(cfg, review_profile),
             effort=_orchestrator_effort_for_profile(review_profile, cfg),
-            mode_hint=_coerce_orchestrator_mode(review_spec.mode_hint or str(review_profile.get("mode_hint") or "ro")),
+            mode_hint=_delegated_mode_hint_for_role(review_role, review_spec.mode_hint or str(review_profile.get("mode_hint") or "ro")),
             requires_approval=False,
             max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
             chat_id=int(chat_id),
@@ -15732,6 +15749,8 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
         if mode_hint in ("rw", "full"):
             mode_hint = "ro"
         requires_approval = False
+    elif role_norm in _WRITE_ENABLED_DELEGATED_ROLE_NAMES and mode_hint in ("", "ro"):
+        mode_hint = "rw"
 
     # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
     return TaskSpec(
@@ -28341,7 +28360,7 @@ def orchestrator_worker_loop(
                             child_profile = _orchestrator_profile(profiles, child_role)
                             model = _orchestrator_model_for_profile(cfg, child_profile)
                             effort = _orchestrator_effort_for_profile(child_profile, cfg)
-                            mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+                            mode_hint = _delegated_mode_hint_for_role(child_role, spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
                             if child_role == "implementer_local" and mode_hint == "ro":
                                 exec_backend = str(child_profile.get("execution_backend") or "").strip().lower()
                                 if exec_backend in {"local_ollama", "ollama"}:
