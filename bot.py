@@ -1703,6 +1703,7 @@ class TelegramAPI:
         fn = filename or file_path.name
         ctype = mimetypes.guess_type(fn)[0] or "application/octet-stream"
         self._request_multipart(
+
             "sendPhoto",
             fields=fields,
             file_field="photo",
@@ -2511,6 +2512,7 @@ _FACTORY_REPO_EXCLUDE_NAMES = frozenset(
 )
 
 
+
 def _state_float(st: dict[str, Any], key: str) -> float | None:
     raw = st.get(key)
     try:
@@ -3062,6 +3064,7 @@ def _qa_set_evidence_artifact_id(cfg: "BotConfig", *, chat_id: int, artifact_id:
     by_chat = qa.get("evidence_artifact_by_chat")
     if not isinstance(by_chat, dict):
         by_chat = {}
+
     artifact_id = (artifact_id or "").strip()
     if artifact_id:
         by_chat[_qa_chat_key(chat_id)] = artifact_id
@@ -3584,6 +3587,7 @@ def _sanitize_model_id(model: str) -> str:
     """
     m = (model or "").strip()
     if not m:
+
         return ""
     if any(ch.isspace() for ch in m):
         return ""
@@ -4137,6 +4141,7 @@ class CodexRunner:
         We run with `--json` and reconstruct the final assistant message from JSONL stdout.
         """
         tid = (thread_id or "").strip()
+
         prompt = (prompt or "").strip()
         if not tid:
             raise ValueError("Empty thread_id")
@@ -5717,6 +5722,7 @@ def _focused_workspace_symbol_excerpt(
     raw_text = str(raw or "")
     if not raw_text:
         return ""
+
     tokens: list[str] = []
     seen_tokens: set[str] = set()
     stop_tokens = {
@@ -6382,6 +6388,7 @@ def _apply_local_implementer_apply_patch(
                 break
             if current.startswith("@@"):
                 if current_hunk:
+
                     hunks.append(current_hunk)
                     current_hunk = []
                 i += 1
@@ -6458,6 +6465,7 @@ def _apply_local_implementer_patch(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=str(worktree_dir),
         capture_output=True,
+
         text=True,
         timeout=20,
     )
@@ -6735,6 +6743,7 @@ def _orchestrator_run_local_ollama(
         except Exception:
             repo_base_dir = Path(repo_path).expanduser()
     repo_default_branch = str((repo_record or {}).get("default_branch") or "").strip()
+
     if not repo_default_branch and repo_base_dir is not None and (repo_base_dir / ".git").exists():
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
@@ -6836,6 +6845,7 @@ def _orchestrator_run_local_ollama(
     except Exception:
         pass
     attempt_errors: list[str] = []
+
     candidate_models: list[str] = []
     used_fallback = False
 
@@ -7460,6 +7470,7 @@ def _maybe_handle_ceo_query(
             msg.chat_id,
             "Jarvis: models by role\n" + "\n".join(lines[1:40]),
             reply_to_message_id=msg.message_id if msg.message_id else None,
+
         )
         return True
 
@@ -7545,6 +7556,7 @@ def _skills_status_text() -> str:
     lines.append("- /skills disable <skill>")
     lines.append("- /skills enable <skill>")
     return "\n".join(lines)
+
 
 
 def _move_skill_dir(*, src: Path, dst: Path) -> None:
@@ -8158,6 +8170,7 @@ def _git_is_ancestor(repo: Path, older_ref: str, newer_ref: str) -> bool:
     return anc.returncode == 0
 
 
+
 def _git_unmerged_conflict_files(repo: Path) -> list[str]:
     diff = _run_git(repo, ["diff", "--name-only", "--diff-filter=U"], check=False)
     if diff.returncode != 0:
@@ -8628,6 +8641,13 @@ def _autocommit_push_order_branch(
 def _git_status_porcelain(repo_dir: Path) -> str:
     proc = _run_git(repo_dir, ["status", "--porcelain"], check=False)
     return str(proc.stdout or "").rstrip()
+
+
+def _git_head_rev(repo_dir: Path) -> str:
+    proc = _run_git(repo_dir, ["rev-parse", "HEAD"], check=False)
+    if proc.returncode != 0:
+        return ""
+    return str(proc.stdout or "").strip()
 
 
 def _purge_internal_worktree_marker(repo_dir: Path) -> None:
@@ -10288,6 +10308,7 @@ def _send_orchestrator_marker_response(
                 reply_to_message_id=reply_to_message_id,
             )
             return True
+
         if sub == "mode":
             if len(parts) < 2:
                 api.send_message(chat_id, "Uso: /factory mode ceo-bounded", reply_to_message_id=reply_to_message_id)
@@ -10802,6 +10823,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue, *, cfg: BotConfig | Non
         for t in running[:12]:
             trace = t.trace or {}
             phase = str(trace.get("live_phase") or "").strip() or "running"
+
             slot = trace.get("live_workspace_slot")
             try:
                 slot_s = str(int(slot)) if slot is not None else "n/a"
@@ -12690,6 +12712,7 @@ def _repo_record_for_order(
         row = _repo_record_for_task(root, orch_q)
         if isinstance(row, dict):
             return row
+
     if chat_id is None:
         return None
     try:
@@ -13542,6 +13565,7 @@ def _is_proactive_order_record(row: dict[str, Any] | None) -> bool:
     title = str(row.get("title") or "").strip()
     body = str(row.get("body") or "").strip()
     blob = f"{title}\n{body}".lower()
+
     if "autonomous proactive sprint" in blob:
         return True
     if title.lower().startswith("proactive sprint"):
@@ -13748,6 +13772,7 @@ def _spawn_proactive_order(
             runtime_mode="venv",
         )
         project_id = str(workspace.get("project_id") or "").strip()
+
         project_name = str(workspace.get("name") or title).strip() or title
         project_path = str(workspace.get("path") or "").strip()
 
@@ -13776,6 +13801,7 @@ def _spawn_proactive_order(
             except Exception:
                 pass
 
+
     order_branch = _order_branch_name(order_id, title)
     branch_repo = Path(repo_path).expanduser().resolve() if repo_path else cfg.codex_workdir
     if repo_id and repo_path:
@@ -13799,6 +13825,7 @@ def _spawn_proactive_order(
                 )
             except Exception:
                 pass
+
             return False
     ok_branch, branch_msg = _git_ensure_branch_from_main(
         branch_repo,
@@ -14163,6 +14190,7 @@ def _proactive_lane_tick(
 
                 _update_state(cfg, _m)
             except Exception:
+
                 pass
         if created > 0:
             try:
@@ -14335,6 +14363,7 @@ def _enqueue_reviewer_local_rework_if_due(
     if not match:
         match = re.search(r"EXPECTED_VALIDATION:\s*`([^`]+)`", impl_summary or "", flags=re.IGNORECASE)
     validation_cmd = str(match.group(1) or "").strip() if match else ""
+
     if not validation_cmd:
         if len(changed_files) == 1 and changed_files[0].endswith('.py'):
             validation_cmd = f"python3 -m py_compile {shlex.quote(changed_files[0])}"
@@ -15231,6 +15260,7 @@ def _enqueue_order_autopilot_task(
         request_type="maintenance",
         priority=int(pr_i),
         model="",
+
         effort="medium",
         mode_hint="ro",
         requires_approval=False,
@@ -15751,6 +15781,7 @@ def _inject_local_specialist_specs(
 
     arch_key: str | None = None
     impl_key: str | None = None
+
 
     if "architect_local" not in roles_present and available_slots > 0:
         arch_key = _unique_subtask_key("local_architecture", used_keys)
@@ -16466,6 +16497,7 @@ def _objective_filter_specs(
     if not kept and specs:
         kept = sorted(specs, key=lambda s: int(s.priority or 2))[: min(2, len(specs))]
     if len(kept) > int(max_keep):
+
         dropped += len(kept) - int(max_keep)
         kept = kept[: int(max_keep)]
     return kept, int(dropped)
@@ -17565,6 +17597,7 @@ def _task_local_specialist_response(task: Task | None, *, max_chars: int = 7000)
             text = text[:max_chars].rstrip()
         return text
 
+
     if task is None:
         return ""
     artifacts_dir = str(getattr(task, "artifacts_dir", "") or "").strip()
@@ -17723,6 +17756,7 @@ def _proactive_local_stale_seconds() -> int:
     except Exception:
         value = 1800
     return max(300, min(12 * 3600, int(value)))
+
 
 
 def _proactive_local_guard_cycles_for_cli_promotion() -> int:
@@ -18260,6 +18294,7 @@ def _apply_autonomous_local_first_policy(
         root_job = None
     root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
     order_chat_id: int | None = None
+
     if isinstance(order_row, dict):
         try:
             raw_chat_id = order_row.get("chat_id")
@@ -18419,6 +18454,7 @@ def _apply_autonomous_local_first_policy(
     trace_arch_job_id = str(root_trace.get("latest_local_architect_job_id") or "").strip()
     try:
         trace_handoff_ts = float(root_trace.get("latest_local_architect_done_at") or 0.0)
+
     except Exception:
         trace_handoff_ts = 0.0
     if trace_handoff and _response_has_exact_file_targets(trace_handoff):
@@ -18914,6 +18950,7 @@ def _apply_autonomous_local_first_policy(
                 ),
                 mode_hint="ro",
                 priority=2,
+
                 depends_on=[],
                 requires_approval=False,
                 acceptance_criteria=[
@@ -19323,6 +19360,7 @@ def _apply_autonomous_local_first_policy(
                     mode_hint="ro",
                     priority=1,
                     depends_on=[],
+
                     requires_approval=False,
                     acceptance_criteria=[
                         "Return READY/NEEDS_REWORK with concrete blocking issues.",
@@ -19840,6 +19878,7 @@ def _sync_order_phase_from_runtime(
                     },
                 )
                 return
+
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
             orch_q.update_trace(
@@ -20627,6 +20666,7 @@ def _drain_backlog_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
     return cancelled
 
 
+
 def _orchestrator_min_evidence_gate(
     *,
     task: Task,
@@ -20969,6 +21009,7 @@ def _blocked_pressure_tick(
             trace={
                 "source": "scheduler",
                 "allow_delegation": True,
+
                 "order_id": root_ticket,
                 "blocked_count": int(len(items)),
                 "blocked_oldest_age_s": float(oldest_age),
@@ -21472,6 +21513,7 @@ def _running_watchdog_tick(
     except Exception:
         runtime_mult = 3.0
     try:
+
         runtime_grace_s = max(120.0, float(os.environ.get("BOT_RUNNING_WATCHDOG_GRACE_SECONDS", "300").strip() or "300"))
     except Exception:
         runtime_grace_s = 300.0
@@ -21844,6 +21886,7 @@ def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: flo
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
     except Exception:
+
         return 0
     if not orders:
         return 0
@@ -21934,6 +21977,7 @@ def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: flo
                 continue
             updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
             age_s = max(0.0, float(now) - updated_at) if updated_at > 0 else 0.0
+
             newer_same_role = newest_guard_by_role.get(role_norm, 0.0) > (updated_at + 60.0)
             redundant_guard = str(child.job_id) in redundant_guard_ids
             expedite_due_to_pressure = order_backlog_pressured and age_s >= 300.0
@@ -23796,6 +23840,7 @@ class ThreadManager:
 
     def get(self, chat_id: int) -> str | None:
         with self._lock:
+
             return self._thread_by_chat.get(int(chat_id))
 
     def set(self, chat_id: int, thread_id: str) -> None:
@@ -23859,6 +23904,7 @@ def _extract_thread_id_from_jsonl_file(path: Path, *, max_bytes: int = 1_000_000
         with path.open("rb") as f:
             read = 0
             while True:
+
                 line_b = f.readline()
                 if not line_b:
                     break
@@ -24762,6 +24808,7 @@ def _orchestrator_run_codex(
                 "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
                 "artifacts": [],
                 "logs": "",
+
                 "next_action": "enable_screenshots",
             }
         approved = bool(task.trace.get("approved", False))
@@ -24944,6 +24991,7 @@ def _orchestrator_run_codex(
                 "label": str(label),
                 "status": status_text,
                 "changed_paths": _git_changed_paths_from_porcelain(status_text),
+                "head": _git_head_rev(target_dir),
             }
 
     runner = CodexRunner(
@@ -24984,6 +25032,7 @@ def _orchestrator_run_codex(
                         prompt=prompt,
                         mode_hint=mode,
                         image_paths=image_paths or None,
+
                         model_override=task.model or None,
                         effort_override=task.effort or None,
                     )
@@ -25029,6 +25078,7 @@ def _orchestrator_run_codex(
             "artifacts": [],
             "logs": str(e),
             "next_action": None,
+
         }
 
     timed_out = False
@@ -25334,7 +25384,7 @@ def _orchestrator_run_codex(
                 }
 
         if worktree_dir is not None and _role_disallows_repo_writes(role):
-            targets: list[tuple[str, Path, str, list[str]]] = []
+            targets: list[tuple[str, Path, str, list[str], str, str]] = []
             seen_target_dirs: set[str] = set()
             for label, repo_dir in (
                 ("worktree", worktree_dir),
@@ -25355,17 +25405,30 @@ def _orchestrator_run_codex(
                 baseline = read_only_repo_baselines.get(target_key) or {}
                 baseline_paths = {
                     str(path)
+
                     for path in (baseline.get("changed_paths") or [])
                     if str(path or "").strip()
                 }
+                baseline_head = str(baseline.get("head") or "").strip()
+                current_head = _git_head_rev(target_dir)
+                head_changed = (
+                    str(label) == "worktree"
+                    and bool(baseline_head)
+                    and bool(current_head)
+                    and current_head != baseline_head
+                )
                 if str(label) == "base_repo" and baseline_paths:
                     # The controller runs in an isolated worktree. A dirty base
                     # checkout can predate this job; do not stash or block the
                     # sprint for unrelated operator/work-in-progress changes.
                     continue
                 new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+                if head_changed:
+                    head_marker = f"HEAD:{baseline_head[:12]}..{current_head[:12]}"
+                    if head_marker not in new_changed_paths:
+                        new_changed_paths.insert(0, head_marker)
                 if new_changed_paths:
-                    targets.append((str(label), target_dir, status_text, new_changed_paths))
+                    targets.append((str(label), target_dir, status_text, new_changed_paths, baseline_head, current_head))
             if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [
@@ -25375,8 +25438,25 @@ def _orchestrator_run_codex(
                 ]
                 cleanup_results: list[dict[str, Any]] = []
                 all_changed_paths: list[str] = []
-                for label, target_dir, status_text, changed_paths in targets:
+                head_changes: list[dict[str, str]] = []
+                for label, target_dir, status_text, changed_paths, baseline_head, current_head in targets:
                     violation_lines.extend(["", f"{label}_repo={target_dir}", "git status --porcelain:", status_text])
+                    if baseline_head and current_head and current_head != baseline_head:
+                        violation_lines.extend(
+                            [
+                                "",
+                                f"{label}_head_before={baseline_head}",
+                                f"{label}_head_after={current_head}",
+                            ]
+                        )
+                        head_changes.append(
+                            {
+                                "label": label,
+                                "repo_dir": str(target_dir),
+                                "before": baseline_head,
+                                "after": current_head,
+                            }
+                        )
                     violation_lines.extend(["", f"{label}_changed_paths:"])
                     violation_lines.extend(f"- {path}" for path in changed_paths[:40])
                     for path in changed_paths:
@@ -25411,6 +25491,7 @@ def _orchestrator_run_codex(
                     "role": role,
                     "reason": "controller_write_policy_violation",
                     "changed_paths": all_changed_paths[:40],
+                    "head_changes": head_changes[:8],
                     "cleanup": cleanup_results,
                     "status_artifact": violation_artifact_str,
                 }
@@ -25539,6 +25620,7 @@ def _send_orchestrator_result(
     def _normalize_jarvis_reply(text: str) -> str:
         """
         CEO UX rule: avoid "No puedo / I can't" phrasing.
+
         Keep responses actionable and operation-focused.
         """
         s = str(text or "").strip()
@@ -26181,6 +26263,7 @@ def _maybe_enqueue_delivery_replan(
     else:
         replan_text = (
             "DELIVERY RECOVERY REPLAN\\n"
+
             f"Ticket: {root_ticket}\\n"
             f"Trigger job: {task.job_id}\\n"
             f"Trigger kind: {task_kind}\\n"
@@ -26284,6 +26367,7 @@ def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) 
     if t is None:
         return ""
     return t.state
+
 
 
 class _OrchestratorExecutor:
@@ -26542,6 +26626,7 @@ def orchestrator_worker_loop(
                 orch_state = "failed"
                 summary = f"BLOCKER: {blocker_summary}"
                 if not next_action:
+
                     next_action = "replan"
             if _is_controller_role(role_norm_task):
                 summary = re.sub(r"\bno puedo\b", "Para avanzar necesito", summary, flags=re.IGNORECASE)
@@ -28989,6 +29074,7 @@ def worker_loop(
                     % (
                         mode_hint,
                         eff_cfg.codex_local_provider if eff_cfg.codex_use_oss else "default",
+
                         model_part,
                         eff_cfg.codex_workdir,
                     ),
@@ -29210,6 +29296,7 @@ def worker_loop(
                 tracker.clear_running(job.chat_id)
             except Exception:
                 LOG.exception("Failed to clear running state")
+
             # Best-effort cleanup of downloaded image files.
             try:
                 for p in (job.image_paths or []):
@@ -31243,6 +31330,7 @@ def main() -> None:
 
         if cfg.orchestrator_daily_digest_seconds >= 60 and _configured_notify_chat_id(cfg):
             notify_chat_id = _configured_notify_chat_id(cfg)
+
 
             def _send_orchestrator_digest() -> None:
                 if orchestrator_queue is None or notify_chat_id is None:
