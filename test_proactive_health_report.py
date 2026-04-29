@@ -412,7 +412,9 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
             anomalies = payload.get("anomalies") or []
             by_order = {item.get("order_id"): item for item in anomalies}
-            self.assertEqual(by_order["active-idle-order"].get("type"), "idle_without_improvement")
+            active = by_order["active-idle-order"]
+            self.assertEqual(active.get("type"), "idle_without_improvement")
+            self.assertEqual(active.get("recommended_action"), "close_or_reseed_idle_order")
             paused = by_order["paused-idle-order"]
             self.assertEqual(paused.get("type"), "paused_idle_backlog")
             self.assertEqual(paused.get("phase"), "planning")

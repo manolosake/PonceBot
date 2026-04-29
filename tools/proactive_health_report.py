@@ -753,6 +753,7 @@ def main() -> int:
                     'order_id': order_id,
                     'phase': order.get('phase'),
                     'last_activity_age_s': last_activity_age_s,
+                    'recommended_action': 'close_or_reseed_idle_order',
                 })
         funnel_totals['slices_started'] += int(autonomy_funnel.get('slices_started', 0) or 0)
         funnel_totals['slices_applied'] += int(autonomy_funnel.get('slices_applied', 0) or 0)
