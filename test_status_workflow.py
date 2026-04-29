@@ -11,6 +11,125 @@ from orchestrator.storage import SQLiteTaskStorage
 
 
 class TestStatusWorkflowSummary(unittest.TestCase):
+    def test_order_evidence_packet_includes_workflow_logs_and_artifact_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            storage = SQLiteTaskStorage(root / "jobs.sqlite")
+            profiles = {
+                "skynet": {"role": "skynet", "max_parallel_jobs": 1},
+                "implementer_local": {"role": "implementer_local", "max_parallel_jobs": 1},
+            }
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+
+            order_id = "11111111-2222-3333-4444-666666666666"
+            child_id = "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Evidence packet",
+                body="Collect order evidence.",
+                status="active",
+                priority=1,
+                phase="executing",
+                project_id="codexbot",
+            )
+            q.submit_task(
+                Task.new(
+                    source="scheduler",
+                    role="skynet",
+                    input_text="Root order",
+                    request_type="maintenance",
+                    priority=1,
+                    model="gpt-5.3-codex",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    is_autonomous=True,
+                    artifacts_dir=str(root / "artifacts" / order_id),
+                    trace={"proactive_slices_applied": 1, "result_artifacts": ["root-summary.md"]},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="scheduler",
+                    role="implementer_local",
+                    input_text="Implement evidence endpoint",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.3-codex",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    is_autonomous=True,
+                    parent_job_id=order_id,
+                    artifacts_dir=str(root / "artifacts" / child_id),
+                    labels={"ticket": order_id, "kind": "subtask"},
+                    trace={"result_artifacts": ["tests/status.log", "diff.patch"]},
+                    job_id=child_id,
+                )
+            )
+            q.append_trace_event(
+                order_id=order_id,
+                job_id=child_id,
+                agent_role="implementer_local",
+                event_type="job.done",
+                severity="info",
+                message="child completed",
+                artifact_id="artifact-1",
+                payload={"result_artifacts": ["trace/final.json"]},
+            )
+            q.append_decision_log(
+                order_id=order_id,
+                job_id=child_id,
+                kind="implementation",
+                state="done",
+                summary="Endpoint implemented",
+                next_action=None,
+                details={"ok": True},
+            )
+            q.append_delegation_edge(
+                root_ticket_id=order_id,
+                from_job_id=order_id,
+                to_job_id=child_id,
+                edge_type="delegated",
+                to_role="implementer_local",
+                to_key="evidence_packet",
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+
+            self.assertEqual(packet["api_version"], "v1")
+            self.assertEqual(packet["schema_version"], 1)
+            self.assertEqual(packet["order_id"], order_id)
+            self.assertEqual(packet["workflow"]["current_stage"], "validation")
+            self.assertEqual(len(packet["children"]), 1)
+            self.assertEqual(packet["children"][0]["job_id"], child_id)
+            self.assertEqual(len(packet["traces"]), 1)
+            self.assertEqual(packet["traces"][0]["artifact_id"], "artifact-1")
+            self.assertEqual(len(packet["decision_log"]), 1)
+            self.assertEqual(len(packet["delegation_log"]), 1)
+
+            artifacts = packet["artifacts"]
+            artifact_paths = {str(a.get("path")) for a in artifacts if a.get("path")}
+            artifact_ids = {str(a.get("artifact_id")) for a in artifacts if a.get("artifact_id")}
+            self.assertIn(str(root / "artifacts" / order_id), artifact_paths)
+            self.assertIn(str(root / "artifacts" / child_id), artifact_paths)
+            self.assertIn("root-summary.md", artifact_paths)
+            self.assertIn("tests/status.log", artifact_paths)
+            self.assertIn("diff.patch", artifact_paths)
+            self.assertIn("trace/final.json", artifact_paths)
+            self.assertIn("artifact-1", artifact_ids)
+            self.assertEqual(packet["counts"]["children"], 1)
+            self.assertEqual(packet["counts"]["artifacts"], len(artifacts))
+
     def test_snapshot_includes_end_to_end_order_workflow_and_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

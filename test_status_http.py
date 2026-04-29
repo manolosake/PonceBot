@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from orchestrator.queue import OrchestratorQueue
+from orchestrator.schemas.task import Task
 from orchestrator.status_http import StatusAPIHandler, start_status_http_server
 from orchestrator.status_service import StatusService
 from orchestrator.storage import SQLiteTaskStorage
@@ -278,3 +279,123 @@ class TestStatusHTTP(unittest.TestCase):
                     self.assertEqual(resp.status, 200)
                     payload = json.loads(resp.read().decode("utf-8"))
                     self.assertEqual((payload.get("factory") or {}).get("status"), "soft_pause")
+
+    def test_order_evidence_endpoint_success_and_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            storage = SQLiteTaskStorage(root / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"skynet": {"role": "skynet"}, "backend": {"role": "backend"}})
+            order_id = "77777777-7777-7777-7777-777777777777"
+            child_id = "88888888-8888-8888-8888-888888888888"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Evidence endpoint",
+                body="Expose evidence packet.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="scheduler",
+                    role="skynet",
+                    input_text="Root order",
+                    request_type="maintenance",
+                    priority=1,
+                    model="gpt-5.3-codex",
+                    effort="medium",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    is_autonomous=True,
+                    trace={"proactive_slices_applied": 1},
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="scheduler",
+                    role="backend",
+                    input_text="Child job",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.3-codex",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    is_autonomous=True,
+                    parent_job_id=order_id,
+                    artifacts_dir=str(root / "artifacts" / child_id),
+                    trace={"result_artifacts": ["child-result.txt"]},
+                    job_id=child_id,
+                )
+            )
+            q.append_trace_event(
+                order_id=order_id,
+                job_id=child_id,
+                agent_role="backend",
+                event_type="job.done",
+                severity="info",
+                message="done",
+            )
+            q.append_decision_log(
+                order_id=order_id,
+                job_id=child_id,
+                kind="qa",
+                state="done",
+                summary="Accepted",
+                next_action=None,
+                details=None,
+            )
+            svc = StatusService(orch_q=q, role_profiles={"skynet": {"role": "skynet"}, "backend": {"role": "backend"}}, cache_ttl_seconds=0)
+
+            with _running_status_http_server(
+                wait_headers={"Authorization": "Bearer secret"},
+                host="127.0.0.1",
+                port=0,
+                status_service=svc,
+                stream_interval_s=0.5,
+                auth_token="secret",
+                snapshot_rate_per_s=0.0,
+                snapshot_burst=1.0,
+                max_sse_per_ip=2,
+            ) as (_http_srv, base):
+                url = base + "/api/v1/orchestration/orders/evidence"
+
+                with self.assertRaises(urllib.error.HTTPError) as unauth_ctx:
+                    urllib.request.urlopen(url + f"?order_id={order_id}", timeout=2).read()
+                self.assertEqual(unauth_ctx.exception.code, 401)
+
+                headers = {"Authorization": "Bearer secret"}
+                missing_req = urllib.request.Request(url, headers=headers)
+                with self.assertRaises(urllib.error.HTTPError) as missing_ctx:
+                    urllib.request.urlopen(missing_req, timeout=2).read()
+                self.assertEqual(missing_ctx.exception.code, 400)
+                self.assertEqual(json.loads(missing_ctx.exception.read().decode("utf-8"))["error"], "missing_order_id")
+
+                not_found_req = urllib.request.Request(url + "?order_id=missing-order", headers=headers)
+                with self.assertRaises(urllib.error.HTTPError) as not_found_ctx:
+                    urllib.request.urlopen(not_found_req, timeout=2).read()
+                self.assertEqual(not_found_ctx.exception.code, 404)
+                self.assertEqual(json.loads(not_found_ctx.exception.read().decode("utf-8"))["error"], "order_not_found")
+
+                req = urllib.request.Request(url + f"?order_id={order_id}", headers=headers)
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(payload["api_version"], "v1")
+                    self.assertEqual(payload["schema_version"], 1)
+                    self.assertEqual(payload["order_id"], order_id)
+                    self.assertEqual(payload["workflow"]["order_id"], order_id)
+                    self.assertEqual(payload["children"][0]["job_id"], child_id)
+                    self.assertEqual(payload["counts"]["traces"], 1)
+                    self.assertEqual(payload["counts"]["decision_log"], 1)
+                    artifact_paths = {str(a.get("path")) for a in payload["artifacts"] if a.get("path")}
+                    self.assertIn(str(root / "artifacts" / child_id), artifact_paths)
+                    self.assertIn("child-result.txt", artifact_paths)
