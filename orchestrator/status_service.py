@@ -190,6 +190,25 @@ _WORKFLOW_STAGE_LABELS = {
     "skynet_review": "Skynet review",
     "deploy": "Deploy",
 }
+_WORKFLOW_STAGE_SLA_SECONDS_BY_TIER = {
+    "P1": {
+        "skynet_plan": 15 * 60,
+        "delivery": 60 * 60,
+        "validation": 30 * 60,
+        "skynet_review": 30 * 60,
+        "deploy": 30 * 60,
+    },
+}
+
+
+def _normalize_sla_tier(sla_tier: str | None) -> str:
+    tier = str(sla_tier or "").strip().upper()
+    return tier if tier in _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER else "P1"
+
+
+def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
+    tier = _normalize_sla_tier(sla_tier)
+    return int((_WORKFLOW_STAGE_SLA_SECONDS_BY_TIER.get(tier) or {}).get(stage, 0) or 0)
 
 
 def _count_task_states(tasks: list[Task]) -> dict[str, int]:
