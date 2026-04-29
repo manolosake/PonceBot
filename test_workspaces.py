@@ -174,6 +174,30 @@ class TestWorkspaces(unittest.TestCase):
             self.assertEqual(status, "")
             self.assertTrue(sentinel.exists())
 
+    def test_prepare_clean_workspace_tracks_base_repo_current_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "base"
+            pool = Path(td) / "pool"
+            base.mkdir(parents=True, exist_ok=True)
+
+            _run(["git", "init", "-b", "main"], cwd=base)
+            _run(["git", "config", "user.email", "test@example.com"], cwd=base)
+            _run(["git", "config", "user.name", "test"], cwd=base)
+            (base / ".gitignore").write_text(_SENTINEL + "\n", encoding="utf-8")
+            (base / "README.md").write_text("main\n", encoding="utf-8")
+            _run(["git", "add", ".gitignore", "README.md"], cwd=base)
+            _run(["git", "commit", "-m", "main"], cwd=base)
+
+            _run(["git", "checkout", "-b", "codex/codexbot-workflow-v2"], cwd=base)
+            (base / "README.md").write_text("runtime branch\n", encoding="utf-8")
+            _run(["git", "commit", "-am", "runtime branch"], cwd=base)
+
+            ensure_worktree_pool(base_repo=base, root=pool, role="sre", slots=1)
+            wt = pool / "sre" / "slot1"
+            prepare_clean_workspace(wt)
+
+            self.assertEqual((wt / "README.md").read_text(encoding="utf-8"), "runtime branch\n")
+
     def test_ensure_worktree_pool_serializes_concurrent_creates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td) / "base"

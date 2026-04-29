@@ -290,7 +290,10 @@ def prepare_clean_workspace(path: Path) -> None:
     _run(["git", "-C", str(path), "fetch", "origin", "--prune"], check=False)
     _run(["git", "-C", str(path), "reset", "--hard"], check=True)
     _run(["git", "-C", str(path), "clean", "-fdx"], check=True)
-    base_ref = _pick_base_ref(path)
+    base_ref_repo = Path(str(metadata.get("base_repo") or "")).expanduser() if isinstance(metadata, dict) else Path()
+    if not str(base_ref_repo) or not base_ref_repo.exists():
+        base_ref_repo = path
+    base_ref = _pick_base_ref(base_ref_repo)
     managed_branch = _managed_branch_from_metadata(path)
     if managed_branch:
         checkout = _run(["git", "-C", str(path), "checkout", "-B", managed_branch, base_ref], check=False)
@@ -324,11 +327,26 @@ def collect_git_artifacts(*, repo_dir: Path, artifacts_dir: Path) -> list[Path]:
 
 
 def _pick_base_ref(repo: Path) -> str:
-    # Prefer origin/main if present, then main, else HEAD.
+    # Prefer the deployed checkout branch. Managed role worktrees should track
+    # the runtime branch (for example codex/codexbot-workflow-v2), not always
+    # origin/main.
+    current = _run(["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    current_branch = str(current.stdout or "").strip() if current.returncode == 0 else ""
+    if current_branch and current_branch != "HEAD" and not current_branch.startswith("poncebot/"):
+        if _run(["git", "-C", str(repo), "rev-parse", "--verify", f"origin/{current_branch}"], check=False).returncode == 0:
+            return f"origin/{current_branch}"
+        if _run(["git", "-C", str(repo), "rev-parse", "--verify", current_branch], check=False).returncode == 0:
+            return current_branch
+
+    # Fall back to conventional main/master names, then current HEAD.
     if _run(["git", "-C", str(repo), "rev-parse", "--verify", "origin/main"], check=False).returncode == 0:
         return "origin/main"
     if _run(["git", "-C", str(repo), "rev-parse", "--verify", "main"], check=False).returncode == 0:
         return "main"
+    if _run(["git", "-C", str(repo), "rev-parse", "--verify", "origin/master"], check=False).returncode == 0:
+        return "origin/master"
+    if _run(["git", "-C", str(repo), "rev-parse", "--verify", "master"], check=False).returncode == 0:
+        return "master"
     return "HEAD"
 
 
