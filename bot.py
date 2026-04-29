@@ -256,13 +256,11 @@ def _role_requires_enforced_read_only(role: str) -> bool:
 
 def _no_write_role_forced_mode() -> str:
     raw = str(os.getenv("BOT_NO_WRITE_ROLE_FORCED_MODE", "ro") or "").strip().lower()
-    if raw in ("read-only", "readonly"):
-        return "ro"
     if raw in ("workspace-write", "write"):
         return "rw"
-    if raw in ("danger-full-access", "danger", "bypass"):
-        return "full"
-    return raw if raw in ("ro", "rw", "full") else "ro"
+    if raw == "rw":
+        return "rw"
+    return "ro"
 
 
 def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: int) -> str | None:
@@ -272,7 +270,7 @@ def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: 
     Breakglass/full-access is for CEO/manual execution, not for autonomous
     planning/review lanes that must delegate code changes. If a host cannot
     start Codex's read-only sandbox, BOT_NO_WRITE_ROLE_FORCED_MODE may opt into
-    a less restrictive runner mode while post-run write policy remains active.
+    workspace-write, but never full bypass, while post-run write policy remains active.
     """
     return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
 
@@ -6015,6 +6013,16 @@ def _build_local_specialist_user_prompt(
     worktree_dir: Path,
 ) -> str:
     user_prompt = build_agent_prompt(task, profile=role_profile)
+    if _role_disallows_repo_writes(role):
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nCONTROLLER_WRITE_POLICY:\n"
+            + f"- This role ({role}) is read-only for repository content and git state.\n"
+            + f"- Assigned worktree for inspection only: {worktree_dir}\n"
+            + "- Never edit files, create commits, create branches, checkout/switch/reset branches, push, merge, or deploy from this lane.\n"
+            + "- Delegate implementation to write-enabled local specialist roles, then review their evidence.\n"
+            + "- VERIFIED_IMPROVEMENT is valid only after prior delegated implementer evidence plus review/QA evidence; controller-only analysis or direct diffs do not qualify.\n"
+        )
     if role in {"architect_local", "reviewer_local"}:
         user_prompt = (
             str(user_prompt or "").rstrip()
@@ -8650,6 +8658,18 @@ def _git_head_rev(repo_dir: Path) -> str:
     return str(proc.stdout or "").strip()
 
 
+def _git_current_branch(repo_dir: Path) -> str:
+    proc = _run_git(repo_dir, ["branch", "--show-current"], check=False)
+    branch = str(proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if branch:
+        return branch
+    proc = _run_git(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if proc.returncode != 0:
+        return ""
+    branch = str(proc.stdout or "").strip()
+    return "" if branch == "HEAD" else branch
+
+
 def _purge_internal_worktree_marker(repo_dir: Path) -> None:
     marker_name = ".poncebot_managed_worktree"
     marker = repo_dir / marker_name
@@ -8747,6 +8767,160 @@ def _stash_read_only_write_violation(
         "stash_created": proc.returncode == 0,
         "stash_message": stash_msg,
         "stash_returncode": int(proc.returncode or 0),
+        "status_after": status_after,
+        "artifact": str(artifact),
+    }
+
+
+def _restore_read_only_base_repo_branch(
+    repo_dir: Path,
+    *,
+    baseline_branch: str,
+    role: str,
+    job_id: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    expected = str(baseline_branch or "").strip()
+    current_before = _git_current_branch(repo_dir)
+    if not expected or current_before == expected:
+        return {
+            "repo_dir": str(repo_dir),
+            "branch_restored": False,
+            "branch_before": current_before,
+            "branch_after": current_before,
+            "reason": "already_on_expected_branch" if expected else "missing_expected_branch",
+        }
+
+    safe_label = "base-repo-branch-restore"
+    proc = _run_git(
+        repo_dir,
+        ["checkout", expected],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    current_after = _git_current_branch(repo_dir)
+    status_after = _git_status_porcelain(repo_dir)
+    artifact = artifacts_dir / f"write_policy_{safe_label}.txt"
+    artifact.write_text(
+        "\n".join(
+            [
+                f"repo_dir={repo_dir}",
+                f"role={role}",
+                f"job_id={job_id}",
+                f"branch_before={current_before}",
+                f"branch_expected={expected}",
+                f"branch_after={current_after}",
+                f"checkout_returncode={proc.returncode}",
+                "checkout_stdout:",
+                str(proc.stdout or "").rstrip(),
+                "checkout_stderr:",
+                str(proc.stderr or "").rstrip(),
+                "",
+                "status_after:",
+                status_after,
+            ]
+        ).rstrip()
+        + "\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "repo_dir": str(repo_dir),
+        "branch_restored": proc.returncode == 0 and current_after == expected,
+        "branch_before": current_before,
+        "branch_expected": expected,
+        "branch_after": current_after,
+        "checkout_returncode": int(proc.returncode or 0),
+        "status_after": status_after,
+        "artifact": str(artifact),
+    }
+
+
+def _restore_read_only_base_repo_head(
+    repo_dir: Path,
+    *,
+    baseline_head: str,
+    role: str,
+    job_id: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    expected = str(baseline_head or "").strip()
+    current_before = _git_head_rev(repo_dir)
+    if not expected or current_before == expected:
+        return {
+            "repo_dir": str(repo_dir),
+            "head_restored": False,
+            "head_before": current_before,
+            "head_after": current_before,
+            "reason": "already_on_expected_head" if expected else "missing_expected_head",
+        }
+
+    if _git_status_porcelain(repo_dir):
+        return {
+            "repo_dir": str(repo_dir),
+            "head_restored": False,
+            "head_before": current_before,
+            "head_expected": expected,
+            "head_after": current_before,
+            "reason": "dirty_after_stash",
+        }
+
+    safe_role = _SAFE_FILENAME_RE.sub("-", str(role or "role").strip().lower()).strip("-._") or "role"
+    backup_branch = f"poncebot/read-only-violation/{safe_role}-{str(job_id or '')[:8]}-{int(time.time())}"
+    backup = _run_git(
+        repo_dir,
+        ["branch", backup_branch, current_before],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    reset = _run_git(
+        repo_dir,
+        ["reset", "--hard", expected],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    current_after = _git_head_rev(repo_dir)
+    status_after = _git_status_porcelain(repo_dir)
+    artifact = artifacts_dir / "write_policy_base-repo-head-restore.txt"
+    artifact.write_text(
+        "\n".join(
+            [
+                f"repo_dir={repo_dir}",
+                f"role={role}",
+                f"job_id={job_id}",
+                f"backup_branch={backup_branch}",
+                f"head_before={current_before}",
+                f"head_expected={expected}",
+                f"head_after={current_after}",
+                f"backup_returncode={backup.returncode}",
+                "backup_stdout:",
+                str(backup.stdout or "").rstrip(),
+                "backup_stderr:",
+                str(backup.stderr or "").rstrip(),
+                "",
+                f"reset_returncode={reset.returncode}",
+                "reset_stdout:",
+                str(reset.stdout or "").rstrip(),
+                "reset_stderr:",
+                str(reset.stderr or "").rstrip(),
+                "",
+                "status_after:",
+                status_after,
+            ]
+        ).rstrip()
+        + "\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "repo_dir": str(repo_dir),
+        "head_restored": reset.returncode == 0 and current_after == expected,
+        "head_before": current_before,
+        "head_expected": expected,
+        "head_after": current_after,
+        "backup_branch": backup_branch,
+        "backup_returncode": int(backup.returncode or 0),
+        "reset_returncode": int(reset.returncode or 0),
         "status_after": status_after,
         "artifact": str(artifact),
     }
@@ -13863,8 +14037,8 @@ def _spawn_proactive_order(
         f"Sprint day: {sprint_day} of 5",
         f"Order ID: {order_id}",
         f"Project ID: {project_id or '(pending)'}",
-        f"Project workspace: {project_path or '(n/a)'}",
-        *( [f"Authorized repo root: {repo_path}"] if repo_path else [] ),
+        f"Registered project workspace: {project_path or '(n/a)'}",
+        *( [f"Registered repo root (controller read-only): {repo_path}"] if repo_path else [] ),
         *( [f"Repo default branch: {repo_default_branch}"] if repo_path else [] ),
         f"Project hint: {project_hint or '(none)'}",
         f"Goal: {goal}",
@@ -13875,10 +14049,12 @@ def _spawn_proactive_order(
         "",
         "Execution policy:",
         (
-            "- Work only inside the registered repo root above; do not create new repos or touch sibling repos."
+            "- Scope decisions to the registered repo root above; do not create new repos or touch sibling repos. Controller access is read-only."
             if repo_path
             else "- Work only inside this initiative scope; do not touch unrelated projects."
         ),
+        "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
+        "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",
         "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
         "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
         "- Bugfixes are allowed only with concrete evidence of a P0/P1 operator/customer-impacting failure, security risk, data loss risk, broken deploy, or failing required validation.",
@@ -24972,6 +25148,7 @@ def _orchestrator_run_codex(
     read_only_repo_baselines: dict[str, dict[str, Any]] = {}
     if worktree_dir is not None and _role_disallows_repo_writes(role):
         seen_target_dirs: set[str] = set()
+        base_branch_blocker: str | None = None
         for label, repo_dir in (
             ("worktree", worktree_dir),
             ("base_repo", repo_base_dir),
@@ -24992,6 +25169,34 @@ def _orchestrator_run_codex(
                 "status": status_text,
                 "changed_paths": _git_changed_paths_from_porcelain(status_text),
                 "head": _git_head_rev(target_dir),
+                "branch": _git_current_branch(target_dir),
+            }
+            if str(label) == "base_repo":
+                current_branch = str(read_only_repo_baselines[target_key].get("branch") or "").strip()
+                expected_branch = str(repo_default_branch or "").strip()
+                if expected_branch and current_branch and current_branch != expected_branch:
+                    base_branch_blocker = (
+                        f"Base repo checkout is on '{current_branch}', expected '{expected_branch}'. "
+                        "Controller lanes refuse to run until the runtime checkout is back on the repo default branch."
+                    )
+        if base_branch_blocker:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (base branch preflight). job=%s role=%s", task.job_id, role)
+            return {
+                "status": "blocked",
+                "summary": base_branch_blocker,
+                "artifacts": [],
+                "logs": base_branch_blocker,
+                "next_action": "restore_base_repo_branch",
+                "structured_digest": {
+                    "role": role,
+                    "workdir": str(eff_cfg.codex_workdir),
+                    "base_repo_branch_preflight": "blocked",
+                    "repo_default_branch": repo_default_branch,
+                },
             }
 
     runner = CodexRunner(
@@ -25384,7 +25589,7 @@ def _orchestrator_run_codex(
                 }
 
         if worktree_dir is not None and _role_disallows_repo_writes(role):
-            targets: list[tuple[str, Path, str, list[str], str, str]] = []
+            targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
             seen_target_dirs: set[str] = set()
             for label, repo_dir in (
                 ("worktree", worktree_dir),
@@ -25411,24 +25616,46 @@ def _orchestrator_run_codex(
                 }
                 baseline_head = str(baseline.get("head") or "").strip()
                 current_head = _git_head_rev(target_dir)
+                baseline_branch = str(baseline.get("branch") or "").strip()
+                current_branch = _git_current_branch(target_dir)
                 head_changed = (
-                    str(label) == "worktree"
-                    and bool(baseline_head)
+                    bool(baseline_head)
                     and bool(current_head)
                     and current_head != baseline_head
                 )
-                if str(label) == "base_repo" and baseline_paths:
+                branch_changed = (
+                    str(label) == "base_repo"
+                    and bool(baseline_branch)
+                    and current_branch != baseline_branch
+                )
+                if str(label) == "base_repo" and baseline_paths and not (head_changed or branch_changed):
                     # The controller runs in an isolated worktree. A dirty base
                     # checkout can predate this job; do not stash or block the
                     # sprint for unrelated operator/work-in-progress changes.
                     continue
                 new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+                if branch_changed:
+                    branch_after = current_branch or "DETACHED"
+                    branch_marker = f"BRANCH:{baseline_branch}..{branch_after}"
+                    if branch_marker not in new_changed_paths:
+                        new_changed_paths.insert(0, branch_marker)
                 if head_changed:
                     head_marker = f"HEAD:{baseline_head[:12]}..{current_head[:12]}"
                     if head_marker not in new_changed_paths:
                         new_changed_paths.insert(0, head_marker)
                 if new_changed_paths:
-                    targets.append((str(label), target_dir, status_text, new_changed_paths, baseline_head, current_head))
+                    targets.append(
+                        (
+                            str(label),
+                            target_dir,
+                            status_text,
+                            new_changed_paths,
+                            baseline_head,
+                            current_head,
+                            baseline_branch,
+                            current_branch,
+                        )
+                    )
             if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [
@@ -25439,8 +25666,25 @@ def _orchestrator_run_codex(
                 cleanup_results: list[dict[str, Any]] = []
                 all_changed_paths: list[str] = []
                 head_changes: list[dict[str, str]] = []
-                for label, target_dir, status_text, changed_paths, baseline_head, current_head in targets:
+                branch_changes: list[dict[str, str]] = []
+                for label, target_dir, status_text, changed_paths, baseline_head, current_head, baseline_branch, current_branch in targets:
                     violation_lines.extend(["", f"{label}_repo={target_dir}", "git status --porcelain:", status_text])
+                    if baseline_branch and current_branch != baseline_branch:
+                        violation_lines.extend(
+                            [
+                                "",
+                                f"{label}_branch_before={baseline_branch}",
+                                f"{label}_branch_after={current_branch or 'DETACHED'}",
+                            ]
+                        )
+                        branch_changes.append(
+                            {
+                                "label": label,
+                                "repo_dir": str(target_dir),
+                                "before": baseline_branch,
+                                "after": current_branch or "DETACHED",
+                            }
+                        )
                     if baseline_head and current_head and current_head != baseline_head:
                         violation_lines.extend(
                             [
@@ -25479,6 +25723,48 @@ def _orchestrator_run_codex(
                             "stash_created": False,
                             "error": str(e),
                         }
+                    if label == "base_repo" and baseline_branch and current_branch != baseline_branch:
+                        try:
+                            branch_restore = _restore_read_only_base_repo_branch(
+                                target_dir,
+                                baseline_branch=baseline_branch,
+                                role=role,
+                                job_id=task.job_id,
+                                artifacts_dir=artifacts_dir,
+                            )
+                        except Exception as e:
+                            branch_restore = {
+                                "repo_dir": str(target_dir),
+                                "branch_restored": False,
+                                "branch_expected": baseline_branch,
+                                "branch_after": _git_current_branch(target_dir),
+                                "error": str(e),
+                            }
+                        cleanup["branch_restore"] = branch_restore
+                        restore_artifact = str(branch_restore.get("artifact") or "").strip()
+                        if restore_artifact and restore_artifact not in artifacts_text:
+                            artifacts_text.append(restore_artifact)
+                    if label == "base_repo" and baseline_head and current_head and current_head != baseline_head:
+                        try:
+                            head_restore = _restore_read_only_base_repo_head(
+                                target_dir,
+                                baseline_head=baseline_head,
+                                role=role,
+                                job_id=task.job_id,
+                                artifacts_dir=artifacts_dir,
+                            )
+                        except Exception as e:
+                            head_restore = {
+                                "repo_dir": str(target_dir),
+                                "head_restored": False,
+                                "head_expected": baseline_head,
+                                "head_after": _git_head_rev(target_dir),
+                                "error": str(e),
+                            }
+                        cleanup["head_restore"] = head_restore
+                        restore_artifact = str(head_restore.get("artifact") or "").strip()
+                        if restore_artifact and restore_artifact not in artifacts_text:
+                            artifacts_text.append(restore_artifact)
                     cleanup_results.append(cleanup)
                     artifact = str(cleanup.get("artifact") or "").strip()
                     if artifact and artifact not in artifacts_text:
@@ -25491,6 +25777,7 @@ def _orchestrator_run_codex(
                     "role": role,
                     "reason": "controller_write_policy_violation",
                     "changed_paths": all_changed_paths[:40],
+                    "branch_changes": branch_changes[:8],
                     "head_changes": head_changes[:8],
                     "cleanup": cleanup_results,
                     "status_artifact": violation_artifact_str,
