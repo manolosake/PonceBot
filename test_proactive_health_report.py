@@ -219,6 +219,15 @@ class TestProactiveHealthReport(unittest.TestCase):
                 payload["autonomy_funnel"]["implementer_fail_rate_trend_min_attempts"],
                 IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
             )
+            actions = payload.get("recommended_actions") or []
+            action = next((item for item in actions if item.get("evidence_type") == "high_implementer_fail_rate"), None)
+            self.assertIsNotNone(action)
+            self.assertEqual(action.get("priority"), "P1")
+            self.assertEqual(action.get("count"), 2)
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("## Recommended Actions", markdown)
+            self.assertIn("high_implementer_fail_rate", markdown)
 
     def test_implementer_fail_rate_trend_ignores_low_sample_size(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -330,6 +339,16 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertFalse(stale_anomaly.get("details_truncated"))
             self.assertEqual(stale_anomaly.get("detail_limit"), STALE_HEARTBEAT_DETAIL_LIMIT)
             self.assertEqual(payload.get("operational_status"), "WARN")
+            actions = payload.get("recommended_actions") or []
+            action = next((item for item in actions if item.get("evidence_type") == "factory_stale_heartbeats"), None)
+            self.assertIsNotNone(action)
+            self.assertEqual(action.get("priority"), "P1")
+            self.assertEqual(action.get("count"), 3)
+            self.assertEqual(action.get("repo_id"), "enabled-missing")
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("## Recommended Actions", markdown)
+            self.assertIn("factory_stale_heartbeats", markdown)
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -400,10 +419,62 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(paused.get("open_jobs"), 0)
             self.assertGreaterEqual(int(paused.get("last_activity_age_s") or 0), 900)
             self.assertEqual(paused.get("recommended_action"), "resume_or_close_stale_order")
+            actions = payload.get("recommended_actions") or []
+            paused_action = next((item for item in actions if item.get("order_id") == "paused-idle-order"), None)
+            self.assertIsNotNone(paused_action)
+            self.assertEqual(paused_action.get("priority"), "P1")
+            self.assertEqual(paused_action.get("evidence_type"), "paused_idle_backlog")
+            self.assertIn("Resume", paused_action.get("action") or "")
 
             markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("## Recommended Actions", markdown)
             self.assertIn("paused_idle_backlog", markdown)
             self.assertIn("resume_or_close_stale_order", markdown)
+
+    def test_healthy_report_has_no_recommended_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE ceo_orders (
+                        order_id TEXT,
+                        status TEXT,
+                        phase TEXT,
+                        title TEXT,
+                        body TEXT,
+                        updated_at REAL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT,
+                        parent_job_id TEXT,
+                        state TEXT,
+                        role TEXT,
+                        labels TEXT,
+                        trace TEXT,
+                        updated_at REAL,
+                        created_at REAL
+                    )
+                    """
+                )
+                con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("status"), "OK")
+            self.assertEqual(payload.get("recommended_actions"), [])
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("## Recommended Actions", markdown)
+            self.assertIn("- None", markdown)
 
     def test_order_autonomy_funnel_no_code_change_slice_can_close(self) -> None:
         order_id = "order-nochange-1234"
