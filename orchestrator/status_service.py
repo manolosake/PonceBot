@@ -845,6 +845,76 @@ def _build_release_readiness(
     }
 
 
+_PROACTIVE_MARKERS = ("[proactive:", "proactive sprint")
+_DECISION_RANK = {
+    "release": 0,
+    "unblock": 1,
+    "advance": 2,
+    "monitor": 3,
+}
+_STAGE_RANK = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
+
+
+def _is_proactive_order(order_row: dict[str, Any], root_task: Task | None) -> bool:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    if bool(trace.get("proactive_lane")):
+        return True
+    if any(str(key).startswith("proactive_") for key in trace.keys()):
+        return True
+
+    haystack = " ".join(
+        [
+            str((order_row or {}).get("title") or ""),
+            str((order_row or {}).get("body") or ""),
+            str(root_task.input_text if root_task is not None else ""),
+        ]
+    ).lower()
+    return any(marker in haystack for marker in _PROACTIVE_MARKERS)
+
+
+def _primary_blocker(order: dict[str, Any]) -> dict[str, Any] | None:
+    blockers = list(order.get("blockers") or [])
+    for blocker in blockers:
+        if isinstance(blocker, dict):
+            return blocker
+    return None
+
+
+def _priority_decision(order: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None]:
+    readiness_state = str(order.get("readiness_state") or "").strip().lower()
+    readiness_verdict = str(order.get("readiness_verdict") or "").strip().lower()
+    stage = str(order.get("current_stage") or "skynet_plan").strip()
+    merge_ready = bool(order.get("merge_ready"))
+    merged_to_main = bool(order.get("merged_to_main"))
+    blocker = _primary_blocker(order)
+
+    if merged_to_main or readiness_state == "released":
+        return "monitor", "Already merged or released; keep it behind unreleased proactive orders.", blocker
+    if merge_ready or readiness_state == "ready" or readiness_verdict == "go":
+        return "release", "Ready/go order should be released before spending attention on blocked or not-ready work.", blocker
+    if blocker is not None or readiness_state == "blocked" or readiness_verdict == "no_go":
+        blocker_summary = str((blocker or {}).get("summary") or "").strip()
+        blocker_stage = str((blocker or {}).get("stage") or stage).strip()
+        why = f"Blocked at {blocker_stage}; clearing this restores flow for an active proactive order."
+        if blocker_summary:
+            why = f"{why} Primary blocker: {blocker_summary}"
+        return "unblock", why, blocker
+    return "advance", f"Not ready yet; advance {stage} evidence before it can be released.", blocker
+
+
+def _priority_next_action(order: dict[str, Any], decision: str, blocker: dict[str, Any] | None) -> str:
+    existing = str(order.get("next_action") or "").strip()
+    if decision == "release":
+        return existing or "Release or merge the order branch."
+    if decision == "monitor":
+        return existing or "Monitor deploy status and post-release evidence."
+    if blocker is not None:
+        summary = str(blocker.get("summary") or "").strip()
+        if summary:
+            return summary
+    return existing or "Advance the proactive workflow evidence."
+
+
 @dataclass
 class StatusService:
     orch_q: OrchestratorQueue
@@ -1171,6 +1241,120 @@ class StatusService:
                 "recommended_next_action": str((bottleneck or {}).get("recommended_next_action") or ""),
             },
             "stages": ordered_stages,
+        }
+
+    def proactive_priorities(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        generated_at = float(time.time())
+        board = self.autonomy_board(chat_id=chat_id, limit=200)
+
+        if chat_id is None:
+            active_rows = self.orch_q.list_orders_global(status="active", limit=200)
+        else:
+            active_rows = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
+        active_by_id = {str(row.get("order_id") or ""): row for row in active_rows if isinstance(row, dict)}
+
+        ranked: list[dict[str, Any]] = []
+        for order in list(board.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            oid = str(order.get("order_id") or "").strip()
+            order_row = active_by_id.get(oid)
+            if not oid or not isinstance(order_row, dict):
+                continue
+            try:
+                root_task = self.orch_q.get_job(oid)
+            except Exception:
+                root_task = None
+            if not _is_proactive_order(order_row, root_task):
+                continue
+
+            decision, why, blocker = _priority_decision(order)
+            primary_blocker = None
+            if blocker is not None:
+                primary_blocker = {
+                    "stage": str(blocker.get("stage") or ""),
+                    "summary": str(blocker.get("summary") or "").strip(),
+                    "job": blocker.get("job"),
+                }
+
+            priority = int(order.get("priority") or 2)
+            current_stage = str(order.get("current_stage") or "skynet_plan")
+            stage_rank = int(_STAGE_RANK.get(current_stage, -1))
+            decision_rank = int(_DECISION_RANK.get(decision, 9))
+            updated_at = _coerce_float(order.get("updated_at")) or 0.0
+
+            ranked.append(
+                {
+                    "rank": 0,
+                    "order_id": oid,
+                    "order_id_short": str(order.get("order_id_short") or oid[:8]),
+                    "title": str(order.get("title") or ""),
+                    "priority": priority,
+                    "phase": str(order.get("phase") or "planning"),
+                    "current_stage": current_stage,
+                    "readiness_state": str(order.get("readiness_state") or "unknown"),
+                    "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
+                    "decision": decision,
+                    "why": why,
+                    "primary_blocker": primary_blocker,
+                    "next_action": _priority_next_action(order, decision, blocker),
+                    "score_breakdown": {
+                        "decision_rank": decision_rank,
+                        "priority": priority,
+                        "stage_rank": stage_rank,
+                        "updated_at": updated_at,
+                    },
+                    "merge_ready": bool(order.get("merge_ready")),
+                    "merged_to_main": bool(order.get("merged_to_main")),
+                    "updated_at": updated_at,
+                }
+            )
+
+        ranked.sort(
+            key=lambda order: (
+                int((order.get("score_breakdown") or {}).get("decision_rank") or 9),
+                int(order.get("priority") or 2),
+                -int((order.get("score_breakdown") or {}).get("stage_rank") or -1),
+                float(order.get("updated_at") or 0.0),
+                str(order.get("order_id") or ""),
+            )
+        )
+        for idx, order in enumerate(ranked, start=1):
+            order["rank"] = idx
+
+        orders = ranked[:lim]
+        top = None
+        if orders:
+            first = orders[0]
+            top = {
+                "order_id": first.get("order_id"),
+                "order_id_short": first.get("order_id_short"),
+                "title": first.get("title"),
+                "decision": first.get("decision"),
+                "why": first.get("why"),
+                "next_action": first.get("next_action"),
+            }
+
+        by_decision: dict[str, int] = {}
+        for order in ranked:
+            decision = str(order.get("decision") or "unknown")
+            by_decision[decision] = by_decision.get(decision, 0) + 1
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "active_proactive_orders": len(ranked),
+                "returned": len(orders),
+                "by_decision": by_decision,
+                "top_decision": (str(top.get("decision")) if isinstance(top, dict) else None),
+            },
+            "top": top,
+            "orders": orders,
         }
 
     def order_evidence_packet(
