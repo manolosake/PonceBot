@@ -323,6 +323,24 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"api_version": _API_VERSION, "chat_id": chat_id, "status": status, "items": items})
             return
 
+        if path in ("/api/v1/orchestration/autonomy-board", "/api/orchestration/autonomy-board"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 50, hi=200)
+            payload = self.server.status_service.autonomy_board(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
+        if path in ("/api/v1/orchestration/workflow-bottlenecks", "/api/orchestration/workflow-bottlenecks"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 50, hi=200)
+            payload = self.server.status_service.workflow_bottlenecks(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/orders/evidence", "/api/orchestration/orders/evidence"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
