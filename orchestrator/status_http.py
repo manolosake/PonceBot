@@ -310,6 +310,14 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path in ("/api/v1/orchestration/control-room", "/api/orchestration/control-room"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            payload = self.server.status_service.control_room(chat_id=chat_id)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/orders", "/api/orchestration/orders"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
