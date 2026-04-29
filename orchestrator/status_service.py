@@ -844,6 +844,103 @@ class StatusService:
     cache_ttl_seconds: int = 2
     factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
 
+    def autonomy_board(self, *, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        generated_at = float(time.time())
+        if chat_id is None:
+            orders = self.orch_q.list_orders_global(status="active", limit=lim)
+        else:
+            orders = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=lim)
+
+        rows: list[dict[str, Any]] = []
+        readiness_counts: dict[str, int] = {}
+        stage_counts: dict[str, int] = {}
+        for order_row in orders:
+            oid = str((order_row or {}).get("order_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                root_task = self.orch_q.get_job(oid)
+            except Exception:
+                root_task = None
+            try:
+                children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=200) if t.job_id != oid]
+            except Exception:
+                children = []
+            try:
+                traces = self.orch_q.list_trace_events(order_id=oid, limit=100)
+            except Exception:
+                traces = []
+            try:
+                decision_log = self.orch_q.list_decision_log(order_id=oid, limit=50)
+            except Exception:
+                decision_log = []
+
+            tasks = ([root_task] if root_task is not None else []) + children
+            artifacts: list[dict[str, Any]] = []
+            for task in tasks:
+                artifacts.extend(_artifact_refs_from_task(task))
+            artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+            workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+            readiness = _build_release_readiness(
+                order_row=order_row,
+                root_task=root_task,
+                children=children,
+                workflow=workflow,
+                decision_log=decision_log,
+                traces=traces,
+                artifacts=artifacts,
+            )
+            children_by_state = _count_task_states(children)
+            children_by_role: dict[str, int] = {}
+            for child in children:
+                role = str(child.role or "").strip().lower() or "unknown"
+                children_by_role[role] = children_by_role.get(role, 0) + 1
+
+            readiness_state = str(readiness.get("state") or "unknown")
+            current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
+            readiness_counts[readiness_state] = readiness_counts.get(readiness_state, 0) + 1
+            stage_counts[current_stage] = stage_counts.get(current_stage, 0) + 1
+            blockers = list(readiness.get("blockers") or workflow.get("blockers") or [])
+            updated_at = float((order_row or {}).get("updated_at") or (root_task.updated_at if root_task is not None else 0.0) or 0.0)
+
+            rows.append(
+                {
+                    "order_id": oid,
+                    "order_id_short": oid[:8],
+                    "chat_id": int((order_row or {}).get("chat_id") or (root_task.chat_id if root_task is not None else 0) or 0),
+                    "title": str((order_row or {}).get("title") or (_task_title(root_task) if root_task is not None else "")),
+                    "priority": int((order_row or {}).get("priority") or (root_task.priority if root_task is not None else 2) or 2),
+                    "phase": str((order_row or {}).get("phase") or "planning"),
+                    "current_stage": current_stage,
+                    "readiness_state": readiness_state,
+                    "readiness_verdict": str(readiness.get("verdict") or "unknown"),
+                    "blockers": blockers,
+                    "next_action": str(readiness.get("next_action") or ""),
+                    "updated_at": updated_at,
+                    "children_total": len(children),
+                    "children_by_state": children_by_state,
+                    "children_by_role": children_by_role,
+                    "merge_ready": bool(workflow.get("merge_ready")),
+                    "merged_to_main": bool(workflow.get("merged_to_main")),
+                }
+            )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "orders_total": len(rows),
+                "by_readiness_state": readiness_counts,
+                "by_current_stage": stage_counts,
+            },
+            "orders": rows,
+        }
+
     def order_evidence_packet(
         self,
         order_id: str,
@@ -1306,6 +1403,7 @@ class StatusService:
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
             "order_workflows": workflows_out,
+            "autonomy_board": self.autonomy_board(chat_id=chat_id, limit=50),
             "projects": projects,
             "workers": workers_out,
             "queued_total": int(queued_total),
