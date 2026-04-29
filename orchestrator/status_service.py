@@ -516,6 +516,327 @@ def _build_order_workflow(
     }
 
 
+_BLOCKING_TASK_STATES = {"failed", "blocked", "blocked_approval", "waiting_deps"}
+
+
+def _readiness_trace_evidence(key: str, value: Any) -> dict[str, Any]:
+    return {"kind": "trace", "key": key, "value": value}
+
+
+def _readiness_job_evidence(task: Task | None) -> list[dict[str, Any]]:
+    ref = _workflow_task_ref(task)
+    return [{"kind": "job", **ref}] if ref is not None else []
+
+
+def _readiness_artifact_evidence(artifacts: list[dict[str, Any]], *, roles: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        role = str(artifact.get("role") or "").strip().lower()
+        if role not in roles:
+            continue
+        item: dict[str, Any] = {"kind": "artifact", "role": role}
+        for key in ("job_id", "job_id_short", "path", "artifact_id"):
+            if artifact.get(key):
+                item[key] = artifact.get(key)
+        out.append(item)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _readiness_decision_evidence(decision_log: list[dict[str, Any]], *, kinds: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in decision_log:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in kinds:
+            continue
+        out.append(
+            {
+                "kind": "decision_log",
+                "decision_kind": kind,
+                "state": str(item.get("state") or "").strip().lower(),
+                "job_id": item.get("job_id"),
+                "job_id_short": item.get("job_id_short"),
+                "summary": str(item.get("summary") or "").strip()[:280] or None,
+            }
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _readiness_trace_event_evidence(traces: list[dict[str, Any]], *, event_types: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for event in traces:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event_type") or "").strip().lower()
+        if event_type not in event_types:
+            continue
+        out.append(
+            {
+                "kind": "trace_event",
+                "trace_event_id": event.get("id"),
+                "event_type": event_type,
+                "job_id": event.get("job_id"),
+                "job_id_short": (str(event.get("job_id"))[:8] if event.get("job_id") else None),
+                "role": event.get("agent_role"),
+                "artifact_id": event.get("artifact_id"),
+            }
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _task_summary(task: Task | None, fallback: str) -> str:
+    if task is None:
+        return fallback
+    trace = task.trace or {}
+    summary = str(trace.get("result_summary") or task.blocked_reason or "").strip()
+    return summary[:280] if summary else fallback
+
+
+def _has_patch_artifact_evidence(task: Task) -> bool:
+    trace = task.trace or {}
+    patch_info = trace.get("local_patch_info")
+    if not isinstance(patch_info, dict):
+        patch_info = trace.get("patch_info")
+    changed = patch_info.get("changed_files") if isinstance(patch_info, dict) else None
+    return bool(
+        trace.get("slice_patch_applied")
+        or (isinstance(changed, list) and any(str(item or "").strip() for item in changed))
+        or _coerce_str_list(trace.get("result_artifacts"))
+        or _coerce_str_list(trace.get("artifacts"))
+        or str(task.artifacts_dir or "").strip()
+    )
+
+
+def _has_validation_evidence(task: Task) -> bool:
+    trace = task.trace or {}
+    patch_info = trace.get("local_patch_info")
+    if not isinstance(patch_info, dict):
+        patch_info = trace.get("patch_info")
+    return bool(
+        trace.get("slice_validation_ok")
+        or trace.get("review_ready")
+        or trace.get("improvement_verified")
+        or trace.get("quality_gate_status") in {"validated", "reviewed_ready", "closed"}
+        or trace.get("slice_status") in {"validated", "reviewed_ready", "closed"}
+        or (isinstance(patch_info, dict) and bool(patch_info.get("validation_ok")))
+    )
+
+
+def _build_release_readiness(
+    *,
+    order_row: dict[str, Any],
+    root_task: Task | None,
+    children: list[Task],
+    workflow: dict[str, Any],
+    decision_log: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    root_trace = dict((root_task.trace or {}) if root_task is not None else {})
+    proactive_keys_present = any(str(key).startswith("proactive_") for key in root_trace.keys())
+    applies = bool(root_trace.get("proactive_lane", False) or proactive_keys_present)
+    phase = str(order_row.get("phase") or "planning")
+    current_stage = str(workflow.get("current_stage") or "skynet_plan")
+    check_keys = ["delivery_applied", "validation_passed", "controller_signoff", "release_evidence", "merge_ready"]
+
+    if not applies:
+        return {
+            "schema_version": 1,
+            "scope": "proactive_order",
+            "applies": False,
+            "state": "not_applicable",
+            "verdict": "n/a",
+            "summary": "Release readiness applies only to proactive orders.",
+            "current_stage": current_stage,
+            "phase": phase,
+            "checks": [
+                {"key": key, "status": "na", "summary": "Not a proactive order.", "evidence": []}
+                for key in check_keys
+            ],
+            "blockers": [],
+            "next_action": "Use the standard order workflow fields.",
+        }
+
+    delivery_children = [t for t in children if str(t.role or "").strip().lower() in _DELIVERY_ROLES]
+    validation_children = [t for t in children if str(t.role or "").strip().lower() in _VALIDATION_ROLES and str(t.role or "").strip().lower() != "release_mgr"]
+    release_children = [t for t in children if str(t.role or "").strip().lower() == "release_mgr"]
+    controller_children = [t for t in children if str(t.role or "").strip().lower() in _CONTROLLER_ROLES]
+
+    latest_delivery = _latest_task(delivery_children)
+    latest_validation = _latest_task(validation_children)
+    latest_release = _latest_task(release_children)
+    latest_controller = _latest_task(controller_children)
+
+    applied_count = _coerce_int(root_trace.get("proactive_slices_applied"))
+    validated_count = _coerce_int(root_trace.get("proactive_slices_validated"))
+    closed_count = _coerce_int(root_trace.get("proactive_slices_closed"))
+    quality_gate_status = str(root_trace.get("proactive_quality_gate_status") or "").strip().lower()
+    merge_ready = bool(root_trace.get("merge_ready", False))
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+    deploy_status = str(root_trace.get("deploy_status") or "").strip().lower()
+    already_released = bool(merged_to_main or deploy_status in {"ok", "scheduled"})
+
+    delivery_blocked = [t for t in delivery_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    validation_blocked = [t for t in validation_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    release_blocked = [t for t in release_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    controller_blocked = [t for t in controller_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+
+    blockers: list[dict[str, Any]] = []
+    for stage, tasks, fallback in (
+        ("delivery", delivery_blocked, "Delivery work is blocked."),
+        ("validation", validation_blocked, "Validation did not pass."),
+        ("release_evidence", release_blocked, "Release evidence is blocked."),
+        ("controller_signoff", controller_blocked, "Controller signoff did not complete cleanly."),
+    ):
+        if not tasks:
+            continue
+        task = _latest_task(tasks)
+        blockers.append({"stage": stage, "summary": _task_summary(task, fallback), "job": _workflow_task_ref(task)})
+    if deploy_status == "failed":
+        blockers.append({"stage": "release", "summary": str(root_trace.get("deploy_summary") or "Deploy failed after merge.")[:280], "job": None})
+
+    delivery_applied = bool(applied_count > 0 or any(str(t.state or "").strip().lower() == "done" and _has_patch_artifact_evidence(t) for t in delivery_children))
+    validation_passed = bool(
+        validated_count > 0
+        or quality_gate_status in {"validated", "reviewed_ready", "closed"}
+        or any(str(t.state or "").strip().lower() == "done" and _has_validation_evidence(t) for t in [*validation_children, *release_children])
+    )
+    controller_signoff = bool(
+        closed_count > 0
+        or root_trace.get("proactive_improvement_verified")
+        or root_trace.get("proactive_improvement_closed")
+        or root_trace.get("proactive_no_change_validated")
+        or any(str(t.state or "").strip().lower() == "done" and _has_validation_evidence(t) for t in controller_children)
+    )
+    release_evidence = bool(
+        root_trace.get("proactive_improvement_closed")
+        or root_trace.get("proactive_no_change_validated")
+        or any(str(t.state or "").strip().lower() == "done" and (_has_validation_evidence(t) or _has_patch_artifact_evidence(t)) for t in release_children)
+        or _readiness_decision_evidence(decision_log, kinds={"release", "release_evidence"})
+        or _readiness_trace_event_evidence(traces, event_types={"order.proactive_verified_improvement_closed", "order.proactive_no_change_closed"})
+    )
+    merge_ready_pass = bool(merge_ready or already_released)
+
+    checks = [
+        {
+            "key": "delivery_applied",
+            "status": "fail" if delivery_blocked else ("pass" if delivery_applied else "pending"),
+            "summary": (
+                "Delivery changes are applied."
+                if delivery_applied
+                else ("Delivery is blocked." if delivery_blocked else "Waiting for applied delivery evidence.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_applied", applied_count)] if applied_count > 0 else _readiness_job_evidence(latest_delivery)
+            ),
+        },
+        {
+            "key": "validation_passed",
+            "status": "fail" if validation_blocked else ("pass" if validation_passed else "pending"),
+            "summary": (
+                "Validation evidence is present."
+                if validation_passed
+                else ("Validation is blocked." if validation_blocked else "Waiting for validation evidence.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_validated", validated_count), _readiness_trace_evidence("proactive_quality_gate_status", quality_gate_status)]
+                if validation_passed
+                else _readiness_job_evidence(latest_validation)
+            ),
+        },
+        {
+            "key": "controller_signoff",
+            "status": "fail" if controller_blocked else ("pass" if controller_signoff else "pending"),
+            "summary": (
+                "Controller signoff is present."
+                if controller_signoff
+                else ("Controller signoff is blocked." if controller_blocked else "Waiting for controller signoff.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_closed", closed_count)]
+                if closed_count > 0
+                else _readiness_job_evidence(latest_controller)
+            ),
+        },
+        {
+            "key": "release_evidence",
+            "status": "fail" if release_blocked else ("pass" if release_evidence else "pending"),
+            "summary": (
+                "Release evidence is present."
+                if release_evidence
+                else ("Release evidence is blocked." if release_blocked else "Waiting for release evidence.")
+            ),
+            "evidence": (
+                [
+                    *_readiness_artifact_evidence(artifacts, roles={"release_mgr", "qa", "reviewer_local", "skynet"}),
+                    *_readiness_decision_evidence(decision_log, kinds={"release", "release_evidence"}),
+                    *_readiness_trace_event_evidence(traces, event_types={"order.proactive_verified_improvement_closed", "order.proactive_no_change_closed"}),
+                ][:5]
+                or ([_readiness_trace_evidence("proactive_improvement_closed", True)] if root_trace.get("proactive_improvement_closed") else _readiness_job_evidence(latest_release))
+            ),
+        },
+        {
+            "key": "merge_ready",
+            "status": "pass" if merge_ready_pass else "pending",
+            "summary": (
+                "Order is already merged or released."
+                if already_released
+                else ("Order is marked ready for merge." if merge_ready else "Waiting for merge-ready signal.")
+            ),
+            "evidence": [
+                _readiness_trace_evidence("merge_ready", merge_ready),
+                _readiness_trace_evidence("merged_to_main", merged_to_main),
+            ],
+        },
+    ]
+
+    if blockers:
+        state = "blocked"
+        verdict = "no_go"
+        summary = f"Release is blocked at {blockers[0]['stage']}."
+        next_action = blockers[0]["summary"]
+    elif already_released:
+        state = "released"
+        verdict = "go"
+        summary = "Proactive order is already merged or released."
+        next_action = "Monitor deploy status and post-release evidence."
+    elif all(str(check.get("status") or "") == "pass" for check in checks):
+        state = "ready"
+        verdict = "go"
+        summary = "Proactive order has delivery, validation, controller, release, and merge-ready evidence."
+        next_action = "Release or merge the order branch."
+    else:
+        state = "not_ready"
+        verdict = "wait"
+        first_pending = next((check for check in checks if str(check.get("status") or "") == "pending"), None)
+        pending_key = str(first_pending.get("key") or "release_readiness") if first_pending else "release_readiness"
+        summary = f"Proactive order is waiting on {pending_key}."
+        next_action = str(first_pending.get("summary") or "Continue the proactive workflow.") if first_pending else "Continue the proactive workflow."
+
+    return {
+        "schema_version": 1,
+        "scope": "proactive_order",
+        "applies": True,
+        "state": state,
+        "verdict": verdict,
+        "summary": summary,
+        "current_stage": current_stage,
+        "phase": phase,
+        "checks": checks,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
 @dataclass
 class StatusService:
     orch_q: OrchestratorQueue
@@ -580,6 +901,17 @@ class StatusService:
             role = str(child.role or "").strip().lower() or "unknown"
             counts_by_role[role] = counts_by_role.get(role, 0) + 1
 
+        workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+        release_readiness = _build_release_readiness(
+            order_row=order_row,
+            root_task=root_task,
+            children=children,
+            workflow=workflow,
+            decision_log=decision_log,
+            traces=traces,
+            artifacts=artifacts,
+        )
+
         return {
             "api_version": "v1",
             "schema_version": 1,
@@ -600,7 +932,8 @@ class StatusService:
                 "updated_at": float(order_row.get("updated_at") or root_task.updated_at or 0.0),
             },
             "root": _task_to_status(root_task),
-            "workflow": _build_order_workflow(order_row=order_row, root_task=root_task, children=children),
+            "workflow": workflow,
+            "release_readiness": release_readiness,
             "children": child_statuses,
             "traces": traces,
             "decision_log": decision_log,
