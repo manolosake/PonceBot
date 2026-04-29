@@ -182,6 +182,14 @@ def _assign_running_to_workers(
 _DELIVERY_ROLES = {"backend", "frontend", "sre", "security", "implementer_local"}
 _VALIDATION_ROLES = {"qa", "release_mgr", "reviewer_local"}
 _CONTROLLER_ROLES = {"skynet"}
+_WORKFLOW_STAGE_ORDER = ("skynet_plan", "delivery", "validation", "skynet_review", "deploy")
+_WORKFLOW_STAGE_LABELS = {
+    "skynet_plan": "Skynet plan",
+    "delivery": "Delivery",
+    "validation": "Validation",
+    "skynet_review": "Skynet review",
+    "deploy": "Deploy",
+}
 
 
 def _count_task_states(tasks: list[Task]) -> dict[str, int]:
@@ -995,6 +1003,15 @@ class StatusService:
                     "priority": int((order_row or {}).get("priority") or (root_task.priority if root_task is not None else 2) or 2),
                     "phase": str((order_row or {}).get("phase") or "planning"),
                     "current_stage": current_stage,
+                    "workflow_stages": [
+                        {
+                            "stage": str(stage.get("stage") or ""),
+                            "status": str(stage.get("status") or "pending"),
+                            "summary": stage.get("summary"),
+                        }
+                        for stage in list(workflow.get("stages") or [])
+                        if str(stage.get("stage") or "") in _WORKFLOW_STAGE_ORDER
+                    ],
                     "readiness_state": readiness_state,
                     "readiness_verdict": str(readiness.get("verdict") or "unknown"),
                     "blockers": blockers,
@@ -1020,6 +1037,140 @@ class StatusService:
                 "by_current_stage": stage_counts,
             },
             "orders": rows,
+        }
+
+    def workflow_bottlenecks(self, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        board = self.autonomy_board(chat_id=chat_id, limit=lim)
+        generated_at = float(board.get("generated_at") or time.time())
+        stage_index = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
+        stages: dict[str, dict[str, Any]] = {
+            stage: {
+                "stage": stage,
+                "label": _WORKFLOW_STAGE_LABELS.get(stage, stage),
+                "orders_count": 0,
+                "blocked_count": 0,
+                "failed_count": 0,
+                "running_count": 0,
+                "pending_count": 0,
+                "oldest_updated_at": None,
+                "recommended_next_action": "No active orders at this stage.",
+                "orders": [],
+            }
+            for stage in _WORKFLOW_STAGE_ORDER
+        }
+
+        def _compact_blockers(order: dict[str, Any], stage: str) -> str:
+            summaries: list[str] = []
+            for blocker in list(order.get("blockers") or []):
+                if not isinstance(blocker, dict):
+                    continue
+                blocker_stage = str(blocker.get("stage") or "").strip()
+                normalized_stage = {
+                    "controller_signoff": "skynet_review",
+                    "release_evidence": "deploy",
+                    "release": "deploy",
+                }.get(blocker_stage, blocker_stage)
+                if normalized_stage != stage:
+                    continue
+                summary = str(blocker.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary[:280])
+            return "; ".join(summaries[:2])
+
+        def _stage_status(order: dict[str, Any], stage: str) -> str:
+            for item in list(order.get("workflow_stages") or []):
+                if isinstance(item, dict) and str(item.get("stage") or "") == stage:
+                    return str(item.get("status") or "pending").strip().lower() or "pending"
+            if str(order.get("current_stage") or "") == stage:
+                state = str(order.get("readiness_state") or "").strip().lower()
+                if state == "blocked":
+                    return "blocked"
+                if state in {"not_ready", "not_applicable"}:
+                    return "pending"
+            return "pending"
+
+        for order in list(board.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            current_stage = str(order.get("current_stage") or "skynet_plan").strip()
+            if current_stage not in stages:
+                current_stage = "skynet_plan"
+            status = _stage_status(order, current_stage)
+            stage = stages[current_stage]
+            stage["orders_count"] = int(stage["orders_count"]) + 1
+            if status == "failed":
+                stage["failed_count"] = int(stage["failed_count"]) + 1
+            elif status in {"blocked", "blocked_approval", "waiting_deps"}:
+                stage["blocked_count"] = int(stage["blocked_count"]) + 1
+            elif status == "running":
+                stage["running_count"] = int(stage["running_count"]) + 1
+            elif status == "pending":
+                stage["pending_count"] = int(stage["pending_count"]) + 1
+
+            updated_at = _coerce_float(order.get("updated_at"))
+            oldest = _coerce_float(stage.get("oldest_updated_at"))
+            if updated_at is not None and (oldest is None or updated_at < oldest):
+                stage["oldest_updated_at"] = updated_at
+
+            compact_order = {
+                "order_id": str(order.get("order_id") or ""),
+                "order_id_short": str(order.get("order_id_short") or str(order.get("order_id") or "")[:8]),
+                "title": str(order.get("title") or ""),
+                "priority": int(order.get("priority") or 2),
+                "phase": str(order.get("phase") or "planning"),
+                "current_stage": current_stage,
+                "readiness_state": str(order.get("readiness_state") or "unknown"),
+                "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
+                "blocker_summary": _compact_blockers(order, current_stage),
+                "next_action": str(order.get("next_action") or ""),
+                "updated_at": updated_at,
+            }
+            orders = list(stage.get("orders") or [])
+            orders.append(compact_order)
+            orders.sort(
+                key=lambda o: (
+                    int(o.get("priority") or 2),
+                    float(o.get("updated_at") or float("inf")),
+                    str(o.get("order_id") or ""),
+                )
+            )
+            stage["orders"] = orders[:lim]
+
+        for stage_name, stage in stages.items():
+            orders = list(stage.get("orders") or [])
+            if orders:
+                first_action = str(orders[0].get("next_action") or orders[0].get("blocker_summary") or "").strip()
+                stage["recommended_next_action"] = first_action or f"Advance the oldest {stage_name} order."
+
+        ordered_stages = [stages[stage] for stage in _WORKFLOW_STAGE_ORDER]
+
+        def _rank_key(stage: dict[str, Any]) -> tuple[int, int, float, int]:
+            name = str(stage.get("stage") or "")
+            blocked_failed = int(stage.get("blocked_count") or 0) + int(stage.get("failed_count") or 0)
+            oldest = _coerce_float(stage.get("oldest_updated_at"))
+            return (
+                -blocked_failed,
+                -int(stage.get("orders_count") or 0),
+                oldest if oldest is not None else float("inf"),
+                stage_index.get(name, 999),
+            )
+
+        bottleneck = min(ordered_stages, key=_rank_key) if ordered_stages else None
+        bottleneck_stage = str((bottleneck or {}).get("stage") or _WORKFLOW_STAGE_ORDER[0])
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "orders_total": int((board.get("summary") or {}).get("orders_total") or 0),
+                "bottleneck_stage": bottleneck_stage,
+                "bottleneck_score": int((bottleneck or {}).get("blocked_count") or 0) + int((bottleneck or {}).get("failed_count") or 0),
+                "recommended_next_action": str((bottleneck or {}).get("recommended_next_action") or ""),
+            },
+            "stages": ordered_stages,
         }
 
     def order_evidence_packet(
