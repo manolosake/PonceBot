@@ -28,6 +28,7 @@ IGNORE_ARTIFACT_TOKENS = (
 )
 STALE_LOCAL_S = 15 * 60
 STALE_HEARTBEAT_DETAIL_LIMIT = 25
+UNCOVERED_REPO_DETAIL_LIMIT = 25
 LOOKBACK_S = 24 * 3600
 AUTONOMY_MINIMUM_SLO = {
     'implementer_fail_rate_lte': 0.35,
@@ -96,6 +97,28 @@ def load_state() -> dict:
 def is_proactive(title: str, body: str) -> bool:
     blob = f"{title or ''}\n{body or ''}".lower()
     return ('proactive sprint' in blob) or ('[proactive:' in blob)
+
+
+def proactive_order_covers_repo(order: dict, repo: dict) -> bool:
+    repo_id = str((repo or {}).get('repo_id') or '').strip()
+    if not repo_id:
+        return False
+    order_project_id = str((order or {}).get('project_id') or '').strip()
+    if order_project_id and order_project_id == repo_id:
+        return True
+
+    blob = f"{(order or {}).get('title') or ''}\n{(order or {}).get('body') or ''}".lower()
+    repo_id_lower = repo_id.lower()
+    if f'[repo:{repo_id_lower}]' in blob or repo_id_lower in blob:
+        return True
+
+    repo_path = str((repo or {}).get('path') or '').strip()
+    if repo_path:
+        repo_path_lower = repo_path.lower()
+        repo_basename = Path(repo_path).name.lower()
+        if repo_path_lower in blob or (repo_basename and repo_basename in blob):
+            return True
+    return False
 
 
 def trace_has_nontrivial_artifacts(trace: dict) -> bool:
