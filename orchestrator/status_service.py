@@ -843,6 +843,87 @@ class StatusService:
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
     factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
+    proactive_health_fn: Callable[[], dict[str, Any]] | None = None
+
+    def proactive_health(self) -> dict[str, Any]:
+        if self.proactive_health_fn is None:
+            return {
+                "status": "not_configured",
+                "operational_status": "not_configured",
+                "trend_status": "not_configured",
+                "alert_level": "OK",
+                "alert_active": False,
+                "summary_reason": "proactive_health_fn_not_configured",
+                "report_found": False,
+                "stale_report": False,
+                "report_age_s": None,
+            }
+
+        try:
+            raw = self.proactive_health_fn()
+        except Exception:
+            raw = None
+        if not isinstance(raw, dict):
+            return {
+                "status": "unavailable",
+                "operational_status": "unavailable",
+                "trend_status": "unavailable",
+                "alert_level": "OK",
+                "alert_active": False,
+                "summary_reason": "proactive_health_fn_unavailable",
+                "report_found": False,
+                "stale_report": False,
+                "report_age_s": None,
+            }
+
+        def _text(name: str, default: str) -> str:
+            value = str(raw.get(name) or "").strip()
+            return value if value else default
+
+        def _bool(name: str, default: bool = False) -> bool:
+            value = raw.get(name)
+            if value is None:
+                return bool(default)
+            return bool(value)
+
+        report_age_raw = raw.get("report_age_s")
+        try:
+            report_age_s = int(report_age_raw) if report_age_raw is not None else None
+        except Exception:
+            report_age_s = None
+
+        alert_level = _text("alert_level", "OK").upper()
+        if alert_level not in ("OK", "WARN", "CRITICAL"):
+            alert_level = "OK"
+
+        return {
+            "status": _text("status", "unavailable"),
+            "operational_status": _text("operational_status", "unavailable"),
+            "trend_status": _text("trend_status", "unavailable"),
+            "alert_level": alert_level,
+            "alert_active": _bool("alert_active", alert_level in ("WARN", "CRITICAL")),
+            "summary_reason": _text("summary_reason", "unavailable"),
+            "report_found": _bool("report_found", False),
+            "stale_report": _bool("stale_report", False),
+            "report_age_s": report_age_s,
+        }
+
+    def _proactive_health_alert(self, proactive_health: dict[str, Any]) -> dict[str, Any] | None:
+        if not bool(proactive_health.get("alert_active")):
+            return None
+        level = str(proactive_health.get("alert_level") or "").strip().upper()
+        severity = {"CRITICAL": "critical", "WARN": "warning"}.get(level, "info")
+        summary = str(proactive_health.get("summary_reason") or "").strip() or "proactive health alert active"
+        return {
+            "kind": "proactive_health",
+            "severity": severity,
+            "summary": summary,
+            "alert_level": level or "OK",
+            "operational_status": proactive_health.get("operational_status"),
+            "trend_status": proactive_health.get("trend_status"),
+            "report_age_s": proactive_health.get("report_age_s"),
+            "stale_report": bool(proactive_health.get("stale_report")),
+        }
 
     def autonomy_board(self, *, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
         lim = max(1, min(200, int(limit)))
