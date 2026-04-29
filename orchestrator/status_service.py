@@ -1201,6 +1201,172 @@ class StatusService:
                     return out
         return out
 
+    def control_room(self, *, chat_id: int | None = None) -> dict[str, Any]:
+        snap = self.snapshot(chat_id=chat_id)
+
+        def _as_list(name: str) -> list[dict[str, Any]]:
+            items = snap.get(name) or []
+            return [x for x in items if isinstance(x, dict)]
+
+        def _count(name: str) -> int:
+            try:
+                return int(snap.get(name) or 0)
+            except Exception:
+                return 0
+
+        alerts = _as_list("alerts")
+        risks = _as_list("risks")
+        pending_decisions = _as_list("decisions_pending")
+        blocked_approvals = _as_list("blocked_requires_approval")
+        stalled_tasks = _as_list("stalled_tasks")
+        order_workflows = _as_list("order_workflows")
+        workers = _as_list("workers")
+
+        critical_alerts = [a for a in alerts if str(a.get("severity") or "").strip().lower() == "critical"]
+        warning_alerts = [a for a in alerts if str(a.get("severity") or "").strip().lower() == "warning"]
+
+        if critical_alerts:
+            health_level = "critical"
+        elif blocked_approvals or stalled_tasks or risks or warning_alerts:
+            health_level = "attention"
+        else:
+            health_level = "ok"
+
+        reasons: list[str] = []
+        if critical_alerts:
+            reasons.append(f"{len(critical_alerts)} critical alert(s)")
+        if blocked_approvals:
+            reasons.append(f"{len(blocked_approvals)} approval(s) blocked")
+        if stalled_tasks:
+            reasons.append(f"{len(stalled_tasks)} stalled task(s)")
+        if risks:
+            reasons.append(f"{len(risks)} risk(s)")
+        if warning_alerts and not critical_alerts:
+            reasons.append(f"{len(warning_alerts)} warning alert(s)")
+        health_summary = "OK: no operator attention required." if not reasons else "Attention: " + "; ".join(reasons[:4]) + "."
+
+        running_workers = sum(1 for w in workers if isinstance(w.get("current"), dict))
+        workers_with_next = sum(1 for w in workers if isinstance(w.get("next"), dict))
+        total_workers = len(workers)
+        idle_workers = max(0, total_workers - running_workers)
+        saturation = round((running_workers / total_workers) if total_workers else 0.0, 3)
+
+        role_rows: dict[str, dict[str, int | str]] = {}
+        for w in workers:
+            role = str(w.get("role") or "").strip().lower() or "unknown"
+            row = role_rows.setdefault(role, {"role": role, "total": 0, "running": 0, "idle": 0, "with_next": 0})
+            row["total"] = int(row["total"]) + 1
+            if isinstance(w.get("current"), dict):
+                row["running"] = int(row["running"]) + 1
+            else:
+                row["idle"] = int(row["idle"]) + 1
+            if isinstance(w.get("next"), dict):
+                row["with_next"] = int(row["with_next"]) + 1
+        by_role = sorted(role_rows.values(), key=lambda r: str(r.get("role") or ""))[:10]
+
+        queued_total = _count("queued_total")
+        blocked_approval_total = _count("blocked_approval_total")
+        recommended_actions: list[dict[str, Any]] = []
+
+        def _add_action(action_id: str, label: str, target: str, count: int, reason: str) -> None:
+            if count <= 0:
+                return
+            recommended_actions.append(
+                {
+                    "action_id": action_id,
+                    "label": label,
+                    "target": target,
+                    "count": int(count),
+                    "reason": reason,
+                }
+            )
+
+        _add_action(
+            "approve_blocked_jobs",
+            "Approve or reject blocked jobs",
+            "/api/v1/status/decisions",
+            max(blocked_approval_total, len(blocked_approvals)),
+            "Jobs are waiting for operator approval.",
+        )
+        _add_action(
+            "resolve_pending_decisions",
+            "Resolve pending decisions",
+            "/api/v1/status/decisions",
+            len(pending_decisions),
+            "Pending decisions are blocking progress or confidence.",
+        )
+        _add_action(
+            "inspect_stalled_tasks",
+            "Inspect stalled tasks",
+            "/api/v1/status/alerts",
+            len(stalled_tasks),
+            "Tasks appear stale and may need intervention.",
+        )
+        _add_action(
+            "inspect_critical_alerts",
+            "Inspect critical alerts",
+            "/api/v1/status/alerts",
+            len(critical_alerts),
+            "Critical alerts require immediate review.",
+        )
+        queue_pressure = next((a for a in alerts if str(a.get("kind") or "") == "queue_pressure"), None)
+        _add_action(
+            "reduce_queue_pressure",
+            "Reduce queue pressure",
+            "/api/v1/orchestration/agents-live",
+            int((queue_pressure or {}).get("count") or 0),
+            "Queued work has reached the pressure threshold.",
+        )
+        low_saturation_with_work = queued_total if queued_total > 0 and total_workers > 0 and saturation < 0.5 else 0
+        _add_action(
+            "check_worker_availability",
+            "Check worker availability",
+            "/api/v1/orchestration/agents-live",
+            low_saturation_with_work,
+            "Queued work exists while worker saturation is low.",
+        )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": snap.get("generated_at"),
+            "chat_id": snap.get("chat_id"),
+            "snapshot_hash": snap.get("snapshot_hash"),
+            "health": {
+                "level": health_level,
+                "summary": health_summary,
+            },
+            "queue": {
+                "queued_runnable": queued_total,
+                "waiting_deps": _count("waiting_deps_total"),
+                "blocked_approval": blocked_approval_total,
+                "running": _count("running_total"),
+                "blocked_legacy": _count("blocked_total"),
+                "by_role": list(snap.get("queue_by_role") or [])[:10],
+            },
+            "orders": {
+                "active_count": len(list(snap.get("orders_active") or [])),
+                "workflows": order_workflows[:10],
+            },
+            "workers": {
+                "total": total_workers,
+                "running": running_workers,
+                "idle": idle_workers,
+                "with_next": workers_with_next,
+                "saturation": saturation,
+                "by_role": by_role,
+            },
+            "attention": {
+                "pending_decisions": pending_decisions[:10],
+                "blocked_approvals": blocked_approvals[:10],
+                "alerts": alerts[:10],
+                "risks": risks[:10],
+                "stalled_tasks": stalled_tasks[:10],
+            },
+            "recommended_actions": recommended_actions[:5],
+            "staleness_seconds": snap.get("staleness_seconds"),
+        }
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.
