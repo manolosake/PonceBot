@@ -1993,7 +1993,7 @@ class SQLiteTaskStorage:
 
     def list_orders(self, *, chat_id: int, status: str | None, limit: int = 50) -> list[dict[str, Any]]:
         st = (status or "").strip().lower() or None
-        if st is not None and st not in ("active", "paused", "done"):
+        if st is not None and st not in ("active", "paused", "done", "failed"):
             st = None
         lim = max(1, min(200, int(limit)))
         with self._conn() as conn:
@@ -2027,7 +2027,7 @@ class SQLiteTaskStorage:
 
     def set_order_status(self, order_id: str, *, chat_id: int, status: str) -> bool:
         st = (status or "").strip().lower()
-        if st not in ("active", "paused", "done"):
+        if st not in ("active", "paused", "done", "failed"):
             return False
         with self._lock:
             with self._conn() as conn:
@@ -2048,6 +2048,11 @@ class SQLiteTaskStorage:
                         "UPDATE ceo_orders SET status = ?, phase = 'done', updated_at = ? WHERE order_id = ? AND chat_id = ?",
                         (st, now, resolved, int(chat_id)),
                     )
+                elif st == "failed":
+                    conn.execute(
+                        "UPDATE ceo_orders SET status = ?, phase = 'failed', updated_at = ? WHERE order_id = ? AND chat_id = ?",
+                        (st, now, resolved, int(chat_id)),
+                    )
                 elif st == "paused":
                     conn.execute(
                         "UPDATE ceo_orders SET status = ?, phase = 'paused', updated_at = ? WHERE order_id = ? AND chat_id = ?",
@@ -2061,16 +2066,17 @@ class SQLiteTaskStorage:
 
                 # Auto-close project when the order is done and no active orders remain for that project.
                 if project_id:
-                    if st == "done":
+                    if st in ("done", "failed"):
                         active_row = conn.execute(
                             "SELECT COUNT(*) AS c FROM ceo_orders WHERE chat_id = ? AND project_id = ? AND status = 'active' AND order_id <> ?",
                             (int(chat_id), project_id, resolved),
                         ).fetchone()
                         active_remaining = int((active_row["c"] if active_row is not None else 0) or 0)
                         if active_remaining <= 0:
+                            project_status = "failed" if st == "failed" else "done"
                             conn.execute(
-                                "UPDATE projects_registry SET status = 'done', updated_at = ? WHERE project_id = ? AND status <> 'done'",
-                                (now, project_id),
+                                "UPDATE projects_registry SET status = ?, updated_at = ? WHERE project_id = ? AND status NOT IN ('done','failed')",
+                                (project_status, now, project_id),
                             )
                     elif st == "active":
                         conn.execute(
@@ -2089,7 +2095,7 @@ class SQLiteTaskStorage:
         params: list[Any] = []
         where = ""
         if st is not None:
-            if st not in ("active", "paused", "done"):
+            if st not in ("active", "paused", "done", "failed"):
                 return []
             where = " WHERE status = ?"
             params.append(st)
@@ -2131,7 +2137,7 @@ class SQLiteTaskStorage:
 
     def set_order_phase(self, order_id: str, *, chat_id: int, phase: str) -> bool:
         ph = (phase or "").strip().lower()
-        if ph not in ("planning", "delegated", "executing", "review", "ceo_approval_pending", "ready_for_merge", "done", "paused"):
+        if ph not in ("planning", "delegated", "executing", "review", "ceo_approval_pending", "ready_for_merge", "done", "paused", "failed"):
             return False
         with self._lock:
             with self._conn() as conn:

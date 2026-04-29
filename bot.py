@@ -73,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 LOG = logging.getLogger("codexbot")
+_MODULE_DATA_DB = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
 
 _STATE_STORES_LOCK = threading.Lock()
 _STATE_STORES_BY_PATH: dict[str, StateStore] = {}
@@ -239,6 +240,9 @@ _GREETING_PREFIXES = (
 
 _CONTROLLER_ROLE_NAMES = frozenset({"jarvis", "skynet"})
 _NO_WRITE_ROLE_NAMES = frozenset({"jarvis", "skynet", "architect_local", "reviewer_local"})
+_WRITE_ENABLED_DELEGATED_ROLE_NAMES = frozenset(
+    {"backend", "frontend", "sre", "product_ops", "release_mgr", "security", "qa", "implementer_local"}
+)
 # Any role that is forbidden to land repo changes must also bypass the normal
 # autonomous mode hint. Default to read-only, but allow an operator override on
 # hosts where Codex's read-only sandbox cannot start (write policy still gates).
@@ -255,29 +259,40 @@ def _role_requires_enforced_read_only(role: str) -> bool:
 
 def _no_write_role_forced_mode() -> str:
     raw = str(os.getenv("BOT_NO_WRITE_ROLE_FORCED_MODE", "ro") or "").strip().lower()
-    if raw in ("read-only", "readonly"):
-        return "ro"
-    if raw in ("workspace-write", "write"):
-        return "rw"
     if raw in ("danger-full-access", "danger", "bypass"):
         return "full"
-    return raw if raw in ("ro", "rw", "full") else "ro"
+    if raw == "full":
+        return "full"
+    if raw in ("workspace-write", "write"):
+        return "rw"
+    if raw == "rw":
+        return "rw"
+    return "ro"
 
 
 def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: int) -> str | None:
     """
     Enforce operator-selected runner mode for advisory/controller roles.
 
-    Breakglass/full-access is for CEO/manual execution, not for autonomous
-    planning/review lanes that must delegate code changes. If a host cannot
-    start Codex's read-only sandbox, BOT_NO_WRITE_ROLE_FORCED_MODE may opt into
-    a less restrictive runner mode while post-run write policy remains active.
+    Breakglass/full-access is normally for CEO/manual execution, not for
+    autonomous planning/review lanes that must delegate code changes. Some hosts
+    cannot start Codex's bwrap sandbox; BOT_NO_WRITE_ROLE_FORCED_MODE may opt
+    into workspace-write or full bypass, while controller prompts plus post-run
+    base-repo/worktree guards still enforce no-write policy.
     """
     return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
     return (role or "").strip().lower() in _NO_WRITE_ROLE_NAMES
+
+
+def _delegated_mode_hint_for_role(role: str, mode_hint: str) -> str:
+    mode = _coerce_orchestrator_mode(mode_hint)
+    role_norm = _coerce_orchestrator_role(role)
+    if role_norm in _WRITE_ENABLED_DELEGATED_ROLE_NAMES and mode == "ro":
+        return "rw"
+    return mode
 
 
 def _role_allows_branch_sync(role: str) -> bool:
@@ -1702,6 +1717,7 @@ class TelegramAPI:
         fn = filename or file_path.name
         ctype = mimetypes.guess_type(fn)[0] or "application/octet-stream"
         self._request_multipart(
+
             "sendPhoto",
             fields=fields,
             file_field="photo",
@@ -2510,6 +2526,7 @@ _FACTORY_REPO_EXCLUDE_NAMES = frozenset(
 )
 
 
+
 def _state_float(st: dict[str, Any], key: str) -> float | None:
     raw = st.get(key)
     try:
@@ -2571,6 +2588,87 @@ def _git_default_branch(repo: Path) -> str:
         except Exception:
             continue
     return "main"
+
+
+_FACTORY_TEMPORARY_DEFAULT_BRANCH_PREFIXES = (
+    "feature/order-",
+    "poncebot/",
+    "codex/r530-main-clean-",
+)
+
+
+def _factory_is_temporary_default_branch(branch: str) -> bool:
+    token = str(branch or "").strip()
+    return bool(token and any(token.startswith(prefix) for prefix in _FACTORY_TEMPORARY_DEFAULT_BRANCH_PREFIXES))
+
+
+def _factory_repo_default_branch_for_sync(
+    *,
+    existing: dict[str, Any],
+    discovered: dict[str, Any],
+    metadata: dict[str, Any],
+    now: float,
+) -> str:
+    discovered_branch = str(discovered.get("default_branch") or "").strip() or "main"
+    existing_branch = str(existing.get("default_branch") or "").strip()
+    canonical_branch = str(metadata.get("canonical_branch") or "").strip()
+    if canonical_branch:
+        return canonical_branch
+    if bool(metadata.get("default_branch_pinned", False)):
+        return existing_branch or discovered_branch
+    if existing_branch and existing_branch != discovered_branch and _factory_is_temporary_default_branch(existing_branch):
+        metadata["canonical_branch"] = discovered_branch
+        metadata["previous_default_branch"] = existing_branch
+        metadata["default_branch_migrated_at"] = float(now)
+        metadata["default_branch_migrated_by"] = "factory_sync"
+        metadata.pop("proactive_branch_note", None)
+        return discovered_branch
+    return existing_branch or discovered_branch
+
+
+def _factory_repo_autonomy_blocker(repo: Path, *, default_branch: str) -> str:
+    try:
+        repo = repo.expanduser().resolve()
+    except Exception:
+        repo = repo.expanduser()
+    if not (repo / ".git").exists():
+        return f"repo path is not a git checkout: {repo}"
+
+    status = _run_git(repo, ["status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        err = (status.stderr or status.stdout or "").strip()
+        return f"git status failed for registered repo: {err[:300] or 'unknown error'}"
+    dirty_lines = [line for line in str(status.stdout or "").splitlines() if line.strip()]
+    if dirty_lines:
+        preview = "; ".join(dirty_lines[:5])
+        extra = "" if len(dirty_lines) <= 5 else f"; +{len(dirty_lines) - 5} more"
+        return f"repo checkout has uncommitted changes ({preview}{extra})"
+
+    branch_proc = _run_git(repo, ["branch", "--show-current"], check=False)
+    current_branch = str(branch_proc.stdout or "").strip()
+    expected_branch = str(default_branch or "").strip() or _git_default_branch(repo)
+    expected_branch = expected_branch or "main"
+    if not current_branch:
+        head = _run_git(repo, ["rev-parse", "--short", "HEAD"], check=False)
+        return f"repo checkout is detached at {(head.stdout or '').strip() or 'unknown HEAD'}"
+    if current_branch != expected_branch:
+        try:
+            _git_refresh_default_branch_ref(repo, expected_branch)
+        except Exception:
+            pass
+        base_ref = _git_pick_main_ref(repo, default_branch=expected_branch)
+        divergence = ""
+        if base_ref and base_ref != "HEAD":
+            counts = _run_git(repo, ["rev-list", "--left-right", "--count", f"{current_branch}...{base_ref}"], check=False)
+            if counts.returncode == 0:
+                parts = str(counts.stdout or "").strip().split()
+                if len(parts) >= 2:
+                    divergence = f" (ahead={parts[0]}, behind={parts[1]} vs {base_ref})"
+        return (
+            f"repo checkout branch '{current_branch}' differs from configured default_branch "
+            f"'{expected_branch}'{divergence}"
+        )
+    return ""
 
 
 def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
@@ -2980,6 +3078,7 @@ def _qa_set_evidence_artifact_id(cfg: "BotConfig", *, chat_id: int, artifact_id:
     by_chat = qa.get("evidence_artifact_by_chat")
     if not isinstance(by_chat, dict):
         by_chat = {}
+
     artifact_id = (artifact_id or "").strip()
     if artifact_id:
         by_chat[_qa_chat_key(chat_id)] = artifact_id
@@ -3502,6 +3601,7 @@ def _sanitize_model_id(model: str) -> str:
     """
     m = (model or "").strip()
     if not m:
+
         return ""
     if any(ch.isspace() for ch in m):
         return ""
@@ -3859,6 +3959,48 @@ def _redact_codex_cmd_for_log(cmd: list[str]) -> list[str]:
     return out
 
 
+def _controller_git_write_guard_script() -> str:
+    return """#!/bin/sh
+real_git="${PONCEBOT_REAL_GIT:-/usr/bin/git}"
+cmd=""
+skip_next=0
+for arg in "$@"; do
+  if [ "$skip_next" = "1" ]; then
+    skip_next=0
+    continue
+  fi
+  case "$arg" in
+    -C|-c|--git-dir|--work-tree|--namespace)
+      skip_next=1
+      continue
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*)
+      continue
+      ;;
+    --*)
+      continue
+      ;;
+    -*)
+      continue
+      ;;
+    *)
+      cmd="$arg"
+      break
+      ;;
+  esac
+done
+
+case "$cmd" in
+  add|am|apply|bisect|branch|checkout|cherry-pick|clean|clone|commit|fetch|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|worktree)
+    echo "PonceBot controller git write guard blocked: git $cmd" >&2
+    exit 126
+    ;;
+esac
+
+exec "$real_git" "$@"
+"""
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -3867,6 +4009,7 @@ class CodexRunner:
         chat_id: int | None = None,
         allow_bypass: bool = True,
         forced_mode: str | None = None,
+        guard_git_writes: bool = False,
     ) -> None:
         self._cfg = cfg
         self._chat_id = chat_id
@@ -3874,6 +4017,7 @@ class CodexRunner:
         if forced_mode not in (None, "ro", "rw", "full"):
             raise ValueError(f"Invalid forced mode: {forced_mode}")
         self._forced_mode = forced_mode
+        self._guard_git_writes = bool(guard_git_writes)
     
     def _bypass_sandbox(self) -> bool:
         if not self._allow_bypass:
@@ -3917,6 +4061,22 @@ class CodexRunner:
             env["TMPDIR"] = str(tmp_root)
             env["TMP"] = str(tmp_root)
             env["TEMP"] = str(tmp_root)
+            if self._guard_git_writes:
+                git_guard_dir = tmp_root / "git-write-guard-bin"
+                git_guard_dir.mkdir(parents=True, exist_ok=True)
+                git_guard = git_guard_dir / "git"
+                real_git = shutil.which("git") or "/usr/bin/git"
+                git_guard.write_text(
+                    _controller_git_write_guard_script(),
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                try:
+                    git_guard.chmod(0o755)
+                except Exception:
+                    pass
+                env["PONCEBOT_REAL_GIT"] = real_git
+                env["PATH"] = str(git_guard_dir) + os.pathsep + str(env.get("PATH") or "")
         except Exception:
             pass
         # Frontend evidence dir: agents can drop `.codexbot_preview/preview.html` and the bot will screenshot it.
@@ -4055,6 +4215,7 @@ class CodexRunner:
         We run with `--json` and reconstruct the final assistant message from JSONL stdout.
         """
         tid = (thread_id or "").strip()
+
         prompt = (prompt or "").strip()
         if not tid:
             raise ValueError("Empty thread_id")
@@ -5043,6 +5204,53 @@ def _repair_unified_diff_text(text: str) -> tuple[str, bool]:
     return repaired, changed
 
 
+def _strip_unified_diff_file_mode_metadata(text: str) -> tuple[str, bool]:
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False
+    lines = raw.splitlines()
+    repaired_lines: list[str] = []
+    changed = False
+    section_lines: list[str] = []
+    mode_line_re = re.compile(r"^(?:old|new) mode [0-7]{6}$")
+    index_mode_re = re.compile(r"^(index [0-9a-fA-F]+\.\.[0-9a-fA-F]+) [0-7]{6}$")
+
+    def _flush_section() -> None:
+        nonlocal changed
+        if not section_lines:
+            return
+        has_content_hunk = any(line.startswith("@@ ") for line in section_lines)
+        for section_line in section_lines:
+            if has_content_hunk and mode_line_re.match(section_line):
+                changed = True
+                continue
+            index_match = index_mode_re.match(section_line) if has_content_hunk else None
+            if index_match:
+                repaired_lines.append(index_match.group(1))
+                changed = True
+                continue
+            repaired_lines.append(section_line)
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            _flush_section()
+            section_lines = [line]
+            continue
+        section_lines.append(line)
+    _flush_section()
+    repaired = "\n".join(repaired_lines)
+    if raw.endswith("\n"):
+        repaired += "\n"
+    return repaired, changed
+
+
+def _git_apply_error_indicates_file_mode_mismatch(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    return bool(re.search(r"\bhas type [0-7]{6}, expected [0-7]{6}\b", blob))
+
+
 def _extract_blocker_response(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
@@ -5069,6 +5277,32 @@ _LOCAL_EXCERPT_BLOCKER_MARKERS: tuple[str, ...] = (
     "need exact current excerpt for `bot.py` around `_classify_local_slice_failure`",
 )
 
+_LOCAL_EXCERPT_BLOCKER_TARGET = "_classify_local_slice_failure"
+
+_LOCAL_EXCERPT_BLOCKER_TARGET_TERMS: tuple[str, ...] = (
+    "current contents",
+    "current code",
+    "current definition",
+    "current implementation",
+    "current snippet",
+    "current source",
+    "current function",
+    "full body",
+    "relevant snippet",
+    "source code",
+    "source excerpt",
+    "current excerpt",
+    "missing excerpt",
+    "exact current function body",
+)
+
+_LOCAL_EXCERPT_BLOCKER_SYMBOL_RE = re.compile(
+    r"(?:`[_a-zA-Z][_a-zA-Z0-9.]*`|\b[_a-zA-Z][_a-zA-Z0-9]*_[a-zA-Z0-9_]*\b)"
+)
+_LOCAL_EXCERPT_BLOCKER_PATH_RE = re.compile(
+    r"\b[\w.-]+(?:/[\w.-]+)+\.[a-zA-Z0-9]{1,8}\b"
+)
+
 
 def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
     blob = str(text or "").strip().lower()
@@ -5076,11 +5310,16 @@ def _local_blocker_requests_grounded_excerpt(text: str) -> bool:
         return False
     if any(marker in blob for marker in _LOCAL_EXCERPT_BLOCKER_MARKERS):
         return True
-    # Fallback: keep matcher resilient to punctuation/phrasing drift when the same
-    # target symbol is explicitly requested with excerpt/body wording.
-    if "_classify_local_slice_failure" in blob:
-        if any(token in blob for token in ("full body", "current excerpt", "missing excerpt", "exact current function body")):
-            return True
+    # Fallback: keep matcher resilient to punctuation/phrasing drift when an
+    # explicit code target is requested with current-source/excerpt/body wording.
+    if not any(token in blob for token in _LOCAL_EXCERPT_BLOCKER_TARGET_TERMS):
+        return False
+    if (
+        _LOCAL_EXCERPT_BLOCKER_TARGET in blob
+        or _LOCAL_EXCERPT_BLOCKER_SYMBOL_RE.search(blob)
+        or _LOCAL_EXCERPT_BLOCKER_PATH_RE.search(blob)
+    ):
+        return True
     return False
 
 
@@ -5557,6 +5796,7 @@ def _focused_workspace_symbol_excerpt(
     raw_text = str(raw or "")
     if not raw_text:
         return ""
+
     tokens: list[str] = []
     seen_tokens: set[str] = set()
     stop_tokens = {
@@ -5849,6 +6089,17 @@ def _build_local_specialist_user_prompt(
     worktree_dir: Path,
 ) -> str:
     user_prompt = build_agent_prompt(task, profile=role_profile)
+    if _role_disallows_repo_writes(role):
+        user_prompt = (
+            str(user_prompt or "").rstrip()
+            + "\n\nCONTROLLER_WRITE_POLICY:\n"
+            + f"- This role ({role}) is read-only for repository content and git state.\n"
+            + f"- Use this assigned worktree for inspection only: {worktree_dir}\n"
+            + "- Treat any registered repo root in the ticket as metadata; do not run shell commands from that base checkout.\n"
+            + "- Never edit files, create commits, create branches, checkout/switch/reset branches, push, merge, or deploy from this lane.\n"
+            + "- Delegate implementation to write-enabled local specialist roles, then review their evidence.\n"
+            + "- VERIFIED_IMPROVEMENT is valid only after prior delegated implementer evidence plus review/QA evidence; controller-only analysis or direct diffs do not qualify.\n"
+        )
     if role in {"architect_local", "reviewer_local"}:
         user_prompt = (
             str(user_prompt or "").rstrip()
@@ -5936,6 +6187,7 @@ def _finalize_local_implementer_change(
     apply_mode: str,
     already_applied: bool = False,
     patch_repaired: bool = False,
+    mode_metadata_stripped: bool = False,
     patch_artifact: str = "",
     rewrite_files: list[str] | None = None,
     changed_files_hint: list[str] | None = None,
@@ -6056,6 +6308,9 @@ def _finalize_local_implementer_change(
         info["patch_artifact"] = str(patch_artifact)
     if patch_artifact:
         info["patch_repaired"] = bool(patch_repaired)
+    if mode_metadata_stripped:
+        info["mode_metadata_stripped"] = True
+        info["patch_repair_reason"] = "file_mode_metadata_mismatch"
     if rewrite_files:
         info["rewrite_files"] = [str(path) for path in rewrite_files if str(path).strip()]
     if hinted_files:
@@ -6218,6 +6473,7 @@ def _apply_local_implementer_apply_patch(
                 break
             if current.startswith("@@"):
                 if current_hunk:
+
                     hunks.append(current_hunk)
                     current_hunk = []
                 i += 1
@@ -6272,6 +6528,7 @@ def _apply_local_implementer_patch(
     repaired_patch_text, patch_repaired = _repair_unified_diff_text(patch_text)
     if repaired_patch_text.strip():
         patch_text = repaired_patch_text
+    mode_metadata_stripped = False
     patch_path = artifacts_dir / "local_ollama_patch.diff"
     patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
     artifacts: list[str] = [str(patch_path)]
@@ -6293,6 +6550,7 @@ def _apply_local_implementer_patch(
         ["git", "rev-parse", "--show-toplevel"],
         cwd=str(worktree_dir),
         capture_output=True,
+
         text=True,
         timeout=20,
     )
@@ -6313,34 +6571,65 @@ def _apply_local_implementer_patch(
         recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(patch_path)])
         if recount_check.returncode == 0:
             apply_check = recount_check
+    def _retry_after_mode_metadata_strip() -> bool:
+        nonlocal patch_text, patch_repaired, mode_metadata_stripped, apply_check
+        stripped_patch_text, stripped = _strip_unified_diff_file_mode_metadata(patch_text)
+        if not stripped or not stripped_patch_text.strip():
+            return False
+        stripped_path = artifacts_dir / "local_ollama_patch.mode-stripped.diff"
+        stripped_path.write_text(stripped_patch_text, encoding="utf-8", errors="replace")
+        stripped_check = _run_patch_cmd(["git", "apply", "--check", str(stripped_path)])
+        if stripped_check.returncode != 0:
+            stripped_recount_check = _run_patch_cmd(["git", "apply", "--check", "--recount", str(stripped_path)])
+            if stripped_recount_check.returncode == 0:
+                stripped_check = stripped_recount_check
+        if stripped_check.returncode != 0:
+            stripped_err_path = artifacts_dir / "local_ollama_patch_mode_strip_error.txt"
+            stripped_err_body = (
+                stripped_check.stderr or stripped_check.stdout or ""
+            ).strip() or "git apply --check failed after stripping file mode metadata"
+            stripped_err_path.write_text(stripped_err_body + "\n", encoding="utf-8", errors="replace")
+            artifacts.append(str(stripped_err_path))
+            return False
+        patch_text = stripped_patch_text
+        patch_path.write_text(patch_text, encoding="utf-8", errors="replace")
+        patch_repaired = True
+        mode_metadata_stripped = True
+        apply_check = stripped_check
+        return True
+
+    apply_check_text = (apply_check.stderr or apply_check.stdout or "").strip()
+    if apply_check.returncode == 0 and _git_apply_error_indicates_file_mode_mismatch(apply_check_text):
+        _retry_after_mode_metadata_strip()
     already_applied = False
     if apply_check.returncode != 0:
         reverse_check = _run_patch_cmd(["git", "apply", "--reverse", "--check", str(patch_path)])
         if reverse_check.returncode == 0:
             already_applied = True
         else:
-            err_path = artifacts_dir / "local_ollama_patch_error.txt"
             err_body = (apply_check.stderr or apply_check.stdout or "").strip() or "git apply --check failed"
-            err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
-            artifacts.append(str(err_path))
-            if rewrite_blocks:
-                fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
-                fallback_note.write_text(
-                    "Patch apply failed; falling back to rewrite blocks.\n"
-                    + err_body
-                    + "\n",
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                artifacts.append(str(fallback_note))
-                return _apply_local_implementer_rewrites(
-                    task=task,
-                    artifacts_dir=artifacts_dir,
-                    content=content,
-                    worktree_dir=worktree_dir,
-                    artifacts=artifacts,
-                )
-            raise RuntimeError(f"implementer_local patch rejected by git apply --check: {err_body}")
+            if not (_git_apply_error_indicates_file_mode_mismatch(err_body) and _retry_after_mode_metadata_strip()):
+                err_path = artifacts_dir / "local_ollama_patch_error.txt"
+                err_path.write_text(err_body + "\n", encoding="utf-8", errors="replace")
+                artifacts.append(str(err_path))
+                if rewrite_blocks:
+                    fallback_note = artifacts_dir / "local_ollama_patch_fallback.txt"
+                    fallback_note.write_text(
+                        "Patch apply failed; falling back to rewrite blocks.\n"
+                        + err_body
+                        + "\n",
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    artifacts.append(str(fallback_note))
+                    return _apply_local_implementer_rewrites(
+                        task=task,
+                        artifacts_dir=artifacts_dir,
+                        content=content,
+                        worktree_dir=worktree_dir,
+                        artifacts=artifacts,
+                    )
+                raise RuntimeError(f"implementer_local patch rejected by git apply --check: {err_body}")
 
     if not already_applied:
         applied = _run_patch_cmd(["git", "apply", str(patch_path)])
@@ -6378,6 +6667,7 @@ def _apply_local_implementer_patch(
         apply_mode="patch",
         already_applied=already_applied,
         patch_repaired=patch_repaired,
+        mode_metadata_stripped=mode_metadata_stripped,
         patch_artifact=str(patch_path),
         changed_files_hint=_extract_changed_files_from_patch_text(patch_text),
     )
@@ -6538,6 +6828,7 @@ def _orchestrator_run_local_ollama(
         except Exception:
             repo_base_dir = Path(repo_path).expanduser()
     repo_default_branch = str((repo_record or {}).get("default_branch") or "").strip()
+
     if not repo_default_branch and repo_base_dir is not None and (repo_base_dir / ".git").exists():
         repo_default_branch = _git_default_branch(repo_base_dir)
     repo_default_branch = repo_default_branch or "main"
@@ -6638,6 +6929,10 @@ def _orchestrator_run_local_ollama(
         live_stream_path.write_text("", encoding="utf-8", errors="replace")
     except Exception:
         pass
+    attempt_errors: list[str] = []
+
+    candidate_models: list[str] = []
+    used_fallback = False
 
     if stop_event.is_set():
         return {
@@ -6745,16 +7040,15 @@ def _orchestrator_run_local_ollama(
                 on_request=(lambda body: _write_local_prompt(model_name=model_name, request_body=body if isinstance(body, dict) else {})),
             )
 
-        used_fallback = False
-        attempt_errors: list[str] = []
         out: dict[str, Any] = {}
         content = ""
-        for idx, candidate_model in enumerate(_candidate_local_models()):
+        candidate_models = _candidate_local_models()
+        for idx, candidate_model in enumerate(candidate_models):
+            model = candidate_model
+            used_fallback = idx > 0
             try:
                 out = _run_local_once(candidate_model)
                 content = str(out.get("content") or "").strip()
-                model = candidate_model
-                used_fallback = idx > 0
                 if content:
                     break
                 attempt_errors.append(f"{candidate_model}: empty response")
@@ -6857,6 +7151,23 @@ def _orchestrator_run_local_ollama(
             err_path.write_text(err_text, encoding="utf-8", errors="replace")
         except Exception:
             pass
+        attempts_path = artifacts_dir / "local_ollama_attempts.json"
+        attempts_payload = {
+            "backend": "local_ollama",
+            "role": role,
+            "requested_model": requested_model,
+            "model": model,
+            "attempt_errors": attempt_errors[:10],
+            "duration_s": round(max(0.0, time.time() - started), 3),
+            "fallback_candidate_count": len(candidate_models),
+            "candidate_models": candidate_models[:10],
+            "fallback_used": bool(used_fallback),
+            "error": str(e),
+        }
+        try:
+            attempts_path.write_text(json.dumps(attempts_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", errors="replace")
+        except Exception:
+            pass
         if orch_q is not None:
             try:
                 orch_q.update_trace(
@@ -6874,10 +7185,30 @@ def _orchestrator_run_local_ollama(
         return {
             "status": "error",
             "summary": f"Local Ollama execution failed: {e}",
-            "artifacts": [x for x in (str(err_path), str(live_response_path), str(live_stream_path), str(prompt_path)) if x and Path(x).exists()],
+            "artifacts": [
+                x
+                for x in (
+                    str(err_path),
+                    str(attempts_path),
+                    str(live_response_path),
+                    str(live_stream_path),
+                    str(prompt_path),
+                )
+                if x and Path(x).exists()
+            ],
             "logs": err_text,
             "next_action": "retry",
-            "structured_digest": {"role": role, "backend": "local_ollama", "model": model},
+            "structured_digest": {
+                "role": role,
+                "backend": "local_ollama",
+                "model": model,
+                "requested_model": requested_model,
+                "duration_s": round(max(0.0, time.time() - started), 3),
+                "fallback_used": bool(used_fallback),
+                "fallback_candidate_count": len(candidate_models),
+                "attempt_errors": attempt_errors[:10],
+                "attempts_artifact": str(attempts_path) if attempts_path.exists() else "",
+            },
         }
 
 
@@ -7224,6 +7555,7 @@ def _maybe_handle_ceo_query(
             msg.chat_id,
             "Jarvis: models by role\n" + "\n".join(lines[1:40]),
             reply_to_message_id=msg.message_id if msg.message_id else None,
+
         )
         return True
 
@@ -7309,6 +7641,7 @@ def _skills_status_text() -> str:
     lines.append("- /skills disable <skill>")
     lines.append("- /skills enable <skill>")
     return "\n".join(lines)
+
 
 
 def _move_skill_dir(*, src: Path, dst: Path) -> None:
@@ -7861,6 +8194,12 @@ def _git_fetch_remote_branch(repo: Path, branch: str) -> tuple[bool, str]:
     return False, detail or "branch_fetch_failed"
 
 
+def _git_refresh_default_branch_ref(repo: Path, default_branch: str) -> None:
+    b = str(default_branch or "").strip()
+    if b and b != "HEAD":
+        _git_fetch_remote_branch(repo, b)
+
+
 def _git_is_non_fast_forward_push_error(detail: str) -> bool:
     blob = str(detail or "").strip().lower()
     if not blob:
@@ -7916,6 +8255,7 @@ def _git_is_ancestor(repo: Path, older_ref: str, newer_ref: str) -> bool:
     return anc.returncode == 0
 
 
+
 def _git_unmerged_conflict_files(repo: Path) -> list[str]:
     diff = _run_git(repo, ["diff", "--name-only", "--diff-filter=U"], check=False)
     if diff.returncode != 0:
@@ -7953,6 +8293,7 @@ def _git_ensure_branch_from_main(
     if not b:
         return False, "branch_missing"
     _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    _git_refresh_default_branch_ref(repo, default_branch)
     if (
         _git_ref_exists(repo, f"refs/remotes/origin/{b}")
         or _git_ref_exists(repo, f"origin/{b}")
@@ -7985,6 +8326,7 @@ def _reconcile_order_branch_with_main(
 
     for attempt in range(max_push_attempts):
         _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+        _git_refresh_default_branch_ref(repo, default_branch)
         remote_exists = (
             _git_ref_exists(repo, f"refs/remotes/origin/{b}")
             or _git_ref_exists(repo, f"origin/{b}")
@@ -8333,6 +8675,7 @@ def _autocommit_push_order_branch(
     b = str(order_branch or "").strip()
     if not b:
         return {"status": "skipped", "reason": "no_branch"}
+    _purge_internal_worktree_marker(worktree_dir)
     st = _run_git(worktree_dir, ["status", "--porcelain"], check=False)
     status_out = str(st.stdout or "").strip()
     if not status_out:
@@ -8343,6 +8686,7 @@ def _autocommit_push_order_branch(
     add = _run_git(worktree_dir, ["add", "-A"], check=False, env=env)
     if add.returncode != 0:
         return {"status": "error", "reason": "git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+    _purge_internal_worktree_marker(worktree_dir)
 
     key = str((task.labels or {}).get("key") or "").strip() or "work"
     msg = f"order:{(task.parent_job_id or task.job_id)[:8]} job:{task.job_id[:8]} role:{task.role} key:{key}"
@@ -8384,6 +8728,39 @@ def _git_status_porcelain(repo_dir: Path) -> str:
     return str(proc.stdout or "").rstrip()
 
 
+def _git_head_rev(repo_dir: Path) -> str:
+    proc = _run_git(repo_dir, ["rev-parse", "HEAD"], check=False)
+    if proc.returncode != 0:
+        return ""
+    return str(proc.stdout or "").strip()
+
+
+def _git_current_branch(repo_dir: Path) -> str:
+    proc = _run_git(repo_dir, ["branch", "--show-current"], check=False)
+    branch = str(proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if branch:
+        return branch
+    proc = _run_git(repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if proc.returncode != 0:
+        return ""
+    branch = str(proc.stdout or "").strip()
+    return "" if branch == "HEAD" else branch
+
+
+def _purge_internal_worktree_marker(repo_dir: Path) -> None:
+    marker_name = ".poncebot_managed_worktree"
+    marker = repo_dir / marker_name
+    tracked = _run_git(repo_dir, ["ls-files", "--error-unmatch", "--", marker_name], check=False)
+    if tracked.returncode == 0:
+        _run_git(repo_dir, ["rm", "-f", "--", marker_name], check=False)
+        return
+    try:
+        if marker.is_file() or marker.is_symlink():
+            marker.unlink()
+    except Exception:
+        pass
+
+
 def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
     out: list[str] = []
     for raw_line in str(status_text or "").splitlines():
@@ -8403,6 +8780,134 @@ def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
         if path_part and path_part not in out:
             out.append(path_part)
     return out
+
+
+def _git_changed_paths_between(repo_dir: Path, before: str, after: str) -> list[str]:
+    old = str(before or "").strip()
+    new = str(after or "").strip()
+    if not old or not new or old == new:
+        return []
+    proc = _run_git(repo_dir, ["diff", "--name-only", old, new], check=False)
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in str(proc.stdout or "").splitlines():
+        rel_path = str(raw or "").strip()
+        if rel_path and rel_path not in out:
+            out.append(rel_path)
+    return out
+
+
+def _create_controller_snapshot_workdir(
+    *,
+    source_dir: Path,
+    artifacts_dir: Path,
+    role: str,
+    job_id: str,
+) -> Path:
+    """
+    Build a disposable Git checkout for controller/no-write roles.
+
+    Some hosts require Codex full-access mode because the read-only sandbox
+    cannot start. Running controllers against this snapshot keeps those agents
+    able to inspect files while making any accidental edits harmless.
+    """
+    source = Path(source_dir).resolve()
+    snapshot = (Path(artifacts_dir).resolve() / "controller_snapshot").resolve()
+    if snapshot.exists():
+        shutil.rmtree(snapshot, ignore_errors=True)
+    snapshot.mkdir(parents=True, exist_ok=True)
+
+    listed = _run_git(source, ["ls-files", "-z"], check=False)
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot source ls-files failed: {detail[:400] or listed.returncode}")
+
+    for raw in str(listed.stdout or "").split("\0"):
+        rel = str(raw or "").strip()
+        if not rel:
+            continue
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            continue
+        src = (source / rel_path).resolve()
+        try:
+            inside_source = str(src).startswith(str(source))
+        except Exception:
+            inside_source = False
+        if not inside_source or not src.exists():
+            continue
+        dst = snapshot / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if src.is_symlink():
+                target = os.readlink(src)
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                os.symlink(target, dst)
+            elif src.is_file():
+                shutil.copy2(src, dst)
+        except Exception:
+            LOG.exception("Failed to copy controller snapshot path. source=%s rel=%s", source, rel)
+            raise
+
+    init = _run_git(snapshot, ["init", "-b", "controller-snapshot"], check=False)
+    if init.returncode != 0:
+        detail = (init.stderr or init.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot git init failed: {detail[:400] or init.returncode}")
+    _run_git(snapshot, ["config", "user.name", "manolosake"], check=False)
+    _run_git(snapshot, ["config", "user.email", "manolosake@gmail.com"], check=False)
+    add = _run_git(snapshot, ["add", "-A"], check=False)
+    if add.returncode != 0:
+        detail = (add.stderr or add.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot git add failed: {detail[:400] or add.returncode}")
+    commit = _run_git(
+        snapshot,
+        ["commit", "--allow-empty", "-m", f"controller snapshot baseline {str(role or 'role')}-{str(job_id or '')[:8]}"],
+        check=False,
+        env=_autonomous_commit_identity_env(snapshot),
+    )
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot baseline commit failed: {detail[:400] or commit.returncode}")
+    return snapshot
+
+
+def _controller_snapshot_safe_prompt(
+    prompt: str,
+    *,
+    snapshot_dir: Path,
+    source_paths: list[Path | str | None],
+) -> str:
+    snapshot = str(Path(snapshot_dir).resolve())
+    scrubbed = str(prompt or "")
+    replacements: list[str] = []
+    seen: set[str] = set()
+    for raw_path in source_paths:
+        if raw_path is None:
+            continue
+        raw_text = str(raw_path or "").strip()
+        if raw_text and raw_text != snapshot and raw_text not in seen:
+            seen.add(raw_text)
+            replacements.append(raw_text)
+        try:
+            path_text = str(Path(raw_path).resolve())
+        except Exception:
+            path_text = raw_text
+        if not path_text or path_text == snapshot or path_text in seen:
+            continue
+        seen.add(path_text)
+        replacements.append(path_text)
+    for path_text in sorted(replacements, key=len, reverse=True):
+        scrubbed = scrubbed.replace(path_text, snapshot)
+    guard = (
+        "CONTROLLER_SNAPSHOT_MODE\n"
+        f"CURRENT_WORKDIR: {snapshot}\n"
+        "Use only CURRENT_WORKDIR for repository inspection. It is a disposable snapshot.\n"
+        "Do not cd to, edit, commit, push, or inspect any source checkout outside CURRENT_WORKDIR.\n"
+        "Controllers must delegate implementation to write-enabled local specialists instead of changing files directly.\n"
+    )
+    return guard.rstrip() + "\n\n" + scrubbed.lstrip()
 
 
 def _stash_read_only_write_violation(
@@ -8467,6 +8972,160 @@ def _stash_read_only_write_violation(
         "stash_created": proc.returncode == 0,
         "stash_message": stash_msg,
         "stash_returncode": int(proc.returncode or 0),
+        "status_after": status_after,
+        "artifact": str(artifact),
+    }
+
+
+def _restore_read_only_base_repo_branch(
+    repo_dir: Path,
+    *,
+    baseline_branch: str,
+    role: str,
+    job_id: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    expected = str(baseline_branch or "").strip()
+    current_before = _git_current_branch(repo_dir)
+    if not expected or current_before == expected:
+        return {
+            "repo_dir": str(repo_dir),
+            "branch_restored": False,
+            "branch_before": current_before,
+            "branch_after": current_before,
+            "reason": "already_on_expected_branch" if expected else "missing_expected_branch",
+        }
+
+    safe_label = "base-repo-branch-restore"
+    proc = _run_git(
+        repo_dir,
+        ["checkout", expected],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    current_after = _git_current_branch(repo_dir)
+    status_after = _git_status_porcelain(repo_dir)
+    artifact = artifacts_dir / f"write_policy_{safe_label}.txt"
+    artifact.write_text(
+        "\n".join(
+            [
+                f"repo_dir={repo_dir}",
+                f"role={role}",
+                f"job_id={job_id}",
+                f"branch_before={current_before}",
+                f"branch_expected={expected}",
+                f"branch_after={current_after}",
+                f"checkout_returncode={proc.returncode}",
+                "checkout_stdout:",
+                str(proc.stdout or "").rstrip(),
+                "checkout_stderr:",
+                str(proc.stderr or "").rstrip(),
+                "",
+                "status_after:",
+                status_after,
+            ]
+        ).rstrip()
+        + "\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "repo_dir": str(repo_dir),
+        "branch_restored": proc.returncode == 0 and current_after == expected,
+        "branch_before": current_before,
+        "branch_expected": expected,
+        "branch_after": current_after,
+        "checkout_returncode": int(proc.returncode or 0),
+        "status_after": status_after,
+        "artifact": str(artifact),
+    }
+
+
+def _restore_read_only_base_repo_head(
+    repo_dir: Path,
+    *,
+    baseline_head: str,
+    role: str,
+    job_id: str,
+    artifacts_dir: Path,
+) -> dict[str, Any]:
+    expected = str(baseline_head or "").strip()
+    current_before = _git_head_rev(repo_dir)
+    if not expected or current_before == expected:
+        return {
+            "repo_dir": str(repo_dir),
+            "head_restored": False,
+            "head_before": current_before,
+            "head_after": current_before,
+            "reason": "already_on_expected_head" if expected else "missing_expected_head",
+        }
+
+    if _git_status_porcelain(repo_dir):
+        return {
+            "repo_dir": str(repo_dir),
+            "head_restored": False,
+            "head_before": current_before,
+            "head_expected": expected,
+            "head_after": current_before,
+            "reason": "dirty_after_stash",
+        }
+
+    safe_role = _SAFE_FILENAME_RE.sub("-", str(role or "role").strip().lower()).strip("-._") or "role"
+    backup_branch = f"poncebot/read-only-violation/{safe_role}-{str(job_id or '')[:8]}-{int(time.time())}"
+    backup = _run_git(
+        repo_dir,
+        ["branch", backup_branch, current_before],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    reset = _run_git(
+        repo_dir,
+        ["reset", "--hard", expected],
+        check=False,
+        env=_autonomous_commit_identity_env(repo_dir),
+    )
+    current_after = _git_head_rev(repo_dir)
+    status_after = _git_status_porcelain(repo_dir)
+    artifact = artifacts_dir / "write_policy_base-repo-head-restore.txt"
+    artifact.write_text(
+        "\n".join(
+            [
+                f"repo_dir={repo_dir}",
+                f"role={role}",
+                f"job_id={job_id}",
+                f"backup_branch={backup_branch}",
+                f"head_before={current_before}",
+                f"head_expected={expected}",
+                f"head_after={current_after}",
+                f"backup_returncode={backup.returncode}",
+                "backup_stdout:",
+                str(backup.stdout or "").rstrip(),
+                "backup_stderr:",
+                str(backup.stderr or "").rstrip(),
+                "",
+                f"reset_returncode={reset.returncode}",
+                "reset_stdout:",
+                str(reset.stdout or "").rstrip(),
+                "reset_stderr:",
+                str(reset.stderr or "").rstrip(),
+                "",
+                "status_after:",
+                status_after,
+            ]
+        ).rstrip()
+        + "\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    return {
+        "repo_dir": str(repo_dir),
+        "head_restored": reset.returncode == 0 and current_after == expected,
+        "head_before": current_before,
+        "head_expected": expected,
+        "head_after": current_after,
+        "backup_branch": backup_branch,
+        "backup_returncode": int(backup.returncode or 0),
+        "reset_returncode": int(reset.returncode or 0),
         "status_after": status_after,
         "artifact": str(artifact),
     }
@@ -8544,6 +9203,7 @@ def _merge_order_branch_to_main(
                 # Hygiene: one branch per project/order, remove after successful merge.
                 _run_git(repo, ["push", "origin", "--delete", b], check=False)
                 _run_git(repo, ["branch", "-D", b], check=False)
+                _sync_repo_checkout_to_default_branch(repo=repo, default_branch=default_branch)
                 return True, "merged_to_main", (merge_commit or None)
 
             push_detail = (ps.stderr or ps.stdout or "").strip() or "push_main_failed"
@@ -10027,6 +10687,7 @@ def _send_orchestrator_marker_response(
                 reply_to_message_id=reply_to_message_id,
             )
             return True
+
         if sub == "mode":
             if len(parts) < 2:
                 api.send_message(chat_id, "Uso: /factory mode ceo-bounded", reply_to_message_id=reply_to_message_id)
@@ -10541,6 +11202,7 @@ def _orchestrator_status_text(orch_q: OrchestratorQueue, *, cfg: BotConfig | Non
         for t in running[:12]:
             trace = t.trace or {}
             phase = str(trace.get("live_phase") or "").strip() or "running"
+
             slot = trace.get("live_workspace_slot")
             try:
                 slot_s = str(int(slot)) if slot is not None else "n/a"
@@ -11633,6 +12295,133 @@ def _jarvis_auto_approve_merge_enabled() -> bool:
     return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+_OPERATIONAL_GATE_LIVE_STATES = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+_OPERATIONAL_GATE_BAD_TERMINAL_STATES = {"failed", "cancelled", "canceled"}
+
+
+def _operational_gate_is_live_state(state: str) -> bool:
+    return str(state or "").strip().lower() in _OPERATIONAL_GATE_LIVE_STATES
+
+
+def _git_dirty_status_lines(repo_dir: Path, *, limit: int = 20) -> list[str]:
+    try:
+        repo = Path(repo_dir)
+    except Exception:
+        return []
+    if not (repo / ".git").exists():
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "status", "--porcelain"],
+            text=True,
+            capture_output=True,
+            timeout=8,
+        )
+    except Exception as exc:
+        return [f"git_status_error:{type(exc).__name__}"]
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return [f"git_status_failed:{err[0][:160] if err else proc.returncode}"]
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    return lines[: max(1, int(limit))]
+
+
+def _order_operational_maturity_gate(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    repo_dir: Path,
+    default_branch: str,
+    merge_required: bool,
+    now: float,
+    require_merge_ready: bool = True,
+    require_proactive_closure: bool = True,
+) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Fail closed before Jarvis auto-merges or marks an order done.
+
+    This gate intentionally centralizes the high-risk operational checks that
+    previously lived as scattered assumptions in the sync/merge flow.
+    """
+    oid = str(order_id or "").strip()
+    payload: dict[str, Any] = {
+        "operational_gate_checked_at": float(now),
+        "operational_gate_default_branch": str(default_branch or "").strip() or "main",
+    }
+    if not oid:
+        return False, "missing_order_id", payload
+    try:
+        order = orch_q.get_order(oid, chat_id=int(chat_id)) or {}
+    except Exception:
+        order = {}
+    if not isinstance(order, dict) or not order:
+        return False, "missing_order_record", payload
+
+    try:
+        root = orch_q.get_job(oid)
+    except Exception:
+        root = None
+    if root is None:
+        return False, "missing_root_job", payload
+
+    root_state = str(getattr(root, "state", "") or "").strip().lower()
+    payload["operational_gate_root_state"] = root_state
+    trace = dict((getattr(root, "trace", None) or {}) if root is not None else {})
+    root_delivery_closed = (
+        bool(trace.get("merged_to_main", False))
+        or bool(trace.get("proactive_improvement_closed", False))
+        or bool(trace.get("proactive_no_change_validated", False))
+        or bool(trace.get("proactive_blocked_with_root_cause", False))
+    )
+    if _operational_gate_is_live_state(root_state):
+        if not (root_state == "blocked" and root_delivery_closed):
+            return False, f"root_job_still_{root_state}", payload
+
+    if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES:
+        if not root_delivery_closed:
+            return False, f"root_job_terminal_{root_state}_without_delivery", payload
+
+    try:
+        children = list(orch_q.jobs_by_parent(parent_job_id=oid, limit=600) or [])
+    except Exception:
+        children = []
+    live_children = [
+        str(getattr(child, "job_id", "") or "") or str(getattr(child, "role", "") or "child")
+        for child in children
+        if _operational_gate_is_live_state(str(getattr(child, "state", "") or ""))
+    ]
+    if live_children:
+        payload["operational_gate_live_children"] = live_children[:12]
+        return False, "child_jobs_still_active", payload
+
+    if str(trace.get("deploy_status") or "").strip().lower() == "failed":
+        return False, "deploy_failed", payload
+
+    if not merge_required:
+        return True, "passed_no_merge_required", payload
+
+    if require_merge_ready and not bool(trace.get("merge_ready", False)):
+        return False, "merge_not_ready", payload
+
+    if require_proactive_closure and _is_proactive_order_record(order):
+        closed = (
+            bool(trace.get("merged_to_main", False))
+            or bool(trace.get("proactive_improvement_closed", False))
+            or bool(trace.get("proactive_no_change_validated", False))
+            or bool(trace.get("proactive_blocked_with_root_cause", False))
+        )
+        if not closed:
+            return False, "proactive_quality_gate_not_closed", payload
+
+    dirty = _git_dirty_status_lines(repo_dir)
+    if dirty:
+        payload["operational_gate_dirty_paths"] = dirty
+        return False, "repo_dirty_before_merge", payload
+
+    return True, "passed", payload
+
+
 def _auto_merge_ready_orders_tick(
     *,
     cfg: BotConfig,
@@ -11787,10 +12576,60 @@ def _auto_merge_ready_orders_tick(
             )
             refreshed = orch_q.get_order(oid, chat_id=int(chat_for_order)) or {}
             phase = str(refreshed.get("phase") or phase).strip().lower()
+            root = orch_q.get_job(oid)
+            trace = dict((root.trace or {}) if root else {})
+            merge_required_now, _branch = _order_trace_requires_merge(
+                trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
         except Exception:
             pass
         if phase != "ready_for_merge":
             continue
+        gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+            orch_q=orch_q,
+            order_id=oid,
+            chat_id=int(chat_for_order),
+            repo_dir=repo_dir,
+            default_branch=default_branch,
+            merge_required=bool(merge_required_now),
+            now=float(now),
+        )
+        if not gate_ok:
+            try:
+                orch_q.set_order_status(oid, chat_id=chat_for_order, status="active")
+                orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="review")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=float(now),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="jarvis",
+                    details={
+                        "order_id": oid,
+                        "reason": str(gate_reason),
+                        "payload": gate_payload,
+                    },
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            orch_q.update_trace(
+                oid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=float(now),
+                **gate_payload,
+            )
+        except Exception:
+            pass
         deploy_failed = str(trace.get("deploy_status") or "").strip().lower() == "failed"
         if bool(trace.get("merged_to_main", False)) and not merge_required_now and (not deploy_failed):
             try:
@@ -11963,8 +12802,8 @@ def _auto_merge_ready_orders_tick(
         result_norm = str(result_text or "").strip().lower()
         merged_ok = False
         if ("failed" not in result_norm) and (
-            ("merged to main" in result_norm)
-            or ("auto-merged by jarvis to main" in result_norm)
+            ("merged to " in result_norm)
+            or ("auto-merged by jarvis to " in result_norm)
         ):
             merged_ok = True
         if not merged_ok:
@@ -11975,8 +12814,30 @@ def _auto_merge_ready_orders_tick(
                 terminal_no_delivery = str(after_trace.get("result_status") or "").strip().lower() in {
                     "merge_no_delta",
                 }
+                deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
+                if terminal_no_delivery:
+                    try:
+                        orch_q.set_order_status(oid, chat_id=chat_for_order, status="failed")
+                        orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="failed")
+                        orch_q.update_trace(
+                            oid,
+                            merge_ready=False,
+                            merge_no_delta_active=False,
+                            merge_no_delta_retired_at=float(now),
+                            merge_auto_error="merge_no_delta",
+                            live_at=float(now),
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.auto_merge_no_delta_retired",
+                            actor="jarvis",
+                            details={"order_id": oid, "reason": "merge_no_delta"},
+                        )
+                    except Exception:
+                        pass
+                    continue
                 merged_ok = (
                     not terminal_no_delivery
+                    and not deploy_failed_after_merge
                     and (
                         bool(after_trace.get("merged_to_main", False))
                         or str(after_order.get("status") or "").strip().lower() == "done"
@@ -12068,6 +12929,106 @@ def _auto_merge_ready_orders_tick(
     return merged_count
 
 
+def _operational_maturity_sweep_tick(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    now: float,
+) -> int:
+    """
+    Final fail-closed sweep for readiness states.
+
+    Multiple autonomous loops can write ready_for_merge. This sweep runs late in
+    the scheduler cycle so unsafe readiness cannot survive just because another
+    tick wrote it after the normal phase sync or auto-merge guard.
+    """
+    try:
+        rows = list(orch_q.list_orders_global(status="active", limit=240) or [])
+    except Exception:
+        return 0
+    corrected = 0
+    for row in rows:
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        try:
+            root = orch_q.get_job(oid)
+            trace = dict((root.trace or {}) if root else {})
+        except Exception:
+            root = None
+            trace = {}
+        phase = str(row.get("phase") or "").strip().lower()
+        if phase != "ready_for_merge" and not bool(trace.get("merge_ready", False)):
+            continue
+        try:
+            _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+            )
+            merge_required, _branch = _order_trace_requires_merge(
+                trace,
+                repo=(repo_dir if (repo_dir / ".git").exists() else None),
+                default_branch=default_branch,
+            )
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=bool(merge_required),
+                now=float(now),
+            )
+        except Exception as exc:
+            gate_ok = False
+            gate_reason = f"operational_gate_exception:{type(exc).__name__}"
+            gate_payload = {"operational_gate_checked_at": float(now)}
+        if gate_ok:
+            try:
+                orch_q.update_trace(
+                    oid,
+                    operational_gate_status="passed",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=float(now),
+                    **gate_payload,
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                oid,
+                merge_ready=False,
+                operational_gate_status="blocked",
+                operational_gate_reason=str(gate_reason),
+                live_at=float(now),
+                **gate_payload,
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_blocked",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "reason": str(gate_reason),
+                    "source": "maturity_sweep",
+                },
+            )
+            corrected += 1
+        except Exception:
+            pass
+    return corrected
+
+
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 
@@ -12150,6 +13111,7 @@ def _repo_record_for_order(
         row = _repo_record_for_task(root, orch_q)
         if isinstance(row, dict):
             return row
+
     if chat_id is None:
         return None
     try:
@@ -12292,6 +13254,106 @@ def _repo_deploy_policy(
     }
 
 
+def _deploy_verify_retry_config(timeout_seconds: int) -> tuple[float, float, float]:
+    try:
+        window_s = float(os.environ.get("BOT_DEPLOY_VERIFY_RETRY_SECONDS", "90").strip() or "90")
+    except Exception:
+        window_s = 90.0
+    try:
+        interval_s = float(os.environ.get("BOT_DEPLOY_VERIFY_RETRY_INTERVAL_SECONDS", "4").strip() or "4")
+    except Exception:
+        interval_s = 4.0
+    try:
+        attempt_timeout_s = float(os.environ.get("BOT_DEPLOY_VERIFY_ATTEMPT_TIMEOUT_SECONDS", "20").strip() or "20")
+    except Exception:
+        attempt_timeout_s = 20.0
+
+    timeout_cap = max(5.0, float(timeout_seconds or 120))
+    window_s = max(1.0, min(300.0, float(window_s), timeout_cap))
+    interval_s = max(0.5, min(30.0, float(interval_s)))
+    attempt_timeout_s = max(3.0, min(120.0, float(attempt_timeout_s), timeout_cap))
+    return window_s, interval_s, attempt_timeout_s
+
+
+def _run_deploy_verify_with_retries(
+    *,
+    verify_command: list[str],
+    cwd: str,
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    command = [str(piece) for piece in verify_command if str(piece).strip()]
+    verify_text = shlex.join(command)
+    if not command:
+        return {
+            "ok": True,
+            "attempts": 0,
+            "verify_command": "",
+            "stdout": "",
+            "stderr": "",
+            "detail": "",
+        }
+
+    window_s, interval_s, attempt_timeout_s = _deploy_verify_retry_config(timeout_seconds)
+    deadline = time.time() + window_s
+    attempts = 0
+    last_stdout = ""
+    last_stderr = ""
+    last_detail = ""
+    last_returncode: int | None = None
+
+    while True:
+        attempts += 1
+        try:
+            verify = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=attempt_timeout_s,
+                check=False,
+            )
+            last_returncode = int(verify.returncode)
+            last_stdout = _tail_text(str(verify.stdout or ""))
+            last_stderr = _tail_text(str(verify.stderr or ""))
+            last_detail = last_stdout or last_stderr
+            if verify.returncode == 0:
+                return {
+                    "ok": True,
+                    "attempts": attempts,
+                    "verify_command": verify_text,
+                    "stdout": last_stdout,
+                    "stderr": last_stderr,
+                    "detail": last_detail,
+                    "returncode": 0,
+                }
+        except subprocess.TimeoutExpired as exc:
+            last_returncode = None
+            last_stdout = _tail_text(str(exc.stdout or ""))
+            last_stderr = _tail_text(str(exc.stderr or ""))
+            last_detail = last_stderr or last_stdout or f"verify timed out after {attempt_timeout_s:.0f}s"
+        except Exception as exc:
+            last_returncode = None
+            last_stdout = ""
+            last_stderr = str(exc)
+            last_detail = str(exc)
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return {
+                "ok": False,
+                "attempts": attempts,
+                "verify_command": verify_text,
+                "stdout": last_stdout,
+                "stderr": last_stderr,
+                "detail": last_detail,
+                "returncode": last_returncode,
+            }
+        time.sleep(min(interval_s, max(0.1, remaining)))
+
+
 def _deploy_after_order_merge(
     *,
     cfg: BotConfig,
@@ -12426,27 +13488,23 @@ def _deploy_after_order_merge(
 
     verify_command = [str(piece) for piece in policy.get("verify_command") or [] if str(piece).strip()]
     if verify_command:
-        verify_text = shlex.join(verify_command)
-        verify = subprocess.run(
-            verify_command,
+        verify_result = _run_deploy_verify_with_retries(
+            verify_command=verify_command,
             cwd=cwd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=min(timeout_seconds, 120),
-            check=False,
+            timeout_seconds=timeout_seconds,
         )
-        if verify.returncode != 0:
+        if not bool(verify_result.get("ok", False)):
             return {
                 "status": "failed",
                 "reason": "verify_failed",
                 "summary": "Deploy completed but verification failed.",
                 "command": command_text,
-                "verify_command": verify_text,
+                "verify_command": verify_result.get("verify_command"),
+                "verify_attempts": verify_result.get("attempts"),
                 "stdout": stdout_tail,
-                "stderr": _tail_text(str(verify.stderr or "")),
-                "detail": _tail_text(str(verify.stdout or "") or str(verify.stderr or "")),
+                "stderr": verify_result.get("stderr"),
+                "detail": verify_result.get("detail"),
             }
 
     return {
@@ -12456,6 +13514,8 @@ def _deploy_after_order_merge(
         "command": command_text,
         "stdout": stdout_tail,
         "stderr": stderr_tail,
+        "verify_command": (shlex.join(verify_command) if verify_command else None),
+        "verify_attempts": (verify_result.get("attempts") if verify_command else None),
         "deployed_commit": (deployed_commit or merge_commit or None),
     }
 
@@ -12511,10 +13571,17 @@ def _factory_sync_repo_registry(
         metadata = dict(existing.get("metadata") or {})
         metadata.update(dict(row.get("metadata") or {}))
         metadata["last_seen_at"] = float(now)
+        previous_default_branch = str(existing.get("default_branch") or "").strip()
+        default_branch = _factory_repo_default_branch_for_sync(
+            existing=existing,
+            discovered=row,
+            metadata=metadata,
+            now=float(now),
+        )
         orch_q.upsert_repo(
             repo_id=repo_id,
             path=str(row.get("path") or ""),
-            default_branch=str(existing.get("default_branch") or row.get("default_branch") or "main"),
+            default_branch=default_branch,
             autonomy_enabled=bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True))),
             priority=int(existing.get("priority") or row.get("priority") or 2),
             runtime_mode=str(existing.get("runtime_mode") or row.get("runtime_mode") or "ceo-bounded"),
@@ -12522,6 +13589,21 @@ def _factory_sync_repo_registry(
             status=str(existing.get("status") or row.get("status") or "active"),
             metadata=metadata,
         )
+        if previous_default_branch and default_branch != previous_default_branch:
+            try:
+                orch_q.append_audit_event(
+                    event_type="repo.default_branch_reconciled",
+                    actor="factory_sync",
+                    details={
+                        "repo_id": repo_id,
+                        "repo_path": str(row.get("path") or ""),
+                        "previous_default_branch": previous_default_branch,
+                        "default_branch": default_branch,
+                        "discovered_default_branch": str(row.get("default_branch") or "").strip() or "main",
+                    },
+                )
+            except Exception:
+                pass
     for repo_id, existing in existing_rows.items():
         if not repo_id or repo_id in discovered_ids:
             continue
@@ -12812,44 +13894,46 @@ def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
     catalog = [
         {
             "key": "poncebot-core",
-            "title": "Proactive Sprint: PonceBot Reliability + Workflow Quality",
+            "title": "Proactive Sprint: PonceBot Product + Autonomy Upgrades",
             "lane": "bot",
             "project_hint": "/home/aponce/codexbot",
             "goal": (
-                "Improve orchestration reliability, reduce noisy notifications, tighten evidence gates, "
-                "ship useful new workflow features, and strengthen end-to-end Telegram traceability."
+                "Ship meaningful autonomy, product, or operator-workflow upgrades. Fix bugs only when there is "
+                "specific evidence of a high-impact failure; otherwise prefer a notable new capability or deeper "
+                "workflow improvement that makes PonceBot visibly more useful."
             ),
             "success": (
-                "Ship one concrete reliability, workflow-quality, or feature improvement inside /home/aponce/codexbot, "
-                "with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
+                "Ship one merged, pushed, and deployable PonceBot capability, workflow improvement, or substantial "
+                "bugfix with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
             ),
         },
         {
             "key": "executive-dashboard",
-            "title": "Proactive Sprint: Executive Dashboard UX + Observability",
+            "title": "Proactive Sprint: Executive Dashboard Features + UX",
             "lane": "dashboard",
             "project_hint": "/home/aponce/ExecutiveDashboard",
             "goal": (
-                "Improve executive readability, reduce visual friction, add useful operator features, "
-                "and strengthen live telemetry and agent-trace usability for daily operations."
+                "Ship visible operator features, clearer workflows, and useful live telemetry. Fix bugs only when "
+                "they block real operator value; otherwise prefer product improvements that make daily operations "
+                "more obvious and actionable."
             ),
             "success": (
-                "Ship one operator-facing UX, feature, or observability improvement with screenshots, telemetry proof, "
-                "or health evidence and no regression to auth/control paths."
+                "Ship one merged, pushed, deployed operator-facing UX, feature, or observability improvement with "
+                "screenshots, telemetry proof, or health evidence and no regression to auth/control paths."
             ),
         },
         {
             "key": "android-parity",
-            "title": "Proactive Sprint: Android App Parity + Product Polish",
+            "title": "Proactive Sprint: Android App Features + Product Polish",
             "lane": "android",
             "project_hint": mobile_path,
             "goal": (
-                "Close parity gaps versus web dashboard, improve native UX quality, and validate via "
-                "emulator evidence with concrete screenshots."
+                "Ship native Android features or product polish that make the app more useful. Fix bugs only when "
+                "there is evidence they block a real workflow; otherwise prefer visible native UX/capability gains."
             ),
             "success": (
-                "Ship one user-visible parity or polish improvement with emulator screenshots and a concise "
-                "validation note proving the change is real and regression-safe."
+                "Ship one merged, pushed, deployable user-visible feature, parity, or polish improvement with "
+                "emulator screenshots and a concise validation note proving the change is real and regression-safe."
             ),
         },
     ]
@@ -12880,6 +13964,7 @@ def _is_proactive_order_record(row: dict[str, Any] | None) -> bool:
     title = str(row.get("title") or "").strip()
     body = str(row.get("body") or "").strip()
     blob = f"{title}\n{body}".lower()
+
     if "autonomous proactive sprint" in blob:
         return True
     if title.lower().startswith("proactive sprint"):
@@ -13086,6 +14171,7 @@ def _spawn_proactive_order(
             runtime_mode="venv",
         )
         project_id = str(workspace.get("project_id") or "").strip()
+
         project_name = str(workspace.get("name") or title).strip() or title
         project_path = str(workspace.get("path") or "").strip()
 
@@ -13114,8 +14200,32 @@ def _spawn_proactive_order(
             except Exception:
                 pass
 
+
     order_branch = _order_branch_name(order_id, title)
     branch_repo = Path(repo_path).expanduser().resolve() if repo_path else cfg.codex_workdir
+    if repo_id and repo_path:
+        blocker = _factory_repo_autonomy_blocker(branch_repo, default_branch=str(repo_default_branch or "main"))
+        if blocker:
+            try:
+                orch_q.set_repo_status(repo_id=repo_id, status="blocked")
+            except Exception:
+                pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="factory.repo_autonomy_blocked",
+                    actor=controller_role,
+                    details={
+                        "repo_id": repo_id,
+                        "repo_path": repo_path,
+                        "default_branch": str(repo_default_branch or "main"),
+                        "reason": blocker,
+                        "initiative": key,
+                    },
+                )
+            except Exception:
+                pass
+
+            return False
     ok_branch, branch_msg = _git_ensure_branch_from_main(
         branch_repo,
         str(order_branch),
@@ -13152,8 +14262,8 @@ def _spawn_proactive_order(
         f"Sprint day: {sprint_day} of 5",
         f"Order ID: {order_id}",
         f"Project ID: {project_id or '(pending)'}",
-        f"Project workspace: {project_path or '(n/a)'}",
-        *( [f"Authorized repo root: {repo_path}"] if repo_path else [] ),
+        f"Registered project workspace: {project_path or '(n/a)'}",
+        *( [f"Registered repo root (controller read-only): {repo_path}"] if repo_path else [] ),
         *( [f"Repo default branch: {repo_default_branch}"] if repo_path else [] ),
         f"Project hint: {project_hint or '(none)'}",
         f"Goal: {goal}",
@@ -13164,23 +14274,32 @@ def _spawn_proactive_order(
         "",
         "Execution policy:",
         (
-            "- Work only inside the registered repo root above; do not create new repos or touch sibling repos."
+            "- Scope decisions to the registered repo root above; do not create new repos or touch sibling repos. Controller access is read-only."
             if repo_path
             else "- Work only inside this initiative scope; do not touch unrelated projects."
         ),
-        "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, or refactor slice that can be validated today.",
+        "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
+        "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",
+        "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
+        "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
+        "- Bugfixes are allowed only with concrete evidence of a P0/P1 operator/customer-impacting failure, security risk, data loss risk, broken deploy, or failing required validation.",
+        "- If no P0/P1 bug is evidenced, default to FEATURE, PRODUCT_WORKFLOW, or NEW_PROJECT_PHASE rather than tiny maintenance.",
+        "- A valid feature must be notable to an operator or user: new workflow, new dashboard insight, new control surface, new integration, automation, or capability expansion.",
         "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.",
         "- Task selection priority (deterministic):",
-        "  1) repeated conversion failures in the local funnel,",
-        "  2) reliability/evidence tests currently failing or flaky,",
-        "  3) useful operator/customer-facing features or UX improvements,",
-        "  4) debt/refactors that measurably reduce operational noise or unlock better delivery.",
+        "  1) P0/P1 operator/customer-impacting failures with exact evidence,",
+        "  2) required validation, deploy, merge, or data-integrity failures currently reproducible,",
+        "  3) useful operator/customer-facing features, product workflows, or new-project phases,",
+        "  4) deeper refactors that unlock a concrete future feature or remove a delivery bottleneck,",
+        "  5) low-level maintenance only when it directly blocks delivery or removes measurable operational noise.",
         "- Do not seed a new local task for a role that already has open work on this ticket.",
         "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.",
         "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.",
         "- New capabilities, deeper refactors, and ambitious product ideas are allowed; decompose them into reversible, reviewable, deployable phases.",
         "- Ask the CEO first only for destructive/irreversible actions, credential or billing changes, public launches, high-risk data migrations, or external purchases.",
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
+        "- Delivery requirement: validated code changes must be merged to the repo default branch, pushed, and deployed through the registered deploy hook when available.",
+        "- Do not mark branch-only work as done. If merge, push, or deploy cannot happen, close as BLOCKED_WITH_ROOT_CAUSE with the exact blocker and next recovery step.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
         "- Default to one bounded local slice plus one validation slice; do not spray parallel tasks.",
@@ -13427,21 +14546,23 @@ def _proactive_lane_tick(
             repo_key = re.sub(r"[^a-z0-9_-]+", "_", repo_id)
             initiative = {
                 "key": f"repo_{repo_key}",
-                "title": f"Proactive Sprint: {Path(str(repo.get('path') or repo_id)).name} Reliability + Delivery",
+                "title": f"Proactive Sprint: {Path(str(repo.get('path') or repo_id)).name} Impact + Product Delivery",
                 "lane": "factory",
                 "project_hint": str(repo.get("path") or ""),
                 "goal": (
-                    "Ship one bounded bugfix, issue-resolution, reliability, quality, maintenance, feature, UX/product, "
-                    "or refactor improvement inside this registered repo, with real evidence and no cross-repo writes."
+                    "Ship one bounded, notable product, UX, automation, integration, or new-project phase inside this "
+                    "registered repo. Fix bugs only when exact evidence shows a high-impact failure; otherwise prefer "
+                    "a feature or deeper capability that makes the repo visibly more valuable."
                 ),
                 "success": (
-                    "Close one verified repo improvement or feature slice with concrete evidence such as tests, validation logs, screenshots, or a reviewed patch."
+                    "Close one verified repo feature or substantial improvement with concrete evidence such as tests, "
+                    "validation logs, screenshots, or a reviewed patch, then merge, push, and deploy if a deploy hook exists."
                 ),
                 "expected_measurable_delta": (
-                    "Increase validated improvements per repo while keeping local failure rate and queue pressure bounded."
+                    "Increase shipped visible value per repo while keeping local failure rate and queue pressure bounded."
                 ),
                 "stop_condition": (
-                    "Stop when one verified improvement is closed for this repo or when the repo is blocked with a concrete root cause."
+                    "Stop when one verified, merged/pushed/deployed improvement is closed for this repo or when the repo is blocked with a concrete root cause."
                 ),
             }
             ok = _spawn_proactive_order(
@@ -13470,6 +14591,7 @@ def _proactive_lane_tick(
 
                 _update_state(cfg, _m)
             except Exception:
+
                 pass
         if created > 0:
             try:
@@ -13527,9 +14649,24 @@ def _enqueue_reviewer_local_rework_if_due(
     except Exception:
         return False
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+
+    def _child_key(child: Any) -> str:
+        labels = getattr(child, "labels", {}) or {}
+        if not isinstance(labels, dict):
+            return ""
+        return str(labels.get("key") or "").strip().lower()
+
+    def _is_rework_lane_child(child: Any) -> bool:
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if _is_local_support_role_name(role_norm):
+            return True
+        if role_norm in {"backend", "qa"} and key.startswith(("local_impl_recover_", "local_review_recover_")):
+            return True
+        return False
+
     if any(
-        _is_local_support_role_name(_coerce_orchestrator_role(str(getattr(child, "role", "") or "")))
-        and str(getattr(child, "state", "") or "").strip().lower() in active_states
+        _is_rework_lane_child(child) and str(getattr(child, "state", "") or "").strip().lower() in active_states
         for child in children
     ):
         return False
@@ -13537,15 +14674,18 @@ def _enqueue_reviewer_local_rework_if_due(
     latest_review = None
     latest_review_summary = ""
     latest_review_ts = 0.0
+    latest_review_role = ""
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
-        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "reviewer_local":
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if role_norm != "reviewer_local" and not (role_norm == "qa" and key.startswith("local_review_recover_")):
             continue
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
         if ts <= 0 or (float(now) - ts) > 3600.0:
             continue
-        summary = _task_local_specialist_response(child, max_chars=5000)
+        summary = _task_local_specialist_response(child, max_chars=5000) if role_norm == "reviewer_local" else ""
         if not summary:
             trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
             summary = str(trace.get("result_summary") or "").strip()
@@ -13554,6 +14694,7 @@ def _enqueue_reviewer_local_rework_if_due(
         latest_review = child
         latest_review_summary = summary[:5000]
         latest_review_ts = ts
+        latest_review_role = role_norm
         break
     if latest_review is None or not latest_review_summary:
         return False
@@ -13561,8 +14702,11 @@ def _enqueue_reviewer_local_rework_if_due(
     latest_impl = None
     latest_impl_ts = 0.0
     latest_impl_no_change_ts = 0.0
+    latest_impl_role = ""
     for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
-        if _coerce_orchestrator_role(str(getattr(child, "role", "") or "")) != "implementer_local":
+        role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        key = _child_key(child)
+        if role_norm != "implementer_local" and not (role_norm == "backend" and key.startswith("local_impl_recover_")):
             continue
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
@@ -13575,6 +14719,7 @@ def _enqueue_reviewer_local_rework_if_due(
         if _trace_has_validated_slice_evidence(trace):
             latest_impl = child
             latest_impl_ts = ts
+            latest_impl_role = role_norm
             break
     if max(latest_impl_ts, latest_impl_no_change_ts) > (latest_review_ts + 5.0):
         return False
@@ -13584,6 +14729,8 @@ def _enqueue_reviewer_local_rework_if_due(
     review_suffix = ""
     if review_key_raw.startswith("local_review_guard_"):
         review_suffix = review_key_raw[len("local_review_guard_") :].strip()
+    elif review_key_raw.startswith("local_review_recover_"):
+        review_suffix = review_key_raw[len("local_review_recover_") :].strip()
     if not review_suffix:
         review_suffix = str(getattr(latest_review, "job_id", "") or "").split("-", 1)[0].strip()
     used_keys = {
@@ -13592,11 +14739,19 @@ def _enqueue_reviewer_local_rework_if_due(
         if str(((getattr(child, "labels", {}) or {}) if isinstance(getattr(child, "labels", {}), dict) else {}).get("key") or "").strip()
     }
     base_suffix = review_suffix or str(max(1, int(now)))
-    impl_key = f"local_impl_guard_{base_suffix}_r2"
+    use_cli_roles = latest_review_role == "qa" or latest_impl_role == "backend" or review_key_raw.startswith("local_review_recover_")
+    impl_prefix = "local_impl_recover" if use_cli_roles else "local_impl_guard"
+    review_prefix = "local_review_recover" if use_cli_roles else "local_review_guard"
+    impl_key = f"{impl_prefix}_{base_suffix}_r2"
     retry_n = 2
     while impl_key in used_keys:
         retry_n += 1
-        impl_key = f"local_impl_guard_{base_suffix}_r{retry_n}"
+        impl_key = f"{impl_prefix}_{base_suffix}_r{retry_n}"
+    review_key = f"{review_prefix}_{base_suffix}_r{retry_n}"
+    review_retry_n = retry_n
+    while review_key in used_keys or review_key == impl_key:
+        review_retry_n += 1
+        review_key = f"{review_prefix}_{base_suffix}_r{review_retry_n}"
 
     impl_trace = dict((getattr(latest_impl, "trace", {}) or {}) if latest_impl and isinstance(getattr(latest_impl, "trace", {}), dict) else {})
     impl_summary = _task_local_specialist_response(latest_impl, max_chars=7000) if latest_impl is not None else ""
@@ -13609,6 +14764,7 @@ def _enqueue_reviewer_local_rework_if_due(
     if not match:
         match = re.search(r"EXPECTED_VALIDATION:\s*`([^`]+)`", impl_summary or "", flags=re.IGNORECASE)
     validation_cmd = str(match.group(1) or "").strip() if match else ""
+
     if not validation_cmd:
         if len(changed_files) == 1 and changed_files[0].endswith('.py'):
             validation_cmd = f"python3 -m py_compile {shlex.quote(changed_files[0])}"
@@ -13617,6 +14773,17 @@ def _enqueue_reviewer_local_rework_if_due(
         else:
             validation_cmd = "git diff --stat"
 
+    root_trace: dict[str, Any] = {}
+    order_branch = ""
+    try:
+        root_job = orch_q.get_job(oid)
+        root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+        order_branch = str(root_trace.get("order_branch") or "").strip()
+    except Exception:
+        root_trace = {}
+        order_branch = ""
+    controller_artifacts = _controller_recovery_artifact_paths(root_trace)
+
     evidence_block = ""
     if impl_summary:
         evidence_block += "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n" + impl_summary
@@ -13624,10 +14791,16 @@ def _enqueue_reviewer_local_rework_if_due(
         evidence_block += "\n\nMANDATORY_FILE_SCOPE:\n- " + "\n- ".join(changed_files[:12])
     if impl_artifacts_dir:
         evidence_block += "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n" + impl_artifacts_dir
+    if controller_artifacts:
+        evidence_block += (
+            "\n\nORIGINAL_CONTROLLER_RECOVERY_ARTIFACTS:\n- "
+            + "\n- ".join(controller_artifacts[:12])
+            + "\nUse changes.patch from these artifacts when present. Do not use stash@{0} from your own worktree."
+        )
 
     spec = TaskSpec(
         key=impl_key,
-        role="implementer_local",
+        role="backend" if use_cli_roles else "implementer_local",
         text=(
             f"Reviewer-directed rework for ticket {oid}.\n"
             f"Reviewer job: {str(getattr(latest_review, "job_id", "") or "").strip() or "(unknown)"}\n"
@@ -13641,28 +14814,31 @@ def _enqueue_reviewer_local_rework_if_due(
             "- Do not ask for another architecture pass.\n"
             "- If code changes are still required, return one single fenced ```diff``` block or explicit rewrite block(s).\n"
             f"- After the code block(s), add EXPECTED_VALIDATION: `{validation_cmd}`.\n"
+            "- For controller recovery, treat ORIGINAL_CONTROLLER_RECOVERY_ARTIFACTS/changes.patch as authoritative when present; never replay stash@{0} from this worktree.\n"
             "- If the reviewer is only missing validation/file evidence and the existing code is already correct, do not invent a diff. Say explicitly that no code change is required, provide exact file evidence, and add EXPECTED_VALIDATION.\n"
             "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
         ),
-        mode_hint="ro",
+        mode_hint="rw" if use_cli_roles else "ro",
         priority=1,
         depends_on=[],
         requires_approval=False,
         acceptance_criteria=[
-            "Address the reviewer_local blocking issue directly without widening scope.",
+            "Address the reviewer blocking issue directly without widening scope.",
             "Return one bounded patch plus a targeted validation command.",
         ],
         definition_of_done=[
-            "A corrected implementer slice is ready for reviewer_local re-check.",
+            "A corrected implementer slice is ready for review re-check.",
         ],
         eta_minutes=40,
         sla_tier="high",
     )
 
-    child_profile = _orchestrator_profile(profiles, "implementer_local")
+    child_role = "backend" if use_cli_roles else "implementer_local"
+    review_role = "qa" if use_cli_roles else ""
+    child_profile = _orchestrator_profile(profiles, child_role)
     model = _orchestrator_model_for_profile(cfg, child_profile)
     effort = _orchestrator_effort_for_profile(child_profile, cfg)
-    mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+    mode_hint = _delegated_mode_hint_for_role(child_role, spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
     requires_approval = False
     child_id = str(uuid.uuid4())
     contract_text = _compose_subtask_instruction(spec, root_ticket=oid)
@@ -13670,9 +14846,9 @@ def _enqueue_reviewer_local_rework_if_due(
         "source": "scheduler",
         "delegated_by": str(getattr(latest_review, "job_id", "") or "").strip() or oid,
         "delegated_key": spec.key,
-        "requested_role": "implementer_local",
-        "profile_name": str(child_profile.get("name") or "implementer_local"),
-        "profile_role": "implementer_local",
+        "requested_role": child_role,
+        "profile_name": str(child_profile.get("name") or child_role),
+        "profile_role": child_role,
         "max_runtime_seconds": int(child_profile.get("max_runtime_seconds") or 0),
         "acceptance_criteria": list(spec.acceptance_criteria or []),
         "definition_of_done": list(spec.definition_of_done or []),
@@ -13684,20 +14860,14 @@ def _enqueue_reviewer_local_rework_if_due(
         "failure_class": "retriable",
         "attempt_n": int(retry_n),
         "improvement_verified": False,
-        "execution_policy": "local_only",
     }
-    order_branch = ""
-    try:
-        root_job = orch_q.get_job(oid)
-        root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
-        order_branch = str(root_trace.get("order_branch") or "").strip()
-    except Exception:
-        order_branch = ""
+    if not use_cli_roles:
+        trace["execution_policy"] = "local_only"
     if order_branch:
         trace["order_branch"] = str(order_branch)
     child = Task.new(
         source="telegram",
-        role="implementer_local",
+        role=child_role,
         input_text=contract_text,
         request_type="task",
         priority=int(spec.priority),
@@ -13719,12 +14889,88 @@ def _enqueue_reviewer_local_rework_if_due(
         job_id=child_id,
     )
     orch_q.submit_task(child)
+    review_child_id = ""
+    if review_role:
+        review_child_id = str(uuid.uuid4())
+        review_profile = _orchestrator_profile(profiles, review_role)
+        review_spec = TaskSpec(
+            key=review_key,
+            role=review_role,
+            text=(
+                f"QA re-check for reviewer-directed rework on ticket {oid}.\n"
+                f"Rework job: {child_id}\n"
+                f"Previous reviewer job: {str(getattr(latest_review, 'job_id', '') or '').strip() or '(unknown)'}\n\n"
+                "Verify the rework resolved the exact blocker below without widening scope.\n\n"
+                "PREVIOUS_REVIEWER_FINDINGS:\n"
+                f"{latest_review_summary}\n\n"
+                "Rules:\n"
+                "- Wait for the rework dependency to finish.\n"
+                "- Check changed files and validation evidence.\n"
+                "- Return READY only if the blocker is fixed and validation is credible.\n"
+                "- Otherwise return NEEDS_REWORK with one concrete next step.\n"
+            ),
+            mode_hint="ro",
+            priority=1,
+            depends_on=[impl_key],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Review verdict references the rework slice only.",
+                "Validation evidence is checked before READY.",
+            ],
+            definition_of_done=[
+                "QA returns READY or NEEDS_REWORK with explicit rationale.",
+            ],
+            eta_minutes=20,
+            sla_tier="high",
+        )
+        review_trace: dict[str, str | int | float | bool | list[str]] = {
+            "source": "scheduler",
+            "delegated_by": child_id,
+            "delegated_key": review_key,
+            "requested_role": review_role,
+            "profile_name": str(review_profile.get("name") or review_role),
+            "profile_role": review_role,
+            "max_runtime_seconds": int(review_profile.get("max_runtime_seconds") or 0),
+            "acceptance_criteria": list(review_spec.acceptance_criteria or []),
+            "definition_of_done": list(review_spec.definition_of_done or []),
+            "eta_minutes": int(review_spec.eta_minutes or 0),
+            "sla_tier": str(review_spec.sla_tier or "normal"),
+            "rework_for_job_id": child_id,
+            "previous_review_job_id": str(getattr(latest_review, "job_id", "") or "").strip(),
+        }
+        if order_branch:
+            review_trace["order_branch"] = str(order_branch)
+            review_child = Task.new(
+            source="telegram",
+            role=review_role,
+            input_text=_compose_subtask_instruction(review_spec, root_ticket=oid),
+            request_type="task",
+            priority=int(review_spec.priority),
+            model=_orchestrator_model_for_profile(cfg, review_profile),
+            effort=_orchestrator_effort_for_profile(review_profile, cfg),
+            mode_hint=_delegated_mode_hint_for_role(review_role, review_spec.mode_hint or str(review_profile.get("mode_hint") or "ro")),
+            requires_approval=False,
+            max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+            chat_id=int(chat_id),
+            is_autonomous=True,
+            parent_job_id=oid,
+            owner="scheduler",
+            depends_on=[child_id],
+            ttl_seconds=int(_ttl_seconds_from_spec(review_spec)),
+            max_retries=1,
+            labels={"ticket": oid, "kind": "subtask", "key": review_key},
+            artifacts_dir=str((cfg.artifacts_root / review_child_id).resolve()),
+            trace=review_trace,
+            job_id=review_child_id,
+        )
+        orch_q.submit_task(review_child)
     try:
         orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="executing")
         orch_q.update_trace(
             oid,
             local_rework_seeded_at=float(now),
             local_rework_seeded_job_id=child_id,
+            local_rework_review_job_id=review_child_id or None,
             local_rework_seeded_from_review=str(getattr(latest_review, 'job_id', '') or '').strip() or None,
             live_at=float(now),
         )
@@ -13734,6 +14980,9 @@ def _enqueue_reviewer_local_rework_if_due(
             details={
                 "order_id": oid,
                 "job_id": child_id,
+                "review_job_id": review_child_id or None,
+                "role": child_role,
+                "review_role": review_role or None,
                 "from_review_job_id": str(getattr(latest_review, 'job_id', '') or '').strip() or None,
                 "validation_cmd": validation_cmd,
             },
@@ -13856,6 +15105,261 @@ def _enqueue_proactive_local_architect_reseed(
     return True
 
 
+def _enqueue_operational_gate_reviewer_recovery(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    order_row: dict[str, Any],
+    children: list[Task],
+    root_trace: dict[str, Any],
+    chat_id: int,
+    now: float,
+    gate_reason: str,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid:
+        return False
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(
+        _is_local_support_role_name(_coerce_orchestrator_role(str(getattr(child, "role", "") or "")))
+        and str(getattr(child, "state", "") or "").strip().lower() in active_states
+        for child in children
+    ):
+        return False
+    review_schema_version = 3
+    try:
+        last_enqueued_at = float(root_trace.get("operational_gate_review_enqueued_at", 0.0) or 0.0)
+    except Exception:
+        last_enqueued_at = 0.0
+    try:
+        last_schema_version = int(root_trace.get("operational_gate_review_schema_version", 0) or 0)
+    except Exception:
+        last_schema_version = 0
+    try:
+        cooldown_s = max(
+            300.0,
+            float(os.environ.get("BOT_OPERATIONAL_GATE_REVIEW_COOLDOWN_SECONDS", "1200").strip() or "1200"),
+        )
+    except Exception:
+        cooldown_s = 1200.0
+    if last_schema_version >= review_schema_version and last_enqueued_at > 0 and (float(now) - last_enqueued_at) < cooldown_s:
+        return False
+
+    latest_impl_summary = ""
+    latest_impl_slice_id = ""
+    latest_review_summary = ""
+    for child in sorted(children, key=lambda c: float(getattr(c, "updated_at", 0.0) or getattr(c, "created_at", 0.0) or 0.0), reverse=True):
+        role = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
+        if str(getattr(child, "state", "") or "").strip().lower() != "done":
+            continue
+        summary = _task_local_specialist_response(child, max_chars=5000)
+        if not summary:
+            trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
+            summary = str(trace.get("result_summary") or "").strip()
+        if (not latest_impl_summary) and role in {"backend", "frontend", "implementer_local"}:
+            latest_impl_summary = str(summary or "").strip()
+            latest_impl_slice_id = _task_slice_id(child, root_ticket=oid)
+        if (not latest_review_summary) and role in {"qa", "reviewer_local"}:
+            latest_review_summary = str(summary or "").strip()
+        if latest_impl_summary and latest_review_summary:
+            break
+
+    if not latest_impl_slice_id:
+        try:
+            skip_reason = "missing_implementer_delivery_slice"
+            gate_reason_norm = str(gate_reason or "").strip()
+            try:
+                last_skip_at = float(root_trace.get("operational_gate_review_skipped_at", 0.0) or 0.0)
+            except Exception:
+                last_skip_at = 0.0
+            last_skip_reason = str(root_trace.get("operational_gate_review_skip_reason") or "").strip()
+            last_skip_gate_reason = str(root_trace.get("operational_gate_review_reason") or "").strip()
+            should_record_skip = (
+                last_skip_at <= 0.0
+                or (float(now) - last_skip_at) >= cooldown_s
+                or last_skip_reason != skip_reason
+                or last_skip_gate_reason != gate_reason_norm
+            )
+            if not should_record_skip:
+                return False
+            orch_q.update_trace(
+                oid,
+                operational_gate_review_skipped_at=float(now),
+                operational_gate_review_skip_reason=skip_reason,
+                operational_gate_review_reason=gate_reason_norm,
+                live_at=float(now),
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_review_skipped",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "reason": gate_reason_norm,
+                    "skip_reason": skip_reason,
+                },
+            )
+        except Exception:
+            pass
+        return False
+
+    stamp = max(1, int(now))
+    review_key = f"local_review_operational_gate_{stamp}"
+    target_slice_id = _sanitize_slice_token(latest_impl_slice_id, fallback=review_key)
+    child_id = str(uuid.uuid4())
+    role = "reviewer_local"
+    profile = _orchestrator_profile(profiles, role)
+    model = _orchestrator_model_for_profile(cfg, profile)
+    effort = _orchestrator_effort_for_profile(profile, cfg)
+    order_branch = str(root_trace.get("order_branch") or "").strip()
+    repo_id = str(root_trace.get("repo_id") or "").strip()
+    repo_path = str(root_trace.get("repo_path") or "").strip()
+    task = Task.new(
+        source="telegram",
+        role=role,
+        input_text=(
+            f"Operational gate recovery review for ticket {oid}.\n"
+            f"Gate blocked merge because: {str(gate_reason or '').strip() or 'unknown'}.\n"
+            f"Repo ID: {repo_id or '(unknown)'}\n"
+            f"Repo path: {repo_path or '(unknown)'}\n"
+            f"Order branch: {order_branch or '(unknown)'}\n\n"
+            f"Target slice_id: {target_slice_id}\n"
+            "Goal: verify the latest implementer slice with real commands and decide if it is safe to merge.\n"
+            "Do not modify files. Do not mark READY if any required validation is only implied or still pending.\n\n"
+            "Latest implementer summary:\n"
+            f"{latest_impl_summary or '(missing)'}\n\n"
+            "Latest review summary:\n"
+            f"{latest_review_summary or '(missing)'}\n\n"
+            "Required output:\n"
+            "- READY only if the branch has a concrete validated improvement and all requested validation has actually run or has a grounded equivalent.\n"
+            "- NEEDS_REWORK with exact failing command and next implementer instruction if anything remains unverified.\n"
+            "- BLOCKED_WITH_ROOT_CAUSE only for an external blocker that cannot be fixed in this repo."
+        ),
+        request_type="task",
+        priority=2,
+        model=model,
+        effort=effort,
+        mode_hint="ro",
+        requires_approval=False,
+        max_cost_window_usd=float(cfg.orchestrator_default_max_cost_window_usd),
+        chat_id=int(chat_id),
+        is_autonomous=True,
+        parent_job_id=oid,
+        owner="scheduler",
+        depends_on=[],
+        ttl_seconds=1800,
+        max_retries=0,
+        labels={"ticket": oid, "kind": "subtask", "key": review_key, "order": oid, "recovery": "operational_gate"},
+        artifacts_dir=str((cfg.artifacts_root / child_id).resolve()),
+        trace={
+            "source": "operational_maturity_gate",
+            "slice_id": target_slice_id,
+            "review_task_key": review_key,
+            "slice_status": "review",
+            "quality_gate_status": "review",
+            "failure_class": "review_required",
+            "operational_gate_reason": str(gate_reason or "").strip(),
+            "operational_gate_review_schema_version": review_schema_version,
+            "order_branch": order_branch,
+            "repo_id": repo_id,
+            "repo_path": repo_path,
+        },
+        job_id=child_id,
+    )
+    orch_q.submit_task(task)
+    try:
+        orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+        orch_q.update_trace(
+            oid,
+            merge_ready=False,
+            operational_gate_review_enqueued_at=float(now),
+            operational_gate_review_job_id=child_id,
+            operational_gate_review_schema_version=review_schema_version,
+            operational_gate_review_target_slice_id=target_slice_id,
+            operational_gate_review_reason=str(gate_reason or "").strip(),
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.operational_gate_review_enqueued",
+            actor="skynet",
+            details={
+                "order_id": oid,
+                "job_id": child_id,
+                "reason": str(gate_reason or "").strip(),
+            },
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _close_proactive_terminal_root_failure(
+    *,
+    orch_q: OrchestratorQueue,
+    order_row: dict[str, Any],
+    root_job: Task | None,
+    children: list[Task],
+    chat_id: int,
+    now: float,
+) -> bool:
+    oid = str(order_row.get("order_id") or "").strip()
+    if not oid or not _is_proactive_order_record(order_row) or root_job is None:
+        return False
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    if root_state not in _OPERATIONAL_GATE_BAD_TERMINAL_STATES:
+        return False
+    root_trace = dict((getattr(root_job, "trace", None) or {}) if root_job is not None else {})
+    if bool(root_trace.get("merged_to_main", False)) or bool(root_trace.get("proactive_improvement_closed", False)):
+        return False
+    if bool(root_trace.get("proactive_no_change_validated", False)) or bool(root_trace.get("proactive_blocked_with_root_cause", False)):
+        return False
+
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    if any(str(getattr(child, "state", "") or "").strip().lower() in active_states for child in children):
+        return False
+    if any(str(getattr(child, "state", "") or "").strip().lower() == "done" for child in children):
+        return False
+
+    try:
+        last_closed_at = float(root_trace.get("proactive_terminal_failure_closed_at", 0.0) or 0.0)
+    except Exception:
+        last_closed_at = 0.0
+    if last_closed_at > 0.0:
+        return False
+
+    reason = f"root_job_terminal_{root_state}_without_delivery"
+    summary = str(root_trace.get("workspace_error") or root_trace.get("result_summary") or "").strip()
+    try:
+        orch_q.set_order_status(oid, chat_id=int(chat_id), status="failed")
+        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="failed")
+        orch_q.update_trace(
+            oid,
+            merge_ready=False,
+            proactive_terminal_failure_closed=True,
+            proactive_terminal_failure_closed_at=float(now),
+            proactive_terminal_failure_reason=reason,
+            operational_gate_status="failed",
+            operational_gate_reason=reason,
+            operational_gate_root_state=root_state,
+            operational_gate_checked_at=float(now),
+            live_at=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.proactive_terminal_failure_closed",
+            actor="skynet",
+            details={
+                "order_id": oid,
+                "reason": reason,
+                "root_state": root_state,
+                "summary": summary[:500],
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _enqueue_order_autopilot_task(
     *,
     cfg: BotConfig,
@@ -13896,6 +15400,39 @@ def _enqueue_order_autopilot_task(
     root_job = orch_q.get_job(oid)
     root_trace = dict((root_job.trace if root_job else {}) or {})
     is_proactive = _is_proactive_order_record(order_row)
+    if _close_proactive_terminal_root_failure(
+        orch_q=orch_q,
+        order_row=order_row,
+        root_job=root_job,
+        children=list(children or []),
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return False
+    root_state_norm = str(getattr(root_job, "state", "") or "").strip().lower() if root_job is not None else ""
+    if is_proactive and _operational_gate_is_live_state(root_state_norm):
+        try:
+            last_wait_at = float(root_trace.get("proactive_root_live_wait_at", 0.0) or 0.0)
+        except Exception:
+            last_wait_at = 0.0
+        if last_wait_at <= 0.0 or (float(now) - last_wait_at) >= 300.0:
+            next_phase = "executing" if root_state_norm == "running" else "delegated" if root_state_norm in ("queued", "waiting_deps") else "review"
+            try:
+                orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(oid, chat_id=int(chat_id), phase=next_phase)
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    proactive_root_live_wait_at=float(now),
+                    operational_gate_status="waiting",
+                    operational_gate_reason=f"root_job_still_{root_state_norm}",
+                    operational_gate_root_state=root_state_norm,
+                    operational_gate_checked_at=float(now),
+                    live_at=float(now),
+                )
+            except Exception:
+                pass
+        return False
     if is_proactive:
         try:
             _repo_record, repo_dir, default_branch = _repo_context_for_order(
@@ -13911,7 +15448,80 @@ def _enqueue_order_autopilot_task(
             )
         except Exception:
             merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
+            repo_dir = Path(str(root_trace.get("repo_path") or ".")).expanduser()
+            default_branch = str(root_trace.get("repo_default_branch") or "main").strip() or "main"
         if merge_required or bool(root_trace.get("merge_ready", False)):
+            try:
+                gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=int(chat_id),
+                    repo_dir=repo_dir,
+                    default_branch=default_branch,
+                    merge_required=bool(merge_required),
+                    now=float(now),
+                    require_merge_ready=False,
+                    require_proactive_closure=False,
+                )
+            except Exception as exc:
+                gate_ok = False
+                gate_reason = f"operational_gate_exception:{type(exc).__name__}"
+                gate_payload = {"operational_gate_checked_at": float(now)}
+            if not gate_ok:
+                try:
+                    gate_block_cooldown = max(
+                        300.0,
+                        float(os.environ.get("BOT_AUTOPILOT_MERGE_GATE_BLOCK_COOLDOWN_SECONDS", "900").strip() or "900"),
+                    )
+                except Exception:
+                    gate_block_cooldown = 900.0
+                try:
+                    last_blocked_at = float(root_trace.get("autopilot_merge_gate_blocked_at", 0.0) or 0.0)
+                except Exception:
+                    last_blocked_at = 0.0
+                previous_reason = str(root_trace.get("autopilot_merge_gate_blocked_reason") or root_trace.get("operational_gate_reason") or "")
+                already_blocked = (
+                    phase == "review"
+                    and not bool(root_trace.get("merge_ready", False))
+                    and previous_reason == str(gate_reason)
+                )
+                should_record_gate_block = (not already_blocked) or last_blocked_at <= 0.0 or (float(now) - last_blocked_at) >= gate_block_cooldown
+                if should_record_gate_block:
+                    try:
+                        orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
+                        orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="review")
+                        orch_q.update_trace(
+                            oid,
+                            merge_ready=False,
+                            autopilot_deferred_to_merge=False,
+                            autopilot_merge_gate_blocked_at=float(now),
+                            autopilot_merge_gate_blocked_reason=str(gate_reason),
+                            operational_gate_status="blocked",
+                            operational_gate_reason=str(gate_reason),
+                            live_at=float(now),
+                            **gate_payload,
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.autopilot_merge_defer_blocked",
+                            actor="skynet",
+                            details={
+                                "order_id": oid,
+                                "reason": str(gate_reason),
+                            },
+                        )
+                    except Exception:
+                        pass
+                return _enqueue_operational_gate_reviewer_recovery(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    profiles=profiles,
+                    order_row=order_row,
+                    children=list(children or []),
+                    root_trace=dict(root_trace),
+                    chat_id=int(chat_id),
+                    now=float(now),
+                    gate_reason=str(gate_reason),
+                )
             try:
                 orch_q.set_order_status(oid, chat_id=int(chat_id), status="active")
                 orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="ready_for_merge")
@@ -13921,7 +15531,10 @@ def _enqueue_order_autopilot_task(
                     merge_ready_at=float(now),
                     autopilot_deferred_to_merge=True,
                     autopilot_deferred_to_merge_at=float(now),
+                    operational_gate_status="passed",
+                    operational_gate_reason=str(gate_reason),
                     live_at=float(now),
+                    **gate_payload,
                     **_merge_ready_trace_reset_payload(now=float(now)),
                 )
                 orch_q.append_audit_event(
@@ -13948,6 +15561,15 @@ def _enqueue_order_autopilot_task(
             reason=str(reason or "").strip() or "forced_local_architect_reseed",
         ):
             return True
+    if _enqueue_reviewer_local_rework_if_due(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        order_row=order_row,
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return True
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     latest_activity = 0.0
     for index, candidate in enumerate([root_job, *children]):
@@ -14050,6 +15672,7 @@ def _enqueue_order_autopilot_task(
         request_type="maintenance",
         priority=int(pr_i),
         model="",
+
         effort="medium",
         mode_hint="ro",
         requires_approval=False,
@@ -14345,6 +15968,8 @@ def _normalize_task_spec_contract(spec: TaskSpec, *, root_ticket: str) -> TaskSp
         if mode_hint in ("rw", "full"):
             mode_hint = "ro"
         requires_approval = False
+    elif role_norm in _WRITE_ENABLED_DELEGATED_ROLE_NAMES and mode_hint in ("", "ro"):
+        mode_hint = "rw"
 
     # Keep all delegated work bound to an explicit contract so queue/runtime can reason about it.
     return TaskSpec(
@@ -14570,6 +16195,7 @@ def _inject_local_specialist_specs(
 
     arch_key: str | None = None
     impl_key: str | None = None
+
 
     if "architect_local" not in roles_present and available_slots > 0:
         arch_key = _unique_subtask_key("local_architecture", used_keys)
@@ -14870,6 +16496,55 @@ def _local_slice_expected_validation_cmd(candidate_files: list[str]) -> str:
     return f"./scripts/bootstrap_pytest_python3.sh -m pytest -q {test_target}"
 
 
+def _normalize_controller_write_policy_changed_path(path: Any) -> str:
+    rel_path = str(path).strip()
+    for scope in ("controller_snapshot:", "worktree:", "base_repo:"):
+        if rel_path.startswith(scope):
+            rel_path = rel_path[len(scope) :].strip()
+            break
+    if rel_path.startswith(("HEAD:", "BRANCH:")):
+        return ""
+    return rel_path
+
+
+def _controller_recovery_artifact_paths(*payloads: Any) -> list[str]:
+    paths: list[str] = []
+
+    def add(raw: Any) -> None:
+        path = str(raw or "").strip()
+        if path and path not in paths:
+            paths.append(path)
+
+    def walk(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in ("controller_recovery_artifacts", "result_artifacts", "artifacts"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    add(item)
+        write_policy = payload.get("write_policy_violation")
+        if isinstance(write_policy, dict):
+            add(write_policy.get("status_artifact"))
+            cleanup_items = write_policy.get("cleanup")
+            if isinstance(cleanup_items, list):
+                for cleanup in cleanup_items:
+                    if not isinstance(cleanup, dict):
+                        continue
+                    add(cleanup.get("artifact"))
+                    for nested_key in ("branch_restore", "head_restore"):
+                        nested = cleanup.get(nested_key)
+                        if isinstance(nested, dict):
+                            add(nested.get("artifact"))
+        structured = payload.get("structured_digest")
+        if isinstance(structured, dict):
+            walk(structured)
+
+    for payload in payloads:
+        walk(payload)
+    return paths
+
+
 def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     if not isinstance(structured_digest, dict):
         return []
@@ -14881,7 +16556,11 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
 
     write_policy = structured_digest.get("write_policy_violation") if isinstance(structured_digest.get("write_policy_violation"), dict) else {}
     changed_paths_raw = write_policy.get("changed_paths") if isinstance(write_policy, dict) else []
-    changed_paths = [str(p).strip() for p in (changed_paths_raw or []) if str(p).strip()]
+    changed_paths = [
+        rel_path
+        for p in (changed_paths_raw or [])
+        if (rel_path := _normalize_controller_write_policy_changed_path(p))
+    ]
     if not changed_paths:
         return []
 
@@ -14905,14 +16584,24 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     controller_intent = summary or (
         "Recreate the bounded patch the controller prepared, but do it through implementer_local so the change stays inside local-only policy."
     )
+    recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
+    recovery_artifact_block = ""
+    if recovery_artifacts:
+        recovery_artifact_block = (
+            "Authoritative controller recovery artifacts:\\n"
+            + "\\n".join(f"- `{path}`" for path in recovery_artifacts[:8])
+            + "\\nUse `changes.patch` from this list when present. Do not use `stash@{0}` from your own worktree; that stash is local to the wrong repo.\\n\\n"
+        )
     implementer_text = (
         "Local recovery for a controller write-policy violation.\\n"
         "The controller identified a bounded patch but cannot edit the repository directly.\\n"
         f"Target files:\\n{file_list}\\n\\n"
         f"Controller intent:\\n{controller_intent}\\n\\n"
+        f"{recovery_artifact_block}"
         "Rules:\\n"
         "- Work only in the listed files.\\n"
         "- Keep the patch bounded to the controller intent; do not expand scope.\\n"
+        "- If the authoritative patch is already present, do not create churn. Publish ticket-scoped no-op evidence that names this ticket, this recovery key, the existing commit/file evidence, and the validation command output.\\n"
         f"- Run this validation command before finishing: `{validation_cmd}`.\\n"
         "- Return the patch, changed files, and validation output/evidence.\\n"
         + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
@@ -14924,6 +16613,7 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
         "Rules:\\n"
         "- Review only the newest implementer_local recovery slice for this ticket.\\n"
         "- Require concrete validation evidence before READY.\\n"
+        "- READY is allowed for a policy-approved no-op only when the implementer names this ticket, this recovery key, the authoritative controller artifact, the existing commit/file evidence, and the validation result.\\n"
         "- Return READY or NEEDS_REWORK with one concrete next step.\\n"
     )
     return [
@@ -15273,6 +16963,7 @@ def _objective_filter_specs(
     if not kept and specs:
         kept = sorted(specs, key=lambda s: int(s.priority or 2))[: min(2, len(specs))]
     if len(kept) > int(max_keep):
+
         dropped += len(kept) - int(max_keep)
         kept = kept[: int(max_keep)]
     return kept, int(dropped)
@@ -15794,7 +17485,7 @@ def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
     key_norm = str(key or "").strip().lower()
     if not key_norm:
         return _sanitize_slice_token(fallback, fallback="slice")
-    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground)_(.+)$", key_norm)
+    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground|recover)_(.+)$", key_norm)
     if m:
         return _sanitize_slice_token(m.group(1), fallback=fallback)
     for suffix in (
@@ -15847,6 +17538,8 @@ def _summary_has_ready_signal(text: str) -> bool:
     blob = str(text or "").strip().lower()
     if not blob:
         return False
+    if _summary_has_explicit_ready_verdict(blob):
+        return True
     if _text_has_no_go_signal(blob):
         return False
     ready_tokens = (
@@ -15858,6 +17551,14 @@ def _summary_has_ready_signal(text: str) -> bool:
         "verified",
     )
     return any(tok in blob for tok in ready_tokens)
+
+
+def _summary_has_explicit_ready_verdict(text: str) -> bool:
+    blob = str(text or "").strip().lower()
+    if not blob:
+        return False
+    compact = re.sub(r"\s+", " ", blob)
+    return bool(re.match(r"^(?:(?:verdict|status|decision)\s*:\s*)?ready\b", compact))
 
 
 def _summary_has_blocked_with_root_cause_signal(text: str) -> bool:
@@ -15872,6 +17573,8 @@ def _summary_has_verified_improvement_signal(text: str) -> bool:
     if not blob:
         return False
     compact = re.sub(r"\s+", " ", blob)
+    if re.search(r"^verified[_ ]improvement\s*[:\-]", compact):
+        return True
     if re.search(r"^(pass|status|decision)\s*:\s*verified[_ ]improvement\b", compact):
         return True
     return bool(re.search(r"\bpass\b.{0,80}\bverified[_ ]improvement\b", compact))
@@ -15980,10 +17683,10 @@ def _task_has_skynet_review_ready_evidence(task: Task | None, *, trace: dict[str
     summary = str(trace_obj.get("result_summary") or "").strip()
     if role_norm == "reviewer_local":
         return bool(trace_obj.get("review_ready", False) or _summary_has_ready_signal(summary))
-    if _text_has_no_go_signal(summary):
-        return False
     if bool(trace_obj.get("review_ready", False)) or _summary_has_ready_signal(summary):
         return True
+    if _text_has_no_go_signal(summary):
+        return False
     return bool(
         _summary_has_validation_signal(summary)
         and (_trace_has_nontrivial_artifacts(trace_obj) or len(summary) >= 80)
@@ -16035,8 +17738,10 @@ def _classify_local_slice_failure(
     if any(tok in blob for tok in blocker_markers) or _local_blocker_requests_grounded_excerpt(blob):
         return "blocked"
 
+    if "no valid patches in input" in blob:
+        return "terminal"
+
     malformed_patch_markers = (
-        "no valid patches in input",
         "corrupt patch at line",
     )
     # Treat malformed diff formatting as recoverable/blocking, not terminal.
@@ -16088,6 +17793,31 @@ def _collect_order_local_autonomy_funnel(
     implementer_failures = 0
     loop_breaker_count = 0
     controller_verifications_no_slice: list[float] = []
+
+    try:
+        root_job = orch_q.get_job(rid)
+    except Exception:
+        root_job = None
+    root_trace = dict((getattr(root_job, "trace", {}) or {}) if root_job and isinstance(getattr(root_job, "trace", {}), dict) else {})
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    root_summary = str(root_trace.get("result_summary") or "").strip()
+    root_digest = root_trace.get("structured_digest")
+    root_digest_summary = ""
+    if isinstance(root_digest, dict):
+        root_digest_summary = str(root_digest.get("summary") or "").strip()
+    root_has_verified_signal = bool(
+        root_state in {"done", "blocked"}
+        and (
+            bool(root_trace.get("improvement_verified", False))
+            or _summary_has_verified_improvement_signal(root_summary)
+            or _summary_has_verified_improvement_signal(root_digest_summary)
+        )
+    )
+    if root_has_verified_signal:
+        # A controller write-policy recovery can leave the root blocked after it
+        # identifies the improvement. Once backend + QA validate the replayed
+        # slice, this root signal acts as the controller verification.
+        controller_verifications_no_slice.append(now_ts)
 
     for child in children:
         role_norm = _coerce_orchestrator_role(str(getattr(child, "role", "") or ""))
@@ -16333,6 +18063,7 @@ def _task_local_specialist_response(task: Task | None, *, max_chars: int = 7000)
             text = text[:max_chars].rstrip()
         return text
 
+
     if task is None:
         return ""
     artifacts_dir = str(getattr(task, "artifacts_dir", "") or "").strip()
@@ -16382,10 +18113,16 @@ def _response_signals_no_code_change(text: str) -> bool:
         "already implemented",
         "already complete",
         "already correct",
+        "already present",
         "already satisfies",
         "already uses",
         "already use",
         "already matches",
+        "existing code is already correct",
+        "existing implementation already contains",
+        "no new delta",
+        "no-op reapplication",
+        "no-op recovery",
         "slice complete",
         "slice is complete",
         "request is satisfied by existing implementation",
@@ -16491,6 +18228,7 @@ def _proactive_local_stale_seconds() -> int:
     except Exception:
         value = 1800
     return max(300, min(12 * 3600, int(value)))
+
 
 
 def _proactive_local_guard_cycles_for_cli_promotion() -> int:
@@ -16882,8 +18620,19 @@ def _apply_autonomous_local_first_policy(
     rid = str(root_ticket or "").strip() or "ticket"
 
     def _latest_meta(role_name: str, *, states: tuple[str, ...] = ("done",), limit: int = 20) -> list[dict[str, Any]]:
-        db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
-        if not db_path.exists():
+        db_path: Path | None = None
+        storage = getattr(orch_q, "_storage", None)
+        storage_path = getattr(storage, "path", None)
+        if storage_path is not None:
+            try:
+                db_path = Path(storage_path)
+            except Exception:
+                db_path = None
+        if db_path is None:
+            candidate = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+            if candidate != _MODULE_DATA_DB and candidate.exists():
+                db_path = candidate
+        if db_path is None or not db_path.exists():
             db_rows = []
         else:
             normalized_states = tuple(
@@ -17017,6 +18766,7 @@ def _apply_autonomous_local_first_policy(
         root_job = None
     root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
     order_chat_id: int | None = None
+
     if isinstance(order_row, dict):
         try:
             raw_chat_id = order_row.get("chat_id")
@@ -17176,6 +18926,7 @@ def _apply_autonomous_local_first_policy(
     trace_arch_job_id = str(root_trace.get("latest_local_architect_job_id") or "").strip()
     try:
         trace_handoff_ts = float(root_trace.get("latest_local_architect_done_at") or 0.0)
+
     except Exception:
         trace_handoff_ts = 0.0
     if trace_handoff and _response_has_exact_file_targets(trace_handoff):
@@ -17671,6 +19422,7 @@ def _apply_autonomous_local_first_policy(
                 ),
                 mode_hint="ro",
                 priority=2,
+
                 depends_on=[],
                 requires_approval=False,
                 acceptance_criteria=[
@@ -17764,7 +19516,15 @@ def _apply_autonomous_local_first_policy(
                 break
         if not candidate_files:
             excerpt_blocker_text = blocker_payload or arch_payload
-            if _local_blocker_requests_grounded_excerpt(excerpt_blocker_text):
+            excerpt_blocker_lc = str(excerpt_blocker_text or "").lower()
+            excerpt_blocker_names_known_bot_target = (
+                "bot.py" in excerpt_blocker_lc
+                or _LOCAL_EXCERPT_BLOCKER_TARGET in excerpt_blocker_lc
+            )
+            if (
+                excerpt_blocker_names_known_bot_target
+                and _local_blocker_requests_grounded_excerpt(excerpt_blocker_text)
+            ):
                 bot_file = (worktree / "bot.py").resolve()
                 try:
                     inside = str(bot_file).startswith(str(worktree))
@@ -18072,6 +19832,7 @@ def _apply_autonomous_local_first_policy(
                     mode_hint="ro",
                     priority=1,
                     depends_on=[],
+
                     requires_approval=False,
                     acceptance_criteria=[
                         "Return READY/NEEDS_REWORK with concrete blocking issues.",
@@ -18375,6 +20136,15 @@ def _sync_order_phase_from_runtime(
             latest_local_done_at_by_identity=latest_local_done_at_by_identity,
         )
     ]
+    if _close_proactive_terminal_root_failure(
+        orch_q=orch_q,
+        order_row=order,
+        root_job=root_job,
+        children=list(children or []),
+        chat_id=int(chat_id),
+        now=time.time(),
+    ):
+        return
     if not phase_children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
@@ -18418,13 +20188,14 @@ def _sync_order_phase_from_runtime(
 
     latest_controller_terminal_summary = str(root_trace.get("result_summary") or "").strip()
     latest_controller_terminal_ts = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
-    any_controller_verified_improvement = bool(
-        _controller_verified_slice_for_closure(
-            orch_q=orch_q,
-            root_ticket=rid,
-            trace=root_trace,
-        )
-    ) and bool(root_trace.get("improvement_verified", False))
+    root_verified_slice = _controller_verified_slice_for_closure(
+        orch_q=orch_q,
+        root_ticket=rid,
+        trace=root_trace,
+    )
+    any_controller_verified_improvement = bool(root_verified_slice) and (
+        bool(root_trace.get("improvement_verified", False)) or proactive_order
+    )
     for child in phase_children:
         role_norm = _coerce_orchestrator_role(str(child.role or ""))
         state = str(child.state or "").strip().lower()
@@ -18447,10 +20218,224 @@ def _sync_order_phase_from_runtime(
 
     proactive_improvement_verified = proactive_improvement_verified or any_controller_verified_improvement
 
-    if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live:
+    root_state = str(getattr(root_job, "state", "") or "").strip().lower()
+    root_blocked_with_root_cause = (
+        proactive_order
+        and root_state == "blocked"
+        and _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
+    )
+    root_has_recovered_delivery = bool(
+        proactive_order
+        and root_state == "blocked"
+        and (not any_live)
+        and (proactive_verified_no_change or proactive_improvement_verified)
+    )
+    if _operational_gate_is_live_state(root_state) and not root_blocked_with_root_cause and not root_has_recovered_delivery:
+        try:
+            next_phase = "executing" if root_state == "running" else "delegated" if root_state in ("queued", "waiting_deps") else "review"
+            now_ts = time.time()
+            reason = f"root_job_still_{root_state}"
+            try:
+                gate_block_cooldown = max(
+                    300.0,
+                    float(os.environ.get("BOT_OPERATIONAL_GATE_BLOCK_COOLDOWN_SECONDS", "900").strip() or "900"),
+                )
+            except Exception:
+                gate_block_cooldown = 900.0
+            try:
+                last_checked_at = float(root_trace.get("operational_gate_checked_at", 0.0) or 0.0)
+            except Exception:
+                last_checked_at = 0.0
+            current_phase = str(order.get("phase") or "").strip().lower()
+            already_blocked = (
+                current_phase == next_phase
+                and not bool(root_trace.get("merge_ready", False))
+                and str(root_trace.get("operational_gate_reason") or "") == reason
+                and str(root_trace.get("operational_gate_source") or "") == "phase_sync"
+            )
+            should_record_gate_block = (not already_blocked) or last_checked_at <= 0.0 or (now_ts - last_checked_at) >= gate_block_cooldown
+            if should_record_gate_block:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase=next_phase)
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=reason,
+                    operational_gate_source="phase_sync",
+                    operational_gate_root_state=root_state,
+                    operational_gate_checked_at=now_ts,
+                    live_at=now_ts,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "reason": reason,
+                        "source": "phase_sync",
+                    },
+                )
+        except Exception:
+            pass
+        return
+
+    terminal_root_recovered_by_local_delivery = bool(
+        proactive_order
+        and root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES
+        and (not any_live)
+        and proactive_improvement_verified
+    )
+    if root_state in _OPERATIONAL_GATE_BAD_TERMINAL_STATES and not (
+        merged_to_main
+        or bool(root_trace.get("proactive_blocked_with_root_cause", False))
+        or terminal_root_recovered_by_local_delivery
+    ):
         try:
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                operational_gate_status="blocked",
+                operational_gate_reason=f"root_job_terminal_{root_state}_without_delivery",
+                operational_gate_root_state=root_state,
+                operational_gate_checked_at=time.time(),
+                live_at=time.time(),
+            )
+            orch_q.append_audit_event(
+                event_type="order.operational_gate_blocked",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "reason": f"root_job_terminal_{root_state}_without_delivery",
+                    "source": "phase_sync",
+                },
+            )
+        except Exception:
+            pass
+        return
+
+    current_phase = str(order.get("phase") or "").strip().lower()
+    if merge_required and bool(root_trace.get("merge_ready", False)) and current_phase == "ready_for_merge" and not any_live:
+        try:
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=True,
+                now=time.time(),
+                require_proactive_closure=False,
+            )
+            if not gate_ok:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=time.time(),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "reason": str(gate_reason),
+                        "source": "phase_sync",
+                    },
+                )
+                return
+
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            orch_q.update_trace(
+                rid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=time.time(),
+                **gate_payload,
+            )
+        except Exception:
+            pass
+        return
+
+    if (
+        proactive_order
+        and (not any_live)
+        and (not proactive_verified_no_change)
+        and (not proactive_improvement_verified)
+        and (not _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary))
+    ):
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                proactive_quality_gate_blocked=True,
+                proactive_quality_gate_blocked_at=time.time(),
+                proactive_improvement_missing=(not proactive_evidence_ok),
+                live_at=time.time(),
+            )
+        except Exception:
+            pass
+        return
+
+    proactive_has_pending_closure = bool(
+        proactive_order
+        and (not any_live)
+        and (
+            proactive_verified_no_change
+            or proactive_improvement_verified
+            or _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary)
+        )
+    )
+    if merge_required and bool(root_trace.get("merge_ready", False)) and not any_live and not proactive_has_pending_closure:
+        try:
+            gate_ok, gate_reason, gate_payload = _order_operational_maturity_gate(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                merge_required=True,
+                now=time.time(),
+            )
+            if not gate_ok:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    operational_gate_status="blocked",
+                    operational_gate_reason=str(gate_reason),
+                    live_at=time.time(),
+                    **gate_payload,
+                )
+                orch_q.append_audit_event(
+                    event_type="order.operational_gate_blocked",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "reason": str(gate_reason),
+                        "source": "phase_sync",
+                    },
+                )
+                return
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
+            orch_q.update_trace(
+                rid,
+                operational_gate_status="passed",
+                operational_gate_reason=str(gate_reason),
+                live_at=time.time(),
+                **gate_payload,
+            )
             if not root_trace.get("merge_ready_at"):
                 orch_q.update_trace(rid, merge_ready_at=time.time(), live_at=time.time())
         except Exception:
@@ -19153,6 +21138,7 @@ def _drain_backlog_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
     return cancelled
 
 
+
 def _orchestrator_min_evidence_gate(
     *,
     task: Task,
@@ -19495,6 +21481,7 @@ def _blocked_pressure_tick(
             trace={
                 "source": "scheduler",
                 "allow_delegation": True,
+
                 "order_id": root_ticket,
                 "blocked_count": int(len(items)),
                 "blocked_oldest_age_s": float(oldest_age),
@@ -19998,6 +21985,7 @@ def _running_watchdog_tick(
     except Exception:
         runtime_mult = 3.0
     try:
+
         runtime_grace_s = max(120.0, float(os.environ.get("BOT_RUNNING_WATCHDOG_GRACE_SECONDS", "300").strip() or "300"))
     except Exception:
         runtime_grace_s = 300.0
@@ -20370,6 +22358,7 @@ def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: flo
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
     except Exception:
+
         return 0
     if not orders:
         return 0
@@ -20460,6 +22449,7 @@ def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: flo
                 continue
             updated_at = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
             age_s = max(0.0, float(now) - updated_at) if updated_at > 0 else 0.0
+
             newer_same_role = newest_guard_by_role.get(role_norm, 0.0) > (updated_at + 60.0)
             redundant_guard = str(child.job_id) in redundant_guard_ids
             expedite_due_to_pressure = order_backlog_pressured and age_s >= 300.0
@@ -22322,6 +24312,7 @@ class ThreadManager:
 
     def get(self, chat_id: int) -> str | None:
         with self._lock:
+
             return self._thread_by_chat.get(int(chat_id))
 
     def set(self, chat_id: int, thread_id: str) -> None:
@@ -22385,6 +24376,7 @@ def _extract_thread_id_from_jsonl_file(path: Path, *, max_bytes: int = 1_000_000
         with path.open("rb") as f:
             read = 0
             while True:
+
                 line_b = f.readline()
                 if not line_b:
                     break
@@ -23172,6 +25164,7 @@ def _orchestrator_run_codex(
     order_branch = _resolve_order_branch_from_task(task, orch_q)
     eff_cfg = dataclasses.replace(cfg, codex_workdir=repo_base_dir) if repo_base_dir is not None else cfg
     worktree_dir: Path | None = None
+    controller_snapshot_dir: Path | None = None
     leased_slot: int | None = None
     lease_base_repo = repo_base_dir if repo_base_dir is not None else cfg.codex_workdir
     lease_enabled = orch_q is not None and (lease_base_repo / ".git").exists()
@@ -23214,6 +25207,9 @@ def _orchestrator_run_codex(
                         live_workdir=str(worktree_dir),
                         live_workspace_slot=int(leased_slot),
                         live_branch=(order_branch or None),
+                        workspace_error=None,
+                        workspace_error_artifact=None,
+                        workspace_recovered_at=time.time(),
                         live_at=time.time(),
                     )
             except Exception:
@@ -23256,6 +25252,47 @@ def _orchestrator_run_codex(
                 },
             }
 
+    if worktree_dir is not None and _role_disallows_repo_writes(role):
+        try:
+            controller_snapshot_dir = _create_controller_snapshot_workdir(
+                source_dir=worktree_dir,
+                artifacts_dir=artifacts_dir,
+                role=role,
+                job_id=task.job_id,
+            )
+            eff_cfg = dataclasses.replace(eff_cfg, codex_workdir=controller_snapshot_dir)
+            try:
+                if orch_q is not None:
+                    orch_q.update_trace(
+                        task.job_id,
+                        controller_snapshot_workdir=str(controller_snapshot_dir),
+                        controller_source_workdir=str(worktree_dir),
+                        live_workdir=str(controller_snapshot_dir),
+                        live_at=time.time(),
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (controller snapshot failure). job=%s role=%s", task.job_id, role)
+            err_path = artifacts_dir / "controller_snapshot_error.txt"
+            err_path.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
+            return {
+                "status": "error",
+                "summary": f"Controller snapshot setup failed; refused unsafe direct controller execution: {e}",
+                "artifacts": [str(err_path)],
+                "logs": str(e),
+                "next_action": "fix_controller_snapshot",
+                "structured_digest": {
+                    "role": role,
+                    "workspace": "controller_snapshot_failed",
+                    "source_workdir": str(worktree_dir),
+                },
+            }
+
     # Optional screenshot capture (Playwright).
     image_paths: list[Path] = []
     needs_shot = bool(task.trace.get("needs_screenshot", False))
@@ -23285,6 +25322,7 @@ def _orchestrator_run_codex(
                 "summary": "Screenshots are disabled. Set BOT_SCREENSHOT_ENABLED=1 and install Playwright.",
                 "artifacts": [],
                 "logs": "",
+
                 "next_action": "enable_screenshots",
             }
         approved = bool(task.trace.get("approved", False))
@@ -23431,6 +25469,12 @@ def _orchestrator_run_codex(
         mode=mode,
         worktree_dir=(eff_cfg.codex_workdir if isinstance(eff_cfg.codex_workdir, Path) else Path(eff_cfg.codex_workdir)),
     )
+    if controller_snapshot_dir is not None:
+        prompt = _controller_snapshot_safe_prompt(
+            prompt,
+            snapshot_dir=controller_snapshot_dir,
+            source_paths=[repo_base_dir, repo_path, worktree_dir, lease_base_repo],
+        )
     try:
         # Safe logging: lengths only (never log prompt contents).
         LOG.debug(
@@ -23446,12 +25490,16 @@ def _orchestrator_run_codex(
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
     forced_mode = _orchestrator_forced_mode_for_role(eff_cfg, role=role, chat_id=int(task.chat_id))
     read_only_repo_baselines: dict[str, dict[str, Any]] = {}
+    read_only_targets: list[tuple[str, Path | None]] = []
     if worktree_dir is not None and _role_disallows_repo_writes(role):
         seen_target_dirs: set[str] = set()
-        for label, repo_dir in (
+        base_branch_blocker: str | None = None
+        read_only_targets = [
+            ("controller_snapshot", controller_snapshot_dir),
             ("worktree", worktree_dir),
             ("base_repo", repo_base_dir),
-        ):
+        ]
+        for label, repo_dir in read_only_targets:
             if repo_dir is None:
                 continue
             try:
@@ -23467,13 +25515,108 @@ def _orchestrator_run_codex(
                 "label": str(label),
                 "status": status_text,
                 "changed_paths": _git_changed_paths_from_porcelain(status_text),
+                "head": _git_head_rev(target_dir),
+                "branch": _git_current_branch(target_dir),
             }
+            if str(label) == "base_repo":
+                current_branch = str(read_only_repo_baselines[target_key].get("branch") or "").strip()
+                expected_branch = str(repo_default_branch or "").strip()
+                if expected_branch and current_branch and current_branch != expected_branch:
+                    base_branch_blocker = (
+                        f"Base repo checkout is on '{current_branch}', expected '{expected_branch}'. "
+                        "Controller lanes refuse to run until the runtime checkout is back on the repo default branch."
+                    )
+        if base_branch_blocker:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (base branch preflight). job=%s role=%s", task.job_id, role)
+            return {
+                "status": "blocked",
+                "summary": base_branch_blocker,
+                "artifacts": [],
+                "logs": base_branch_blocker,
+                "next_action": "restore_base_repo_branch",
+                "structured_digest": {
+                    "role": role,
+                    "workdir": str(eff_cfg.codex_workdir),
+                    "base_repo_branch_preflight": "blocked",
+                    "repo_default_branch": repo_default_branch,
+                },
+            }
+
+    def _read_only_policy_violation_targets() -> list[tuple[str, Path, str, list[str], str, str, str, str]]:
+        if worktree_dir is None or not _role_disallows_repo_writes(role):
+            return []
+        targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
+        seen_target_dirs: set[str] = set()
+        for label, repo_dir in read_only_targets:
+            if repo_dir is None:
+                continue
+            try:
+                target_dir = Path(repo_dir).resolve()
+            except Exception:
+                target_dir = Path(repo_dir)
+            target_key = str(target_dir)
+            if target_key in seen_target_dirs:
+                continue
+            seen_target_dirs.add(target_key)
+            status_text = _git_status_porcelain(target_dir)
+            changed_paths = _git_changed_paths_from_porcelain(status_text)
+            baseline = read_only_repo_baselines.get(target_key) or {}
+            baseline_paths = {
+                str(path)
+                for path in (baseline.get("changed_paths") or [])
+                if str(path or "").strip()
+            }
+            baseline_head = str(baseline.get("head") or "").strip()
+            current_head = _git_head_rev(target_dir)
+            baseline_branch = str(baseline.get("branch") or "").strip()
+            current_branch = _git_current_branch(target_dir)
+            head_changed = bool(baseline_head) and bool(current_head) and current_head != baseline_head
+            branch_changed = (
+                str(label) == "base_repo"
+                and bool(baseline_branch)
+                and current_branch != baseline_branch
+            )
+            if str(label) == "base_repo" and baseline_paths and not (head_changed or branch_changed):
+                continue
+            new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+            if head_changed:
+                for path in _git_changed_paths_between(target_dir, baseline_head, current_head):
+                    if path not in new_changed_paths:
+                        new_changed_paths.append(path)
+            if branch_changed:
+                branch_after = current_branch or "DETACHED"
+                branch_marker = f"BRANCH:{baseline_branch}..{branch_after}"
+                if branch_marker not in new_changed_paths:
+                    new_changed_paths.insert(0, branch_marker)
+            if head_changed:
+                head_marker = f"HEAD:{baseline_head[:12]}..{current_head[:12]}"
+                if head_marker not in new_changed_paths:
+                    new_changed_paths.insert(0, head_marker)
+            if new_changed_paths:
+                targets.append(
+                    (
+                        str(label),
+                        target_dir,
+                        status_text,
+                        new_changed_paths,
+                        baseline_head,
+                        current_head,
+                        baseline_branch,
+                        current_branch,
+                    )
+                )
+        return targets
 
     runner = CodexRunner(
         eff_cfg,
         chat_id=task.chat_id,
         allow_bypass=True,
         forced_mode=forced_mode,
+        guard_git_writes=_role_disallows_repo_writes(role),
     )
     proc: CodexRunner.Running
     used_thread_id: str | None = None
@@ -23507,6 +25650,7 @@ def _orchestrator_run_codex(
                         prompt=prompt,
                         mode_hint=mode,
                         image_paths=image_paths or None,
+
                         model_override=task.model or None,
                         effort_override=task.effort or None,
                     )
@@ -23552,11 +25696,13 @@ def _orchestrator_run_codex(
             "artifacts": [],
             "logs": str(e),
             "next_action": None,
+
         }
 
     timed_out = False
     canceled = False
     last_live_update = 0.0
+    last_write_guard_check = 0.0
     completed_stream_terminated = False
     completed_stream_since: float | None = None
     completed_stream_size = -1
@@ -23590,9 +25736,18 @@ def _orchestrator_run_codex(
                 timed_out = True
                 break
 
+            now = time.time()
+            if read_only_repo_baselines and now - last_write_guard_check >= 5.0:
+                last_write_guard_check = now
+                try:
+                    if _read_only_policy_violation_targets():
+                        _terminate_process(proc.proc)
+                        break
+                except Exception:
+                    LOG.exception("Failed controller write policy live check. job=%s role=%s", task.job_id, role)
+
             # Live progress for CEO visibility: update stdout/stderr tails periodically.
             if orch_q is not None and cfg.orchestrator_live_update_seconds > 0:
-                now = time.time()
                 if now - last_live_update >= float(cfg.orchestrator_live_update_seconds):
                     try:
                         stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=10000)).strip()
@@ -23760,10 +25915,11 @@ def _orchestrator_run_codex(
                 artifacts.append(p)
         # Collect PNGs created in the Codex workdir.
         artifacts.extend(_collect_png_artifacts(eff_cfg, start_time=proc.start_time, text=body))
-        # Collect git diff/status whenever we ran inside a managed worktree.
-        if worktree_dir is not None:
+        # Collect git diff/status whenever we ran inside a managed or disposable worktree.
+        artifact_repo_dir = controller_snapshot_dir or worktree_dir
+        if artifact_repo_dir is not None:
             try:
-                artifacts.extend(collect_git_artifacts(repo_dir=worktree_dir, artifacts_dir=artifacts_dir))
+                artifacts.extend(collect_git_artifacts(repo_dir=artifact_repo_dir, artifacts_dir=artifacts_dir))
             except Exception:
                 LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
 
@@ -23830,6 +25986,11 @@ def _orchestrator_run_codex(
             structured["order_branch"] = str(order_branch)
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
+        if controller_snapshot_dir is not None:
+            structured["controller_snapshot"] = {
+                "workdir": str(controller_snapshot_dir),
+                "source_workdir": str(worktree_dir) if worktree_dir is not None else "",
+            }
         if used_thread_id:
             structured["thread_id"] = used_thread_id
 
@@ -23857,38 +26018,7 @@ def _orchestrator_run_codex(
                 }
 
         if worktree_dir is not None and _role_disallows_repo_writes(role):
-            targets: list[tuple[str, Path, str, list[str]]] = []
-            seen_target_dirs: set[str] = set()
-            for label, repo_dir in (
-                ("worktree", worktree_dir),
-                ("base_repo", repo_base_dir),
-            ):
-                if repo_dir is None:
-                    continue
-                try:
-                    target_dir = Path(repo_dir).resolve()
-                except Exception:
-                    target_dir = Path(repo_dir)
-                target_key = str(target_dir)
-                if target_key in seen_target_dirs:
-                    continue
-                seen_target_dirs.add(target_key)
-                status_text = _git_status_porcelain(target_dir)
-                changed_paths = _git_changed_paths_from_porcelain(status_text)
-                baseline = read_only_repo_baselines.get(target_key) or {}
-                baseline_paths = {
-                    str(path)
-                    for path in (baseline.get("changed_paths") or [])
-                    if str(path or "").strip()
-                }
-                if str(label) == "base_repo" and baseline_paths:
-                    # The controller runs in an isolated worktree. A dirty base
-                    # checkout can predate this job; do not stash or block the
-                    # sprint for unrelated operator/work-in-progress changes.
-                    continue
-                new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
-                if new_changed_paths:
-                    targets.append((str(label), target_dir, status_text, new_changed_paths))
+            targets = _read_only_policy_violation_targets()
             if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [
@@ -23898,8 +26028,42 @@ def _orchestrator_run_codex(
                 ]
                 cleanup_results: list[dict[str, Any]] = []
                 all_changed_paths: list[str] = []
-                for label, target_dir, status_text, changed_paths in targets:
+                head_changes: list[dict[str, str]] = []
+                branch_changes: list[dict[str, str]] = []
+                for label, target_dir, status_text, changed_paths, baseline_head, current_head, baseline_branch, current_branch in targets:
                     violation_lines.extend(["", f"{label}_repo={target_dir}", "git status --porcelain:", status_text])
+                    if baseline_branch and current_branch != baseline_branch:
+                        violation_lines.extend(
+                            [
+                                "",
+                                f"{label}_branch_before={baseline_branch}",
+                                f"{label}_branch_after={current_branch or 'DETACHED'}",
+                            ]
+                        )
+                        branch_changes.append(
+                            {
+                                "label": label,
+                                "repo_dir": str(target_dir),
+                                "before": baseline_branch,
+                                "after": current_branch or "DETACHED",
+                            }
+                        )
+                    if baseline_head and current_head and current_head != baseline_head:
+                        violation_lines.extend(
+                            [
+                                "",
+                                f"{label}_head_before={baseline_head}",
+                                f"{label}_head_after={current_head}",
+                            ]
+                        )
+                        head_changes.append(
+                            {
+                                "label": label,
+                                "repo_dir": str(target_dir),
+                                "before": baseline_head,
+                                "after": current_head,
+                            }
+                        )
                     violation_lines.extend(["", f"{label}_changed_paths:"])
                     violation_lines.extend(f"- {path}" for path in changed_paths[:40])
                     for path in changed_paths:
@@ -23922,6 +26086,48 @@ def _orchestrator_run_codex(
                             "stash_created": False,
                             "error": str(e),
                         }
+                    if label == "base_repo" and baseline_branch and current_branch != baseline_branch:
+                        try:
+                            branch_restore = _restore_read_only_base_repo_branch(
+                                target_dir,
+                                baseline_branch=baseline_branch,
+                                role=role,
+                                job_id=task.job_id,
+                                artifacts_dir=artifacts_dir,
+                            )
+                        except Exception as e:
+                            branch_restore = {
+                                "repo_dir": str(target_dir),
+                                "branch_restored": False,
+                                "branch_expected": baseline_branch,
+                                "branch_after": _git_current_branch(target_dir),
+                                "error": str(e),
+                            }
+                        cleanup["branch_restore"] = branch_restore
+                        restore_artifact = str(branch_restore.get("artifact") or "").strip()
+                        if restore_artifact and restore_artifact not in artifacts_text:
+                            artifacts_text.append(restore_artifact)
+                    if label == "base_repo" and baseline_head and current_head and current_head != baseline_head:
+                        try:
+                            head_restore = _restore_read_only_base_repo_head(
+                                target_dir,
+                                baseline_head=baseline_head,
+                                role=role,
+                                job_id=task.job_id,
+                                artifacts_dir=artifacts_dir,
+                            )
+                        except Exception as e:
+                            head_restore = {
+                                "repo_dir": str(target_dir),
+                                "head_restored": False,
+                                "head_expected": baseline_head,
+                                "head_after": _git_head_rev(target_dir),
+                                "error": str(e),
+                            }
+                        cleanup["head_restore"] = head_restore
+                        restore_artifact = str(head_restore.get("artifact") or "").strip()
+                        if restore_artifact and restore_artifact not in artifacts_text:
+                            artifacts_text.append(restore_artifact)
                     cleanup_results.append(cleanup)
                     artifact = str(cleanup.get("artifact") or "").strip()
                     if artifact and artifact not in artifacts_text:
@@ -23930,10 +26136,20 @@ def _orchestrator_run_codex(
                 violation_artifact_str = str(violation_artifact)
                 if violation_artifact_str not in artifacts_text:
                     artifacts_text.append(violation_artifact_str)
+                controller_recovery_artifacts = []
+                for raw_artifact in artifacts_text:
+                    artifact_name = Path(str(raw_artifact or "")).name.lower()
+                    if artifact_name in {"changes.patch", "controller_write_policy_violation.txt"} or artifact_name.startswith("write_policy_"):
+                        controller_recovery_artifacts.append(str(raw_artifact))
+                if controller_recovery_artifacts:
+                    structured["controller_recovery_artifacts"] = controller_recovery_artifacts[:12]
+                structured["result_artifacts"] = artifacts_text[:40]
                 structured["write_policy_violation"] = {
                     "role": role,
                     "reason": "controller_write_policy_violation",
                     "changed_paths": all_changed_paths[:40],
+                    "branch_changes": branch_changes[:8],
+                    "head_changes": head_changes[:8],
                     "cleanup": cleanup_results,
                     "status_artifact": violation_artifact_str,
                 }
@@ -24062,6 +26278,7 @@ def _send_orchestrator_result(
     def _normalize_jarvis_reply(text: str) -> str:
         """
         CEO UX rule: avoid "No puedo / I can't" phrasing.
+
         Keep responses actionable and operation-focused.
         """
         s = str(text or "").strip()
@@ -24704,6 +26921,7 @@ def _maybe_enqueue_delivery_replan(
     else:
         replan_text = (
             "DELIVERY RECOVERY REPLAN\\n"
+
             f"Ticket: {root_ticket}\\n"
             f"Trigger job: {task.job_id}\\n"
             f"Trigger kind: {task_kind}\\n"
@@ -24807,6 +27025,7 @@ def _poll_orchestrator_job_state(orch_q: OrchestratorQueue | None, job_id: str) 
     if t is None:
         return ""
     return t.state
+
 
 
 class _OrchestratorExecutor:
@@ -25065,6 +27284,7 @@ def orchestrator_worker_loop(
                 orch_state = "failed"
                 summary = f"BLOCKER: {blocker_summary}"
                 if not next_action:
+
                     next_action = "replan"
             if _is_controller_role(role_norm_task):
                 summary = re.sub(r"\bno puedo\b", "Para avanzar necesito", summary, flags=re.IGNORECASE)
@@ -25215,12 +27435,12 @@ def orchestrator_worker_loop(
                         root_ticket=root_ticket,
                         slice_id=slice_id,
                     )
-                    if review_ready and not ((applied_ev and validated_ev) or no_change_ev):
+                    if review_ready and not (applied_ev or no_change_ev):
                         review_ready = False
                         orch_state = "failed"
                         summary = (
-                            f"{summary}\n\nReviewer gate rejected: READY requires prior implementer evidence "
-                            f"(validated change or verified no-change) for slice_id={slice_id}."
+                            f"{summary}\n\nReviewer gate rejected: READY requires prior implementer delivery evidence "
+                            f"(changed slice or verified no-change) for slice_id={slice_id}."
                         ).strip()
                         result_meta["result_summary"] = summary
                     result_meta["review_ready"] = bool(review_ready)
@@ -26496,7 +28716,7 @@ def orchestrator_worker_loop(
                             child_profile = _orchestrator_profile(profiles, child_role)
                             model = _orchestrator_model_for_profile(cfg, child_profile)
                             effort = _orchestrator_effort_for_profile(child_profile, cfg)
-                            mode_hint = _coerce_orchestrator_mode(spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
+                            mode_hint = _delegated_mode_hint_for_role(child_role, spec.mode_hint or str(child_profile.get("mode_hint") or "ro"))
                             if child_role == "implementer_local" and mode_hint == "ro":
                                 exec_backend = str(child_profile.get("execution_backend") or "").strip().lower()
                                 if exec_backend in {"local_ollama", "ollama"}:
@@ -27516,6 +29736,7 @@ def worker_loop(
                     % (
                         mode_hint,
                         eff_cfg.codex_local_provider if eff_cfg.codex_use_oss else "default",
+
                         model_part,
                         eff_cfg.codex_workdir,
                     ),
@@ -27737,6 +29958,7 @@ def worker_loop(
                 tracker.clear_running(job.chat_id)
             except Exception:
                 LOG.exception("Failed to clear running state")
+
             # Best-effort cleanup of downloaded image files.
             try:
                 for p in (job.image_paths or []):
@@ -29771,6 +31993,7 @@ def main() -> None:
         if cfg.orchestrator_daily_digest_seconds >= 60 and _configured_notify_chat_id(cfg):
             notify_chat_id = _configured_notify_chat_id(cfg)
 
+
             def _send_orchestrator_digest() -> None:
                 if orchestrator_queue is None or notify_chat_id is None:
                     return
@@ -29967,6 +32190,14 @@ def main() -> None:
                         )
                     except Exception:
                         LOG.exception("Active-order watchdog tick failed")
+                    try:
+                        _operational_maturity_sweep_tick(
+                            cfg=cfg,
+                            orch_q=orchestrator_queue,
+                            now=time.time(),
+                        )
+                    except Exception:
+                        LOG.exception("Operational maturity sweep tick failed")
 
                 if notify_chat_id is None:
                     return

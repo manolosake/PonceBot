@@ -3,13 +3,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import sys
 from pathlib import Path
 from typing import Any
 
 
+def _is_absolute_artifact_path(raw_path: str) -> bool:
+    # Use both local-path semantics and Windows semantics so checks are platform-agnostic.
+    return Path(raw_path).is_absolute() or ntpath.isabs(raw_path)
+
+
+def _artifact_candidate_path(raw_path: str) -> Path:
+    # Interpret Windows-style separators consistently for platform-agnostic safety checks.
+    return Path(raw_path.replace("\\", "/"))
+
+
 def _resolve_artifact_path(*, artifacts_dir: Path, raw_path: str) -> Path:
-    candidate = Path(str(raw_path or "").strip()).expanduser()
+    candidate = _artifact_candidate_path(str(raw_path or "").strip()).expanduser()
     if candidate.is_absolute():
         return candidate.resolve()
     return (artifacts_dir / candidate).resolve()
@@ -82,8 +93,13 @@ def validate_evidence(
 
     missing_files: list[str] = []
     outside_dir: list[str] = []
+    non_files: list[str] = []
+    empty_files: list[str] = []
     resolved_artifacts: list[str] = []
     for raw_path in artifacts:
+        if _is_absolute_artifact_path(raw_path):
+            outside_dir.append(raw_path)
+            continue
         resolved = _resolve_artifact_path(artifacts_dir=artifacts_root, raw_path=raw_path)
         resolved_artifacts.append(str(resolved))
         try:
@@ -93,6 +109,12 @@ def validate_evidence(
             continue
         if not allow_missing_files and not resolved.exists():
             missing_files.append(str(resolved))
+            continue
+        if resolved.exists() and not resolved.is_file():
+            non_files.append(str(resolved))
+            continue
+        if resolved.is_file() and resolved.stat().st_size == 0:
+            empty_files.append(str(resolved))
 
     if outside_dir:
         return False, {
@@ -108,6 +130,22 @@ def validate_evidence(
             "reason": "artifact_missing",
             "summary_path": str(summary_path),
             "missing_artifacts": missing_files,
+        }
+
+    if non_files:
+        return False, {
+            "ok": False,
+            "reason": "artifact_not_file",
+            "summary_path": str(summary_path),
+            "not_file_artifacts": non_files,
+        }
+
+    if empty_files:
+        return False, {
+            "ok": False,
+            "reason": "artifact_empty",
+            "summary_path": str(summary_path),
+            "empty_artifacts": empty_files,
         }
 
     return True, {

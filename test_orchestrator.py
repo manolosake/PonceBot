@@ -3120,6 +3120,15 @@ class TestCeoOrders(unittest.TestCase):
             assert got2 is not None
             self.assertEqual(str(got2["status"]), "paused")
 
+            ok_failed = st.set_order_status(oid[:8], chat_id=1, status="failed")
+            self.assertTrue(ok_failed)
+            failed = st.get_order(oid, chat_id=1)
+            self.assertIsNotNone(failed)
+            assert failed is not None
+            self.assertEqual(str(failed["status"]), "failed")
+            self.assertEqual(str(failed["phase"]), "failed")
+            self.assertEqual(len(st.list_orders(chat_id=1, status="failed", limit=10)), 1)
+
             bad = st.set_order_status(oid[:8], chat_id=1, status="nope")
             self.assertFalse(bad)
 
@@ -4165,6 +4174,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 return_value=(True, "feature/repo-secondary"),
             ), patch.object(
                 bot,
+                "_git_dirty_status_lines",
+                return_value=[],
+            ), patch.object(
+                bot,
                 "_order_command_text",
                 return_value="Order ord-merge-retry-01 auto-merged by Jarvis to main",
             ), patch.object(bot, "_send_chunked_text", return_value=None):
@@ -4252,6 +4265,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_order_trace_requires_merge",
                 return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ), patch.object(
                 bot,
                 "_order_command_text",
@@ -4370,6 +4387,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_order_trace_requires_merge",
                 return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ):
                 merged = bot._auto_merge_ready_orders_tick(
                     cfg=cfg,
@@ -4726,6 +4747,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_git_is_ancestor",
                 return_value=True,
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ), patch.object(
                 bot,
                 "_order_command_text",

@@ -45,6 +45,32 @@ class TestArtifactManifest(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["mismatch_count"], 0)
 
+    def test_check_rejects_malformed_manifest_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            (artifacts_dir / "FINAL_MANIFEST.json").write_text("{ nope", encoding="utf-8")
+
+            rc, payload = self._run_check(artifacts_dir)
+
+            self.assertEqual(rc, 2)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"], "malformed manifest JSON")
+            self.assertIn("reason", payload)
+
+    def test_check_rejects_non_object_manifest_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            (artifacts_dir / "FINAL_MANIFEST.json").write_text(
+                json.dumps(["not", "an", "object"]), encoding="utf-8"
+            )
+
+            rc, payload = self._run_check(artifacts_dir)
+
+            self.assertEqual(rc, 2)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"], "invalid manifest root")
+            self.assertEqual(payload["reason"], "manifest root must be an object")
+
     def test_check_rejects_parent_escape_entry_name(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

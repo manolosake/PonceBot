@@ -27,7 +27,14 @@ IGNORE_ARTIFACT_TOKENS = (
     'local_ollama_prompt',
 )
 STALE_LOCAL_S = 15 * 60
+STALE_HEARTBEAT_DETAIL_LIMIT = 25
+UNCOVERED_REPO_DETAIL_LIMIT = 25
 LOOKBACK_S = 24 * 3600
+AUTONOMY_MINIMUM_SLO = {
+    'implementer_fail_rate_lte': 0.35,
+    'closed_over_started_gte': 0.50,
+}
+IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS = 5
 
 
 def worst_status(*values: str) -> str:
@@ -47,8 +54,16 @@ def classify_open_job_mode(counts_by_role: dict, open_jobs: int) -> str:
     """Classify order mode without reporting idle when open jobs still exist."""
     if int(open_jobs or 0) <= 0:
         return 'idle'
-    has_local = any(role in LOCAL_ROLES for role in counts_by_role)
-    has_cli = any(role in CLI_ROLES for role in counts_by_role)
+    active_roles = set()
+    for role, raw_count in (counts_by_role or {}).items():
+        try:
+            count = int(raw_count or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            active_roles.add(role)
+    has_local = any(role in LOCAL_ROLES for role in active_roles)
+    has_cli = any(role in CLI_ROLES for role in active_roles)
     if has_local and has_cli:
         return 'mixed'
     if has_cli:
@@ -82,6 +97,28 @@ def load_state() -> dict:
 def is_proactive(title: str, body: str) -> bool:
     blob = f"{title or ''}\n{body or ''}".lower()
     return ('proactive sprint' in blob) or ('[proactive:' in blob)
+
+
+def proactive_order_covers_repo(order: dict, repo: dict) -> bool:
+    repo_id = str((repo or {}).get('repo_id') or '').strip()
+    if not repo_id:
+        return False
+    order_project_id = str((order or {}).get('project_id') or '').strip()
+    if order_project_id and order_project_id == repo_id:
+        return True
+
+    blob = f"{(order or {}).get('title') or ''}\n{(order or {}).get('body') or ''}".lower()
+    repo_id_lower = repo_id.lower()
+    if f'[repo:{repo_id_lower}]' in blob or repo_id_lower in blob:
+        return True
+
+    repo_path = str((repo or {}).get('path') or '').strip()
+    if repo_path:
+        repo_path_lower = repo_path.lower()
+        repo_basename = Path(repo_path).name.lower()
+        if repo_path_lower in blob or (repo_basename and repo_basename in blob):
+            return True
+    return False
 
 
 def trace_has_nontrivial_artifacts(trace: dict) -> bool:
@@ -396,6 +433,14 @@ def fetch_rows(cur, query: str, params=()):
 
 def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    recommended_actions = [
+        {
+            'priority': 'P0',
+            'action': 'Restore the orchestration database or point CODEXBOT_ORCH_DB at the active database.',
+            'reason': f'Health report cannot read required state: {reason}.',
+            'evidence_type': reason,
+        }
+    ]
     report = {
         'generated_at': datetime.now(UTC).isoformat().replace('+00:00', 'Z'),
         'operational_status': 'CRITICAL',
@@ -405,6 +450,7 @@ def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
         'order_reports': [],
         'anomalies': [],
         'trend_flags': [],
+        'recommended_actions': recommended_actions,
     }
     payload = json.dumps(report, ensure_ascii=False, indent=2) + '\n'
     markdown = '\n'.join(
@@ -413,6 +459,9 @@ def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
             f'- status=CRITICAL reason={reason}',
             f'- db_path={DB}',
             f'- state_file={STATE_FILE}',
+            '',
+            '## Recommended Actions',
+            f"- {recommended_action_markdown(recommended_actions[0])}",
         ]
     ) + '\n'
     latest_json = OUT_DIR / 'latest.json'
@@ -422,6 +471,181 @@ def _write_error_report(*, now: float, stamp: str, reason: str) -> int:
     for path, content in ((latest_json, payload), (latest_md, markdown), (stamped_json, payload), (stamped_md, markdown)):
         path.write_text(content, encoding='utf-8')
     return 2
+
+
+def build_recommended_actions(anomalies: list, trend_flags: list) -> list:
+    actions = []
+
+    def add(priority: str, action: str, reason: str, evidence_type: str, **fields) -> None:
+        item = {
+            'priority': priority,
+            'action': action,
+            'reason': reason,
+            'evidence_type': evidence_type,
+        }
+        for key in ('order_id', 'repo_id', 'count'):
+            if key in fields and fields[key] not in (None, ''):
+                item[key] = fields[key]
+        actions.append(item)
+
+    for anomaly in anomalies:
+        evidence_type = str((anomaly or {}).get('type') or '').strip()
+        order_id = str((anomaly or {}).get('order_id') or '').strip()
+        if evidence_type == 'factory_hard_stop':
+            add(
+                'P0',
+                'Clear the factory hard stop or document the hold owner.',
+                f"Factory is manually stopped: {str((anomaly or {}).get('reason') or 'unspecified')}.",
+                evidence_type,
+            )
+        elif evidence_type == 'factory_soft_pause':
+            add(
+                'P1',
+                'Review the soft pause and resume the factory when the hold expires.',
+                f"Factory soft pause is active: {str((anomaly or {}).get('reason') or 'unspecified')}.",
+                evidence_type,
+            )
+        elif evidence_type == 'ready_without_quality_gate':
+            add(
+                'P0',
+                'Run or inspect the missing quality gate before merge.',
+                'Order is ready for merge without a verified improvement gate.',
+                evidence_type,
+                order_id=order_id,
+            )
+        elif evidence_type == 'ready_with_open_work':
+            add(
+                'P0',
+                'Close, cancel, or account for open work before merge.',
+                'Order is ready for merge while jobs are still open.',
+                evidence_type,
+                order_id=order_id,
+                count=(anomaly or {}).get('open_jobs'),
+            )
+        elif evidence_type == 'stale_local_open':
+            add(
+                'P1',
+                'Cancel or reseed stale local jobs and unblock the order.',
+                'Local jobs have exceeded the stale open-job threshold.',
+                evidence_type,
+                order_id=order_id,
+                count=(anomaly or {}).get('count'),
+            )
+        elif evidence_type == 'paused_idle_backlog':
+            add(
+                'P1',
+                'Resume, reassign, or close the paused stale order.',
+                'Paused order has no open work and no verified improvement.',
+                evidence_type,
+                order_id=order_id,
+            )
+        elif evidence_type == 'idle_without_improvement':
+            add(
+                'P1',
+                'Seed the next job or close the idle order with evidence.',
+                'Active order has gone idle without a verified improvement.',
+                evidence_type,
+                order_id=order_id,
+            )
+        elif evidence_type == 'factory_without_active_orders':
+            add(
+                'P1',
+                'Seed proactive orders for enabled repos or disable idle repos.',
+                'Factory has enabled repos but no active proactive orders.',
+                evidence_type,
+                count=(anomaly or {}).get('enabled_repos'),
+            )
+        elif evidence_type == 'factory_stale_heartbeats':
+            details = (anomaly or {}).get('details') or []
+            first_repo_id = ''
+            if details:
+                first_repo_id = str((details[0] or {}).get('repo_id') or '').strip()
+            add(
+                'P1',
+                'Restart or inspect agents with stale factory heartbeats.',
+                'One or more enabled repos have missing or stale runtime heartbeats.',
+                evidence_type,
+                repo_id=first_repo_id,
+                count=(anomaly or {}).get('count'),
+            )
+        elif evidence_type == 'factory_uncovered_enabled_repos':
+            details = (anomaly or {}).get('details') or []
+            first_repo_id = ''
+            if details:
+                first_repo_id = str((details[0] or {}).get('repo_id') or '').strip()
+            add(
+                'P1',
+                'Seed or resume proactive orders for uncovered autonomy-enabled repos.',
+                'One or more active autonomy-enabled repos are not covered by active or paused proactive orders.',
+                evidence_type,
+                repo_id=first_repo_id,
+                count=(anomaly or {}).get('count'),
+            )
+
+    for flag in trend_flags:
+        evidence_type = str((flag or {}).get('type') or '').strip()
+        if evidence_type == 'high_implementer_fail_rate':
+            add(
+                'P1',
+                'Inspect recent implementer failures and tighten slice prompts or routing.',
+                'Implementer failure rate is above the autonomy SLO.',
+                evidence_type,
+                count=(flag or {}).get('failures'),
+            )
+        elif evidence_type == 'high_empty_local_responses':
+            add(
+                'P2',
+                'Check local model health and fallback routing for empty responses.',
+                'Empty local model responses crossed the 24h threshold.',
+                evidence_type,
+                count=(flag or {}).get('count'),
+            )
+        elif evidence_type == 'high_model_fallbacks':
+            add(
+                'P2',
+                'Review model fallback logs and capacity for affected repos.',
+                'Factory model fallback volume crossed the 24h threshold.',
+                evidence_type,
+                count=(flag or {}).get('count'),
+            )
+        elif evidence_type == 'high_stale_local_cancels':
+            add(
+                'P2',
+                'Review why local jobs are being cancelled as stale.',
+                'Stale local cancellations crossed the 24h threshold.',
+                evidence_type,
+                count=(flag or {}).get('count'),
+            )
+        elif evidence_type == 'high_final_sweeps':
+            add(
+                'P2',
+                'Inspect final sweep churn for repeated late-stage cleanup.',
+                'Final sweep volume crossed the 24h threshold.',
+                evidence_type,
+                count=(flag or {}).get('count'),
+            )
+
+    priority_rank = {'P0': 0, 'P1': 1, 'P2': 2}
+    return [
+        item
+        for _, item in sorted(
+            enumerate(actions),
+            key=lambda pair: (priority_rank.get(pair[1].get('priority'), 99), pair[0]),
+        )
+    ]
+
+
+def recommended_action_markdown(item: dict) -> str:
+    parts = [
+        f"[{item.get('priority')}]",
+        str(item.get('action') or '').strip(),
+        f"Reason: {str(item.get('reason') or '').strip()}",
+        f"Evidence: {str(item.get('evidence_type') or '').strip()}",
+    ]
+    for key in ('order_id', 'repo_id', 'count'):
+        if key in item:
+            parts.append(f"{key}={item[key]}")
+    return ' '.join(part for part in parts if part)
 
 
 def main() -> int:
@@ -436,9 +660,6 @@ def main() -> int:
         soft_pause_until = 0.0
     factory_soft_pause_active = bool((not factory_hard_stop) and soft_pause_until > now)
     factory_pause_reason = str(state.get('factory_pause_reason') or state.get('proactive_lane_paused_reason') or '').strip()
-
-    if not DB.exists():
-        return _write_error_report(now=now, stamp=stamp, reason='db_missing')
 
     if not DB.exists():
         return _write_error_report(now=now, stamp=stamp, reason='db_missing')
@@ -551,13 +772,25 @@ def main() -> int:
                 'order_id': order_id,
                 'count': len(stale_local),
             })
+        order_status = str(order.get('status') or '').strip().lower()
         if (not open_children) and (not improvement) and (last_activity_age_s is not None) and last_activity_age_s >= 900:
-            anomalies.append({
-                'type': 'idle_without_improvement',
-                'order_id': order_id,
-                'phase': order.get('phase'),
-                'last_activity_age_s': last_activity_age_s,
-            })
+            if order_status == 'paused':
+                anomalies.append({
+                    'type': 'paused_idle_backlog',
+                    'order_id': order_id,
+                    'phase': order.get('phase'),
+                    'open_jobs': len(open_children),
+                    'last_activity_age_s': last_activity_age_s,
+                    'recommended_action': 'resume_or_close_stale_order',
+                })
+            else:
+                anomalies.append({
+                    'type': 'idle_without_improvement',
+                    'order_id': order_id,
+                    'phase': order.get('phase'),
+                    'last_activity_age_s': last_activity_age_s,
+                    'recommended_action': 'close_or_reseed_idle_order',
+                })
         funnel_totals['slices_started'] += int(autonomy_funnel.get('slices_started', 0) or 0)
         funnel_totals['slices_applied'] += int(autonomy_funnel.get('slices_applied', 0) or 0)
         funnel_totals['slices_validated'] += int(autonomy_funnel.get('slices_validated', 0) or 0)
@@ -592,14 +825,76 @@ def main() -> int:
         (since, '%empty response from local ollama model%'),
     ).fetchone()['n']
     enabled_repos = [row for row in repo_rows if str(row.get('status') or '').strip().lower() == 'active' and bool(int(row.get('autonomy_enabled') or 0))]
-    stale_heartbeats = 0
+    enabled_repo_by_id = {
+        str(row.get('repo_id') or '').strip(): row
+        for row in enabled_repos
+        if str(row.get('repo_id') or '').strip()
+    }
+    enabled_repo_ids = set(enabled_repo_by_id.keys())
+    uncovered_repo_details = []
+    for repo in enabled_repos:
+        repo_id = str(repo.get('repo_id') or '').strip()
+        if not repo_id:
+            continue
+        if any(proactive_order_covers_repo(order, repo) for order in proactive_orders):
+            continue
+        uncovered_repo_details.append({
+            'repo_id': repo_id,
+            'repo_path': str(repo.get('path') or ''),
+            'priority': repo.get('priority'),
+            'status': str(repo.get('status') or ''),
+            'updated_at': repo.get('updated_at'),
+        })
+    uncovered_repo_details.sort(key=lambda item: (
+        item.get('priority') if item.get('priority') is not None else 999999,
+        str(item.get('repo_id') or ''),
+    ))
+    uncovered_repo_count = len(uncovered_repo_details)
+    uncovered_repo_details_limited = uncovered_repo_details[:UNCOVERED_REPO_DETAIL_LIMIT]
+    uncovered_repo_details_truncated = uncovered_repo_count > len(uncovered_repo_details_limited)
+    stale_heartbeat_details = []
+    seen_enabled_repo_ids = set()
     for hb in heartbeat_rows:
+        repo_id = str(hb.get('repo_id') or '').strip()
+        if repo_id not in enabled_repo_ids:
+            continue
+        seen_enabled_repo_ids.add(repo_id)
         try:
             heartbeat_at = float(hb.get('heartbeat_at') or 0.0)
         except Exception:
             heartbeat_at = 0.0
         if heartbeat_at <= 0 or (now - heartbeat_at) >= STALE_LOCAL_S:
-            stale_heartbeats += 1
+            repo = enabled_repo_by_id.get(repo_id) or {}
+            stale_heartbeat_details.append({
+                'repo_id': repo_id,
+                'repo_path': str(repo.get('path') or ''),
+                'agent_key': str(hb.get('agent_key') or ''),
+                'role': str(hb.get('role') or ''),
+                'heartbeat_at': heartbeat_at if heartbeat_at > 0 else None,
+                'heartbeat_age_s': max(0, int(now - heartbeat_at)) if heartbeat_at > 0 else None,
+                'updated_at': hb.get('updated_at'),
+                'reason': 'missing_heartbeat' if heartbeat_at <= 0 else 'stale_heartbeat',
+            })
+    for repo_id in sorted(enabled_repo_ids - seen_enabled_repo_ids):
+        repo = enabled_repo_by_id.get(repo_id) or {}
+        stale_heartbeat_details.append({
+            'repo_id': repo_id,
+            'repo_path': str(repo.get('path') or ''),
+            'agent_key': '',
+            'role': '',
+            'heartbeat_at': None,
+            'heartbeat_age_s': None,
+            'updated_at': None,
+            'reason': 'missing_runtime_state_row',
+        })
+    stale_heartbeat_details.sort(key=lambda item: (
+        str(item.get('repo_id') or ''),
+        str(item.get('role') or ''),
+        str(item.get('agent_key') or ''),
+    ))
+    stale_heartbeat_count = len(stale_heartbeat_details)
+    stale_heartbeat_details_limited = stale_heartbeat_details[:STALE_HEARTBEAT_DETAIL_LIMIT]
+    stale_heartbeat_details_truncated = stale_heartbeat_count > len(stale_heartbeat_details_limited)
 
     def audit_count(event_type: str) -> int:
         return int(
@@ -622,6 +917,8 @@ def main() -> int:
         'slices_applied': int(funnel_totals['slices_applied']),
         'slices_validated': int(funnel_totals['slices_validated']),
         'slices_closed': int(funnel_totals['slices_closed']),
+        'implementer_attempts': int(funnel_totals['implementer_attempts']),
+        'implementer_failures': int(funnel_totals['implementer_failures']),
         'implementer_fail_rate': round(float(implementer_fail_rate), 4),
         'mean_time_to_validated_improvement': mean_time_to_validated_improvement,
         'loop_breaker_count': int(funnel_totals['loop_breaker_count']),
@@ -635,7 +932,8 @@ def main() -> int:
         'factory_repo_orders_24h': audit_count('factory.repo_order.created'),
         'factory_enabled_repos': len(enabled_repos),
         'factory_registered_repos': len(repo_rows),
-        'factory_stale_heartbeats': int(stale_heartbeats),
+        'factory_stale_heartbeats': int(stale_heartbeat_count),
+        'factory_uncovered_enabled_repos': int(uncovered_repo_count),
     }
 
     operational_status = 'OK'
@@ -666,6 +964,18 @@ def main() -> int:
         anomalies.append({
             'type': 'factory_stale_heartbeats',
             'count': metrics['factory_stale_heartbeats'],
+            'details': stale_heartbeat_details_limited,
+            'details_truncated': stale_heartbeat_details_truncated,
+            'detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+        })
+        operational_status = worst_status(operational_status, 'WARN')
+    if metrics['factory_uncovered_enabled_repos'] > 0:
+        anomalies.append({
+            'type': 'factory_uncovered_enabled_repos',
+            'count': metrics['factory_uncovered_enabled_repos'],
+            'details': uncovered_repo_details_limited,
+            'details_truncated': uncovered_repo_details_truncated,
+            'detail_limit': UNCOVERED_REPO_DETAIL_LIMIT,
         })
         operational_status = worst_status(operational_status, 'WARN')
 
@@ -690,8 +1000,22 @@ def main() -> int:
             'type': 'high_model_fallbacks',
             'count': metrics['factory_model_fallback_24h'],
         })
+    implementer_fail_rate_threshold = float(AUTONOMY_MINIMUM_SLO['implementer_fail_rate_lte'])
+    if (
+        int(metrics['implementer_attempts']) >= IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS
+        and float(metrics['implementer_fail_rate']) > implementer_fail_rate_threshold
+    ):
+        trend_flags.append({
+            'type': 'high_implementer_fail_rate',
+            'fail_rate': metrics['implementer_fail_rate'],
+            'attempts': metrics['implementer_attempts'],
+            'failures': metrics['implementer_failures'],
+            'threshold': implementer_fail_rate_threshold,
+            'minimum_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
+        })
     trend_status = 'WARN' if trend_flags else 'OK'
     status = worst_status(operational_status, trend_status)
+    recommended_actions = build_recommended_actions(anomalies, trend_flags)
 
     report = {
         'ts': now,
@@ -706,7 +1030,14 @@ def main() -> int:
             'soft_pause_until': soft_pause_until if factory_soft_pause_active else None,
             'registered_repos': len(repo_rows),
             'enabled_repos': len(enabled_repos),
-            'stale_heartbeats': int(stale_heartbeats),
+            'uncovered_enabled_repos': int(uncovered_repo_count),
+            'uncovered_repo_details': uncovered_repo_details_limited,
+            'uncovered_repo_details_truncated': uncovered_repo_details_truncated,
+            'uncovered_repo_detail_limit': UNCOVERED_REPO_DETAIL_LIMIT,
+            'stale_heartbeats': int(stale_heartbeat_count),
+            'stale_heartbeat_details': stale_heartbeat_details_limited,
+            'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
+            'stale_heartbeat_detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
         },
         'metrics': metrics,
         'autonomy_funnel': {
@@ -714,17 +1045,18 @@ def main() -> int:
             'slices_applied': metrics['slices_applied'],
             'slices_validated': metrics['slices_validated'],
             'slices_closed': metrics['slices_closed'],
+            'implementer_attempts': metrics['implementer_attempts'],
+            'implementer_failures': metrics['implementer_failures'],
             'implementer_fail_rate': metrics['implementer_fail_rate'],
             'mean_time_to_validated_improvement': metrics['mean_time_to_validated_improvement'],
             'loop_breaker_count': metrics['loop_breaker_count'],
-            'autonomy_minimum_slo': {
-                'implementer_fail_rate_lte': 0.35,
-                'closed_over_started_gte': 0.50,
-            },
+            'autonomy_minimum_slo': AUTONOMY_MINIMUM_SLO,
+            'implementer_fail_rate_trend_min_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
         },
         'orders': order_reports,
         'anomalies': anomalies,
         'trend_flags': trend_flags,
+        'recommended_actions': recommended_actions,
     }
 
     lines = [
@@ -735,6 +1067,7 @@ def main() -> int:
         f'- Trend status: {trend_status}',
         f"- Factory state: {'hard_stop' if factory_hard_stop else ('soft_pause' if factory_soft_pause_active else 'active')}",
         f"- Factory repos: registered={metrics['factory_registered_repos']} enabled={metrics['factory_enabled_repos']}",
+        f"- Factory uncovered enabled repos: {metrics['factory_uncovered_enabled_repos']}",
         f"- Factory stale heartbeats: {metrics['factory_stale_heartbeats']}",
         f"- Active proactive orders: {metrics['proactive_active_orders']}",
         f"- Autonomy funnel (24h): started={metrics['slices_started']} applied={metrics['slices_applied']} validated={metrics['slices_validated']} closed={metrics['slices_closed']}",
@@ -748,8 +1081,17 @@ def main() -> int:
         f"- Final sweeps (24h): {metrics['final_sweeps_24h']}",
         f"- Model fallbacks (24h): {metrics['factory_model_fallback_24h']}",
         '',
-        '## Orders',
+        '## Recommended Actions',
     ]
+    if not recommended_actions:
+        lines.append('- None')
+    else:
+        for item in recommended_actions:
+            lines.append(f"- {recommended_action_markdown(item)}")
+    lines.extend([
+        '',
+        '## Orders',
+    ])
     if not order_reports:
         lines.append('- No active proactive orders.')
     for item in order_reports:

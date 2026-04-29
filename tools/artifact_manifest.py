@@ -110,8 +110,36 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(json.dumps({'ok': False, 'error': f'missing manifest: {manifest_path}'}, indent=2))
         return 2
 
-    obj = json.loads(manifest_path.read_text(encoding='utf-8'))
-    entries = obj.get('entries') if isinstance(obj, dict) else None
+    try:
+        obj = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError as exc:
+        print(
+            json.dumps(
+                {
+                    'ok': False,
+                    'error': 'malformed manifest JSON',
+                    'reason': str(exc),
+                    'manifest_path': str(manifest_path),
+                },
+                indent=2,
+            )
+        )
+        return 2
+    if not isinstance(obj, dict):
+        print(
+            json.dumps(
+                {
+                    'ok': False,
+                    'error': 'invalid manifest root',
+                    'reason': 'manifest root must be an object',
+                    'manifest_path': str(manifest_path),
+                },
+                indent=2,
+            )
+        )
+        return 2
+
+    entries = obj.get('entries')
     if not isinstance(entries, list):
         print(json.dumps({'ok': False, 'error': 'invalid manifest entries'}, indent=2))
         return 2

@@ -73,6 +73,14 @@ def _preview(text: Any, limit: int = 180) -> str:
     return raw[: limit - 3].rstrip() + "..."
 
 
+def _is_idle_no_open_jobs_self_check(row: dict[str, Any]) -> bool:
+    role = str(row.get("role") or "").strip().lower()
+    text = str(row.get("input_text") or "").strip()
+    return role == "sre" and text.startswith(
+        "Preflight guard and closure protocol for idle scheduler state (no open jobs)."
+    )
+
+
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -118,6 +126,8 @@ def fetch_open_jobs(conn: sqlite3.Connection, *, now: float | None = None) -> li
     out: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        if _is_idle_no_open_jobs_self_check(item):
+            continue
         created_at = _safe_float(item.get("created_at"))
         updated_at = _safe_float(item.get("updated_at"))
         stalled_since = _safe_float(item.get("stalled_since"))
@@ -169,4 +179,3 @@ def build_liveness_payload(db_path: Path | None = None, *, now: float | None = N
         "open_jobs": open_jobs,
         "oldest_open_age_seconds": oldest,
     }
-

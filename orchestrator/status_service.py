@@ -182,6 +182,33 @@ def _assign_running_to_workers(
 _DELIVERY_ROLES = {"backend", "frontend", "sre", "security", "implementer_local"}
 _VALIDATION_ROLES = {"qa", "release_mgr", "reviewer_local"}
 _CONTROLLER_ROLES = {"skynet"}
+_WORKFLOW_STAGE_ORDER = ("skynet_plan", "delivery", "validation", "skynet_review", "deploy")
+_WORKFLOW_STAGE_LABELS = {
+    "skynet_plan": "Skynet plan",
+    "delivery": "Delivery",
+    "validation": "Validation",
+    "skynet_review": "Skynet review",
+    "deploy": "Deploy",
+}
+_WORKFLOW_STAGE_SLA_SECONDS_BY_TIER = {
+    "P1": {
+        "skynet_plan": 15 * 60,
+        "delivery": 60 * 60,
+        "validation": 30 * 60,
+        "skynet_review": 30 * 60,
+        "deploy": 30 * 60,
+    },
+}
+
+
+def _normalize_sla_tier(sla_tier: str | None) -> str:
+    tier = str(sla_tier or "").strip().upper()
+    return tier if tier in _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER else "P1"
+
+
+def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
+    tier = _normalize_sla_tier(sla_tier)
+    return int((_WORKFLOW_STAGE_SLA_SECONDS_BY_TIER.get(tier) or {}).get(stage, 0) or 0)
 
 
 def _count_task_states(tasks: list[Task]) -> dict[str, int]:
@@ -249,6 +276,63 @@ def _controller_failure_summary(task: Task | None) -> str | None:
     if stdout_tail:
         return stdout_tail[:280]
     return None
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            s = str(item or "").strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+def _artifact_refs_from_task(task: Task) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    base = {
+        "job_id": task.job_id,
+        "job_id_short": task.job_id[:8],
+        "role": str(task.role or "").strip().lower(),
+    }
+    artifacts_dir = str(task.artifacts_dir or "").strip()
+    if artifacts_dir:
+        refs.append({**base, "kind": "artifacts_dir", "path": artifacts_dir})
+
+    trace = task.trace or {}
+    for key in ("result_artifacts", "artifacts"):
+        for path in _coerce_str_list(trace.get(key)):
+            refs.append({**base, "kind": key, "path": path})
+    return refs
+
+
+def _artifact_refs_from_trace_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        base = {
+            "trace_event_id": event.get("id"),
+            "job_id": event.get("job_id"),
+            "job_id_short": (str(event.get("job_id"))[:8] if event.get("job_id") else None),
+            "role": event.get("agent_role"),
+        }
+        artifact_id = str(event.get("artifact_id") or "").strip()
+        if artifact_id:
+            refs.append({**base, "kind": "trace_artifact_id", "artifact_id": artifact_id})
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        for key in ("result_artifacts", "artifacts"):
+            for path in _coerce_str_list(payload.get(key)):
+                refs.append({**base, "kind": f"trace_payload_{key}", "path": path})
+    return refs
 
 
 def _derive_stage_status(
@@ -459,12 +543,944 @@ def _build_order_workflow(
     }
 
 
+_BLOCKING_TASK_STATES = {"failed", "blocked", "blocked_approval", "waiting_deps"}
+
+
+def _readiness_trace_evidence(key: str, value: Any) -> dict[str, Any]:
+    return {"kind": "trace", "key": key, "value": value}
+
+
+def _readiness_job_evidence(task: Task | None) -> list[dict[str, Any]]:
+    ref = _workflow_task_ref(task)
+    return [{"kind": "job", **ref}] if ref is not None else []
+
+
+def _readiness_artifact_evidence(artifacts: list[dict[str, Any]], *, roles: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        role = str(artifact.get("role") or "").strip().lower()
+        if role not in roles:
+            continue
+        item: dict[str, Any] = {"kind": "artifact", "role": role}
+        for key in ("job_id", "job_id_short", "path", "artifact_id"):
+            if artifact.get(key):
+                item[key] = artifact.get(key)
+        out.append(item)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _readiness_decision_evidence(decision_log: list[dict[str, Any]], *, kinds: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in decision_log:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        if kind not in kinds:
+            continue
+        out.append(
+            {
+                "kind": "decision_log",
+                "decision_kind": kind,
+                "state": str(item.get("state") or "").strip().lower(),
+                "job_id": item.get("job_id"),
+                "job_id_short": item.get("job_id_short"),
+                "summary": str(item.get("summary") or "").strip()[:280] or None,
+            }
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _readiness_trace_event_evidence(traces: list[dict[str, Any]], *, event_types: set[str]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for event in traces:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("event_type") or "").strip().lower()
+        if event_type not in event_types:
+            continue
+        out.append(
+            {
+                "kind": "trace_event",
+                "trace_event_id": event.get("id"),
+                "event_type": event_type,
+                "job_id": event.get("job_id"),
+                "job_id_short": (str(event.get("job_id"))[:8] if event.get("job_id") else None),
+                "role": event.get("agent_role"),
+                "artifact_id": event.get("artifact_id"),
+            }
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _task_summary(task: Task | None, fallback: str) -> str:
+    if task is None:
+        return fallback
+    trace = task.trace or {}
+    summary = str(trace.get("result_summary") or task.blocked_reason or "").strip()
+    return summary[:280] if summary else fallback
+
+
+def _has_patch_artifact_evidence(task: Task) -> bool:
+    trace = task.trace or {}
+    patch_info = trace.get("local_patch_info")
+    if not isinstance(patch_info, dict):
+        patch_info = trace.get("patch_info")
+    changed = patch_info.get("changed_files") if isinstance(patch_info, dict) else None
+    return bool(
+        trace.get("slice_patch_applied")
+        or (isinstance(changed, list) and any(str(item or "").strip() for item in changed))
+        or _coerce_str_list(trace.get("result_artifacts"))
+        or _coerce_str_list(trace.get("artifacts"))
+        or str(task.artifacts_dir or "").strip()
+    )
+
+
+def _has_validation_evidence(task: Task) -> bool:
+    trace = task.trace or {}
+    patch_info = trace.get("local_patch_info")
+    if not isinstance(patch_info, dict):
+        patch_info = trace.get("patch_info")
+    return bool(
+        trace.get("slice_validation_ok")
+        or trace.get("review_ready")
+        or trace.get("improvement_verified")
+        or trace.get("quality_gate_status") in {"validated", "reviewed_ready", "closed"}
+        or trace.get("slice_status") in {"validated", "reviewed_ready", "closed"}
+        or (isinstance(patch_info, dict) and bool(patch_info.get("validation_ok")))
+    )
+
+
+def _build_release_readiness(
+    *,
+    order_row: dict[str, Any],
+    root_task: Task | None,
+    children: list[Task],
+    workflow: dict[str, Any],
+    decision_log: list[dict[str, Any]],
+    traces: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    root_trace = dict((root_task.trace or {}) if root_task is not None else {})
+    proactive_keys_present = any(str(key).startswith("proactive_") for key in root_trace.keys())
+    applies = bool(root_trace.get("proactive_lane", False) or proactive_keys_present)
+    phase = str(order_row.get("phase") or "planning")
+    current_stage = str(workflow.get("current_stage") or "skynet_plan")
+    check_keys = ["delivery_applied", "validation_passed", "controller_signoff", "release_evidence", "merge_ready"]
+
+    if not applies:
+        return {
+            "schema_version": 1,
+            "scope": "proactive_order",
+            "applies": False,
+            "state": "not_applicable",
+            "verdict": "n/a",
+            "summary": "Release readiness applies only to proactive orders.",
+            "current_stage": current_stage,
+            "phase": phase,
+            "checks": [
+                {"key": key, "status": "na", "summary": "Not a proactive order.", "evidence": []}
+                for key in check_keys
+            ],
+            "blockers": [],
+            "next_action": "Use the standard order workflow fields.",
+        }
+
+    delivery_children = [t for t in children if str(t.role or "").strip().lower() in _DELIVERY_ROLES]
+    validation_children = [t for t in children if str(t.role or "").strip().lower() in _VALIDATION_ROLES and str(t.role or "").strip().lower() != "release_mgr"]
+    release_children = [t for t in children if str(t.role or "").strip().lower() == "release_mgr"]
+    controller_children = [t for t in children if str(t.role or "").strip().lower() in _CONTROLLER_ROLES]
+
+    latest_delivery = _latest_task(delivery_children)
+    latest_validation = _latest_task(validation_children)
+    latest_release = _latest_task(release_children)
+    latest_controller = _latest_task(controller_children)
+
+    applied_count = _coerce_int(root_trace.get("proactive_slices_applied"))
+    validated_count = _coerce_int(root_trace.get("proactive_slices_validated"))
+    closed_count = _coerce_int(root_trace.get("proactive_slices_closed"))
+    quality_gate_status = str(root_trace.get("proactive_quality_gate_status") or "").strip().lower()
+    merge_ready = bool(root_trace.get("merge_ready", False))
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+    deploy_status = str(root_trace.get("deploy_status") or "").strip().lower()
+    already_released = bool(merged_to_main or deploy_status in {"ok", "scheduled"})
+
+    delivery_blocked = [t for t in delivery_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    validation_blocked = [t for t in validation_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    release_blocked = [t for t in release_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+    controller_blocked = [t for t in controller_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
+
+    blockers: list[dict[str, Any]] = []
+    for stage, tasks, fallback in (
+        ("delivery", delivery_blocked, "Delivery work is blocked."),
+        ("validation", validation_blocked, "Validation did not pass."),
+        ("release_evidence", release_blocked, "Release evidence is blocked."),
+        ("controller_signoff", controller_blocked, "Controller signoff did not complete cleanly."),
+    ):
+        if not tasks:
+            continue
+        task = _latest_task(tasks)
+        blockers.append({"stage": stage, "summary": _task_summary(task, fallback), "job": _workflow_task_ref(task)})
+    if deploy_status == "failed":
+        blockers.append({"stage": "release", "summary": str(root_trace.get("deploy_summary") or "Deploy failed after merge.")[:280], "job": None})
+
+    delivery_applied = bool(applied_count > 0 or any(str(t.state or "").strip().lower() == "done" and _has_patch_artifact_evidence(t) for t in delivery_children))
+    validation_passed = bool(
+        validated_count > 0
+        or quality_gate_status in {"validated", "reviewed_ready", "closed"}
+        or any(str(t.state or "").strip().lower() == "done" and _has_validation_evidence(t) for t in [*validation_children, *release_children])
+    )
+    controller_signoff = bool(
+        closed_count > 0
+        or root_trace.get("proactive_improvement_verified")
+        or root_trace.get("proactive_improvement_closed")
+        or root_trace.get("proactive_no_change_validated")
+        or any(str(t.state or "").strip().lower() == "done" and _has_validation_evidence(t) for t in controller_children)
+    )
+    release_evidence = bool(
+        root_trace.get("proactive_improvement_closed")
+        or root_trace.get("proactive_no_change_validated")
+        or any(str(t.state or "").strip().lower() == "done" and (_has_validation_evidence(t) or _has_patch_artifact_evidence(t)) for t in release_children)
+        or _readiness_decision_evidence(decision_log, kinds={"release", "release_evidence"})
+        or _readiness_trace_event_evidence(traces, event_types={"order.proactive_verified_improvement_closed", "order.proactive_no_change_closed"})
+    )
+    merge_ready_pass = bool(merge_ready or already_released)
+
+    checks = [
+        {
+            "key": "delivery_applied",
+            "status": "fail" if delivery_blocked else ("pass" if delivery_applied else "pending"),
+            "summary": (
+                "Delivery changes are applied."
+                if delivery_applied
+                else ("Delivery is blocked." if delivery_blocked else "Waiting for applied delivery evidence.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_applied", applied_count)] if applied_count > 0 else _readiness_job_evidence(latest_delivery)
+            ),
+        },
+        {
+            "key": "validation_passed",
+            "status": "fail" if validation_blocked else ("pass" if validation_passed else "pending"),
+            "summary": (
+                "Validation evidence is present."
+                if validation_passed
+                else ("Validation is blocked." if validation_blocked else "Waiting for validation evidence.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_validated", validated_count), _readiness_trace_evidence("proactive_quality_gate_status", quality_gate_status)]
+                if validation_passed
+                else _readiness_job_evidence(latest_validation)
+            ),
+        },
+        {
+            "key": "controller_signoff",
+            "status": "fail" if controller_blocked else ("pass" if controller_signoff else "pending"),
+            "summary": (
+                "Controller signoff is present."
+                if controller_signoff
+                else ("Controller signoff is blocked." if controller_blocked else "Waiting for controller signoff.")
+            ),
+            "evidence": (
+                [_readiness_trace_evidence("proactive_slices_closed", closed_count)]
+                if closed_count > 0
+                else _readiness_job_evidence(latest_controller)
+            ),
+        },
+        {
+            "key": "release_evidence",
+            "status": "fail" if release_blocked else ("pass" if release_evidence else "pending"),
+            "summary": (
+                "Release evidence is present."
+                if release_evidence
+                else ("Release evidence is blocked." if release_blocked else "Waiting for release evidence.")
+            ),
+            "evidence": (
+                [
+                    *_readiness_artifact_evidence(artifacts, roles={"release_mgr", "qa", "reviewer_local", "skynet"}),
+                    *_readiness_decision_evidence(decision_log, kinds={"release", "release_evidence"}),
+                    *_readiness_trace_event_evidence(traces, event_types={"order.proactive_verified_improvement_closed", "order.proactive_no_change_closed"}),
+                ][:5]
+                or ([_readiness_trace_evidence("proactive_improvement_closed", True)] if root_trace.get("proactive_improvement_closed") else _readiness_job_evidence(latest_release))
+            ),
+        },
+        {
+            "key": "merge_ready",
+            "status": "pass" if merge_ready_pass else "pending",
+            "summary": (
+                "Order is already merged or released."
+                if already_released
+                else ("Order is marked ready for merge." if merge_ready else "Waiting for merge-ready signal.")
+            ),
+            "evidence": [
+                _readiness_trace_evidence("merge_ready", merge_ready),
+                _readiness_trace_evidence("merged_to_main", merged_to_main),
+            ],
+        },
+    ]
+
+    if blockers:
+        state = "blocked"
+        verdict = "no_go"
+        summary = f"Release is blocked at {blockers[0]['stage']}."
+        next_action = blockers[0]["summary"]
+    elif already_released:
+        state = "released"
+        verdict = "go"
+        summary = "Proactive order is already merged or released."
+        next_action = "Monitor deploy status and post-release evidence."
+    elif all(str(check.get("status") or "") == "pass" for check in checks):
+        state = "ready"
+        verdict = "go"
+        summary = "Proactive order has delivery, validation, controller, release, and merge-ready evidence."
+        next_action = "Release or merge the order branch."
+    else:
+        state = "not_ready"
+        verdict = "wait"
+        first_pending = next((check for check in checks if str(check.get("status") or "") == "pending"), None)
+        pending_key = str(first_pending.get("key") or "release_readiness") if first_pending else "release_readiness"
+        summary = f"Proactive order is waiting on {pending_key}."
+        next_action = str(first_pending.get("summary") or "Continue the proactive workflow.") if first_pending else "Continue the proactive workflow."
+
+    return {
+        "schema_version": 1,
+        "scope": "proactive_order",
+        "applies": True,
+        "state": state,
+        "verdict": verdict,
+        "summary": summary,
+        "current_stage": current_stage,
+        "phase": phase,
+        "checks": checks,
+        "blockers": blockers,
+        "next_action": next_action,
+    }
+
+
+_PROACTIVE_MARKERS = ("[proactive:", "proactive sprint")
+_DECISION_RANK = {
+    "release": 0,
+    "unblock": 1,
+    "advance": 2,
+    "monitor": 3,
+}
+_STAGE_RANK = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
+
+
+def _is_proactive_order(order_row: dict[str, Any], root_task: Task | None) -> bool:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    if bool(trace.get("proactive_lane")):
+        return True
+    if any(str(key).startswith("proactive_") for key in trace.keys()):
+        return True
+
+    haystack = " ".join(
+        [
+            str((order_row or {}).get("title") or ""),
+            str((order_row or {}).get("body") or ""),
+            str(root_task.input_text if root_task is not None else ""),
+        ]
+    ).lower()
+    return any(marker in haystack for marker in _PROACTIVE_MARKERS)
+
+
+def _primary_blocker(order: dict[str, Any]) -> dict[str, Any] | None:
+    blockers = list(order.get("blockers") or [])
+    for blocker in blockers:
+        if isinstance(blocker, dict):
+            return blocker
+    return None
+
+
+def _priority_decision(order: dict[str, Any]) -> tuple[str, str, dict[str, Any] | None]:
+    readiness_state = str(order.get("readiness_state") or "").strip().lower()
+    readiness_verdict = str(order.get("readiness_verdict") or "").strip().lower()
+    stage = str(order.get("current_stage") or "skynet_plan").strip()
+    merge_ready = bool(order.get("merge_ready"))
+    merged_to_main = bool(order.get("merged_to_main"))
+    blocker = _primary_blocker(order)
+
+    if merged_to_main or readiness_state == "released":
+        return "monitor", "Already merged or released; keep it behind unreleased proactive orders.", blocker
+    if merge_ready or readiness_state == "ready" or readiness_verdict == "go":
+        return "release", "Ready/go order should be released before spending attention on blocked or not-ready work.", blocker
+    if blocker is not None or readiness_state == "blocked" or readiness_verdict == "no_go":
+        blocker_summary = str((blocker or {}).get("summary") or "").strip()
+        blocker_stage = str((blocker or {}).get("stage") or stage).strip()
+        why = f"Blocked at {blocker_stage}; clearing this restores flow for an active proactive order."
+        if blocker_summary:
+            why = f"{why} Primary blocker: {blocker_summary}"
+        return "unblock", why, blocker
+    return "advance", f"Not ready yet; advance {stage} evidence before it can be released.", blocker
+
+
+def _priority_next_action(order: dict[str, Any], decision: str, blocker: dict[str, Any] | None) -> str:
+    existing = str(order.get("next_action") or "").strip()
+    if decision == "release":
+        return existing or "Release or merge the order branch."
+    if decision == "monitor":
+        return existing or "Monitor deploy status and post-release evidence."
+    if blocker is not None:
+        summary = str(blocker.get("summary") or "").strip()
+        if summary:
+            return summary
+    return existing or "Advance the proactive workflow evidence."
+
+
 @dataclass
 class StatusService:
     orch_q: OrchestratorQueue
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
     factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
+    proactive_health_fn: Callable[[], dict[str, Any]] | None = None
+
+    def proactive_health(self) -> dict[str, Any]:
+        if self.proactive_health_fn is None:
+            return {
+                "status": "not_configured",
+                "operational_status": "not_configured",
+                "trend_status": "not_configured",
+                "alert_level": "OK",
+                "alert_active": False,
+                "summary_reason": "proactive_health_fn_not_configured",
+                "report_found": False,
+                "stale_report": False,
+                "report_age_s": None,
+            }
+
+        try:
+            raw = self.proactive_health_fn()
+        except Exception:
+            raw = None
+        if not isinstance(raw, dict):
+            return {
+                "status": "unavailable",
+                "operational_status": "unavailable",
+                "trend_status": "unavailable",
+                "alert_level": "OK",
+                "alert_active": False,
+                "summary_reason": "proactive_health_fn_unavailable",
+                "report_found": False,
+                "stale_report": False,
+                "report_age_s": None,
+            }
+
+        def _text(name: str, default: str) -> str:
+            value = str(raw.get(name) or "").strip()
+            return value if value else default
+
+        def _bool(name: str, default: bool = False) -> bool:
+            value = raw.get(name)
+            if value is None:
+                return bool(default)
+            return bool(value)
+
+        report_age_raw = raw.get("report_age_s")
+        try:
+            report_age_s = int(report_age_raw) if report_age_raw is not None else None
+        except Exception:
+            report_age_s = None
+
+        alert_level = _text("alert_level", "OK").upper()
+        if alert_level not in ("OK", "WARN", "CRITICAL"):
+            alert_level = "OK"
+
+        return {
+            "status": _text("status", "unavailable"),
+            "operational_status": _text("operational_status", "unavailable"),
+            "trend_status": _text("trend_status", "unavailable"),
+            "alert_level": alert_level,
+            "alert_active": _bool("alert_active", alert_level in ("WARN", "CRITICAL")),
+            "summary_reason": _text("summary_reason", "unavailable"),
+            "report_found": _bool("report_found", False),
+            "stale_report": _bool("stale_report", False),
+            "report_age_s": report_age_s,
+        }
+
+    def _proactive_health_alert(self, proactive_health: dict[str, Any]) -> dict[str, Any] | None:
+        if not bool(proactive_health.get("alert_active")):
+            return None
+        level = str(proactive_health.get("alert_level") or "").strip().upper()
+        severity = {"CRITICAL": "critical", "WARN": "warning"}.get(level, "info")
+        summary = str(proactive_health.get("summary_reason") or "").strip() or "proactive health alert active"
+        return {
+            "kind": "proactive_health",
+            "severity": severity,
+            "summary": summary,
+            "alert_level": level or "OK",
+            "operational_status": proactive_health.get("operational_status"),
+            "trend_status": proactive_health.get("trend_status"),
+            "report_age_s": proactive_health.get("report_age_s"),
+            "stale_report": bool(proactive_health.get("stale_report")),
+        }
+
+    def autonomy_board(self, *, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        generated_at = float(time.time())
+        if chat_id is None:
+            orders = self.orch_q.list_orders_global(status="active", limit=lim)
+        else:
+            orders = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=lim)
+
+        rows: list[dict[str, Any]] = []
+        readiness_counts: dict[str, int] = {}
+        stage_counts: dict[str, int] = {}
+        for order_row in orders:
+            oid = str((order_row or {}).get("order_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                root_task = self.orch_q.get_job(oid)
+            except Exception:
+                root_task = None
+            try:
+                children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=200) if t.job_id != oid]
+            except Exception:
+                children = []
+            try:
+                traces = self.orch_q.list_trace_events(order_id=oid, limit=100)
+            except Exception:
+                traces = []
+            try:
+                decision_log = self.orch_q.list_decision_log(order_id=oid, limit=50)
+            except Exception:
+                decision_log = []
+
+            tasks = ([root_task] if root_task is not None else []) + children
+            artifacts: list[dict[str, Any]] = []
+            for task in tasks:
+                artifacts.extend(_artifact_refs_from_task(task))
+            artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+            workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+            readiness = _build_release_readiness(
+                order_row=order_row,
+                root_task=root_task,
+                children=children,
+                workflow=workflow,
+                decision_log=decision_log,
+                traces=traces,
+                artifacts=artifacts,
+            )
+            children_by_state = _count_task_states(children)
+            children_by_role: dict[str, int] = {}
+            for child in children:
+                role = str(child.role or "").strip().lower() or "unknown"
+                children_by_role[role] = children_by_role.get(role, 0) + 1
+
+            readiness_state = str(readiness.get("state") or "unknown")
+            current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
+            readiness_counts[readiness_state] = readiness_counts.get(readiness_state, 0) + 1
+            stage_counts[current_stage] = stage_counts.get(current_stage, 0) + 1
+            blockers = list(readiness.get("blockers") or workflow.get("blockers") or [])
+            updated_at = float((order_row or {}).get("updated_at") or (root_task.updated_at if root_task is not None else 0.0) or 0.0)
+
+            rows.append(
+                {
+                    "order_id": oid,
+                    "order_id_short": oid[:8],
+                    "chat_id": int((order_row or {}).get("chat_id") or (root_task.chat_id if root_task is not None else 0) or 0),
+                    "title": str((order_row or {}).get("title") or (_task_title(root_task) if root_task is not None else "")),
+                    "priority": int((order_row or {}).get("priority") or (root_task.priority if root_task is not None else 2) or 2),
+                    "phase": str((order_row or {}).get("phase") or "planning"),
+                    "current_stage": current_stage,
+                    "workflow_stages": [
+                        {
+                            "stage": str(stage.get("stage") or ""),
+                            "status": str(stage.get("status") or "pending"),
+                            "summary": stage.get("summary"),
+                        }
+                        for stage in list(workflow.get("stages") or [])
+                        if str(stage.get("stage") or "") in _WORKFLOW_STAGE_ORDER
+                    ],
+                    "readiness_state": readiness_state,
+                    "readiness_verdict": str(readiness.get("verdict") or "unknown"),
+                    "blockers": blockers,
+                    "next_action": str(readiness.get("next_action") or ""),
+                    "updated_at": updated_at,
+                    "children_total": len(children),
+                    "children_by_state": children_by_state,
+                    "children_by_role": children_by_role,
+                    "merge_ready": bool(workflow.get("merge_ready")),
+                    "merged_to_main": bool(workflow.get("merged_to_main")),
+                }
+            )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "orders_total": len(rows),
+                "by_readiness_state": readiness_counts,
+                "by_current_stage": stage_counts,
+            },
+            "orders": rows,
+        }
+
+    def workflow_bottlenecks(self, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        board = self.autonomy_board(chat_id=chat_id, limit=lim)
+        generated_at = float(board.get("generated_at") or time.time())
+        stage_index = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
+        stages: dict[str, dict[str, Any]] = {
+            stage: {
+                "stage": stage,
+                "label": _WORKFLOW_STAGE_LABELS.get(stage, stage),
+                "orders_count": 0,
+                "blocked_count": 0,
+                "failed_count": 0,
+                "running_count": 0,
+                "pending_count": 0,
+                "oldest_updated_at": None,
+                "recommended_next_action": "No active orders at this stage.",
+                "orders": [],
+            }
+            for stage in _WORKFLOW_STAGE_ORDER
+        }
+
+        def _compact_blockers(order: dict[str, Any], stage: str) -> str:
+            summaries: list[str] = []
+            for blocker in list(order.get("blockers") or []):
+                if not isinstance(blocker, dict):
+                    continue
+                blocker_stage = str(blocker.get("stage") or "").strip()
+                normalized_stage = {
+                    "controller_signoff": "skynet_review",
+                    "release_evidence": "deploy",
+                    "release": "deploy",
+                }.get(blocker_stage, blocker_stage)
+                if normalized_stage != stage:
+                    continue
+                summary = str(blocker.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary[:280])
+            return "; ".join(summaries[:2])
+
+        def _stage_status(order: dict[str, Any], stage: str) -> str:
+            for item in list(order.get("workflow_stages") or []):
+                if isinstance(item, dict) and str(item.get("stage") or "") == stage:
+                    return str(item.get("status") or "pending").strip().lower() or "pending"
+            if str(order.get("current_stage") or "") == stage:
+                state = str(order.get("readiness_state") or "").strip().lower()
+                if state == "blocked":
+                    return "blocked"
+                if state in {"not_ready", "not_applicable"}:
+                    return "pending"
+            return "pending"
+
+        for order in list(board.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            current_stage = str(order.get("current_stage") or "skynet_plan").strip()
+            if current_stage not in stages:
+                current_stage = "skynet_plan"
+            status = _stage_status(order, current_stage)
+            stage = stages[current_stage]
+            stage["orders_count"] = int(stage["orders_count"]) + 1
+            if status == "failed":
+                stage["failed_count"] = int(stage["failed_count"]) + 1
+            elif status in {"blocked", "blocked_approval", "waiting_deps"}:
+                stage["blocked_count"] = int(stage["blocked_count"]) + 1
+            elif status == "running":
+                stage["running_count"] = int(stage["running_count"]) + 1
+            elif status == "pending":
+                stage["pending_count"] = int(stage["pending_count"]) + 1
+
+            updated_at = _coerce_float(order.get("updated_at"))
+            oldest = _coerce_float(stage.get("oldest_updated_at"))
+            if updated_at is not None and (oldest is None or updated_at < oldest):
+                stage["oldest_updated_at"] = updated_at
+
+            compact_order = {
+                "order_id": str(order.get("order_id") or ""),
+                "order_id_short": str(order.get("order_id_short") or str(order.get("order_id") or "")[:8]),
+                "title": str(order.get("title") or ""),
+                "priority": int(order.get("priority") or 2),
+                "phase": str(order.get("phase") or "planning"),
+                "current_stage": current_stage,
+                "readiness_state": str(order.get("readiness_state") or "unknown"),
+                "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
+                "blocker_summary": _compact_blockers(order, current_stage),
+                "next_action": str(order.get("next_action") or ""),
+                "updated_at": updated_at,
+            }
+            orders = list(stage.get("orders") or [])
+            orders.append(compact_order)
+            orders.sort(
+                key=lambda o: (
+                    int(o.get("priority") or 2),
+                    float(o.get("updated_at") or float("inf")),
+                    str(o.get("order_id") or ""),
+                )
+            )
+            stage["orders"] = orders[:lim]
+
+        for stage_name, stage in stages.items():
+            orders = list(stage.get("orders") or [])
+            if orders:
+                first_action = str(orders[0].get("next_action") or orders[0].get("blocker_summary") or "").strip()
+                stage["recommended_next_action"] = first_action or f"Advance the oldest {stage_name} order."
+
+        ordered_stages = [stages[stage] for stage in _WORKFLOW_STAGE_ORDER]
+
+        def _rank_key(stage: dict[str, Any]) -> tuple[int, int, float, int]:
+            name = str(stage.get("stage") or "")
+            blocked_failed = int(stage.get("blocked_count") or 0) + int(stage.get("failed_count") or 0)
+            oldest = _coerce_float(stage.get("oldest_updated_at"))
+            return (
+                -blocked_failed,
+                -int(stage.get("orders_count") or 0),
+                oldest if oldest is not None else float("inf"),
+                stage_index.get(name, 999),
+            )
+
+        bottleneck = min(ordered_stages, key=_rank_key) if ordered_stages else None
+        bottleneck_stage = str((bottleneck or {}).get("stage") or _WORKFLOW_STAGE_ORDER[0])
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "orders_total": int((board.get("summary") or {}).get("orders_total") or 0),
+                "bottleneck_stage": bottleneck_stage,
+                "bottleneck_score": int((bottleneck or {}).get("blocked_count") or 0) + int((bottleneck or {}).get("failed_count") or 0),
+                "recommended_next_action": str((bottleneck or {}).get("recommended_next_action") or ""),
+            },
+            "stages": ordered_stages,
+        }
+
+    def proactive_priorities(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        generated_at = float(time.time())
+        board = self.autonomy_board(chat_id=chat_id, limit=200)
+
+        if chat_id is None:
+            active_rows = self.orch_q.list_orders_global(status="active", limit=200)
+        else:
+            active_rows = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
+        active_by_id = {str(row.get("order_id") or ""): row for row in active_rows if isinstance(row, dict)}
+
+        ranked: list[dict[str, Any]] = []
+        for order in list(board.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            oid = str(order.get("order_id") or "").strip()
+            order_row = active_by_id.get(oid)
+            if not oid or not isinstance(order_row, dict):
+                continue
+            try:
+                root_task = self.orch_q.get_job(oid)
+            except Exception:
+                root_task = None
+            if not _is_proactive_order(order_row, root_task):
+                continue
+
+            decision, why, blocker = _priority_decision(order)
+            primary_blocker = None
+            if blocker is not None:
+                primary_blocker = {
+                    "stage": str(blocker.get("stage") or ""),
+                    "summary": str(blocker.get("summary") or "").strip(),
+                    "job": blocker.get("job"),
+                }
+
+            priority = int(order.get("priority") or 2)
+            current_stage = str(order.get("current_stage") or "skynet_plan")
+            stage_rank = int(_STAGE_RANK.get(current_stage, -1))
+            decision_rank = int(_DECISION_RANK.get(decision, 9))
+            updated_at = _coerce_float(order.get("updated_at")) or 0.0
+
+            ranked.append(
+                {
+                    "rank": 0,
+                    "order_id": oid,
+                    "order_id_short": str(order.get("order_id_short") or oid[:8]),
+                    "title": str(order.get("title") or ""),
+                    "priority": priority,
+                    "phase": str(order.get("phase") or "planning"),
+                    "current_stage": current_stage,
+                    "readiness_state": str(order.get("readiness_state") or "unknown"),
+                    "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
+                    "decision": decision,
+                    "why": why,
+                    "primary_blocker": primary_blocker,
+                    "next_action": _priority_next_action(order, decision, blocker),
+                    "score_breakdown": {
+                        "decision_rank": decision_rank,
+                        "priority": priority,
+                        "stage_rank": stage_rank,
+                        "updated_at": updated_at,
+                    },
+                    "merge_ready": bool(order.get("merge_ready")),
+                    "merged_to_main": bool(order.get("merged_to_main")),
+                    "updated_at": updated_at,
+                }
+            )
+
+        ranked.sort(
+            key=lambda order: (
+                int((order.get("score_breakdown") or {}).get("decision_rank") or 9),
+                int(order.get("priority") or 2),
+                -int((order.get("score_breakdown") or {}).get("stage_rank") or -1),
+                float(order.get("updated_at") or 0.0),
+                str(order.get("order_id") or ""),
+            )
+        )
+        for idx, order in enumerate(ranked, start=1):
+            order["rank"] = idx
+
+        orders = ranked[:lim]
+        top = None
+        if orders:
+            first = orders[0]
+            top = {
+                "order_id": first.get("order_id"),
+                "order_id_short": first.get("order_id_short"),
+                "title": first.get("title"),
+                "decision": first.get("decision"),
+                "why": first.get("why"),
+                "next_action": first.get("next_action"),
+            }
+
+        by_decision: dict[str, int] = {}
+        for order in ranked:
+            decision = str(order.get("decision") or "unknown")
+            by_decision[decision] = by_decision.get(decision, 0) + 1
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "active_proactive_orders": len(ranked),
+                "returned": len(orders),
+                "by_decision": by_decision,
+                "top_decision": (str(top.get("decision")) if isinstance(top, dict) else None),
+            },
+            "top": top,
+            "orders": orders,
+        }
+
+    def order_evidence_packet(
+        self,
+        order_id: str,
+        *,
+        trace_limit: int = 100,
+        child_limit: int = 200,
+        log_limit: int = 200,
+    ) -> dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {}
+
+        root_task = self.orch_q.get_job(oid)
+        if root_task is None:
+            return {}
+
+        child_lim = max(1, min(2000, int(child_limit)))
+        trace_lim = max(1, min(5000, int(trace_limit)))
+        log_lim = max(1, min(2000, int(log_limit)))
+
+        children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=child_lim) if t.job_id != oid]
+        order_row: dict[str, Any] | None = None
+        try:
+            order_row = self.orch_q.get_order(oid, chat_id=int(root_task.chat_id))
+        except Exception:
+            order_row = None
+        if not isinstance(order_row, dict):
+            order_row = {
+                "order_id": oid,
+                "chat_id": int(root_task.chat_id),
+                "status": str(root_task.state or ""),
+                "phase": "planning",
+                "intent_type": "",
+                "project_id": None,
+                "source_message_id": root_task.reply_to_message_id,
+                "reply_to_message_id": root_task.reply_to_message_id,
+                "priority": int(root_task.priority or 2),
+                "title": _task_title(root_task),
+                "updated_at": float(root_task.updated_at or 0.0),
+            }
+
+        traces = self.orch_q.list_trace_events(order_id=oid, limit=trace_lim)
+        decision_log = self.orch_q.list_decision_log(order_id=oid, limit=log_lim)
+        delegation_log = self.orch_q.list_delegation_log(root_ticket_id=oid, limit=log_lim)
+        tasks = [root_task, *children]
+        artifacts: list[dict[str, Any]] = []
+        for task in tasks:
+            artifacts.extend(_artifact_refs_from_task(task))
+        artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+        child_statuses = [_task_to_status(t) for t in children]
+        counts_by_state = _count_task_states(children)
+        counts_by_role: dict[str, int] = {}
+        for child in children:
+            role = str(child.role or "").strip().lower() or "unknown"
+            counts_by_role[role] = counts_by_role.get(role, 0) + 1
+
+        workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+        release_readiness = _build_release_readiness(
+            order_row=order_row,
+            root_task=root_task,
+            children=children,
+            workflow=workflow,
+            decision_log=decision_log,
+            traces=traces,
+            artifacts=artifacts,
+        )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": float(time.time()),
+            "order_id": oid,
+            "order_id_short": oid[:8],
+            "order": {
+                "order_id": oid,
+                "chat_id": int(order_row.get("chat_id") or root_task.chat_id),
+                "status": str(order_row.get("status") or ""),
+                "phase": str(order_row.get("phase") or "planning"),
+                "intent_type": str(order_row.get("intent_type") or ""),
+                "project_id": (str(order_row.get("project_id") or "").strip() or None),
+                "source_message_id": order_row.get("source_message_id"),
+                "reply_to_message_id": order_row.get("reply_to_message_id"),
+                "priority": int(order_row.get("priority") or root_task.priority or 2),
+                "title": str(order_row.get("title") or _task_title(root_task)),
+                "updated_at": float(order_row.get("updated_at") or root_task.updated_at or 0.0),
+            },
+            "root": _task_to_status(root_task),
+            "workflow": workflow,
+            "release_readiness": release_readiness,
+            "children": child_statuses,
+            "traces": traces,
+            "decision_log": decision_log,
+            "delegation_log": delegation_log,
+            "artifacts": artifacts,
+            "counts": {
+                "children": len(child_statuses),
+                "children_by_state": counts_by_state,
+                "children_by_role": counts_by_role,
+                "traces": len(traces),
+                "decision_log": len(decision_log),
+                "delegation_log": len(delegation_log),
+                "artifacts": len(artifacts),
+            },
+        }
 
     def _build_alerts(
         self,
@@ -619,6 +1635,172 @@ class StatusService:
                 if len(out) >= 50:
                     return out
         return out
+
+    def control_room(self, *, chat_id: int | None = None) -> dict[str, Any]:
+        snap = self.snapshot(chat_id=chat_id)
+
+        def _as_list(name: str) -> list[dict[str, Any]]:
+            items = snap.get(name) or []
+            return [x for x in items if isinstance(x, dict)]
+
+        def _count(name: str) -> int:
+            try:
+                return int(snap.get(name) or 0)
+            except Exception:
+                return 0
+
+        alerts = _as_list("alerts")
+        risks = _as_list("risks")
+        pending_decisions = _as_list("decisions_pending")
+        blocked_approvals = _as_list("blocked_requires_approval")
+        stalled_tasks = _as_list("stalled_tasks")
+        order_workflows = _as_list("order_workflows")
+        workers = _as_list("workers")
+
+        critical_alerts = [a for a in alerts if str(a.get("severity") or "").strip().lower() == "critical"]
+        warning_alerts = [a for a in alerts if str(a.get("severity") or "").strip().lower() == "warning"]
+
+        if critical_alerts:
+            health_level = "critical"
+        elif blocked_approvals or stalled_tasks or risks or warning_alerts:
+            health_level = "attention"
+        else:
+            health_level = "ok"
+
+        reasons: list[str] = []
+        if critical_alerts:
+            reasons.append(f"{len(critical_alerts)} critical alert(s)")
+        if blocked_approvals:
+            reasons.append(f"{len(blocked_approvals)} approval(s) blocked")
+        if stalled_tasks:
+            reasons.append(f"{len(stalled_tasks)} stalled task(s)")
+        if risks:
+            reasons.append(f"{len(risks)} risk(s)")
+        if warning_alerts and not critical_alerts:
+            reasons.append(f"{len(warning_alerts)} warning alert(s)")
+        health_summary = "OK: no operator attention required." if not reasons else "Attention: " + "; ".join(reasons[:4]) + "."
+
+        running_workers = sum(1 for w in workers if isinstance(w.get("current"), dict))
+        workers_with_next = sum(1 for w in workers if isinstance(w.get("next"), dict))
+        total_workers = len(workers)
+        idle_workers = max(0, total_workers - running_workers)
+        saturation = round((running_workers / total_workers) if total_workers else 0.0, 3)
+
+        role_rows: dict[str, dict[str, int | str]] = {}
+        for w in workers:
+            role = str(w.get("role") or "").strip().lower() or "unknown"
+            row = role_rows.setdefault(role, {"role": role, "total": 0, "running": 0, "idle": 0, "with_next": 0})
+            row["total"] = int(row["total"]) + 1
+            if isinstance(w.get("current"), dict):
+                row["running"] = int(row["running"]) + 1
+            else:
+                row["idle"] = int(row["idle"]) + 1
+            if isinstance(w.get("next"), dict):
+                row["with_next"] = int(row["with_next"]) + 1
+        by_role = sorted(role_rows.values(), key=lambda r: str(r.get("role") or ""))[:10]
+
+        queued_total = _count("queued_total")
+        blocked_approval_total = _count("blocked_approval_total")
+        recommended_actions: list[dict[str, Any]] = []
+
+        def _add_action(action_id: str, label: str, target: str, count: int, reason: str) -> None:
+            if count <= 0:
+                return
+            recommended_actions.append(
+                {
+                    "action_id": action_id,
+                    "label": label,
+                    "target": target,
+                    "count": int(count),
+                    "reason": reason,
+                }
+            )
+
+        _add_action(
+            "approve_blocked_jobs",
+            "Approve or reject blocked jobs",
+            "/api/v1/status/decisions",
+            max(blocked_approval_total, len(blocked_approvals)),
+            "Jobs are waiting for operator approval.",
+        )
+        _add_action(
+            "resolve_pending_decisions",
+            "Resolve pending decisions",
+            "/api/v1/status/decisions",
+            len(pending_decisions),
+            "Pending decisions are blocking progress or confidence.",
+        )
+        _add_action(
+            "inspect_stalled_tasks",
+            "Inspect stalled tasks",
+            "/api/v1/status/alerts",
+            len(stalled_tasks),
+            "Tasks appear stale and may need intervention.",
+        )
+        _add_action(
+            "inspect_critical_alerts",
+            "Inspect critical alerts",
+            "/api/v1/status/alerts",
+            len(critical_alerts),
+            "Critical alerts require immediate review.",
+        )
+        queue_pressure = next((a for a in alerts if str(a.get("kind") or "") == "queue_pressure"), None)
+        _add_action(
+            "reduce_queue_pressure",
+            "Reduce queue pressure",
+            "/api/v1/orchestration/agents-live",
+            int((queue_pressure or {}).get("count") or 0),
+            "Queued work has reached the pressure threshold.",
+        )
+        low_saturation_with_work = queued_total if queued_total > 0 and total_workers > 0 and saturation < 0.5 else 0
+        _add_action(
+            "check_worker_availability",
+            "Check worker availability",
+            "/api/v1/orchestration/agents-live",
+            low_saturation_with_work,
+            "Queued work exists while worker saturation is low.",
+        )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": snap.get("generated_at"),
+            "chat_id": snap.get("chat_id"),
+            "snapshot_hash": snap.get("snapshot_hash"),
+            "health": {
+                "level": health_level,
+                "summary": health_summary,
+            },
+            "queue": {
+                "queued_runnable": queued_total,
+                "waiting_deps": _count("waiting_deps_total"),
+                "blocked_approval": blocked_approval_total,
+                "running": _count("running_total"),
+                "blocked_legacy": _count("blocked_total"),
+                "by_role": list(snap.get("queue_by_role") or [])[:10],
+            },
+            "orders": {
+                "active_count": len(list(snap.get("orders_active") or [])),
+                "workflows": order_workflows[:10],
+            },
+            "workers": {
+                "total": total_workers,
+                "running": running_workers,
+                "idle": idle_workers,
+                "with_next": workers_with_next,
+                "saturation": saturation,
+                "by_role": by_role,
+            },
+            "attention": {
+                "pending_decisions": pending_decisions[:10],
+                "blocked_approvals": blocked_approvals[:10],
+                "alerts": alerts[:10],
+                "risks": risks[:10],
+                "stalled_tasks": stalled_tasks[:10],
+            },
+            "recommended_actions": recommended_actions[:5],
+            "staleness_seconds": snap.get("staleness_seconds"),
+        }
 
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
@@ -822,6 +2004,7 @@ class StatusService:
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "orders_active": orders_out,
             "order_workflows": workflows_out,
+            "autonomy_board": self.autonomy_board(chat_id=chat_id, limit=50),
             "projects": projects,
             "workers": workers_out,
             "queued_total": int(queued_total),

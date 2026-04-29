@@ -156,6 +156,7 @@ In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
   - admin-controlled activation/deactivation from Telegram (`/breakglass ...`)
   - operator awareness that `access_mode=full` can remain selected while dangerous bypass is already OFF after breakglass expiry
 - Status HTTP API requires token auth (`Authorization: Bearer ...`) and strict CORS allowlist.
+- `GET /api/v1/orchestration/orders/evidence?order_id=<id>` returns an authenticated, rate-limited order evidence packet with workflow stage, child jobs, traces, decisions, delegations, and artifact references.
 
 ## Deliverability Checklist (Safe Defaults)
 
@@ -178,6 +179,8 @@ make verify
 - security guardrail checks (`tools/security_check.py --strict`)
 - unit tests (`python -m unittest -q`)
 - coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.70`)
+
+`make pytest` runs deterministic pytest replay through `./scripts/bootstrap_pytest_python3.sh`.
 
 ## Deployment Notes
 

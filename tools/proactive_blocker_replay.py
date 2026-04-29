@@ -17,7 +17,10 @@ def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
     if updated_at in (None, ""):
         return 0.0
     try:
-        return max(0.0, float(now_epoch) - float(updated_at))
+        raw_ts = float(updated_at)
+        if raw_ts > 1e11:
+            raw_ts = raw_ts / 1000.0
+        return max(0.0, float(now_epoch) - raw_ts)
     except Exception:
         pass
 
@@ -34,10 +37,99 @@ def _updated_age_seconds(updated_at: object, now_epoch: float) -> float:
 
 
 _ACTIVE_STATES = ("blocked", "blocked_approval", "waiting_deps", "running", "queued")
+_REQUIRED_JOB_COLUMNS = {
+    "job_id",
+    "role",
+    "state",
+    "depends_on",
+    "blocked_reason",
+    "updated_at",
+    "created_at",
+    "parent_job_id",
+    "labels",
+}
 
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _coerce_depends_on_list(depends_on: object) -> tuple[list[str], bool]:
+    try:
+        raw_deps = json.loads(str(depends_on or "[]"))
+    except Exception:
+        return [], True
+
+    if not isinstance(raw_deps, list):
+        return [], True
+
+    deps = [dep.strip() for dep in raw_deps if isinstance(dep, str) and dep.strip()]
+    return deps, False
+
+
+def _stale_blocker_detail(row: dict) -> dict:
+    return {
+        "job_id": str(row.get("job_id") or ""),
+        "role": str(row.get("role") or ""),
+        "state": str(row.get("state") or ""),
+        "updated_age_s": float(row.get("updated_age_s") or 0.0),
+        "updated_at": row.get("updated_at"),
+        "blocked_reason": str(row.get("blocked_reason") or ""),
+    }
+
+
+def _stale_blocker_action(*, ticket_id: str, detail: dict) -> dict:
+    job_id = str(detail.get("job_id") or "").strip()
+    return {
+        "job_id": job_id,
+        "action": "cancel_or_reseed",
+        "cancel_hint": f"cancel job {job_id} for ticket {ticket_id}",
+        "reseed_hint": f"spawn replacement slice for ticket {ticket_id} key:proactive_cli_seed_r1",
+    }
+
+
+def _stale_blocker_by_role(stale_details: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for detail in stale_details:
+        role = str(detail.get("role") or "").strip() or "unknown"
+        counts[role] = int(counts.get(role, 0)) + 1
+    return counts
+
+
+def _stale_blocker_top_reason(stale_details: list[dict]) -> str:
+    counts: dict[str, int] = {}
+    for detail in stale_details:
+        reason = str(detail.get("blocked_reason") or "").strip()
+        if not reason:
+            continue
+        counts[reason] = int(counts.get(reason, 0)) + 1
+    if not counts:
+        return ""
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _error_payload(ticket_id: str, db_path: Path, error: str, recommendation: str) -> dict:
+    return {
+        "generated_at": _utc_now(),
+        "ticket_id": str(ticket_id),
+        "db_path": str(db_path),
+        "error": error,
+        "recommendation": recommendation,
+    }
+
+
+def _schema_error(con: sqlite3.Connection) -> str | None:
+    table_row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("jobs",),
+    ).fetchone()
+    if table_row is None:
+        return "schema_missing"
+
+    columns = {str(row["name"]) for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
+    if not _REQUIRED_JOB_COLUMNS.issubset(columns):
+        return "schema_missing"
+    return None
 
 
 def _select_rows_for_ticket(con: sqlite3.Connection, ticket_id: str) -> tuple[list[dict], str]:
@@ -89,8 +181,38 @@ def main() -> int:
     args = ap.parse_args()
 
     db_path = Path(args.db).expanduser()
+    if not db_path.is_file():
+        print(
+            json.dumps(
+                _error_payload(
+                    str(args.ticket_id),
+                    db_path,
+                    "db_missing",
+                    "provide_existing_jobs_sqlite_path",
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+
     con = sqlite3.connect(str(db_path))
     con.row_factory = sqlite3.Row
+    schema_error = _schema_error(con)
+    if schema_error is not None:
+        print(
+            json.dumps(
+                _error_payload(
+                    str(args.ticket_id),
+                    db_path,
+                    schema_error,
+                    "run_against_jobs_database_with_required_jobs_schema",
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
 
     rows, selector_strategy = _select_rows_for_ticket(con, str(args.ticket_id))
 
@@ -100,17 +222,18 @@ def main() -> int:
 
     blocked = [r for r in rows if str(r.get("state", "")).lower() in {"blocked", "blocked_approval", "waiting_deps"}]
     stale = [r for r in blocked if float(r.get("updated_age_s") or 0.0) > float(args.stale_seconds)]
+    stale_details = [_stale_blocker_detail(r) for r in stale]
+    stale_actions = [_stale_blocker_action(ticket_id=str(args.ticket_id), detail=detail) for detail in stale_details]
+    stale_by_role = _stale_blocker_by_role(stale_details)
+    stale_top_reason = _stale_blocker_top_reason(stale_details)
     ids = {str(r.get("job_id") or "") for r in rows}
 
     invalid_wait = []
     for r in blocked:
         if str(r.get("state", "")).lower() != "waiting_deps":
             continue
-        try:
-            deps = json.loads(str(r.get("depends_on") or "[]"))
-        except Exception:
-            deps = []
-        if not deps or not any(str(d) in ids for d in deps):
+        deps, malformed_deps = _coerce_depends_on_list(r.get("depends_on"))
+        if malformed_deps or not deps or not any(d in ids for d in deps):
             invalid_wait.append(str(r.get("job_id") or ""))
 
     payload = {
@@ -121,6 +244,11 @@ def main() -> int:
         "blocked_or_waiting_count": len(blocked),
         "stale_threshold_seconds": float(args.stale_seconds),
         "stale_blocked_count": len(stale),
+        "stale_blocked_job_ids": [detail["job_id"] for detail in stale_details],
+        "stale_blocked_jobs": stale_details,
+        "stale_blocker_actions": stale_actions,
+        "stale_blocked_by_role": stale_by_role,
+        "stale_blocked_top_reason": stale_top_reason,
         "invalid_wait_dependency_count": len(invalid_wait),
         "invalid_wait_job_ids": invalid_wait,
         "recommendation": (

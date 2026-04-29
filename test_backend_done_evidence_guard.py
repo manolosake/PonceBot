@@ -69,6 +69,50 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertEqual(payload["reason"], "artifact_missing")
             self.assertEqual(len(payload["missing_artifacts"]), 1)
 
+    def test_validate_evidence_fails_when_referenced_artifact_is_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof_dir = artifacts_dir / "proof"
+            proof_dir.mkdir()
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof"],
+                        "next_action": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "artifact_not_file")
+            self.assertEqual(payload["not_file_artifacts"], [str(proof_dir.resolve())])
+
+    def test_validate_evidence_fails_when_referenced_artifact_is_empty_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof = artifacts_dir / "proof.log"
+            proof.write_text("", encoding="utf-8")
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof.log"],
+                        "next_action": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "artifact_empty")
+            self.assertEqual(payload["empty_artifacts"], [str(proof.resolve())])
+
     def test_validate_evidence_fails_when_artifacts_list_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
@@ -106,6 +150,35 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
 
             self.assertFalse(ok)
             self.assertEqual(payload["reason"], "artifact_outside_dir")
+
+    def test_validate_evidence_fails_when_windows_artifact_path_escapes_dir(self) -> None:
+        unsafe_paths = [
+            "..\\escape.log",
+            "C:/temp/proof.log",
+            "C:\\temp\\proof.log",
+            "\\\\server\\share\\proof.log",
+        ]
+        for unsafe_path in unsafe_paths:
+            with self.subTest(unsafe_path=unsafe_path), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                (artifacts_dir / "final_evidence.json").write_text(
+                    json.dumps(
+                        {
+                            "summary": "verified improvement",
+                            "artifacts": [unsafe_path],
+                            "next_action": None,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    allow_missing_files=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], "artifact_outside_dir")
 
     def test_validate_evidence_fails_when_absolute_artifact_escapes_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside_td:
