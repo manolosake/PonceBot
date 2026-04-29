@@ -568,6 +568,19 @@ def build_recommended_actions(anomalies: list, trend_flags: list) -> list:
                 repo_id=first_repo_id,
                 count=(anomaly or {}).get('count'),
             )
+        elif evidence_type == 'factory_uncovered_enabled_repos':
+            details = (anomaly or {}).get('details') or []
+            first_repo_id = ''
+            if details:
+                first_repo_id = str((details[0] or {}).get('repo_id') or '').strip()
+            add(
+                'P1',
+                'Seed or resume proactive orders for uncovered autonomy-enabled repos.',
+                'One or more active autonomy-enabled repos are not covered by active or paused proactive orders.',
+                evidence_type,
+                repo_id=first_repo_id,
+                count=(anomaly or {}).get('count'),
+            )
 
     for flag in trend_flags:
         evidence_type = str((flag or {}).get('type') or '').strip()
@@ -818,6 +831,27 @@ def main() -> int:
         if str(row.get('repo_id') or '').strip()
     }
     enabled_repo_ids = set(enabled_repo_by_id.keys())
+    uncovered_repo_details = []
+    for repo in enabled_repos:
+        repo_id = str(repo.get('repo_id') or '').strip()
+        if not repo_id:
+            continue
+        if any(proactive_order_covers_repo(order, repo) for order in proactive_orders):
+            continue
+        uncovered_repo_details.append({
+            'repo_id': repo_id,
+            'repo_path': str(repo.get('path') or ''),
+            'priority': repo.get('priority'),
+            'status': str(repo.get('status') or ''),
+            'updated_at': repo.get('updated_at'),
+        })
+    uncovered_repo_details.sort(key=lambda item: (
+        item.get('priority') if item.get('priority') is not None else 999999,
+        str(item.get('repo_id') or ''),
+    ))
+    uncovered_repo_count = len(uncovered_repo_details)
+    uncovered_repo_details_limited = uncovered_repo_details[:UNCOVERED_REPO_DETAIL_LIMIT]
+    uncovered_repo_details_truncated = uncovered_repo_count > len(uncovered_repo_details_limited)
     stale_heartbeat_details = []
     seen_enabled_repo_ids = set()
     for hb in heartbeat_rows:
@@ -899,6 +933,7 @@ def main() -> int:
         'factory_enabled_repos': len(enabled_repos),
         'factory_registered_repos': len(repo_rows),
         'factory_stale_heartbeats': int(stale_heartbeat_count),
+        'factory_uncovered_enabled_repos': int(uncovered_repo_count),
     }
 
     operational_status = 'OK'
@@ -932,6 +967,15 @@ def main() -> int:
             'details': stale_heartbeat_details_limited,
             'details_truncated': stale_heartbeat_details_truncated,
             'detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+        })
+        operational_status = worst_status(operational_status, 'WARN')
+    if metrics['factory_uncovered_enabled_repos'] > 0:
+        anomalies.append({
+            'type': 'factory_uncovered_enabled_repos',
+            'count': metrics['factory_uncovered_enabled_repos'],
+            'details': uncovered_repo_details_limited,
+            'details_truncated': uncovered_repo_details_truncated,
+            'detail_limit': UNCOVERED_REPO_DETAIL_LIMIT,
         })
         operational_status = worst_status(operational_status, 'WARN')
 
@@ -986,6 +1030,10 @@ def main() -> int:
             'soft_pause_until': soft_pause_until if factory_soft_pause_active else None,
             'registered_repos': len(repo_rows),
             'enabled_repos': len(enabled_repos),
+            'uncovered_enabled_repos': int(uncovered_repo_count),
+            'uncovered_repo_details': uncovered_repo_details_limited,
+            'uncovered_repo_details_truncated': uncovered_repo_details_truncated,
+            'uncovered_repo_detail_limit': UNCOVERED_REPO_DETAIL_LIMIT,
             'stale_heartbeats': int(stale_heartbeat_count),
             'stale_heartbeat_details': stale_heartbeat_details_limited,
             'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
@@ -1019,6 +1067,7 @@ def main() -> int:
         f'- Trend status: {trend_status}',
         f"- Factory state: {'hard_stop' if factory_hard_stop else ('soft_pause' if factory_soft_pause_active else 'active')}",
         f"- Factory repos: registered={metrics['factory_registered_repos']} enabled={metrics['factory_enabled_repos']}",
+        f"- Factory uncovered enabled repos: {metrics['factory_uncovered_enabled_repos']}",
         f"- Factory stale heartbeats: {metrics['factory_stale_heartbeats']}",
         f"- Active proactive orders: {metrics['proactive_active_orders']}",
         f"- Autonomy funnel (24h): started={metrics['slices_started']} applied={metrics['slices_applied']} validated={metrics['slices_validated']} closed={metrics['slices_closed']}",
