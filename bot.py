@@ -8782,6 +8782,97 @@ def _git_changed_paths_from_porcelain(status_text: str) -> list[str]:
     return out
 
 
+def _git_changed_paths_between(repo_dir: Path, before: str, after: str) -> list[str]:
+    old = str(before or "").strip()
+    new = str(after or "").strip()
+    if not old or not new or old == new:
+        return []
+    proc = _run_git(repo_dir, ["diff", "--name-only", old, new], check=False)
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in str(proc.stdout or "").splitlines():
+        rel_path = str(raw or "").strip()
+        if rel_path and rel_path not in out:
+            out.append(rel_path)
+    return out
+
+
+def _create_controller_snapshot_workdir(
+    *,
+    source_dir: Path,
+    artifacts_dir: Path,
+    role: str,
+    job_id: str,
+) -> Path:
+    """
+    Build a disposable Git checkout for controller/no-write roles.
+
+    Some hosts require Codex full-access mode because the read-only sandbox
+    cannot start. Running controllers against this snapshot keeps those agents
+    able to inspect files while making any accidental edits harmless.
+    """
+    source = Path(source_dir).resolve()
+    snapshot = (Path(artifacts_dir).resolve() / "controller_snapshot").resolve()
+    if snapshot.exists():
+        shutil.rmtree(snapshot, ignore_errors=True)
+    snapshot.mkdir(parents=True, exist_ok=True)
+
+    listed = _run_git(source, ["ls-files", "-z"], check=False)
+    if listed.returncode != 0:
+        detail = (listed.stderr or listed.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot source ls-files failed: {detail[:400] or listed.returncode}")
+
+    for raw in str(listed.stdout or "").split("\0"):
+        rel = str(raw or "").strip()
+        if not rel:
+            continue
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            continue
+        src = (source / rel_path).resolve()
+        try:
+            inside_source = str(src).startswith(str(source))
+        except Exception:
+            inside_source = False
+        if not inside_source or not src.exists():
+            continue
+        dst = snapshot / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if src.is_symlink():
+                target = os.readlink(src)
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                os.symlink(target, dst)
+            elif src.is_file():
+                shutil.copy2(src, dst)
+        except Exception:
+            LOG.exception("Failed to copy controller snapshot path. source=%s rel=%s", source, rel)
+            raise
+
+    init = _run_git(snapshot, ["init", "-b", "controller-snapshot"], check=False)
+    if init.returncode != 0:
+        detail = (init.stderr or init.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot git init failed: {detail[:400] or init.returncode}")
+    _run_git(snapshot, ["config", "user.name", "manolosake"], check=False)
+    _run_git(snapshot, ["config", "user.email", "manolosake@gmail.com"], check=False)
+    add = _run_git(snapshot, ["add", "-A"], check=False)
+    if add.returncode != 0:
+        detail = (add.stderr or add.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot git add failed: {detail[:400] or add.returncode}")
+    commit = _run_git(
+        snapshot,
+        ["commit", "--allow-empty", "-m", f"controller snapshot baseline {str(role or 'role')}-{str(job_id or '')[:8]}"],
+        check=False,
+        env=_autonomous_commit_identity_env(snapshot),
+    )
+    if commit.returncode != 0:
+        detail = (commit.stderr or commit.stdout or "").strip()
+        raise RuntimeError(f"controller snapshot baseline commit failed: {detail[:400] or commit.returncode}")
+    return snapshot
+
+
 def _stash_read_only_write_violation(
     repo_dir: Path,
     *,
@@ -16359,9 +16450,12 @@ def _local_slice_expected_validation_cmd(candidate_files: list[str]) -> str:
 
 def _normalize_controller_write_policy_changed_path(path: Any) -> str:
     rel_path = str(path).strip()
-    for scope in ("worktree:", "base_repo:"):
+    for scope in ("controller_snapshot:", "worktree:", "base_repo:"):
         if rel_path.startswith(scope):
-            return rel_path[len(scope) :].strip()
+            rel_path = rel_path[len(scope) :].strip()
+            break
+    if rel_path.startswith(("HEAD:", "BRANCH:")):
+        return ""
     return rel_path
 
 
@@ -24967,6 +25061,7 @@ def _orchestrator_run_codex(
     order_branch = _resolve_order_branch_from_task(task, orch_q)
     eff_cfg = dataclasses.replace(cfg, codex_workdir=repo_base_dir) if repo_base_dir is not None else cfg
     worktree_dir: Path | None = None
+    controller_snapshot_dir: Path | None = None
     leased_slot: int | None = None
     lease_base_repo = repo_base_dir if repo_base_dir is not None else cfg.codex_workdir
     lease_enabled = orch_q is not None and (lease_base_repo / ".git").exists()
@@ -25051,6 +25146,47 @@ def _orchestrator_run_codex(
                     "workspace": "setup_failed",
                     "order_branch": order_branch or None,
                     "default_branch": repo_default_branch,
+                },
+            }
+
+    if worktree_dir is not None and _role_disallows_repo_writes(role):
+        try:
+            controller_snapshot_dir = _create_controller_snapshot_workdir(
+                source_dir=worktree_dir,
+                artifacts_dir=artifacts_dir,
+                role=role,
+                job_id=task.job_id,
+            )
+            eff_cfg = dataclasses.replace(eff_cfg, codex_workdir=controller_snapshot_dir)
+            try:
+                if orch_q is not None:
+                    orch_q.update_trace(
+                        task.job_id,
+                        controller_snapshot_workdir=str(controller_snapshot_dir),
+                        controller_source_workdir=str(worktree_dir),
+                        live_workdir=str(controller_snapshot_dir),
+                        live_at=time.time(),
+                    )
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                if orch_q is not None and leased_slot is not None:
+                    orch_q.release_workspace(job_id=task.job_id)
+            except Exception:
+                LOG.exception("Failed to release workspace lease (controller snapshot failure). job=%s role=%s", task.job_id, role)
+            err_path = artifacts_dir / "controller_snapshot_error.txt"
+            err_path.write_text(str(e) + "\n", encoding="utf-8", errors="replace")
+            return {
+                "status": "error",
+                "summary": f"Controller snapshot setup failed; refused unsafe direct controller execution: {e}",
+                "artifacts": [str(err_path)],
+                "logs": str(e),
+                "next_action": "fix_controller_snapshot",
+                "structured_digest": {
+                    "role": role,
+                    "workspace": "controller_snapshot_failed",
+                    "source_workdir": str(worktree_dir),
                 },
             }
 
@@ -25248,10 +25384,12 @@ def _orchestrator_run_codex(
     if worktree_dir is not None and _role_disallows_repo_writes(role):
         seen_target_dirs: set[str] = set()
         base_branch_blocker: str | None = None
-        for label, repo_dir in (
+        read_only_targets: list[tuple[str, Path | None]] = [
+            ("controller_snapshot", controller_snapshot_dir),
             ("worktree", worktree_dir),
             ("base_repo", repo_base_dir),
-        ):
+        ]
+        for label, repo_dir in read_only_targets:
             if repo_dir is None:
                 continue
             try:
@@ -25592,10 +25730,11 @@ def _orchestrator_run_codex(
                 artifacts.append(p)
         # Collect PNGs created in the Codex workdir.
         artifacts.extend(_collect_png_artifacts(eff_cfg, start_time=proc.start_time, text=body))
-        # Collect git diff/status whenever we ran inside a managed worktree.
-        if worktree_dir is not None:
+        # Collect git diff/status whenever we ran inside a managed or disposable worktree.
+        artifact_repo_dir = controller_snapshot_dir or worktree_dir
+        if artifact_repo_dir is not None:
             try:
-                artifacts.extend(collect_git_artifacts(repo_dir=worktree_dir, artifacts_dir=artifacts_dir))
+                artifacts.extend(collect_git_artifacts(repo_dir=artifact_repo_dir, artifacts_dir=artifacts_dir))
             except Exception:
                 LOG.exception("Failed to collect git artifacts. job=%s role=%s", task.job_id, role)
 
@@ -25662,6 +25801,11 @@ def _orchestrator_run_codex(
             structured["order_branch"] = str(order_branch)
         if leased_slot is not None:
             structured["workspace_slot"] = int(leased_slot)
+        if controller_snapshot_dir is not None:
+            structured["controller_snapshot"] = {
+                "workdir": str(controller_snapshot_dir),
+                "source_workdir": str(worktree_dir) if worktree_dir is not None else "",
+            }
         if used_thread_id:
             structured["thread_id"] = used_thread_id
 
@@ -25691,10 +25835,12 @@ def _orchestrator_run_codex(
         if worktree_dir is not None and _role_disallows_repo_writes(role):
             targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
             seen_target_dirs: set[str] = set()
-            for label, repo_dir in (
+            read_only_targets = [
+                ("controller_snapshot", controller_snapshot_dir),
                 ("worktree", worktree_dir),
                 ("base_repo", repo_base_dir),
-            ):
+            ]
+            for label, repo_dir in read_only_targets:
                 if repo_dir is None:
                     continue
                 try:
@@ -25718,6 +25864,7 @@ def _orchestrator_run_codex(
                 current_head = _git_head_rev(target_dir)
                 baseline_branch = str(baseline.get("branch") or "").strip()
                 current_branch = _git_current_branch(target_dir)
+                committed_changed_paths: list[str] = []
                 head_changed = (
                     bool(baseline_head)
                     and bool(current_head)
@@ -25734,6 +25881,11 @@ def _orchestrator_run_codex(
                     # sprint for unrelated operator/work-in-progress changes.
                     continue
                 new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+                if head_changed:
+                    committed_changed_paths = _git_changed_paths_between(target_dir, baseline_head, current_head)
+                    for path in committed_changed_paths:
+                        if path not in new_changed_paths:
+                            new_changed_paths.append(path)
                 if branch_changed:
                     branch_after = current_branch or "DETACHED"
                     branch_marker = f"BRANCH:{baseline_branch}..{branch_after}"

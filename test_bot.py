@@ -792,7 +792,13 @@ class TestStateHandling(unittest.TestCase):
             {
                 "summary": "Prepared a bounded controller recovery patch.",
                 "write_policy_violation": {
-                    "changed_paths": ["worktree:", "worktree:bot.py", "base_repo:tools/health.py"],
+                    "changed_paths": [
+                        "controller_snapshot:HEAD:aaa..bbb",
+                        "worktree:",
+                        "worktree:bot.py",
+                        "base_repo:BRANCH:main..feature/bad",
+                        "base_repo:tools/health.py",
+                    ],
                 },
             }
         )
@@ -801,6 +807,9 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("- `tools/health.py`", specs[0].text)
         self.assertNotIn("worktree:", specs[0].text)
         self.assertNotIn("base_repo:", specs[0].text)
+        self.assertNotIn("controller_snapshot:", specs[0].text)
+        self.assertNotIn("HEAD:", specs[0].text)
+        self.assertNotIn("BRANCH:", specs[0].text)
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[0].text)
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[1].text)
 
@@ -3324,7 +3333,13 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             violation = result["structured_digest"].get("write_policy_violation")
             self.assertIsInstance(violation, dict)
-            self.assertTrue(any(str(path).startswith("worktree:HEAD:") for path in violation.get("changed_paths", [])))
+            self.assertTrue(
+                any(
+                    str(path).startswith(("worktree:HEAD:", "controller_snapshot:HEAD:"))
+                    for path in violation.get("changed_paths", [])
+                )
+            )
+            self.assertTrue(any(str(path).endswith(":bot.py") for path in violation.get("changed_paths", [])))
             self.assertTrue(violation.get("head_changes"))
             worktree = bot._repo_worktree_root(cfg, repo_id=repo_id) / "skynet" / "slot1"
             self.assertEqual(bot._git_status_porcelain(worktree), "")
