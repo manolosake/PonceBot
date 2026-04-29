@@ -3959,6 +3959,48 @@ def _redact_codex_cmd_for_log(cmd: list[str]) -> list[str]:
     return out
 
 
+def _controller_git_write_guard_script() -> str:
+    return """#!/bin/sh
+real_git="${PONCEBOT_REAL_GIT:-/usr/bin/git}"
+cmd=""
+skip_next=0
+for arg in "$@"; do
+  if [ "$skip_next" = "1" ]; then
+    skip_next=0
+    continue
+  fi
+  case "$arg" in
+    -C|-c|--git-dir|--work-tree|--namespace)
+      skip_next=1
+      continue
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*)
+      continue
+      ;;
+    --*)
+      continue
+      ;;
+    -*)
+      continue
+      ;;
+    *)
+      cmd="$arg"
+      break
+      ;;
+  esac
+done
+
+case "$cmd" in
+  add|am|apply|bisect|branch|checkout|cherry-pick|clean|clone|commit|fetch|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|worktree)
+    echo "PonceBot controller git write guard blocked: git $cmd" >&2
+    exit 126
+    ;;
+esac
+
+exec "$real_git" "$@"
+"""
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -3967,6 +4009,7 @@ class CodexRunner:
         chat_id: int | None = None,
         allow_bypass: bool = True,
         forced_mode: str | None = None,
+        guard_git_writes: bool = False,
     ) -> None:
         self._cfg = cfg
         self._chat_id = chat_id
@@ -3974,6 +4017,7 @@ class CodexRunner:
         if forced_mode not in (None, "ro", "rw", "full"):
             raise ValueError(f"Invalid forced mode: {forced_mode}")
         self._forced_mode = forced_mode
+        self._guard_git_writes = bool(guard_git_writes)
     
     def _bypass_sandbox(self) -> bool:
         if not self._allow_bypass:
@@ -4017,6 +4061,22 @@ class CodexRunner:
             env["TMPDIR"] = str(tmp_root)
             env["TMP"] = str(tmp_root)
             env["TEMP"] = str(tmp_root)
+            if self._guard_git_writes:
+                git_guard_dir = tmp_root / "git-write-guard-bin"
+                git_guard_dir.mkdir(parents=True, exist_ok=True)
+                git_guard = git_guard_dir / "git"
+                real_git = shutil.which("git") or "/usr/bin/git"
+                git_guard.write_text(
+                    _controller_git_write_guard_script(),
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                try:
+                    git_guard.chmod(0o755)
+                except Exception:
+                    pass
+                env["PONCEBOT_REAL_GIT"] = real_git
+                env["PATH"] = str(git_guard_dir) + os.pathsep + str(env.get("PATH") or "")
         except Exception:
             pass
         # Frontend evidence dir: agents can drop `.codexbot_preview/preview.html` and the bot will screenshot it.
@@ -25223,6 +25283,7 @@ def _orchestrator_run_codex(
         chat_id=task.chat_id,
         allow_bypass=True,
         forced_mode=forced_mode,
+        guard_git_writes=_role_disallows_repo_writes(role),
     )
     proc: CodexRunner.Running
     used_thread_id: str | None = None

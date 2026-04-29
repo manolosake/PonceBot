@@ -4204,6 +4204,22 @@ class TestBypassAwareEnforcement(unittest.TestCase):
                 forced = bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=123)  # type: ignore[attr-defined]
             self.assertEqual(forced, "ro")
 
+    def test_controller_git_write_guard_blocks_mutating_git_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            guard = Path(td) / "git"
+            guard.write_text(bot._controller_git_write_guard_script(), encoding="utf-8")
+            guard.chmod(0o755)
+            env = dict(os.environ)
+            env["PONCEBOT_REAL_GIT"] = "/bin/echo"
+
+            ok = subprocess.run([str(guard), "status", "--short"], env=env, capture_output=True, text=True)
+            self.assertEqual(ok.returncode, 0)
+            self.assertIn("status --short", ok.stdout)
+
+            blocked = subprocess.run([str(guard), "-C", "/tmp/repo", "push", "origin", "main"], env=env, capture_output=True, text=True)
+            self.assertEqual(blocked.returncode, 126)
+            self.assertIn("blocked: git push", blocked.stderr)
+
     def test_read_only_violation_stash_cleans_worktree(self) -> None:
 
         with tempfile.TemporaryDirectory() as td:
