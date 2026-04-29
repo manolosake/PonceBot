@@ -49,6 +49,14 @@ def worst_status(*values: str) -> str:
     return best
 
 
+def _stale_heartbeat_reason_counts(details: list[dict]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for detail in details:
+        reason = str(detail.get('reason') or '').strip() or 'unknown'
+        counts[reason] = int(counts.get(reason, 0)) + 1
+    return counts
+
+
 def classify_open_job_mode(counts_by_role: dict, open_jobs: int) -> str:
     """Classify order mode without reporting idle when open jobs still exist."""
     if int(open_jobs or 0) <= 0:
@@ -663,6 +671,7 @@ def main() -> int:
     stale_heartbeat_count = len(stale_heartbeat_details)
     stale_heartbeat_details_limited = stale_heartbeat_details[:STALE_HEARTBEAT_DETAIL_LIMIT]
     stale_heartbeat_details_truncated = stale_heartbeat_count > len(stale_heartbeat_details_limited)
+    stale_heartbeat_reason_counts = _stale_heartbeat_reason_counts(stale_heartbeat_details)
 
     def audit_count(event_type: str) -> int:
         return int(
@@ -734,6 +743,7 @@ def main() -> int:
             'details': stale_heartbeat_details_limited,
             'details_truncated': stale_heartbeat_details_truncated,
             'detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+            'reason_counts': stale_heartbeat_reason_counts,
         })
         operational_status = worst_status(operational_status, 'WARN')
 
@@ -791,6 +801,7 @@ def main() -> int:
             'stale_heartbeat_details': stale_heartbeat_details_limited,
             'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
             'stale_heartbeat_detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+            'stale_heartbeat_reason_counts': stale_heartbeat_reason_counts,
         },
         'metrics': metrics,
         'autonomy_funnel': {

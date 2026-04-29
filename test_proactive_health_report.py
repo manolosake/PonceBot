@@ -306,6 +306,14 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(payload["factory"]["stale_heartbeats"], 3)
             self.assertEqual(payload["factory"]["stale_heartbeat_detail_limit"], STALE_HEARTBEAT_DETAIL_LIMIT)
             self.assertFalse(payload["factory"]["stale_heartbeat_details_truncated"])
+            self.assertEqual(
+                payload["factory"]["stale_heartbeat_reason_counts"],
+                {
+                    "missing_heartbeat": 1,
+                    "missing_runtime_state_row": 1,
+                    "stale_heartbeat": 1,
+                },
+            )
             details = payload["factory"]["stale_heartbeat_details"]
             self.assertEqual([item["repo_id"] for item in details], ["enabled-missing", "enabled-no-row", "enabled-repo"])
             self.assertEqual(details[0]["agent_key"], "enabled-missing-1")
@@ -329,6 +337,14 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(stale_anomaly.get("details"), details)
             self.assertFalse(stale_anomaly.get("details_truncated"))
             self.assertEqual(stale_anomaly.get("detail_limit"), STALE_HEARTBEAT_DETAIL_LIMIT)
+            self.assertEqual(
+                stale_anomaly.get("reason_counts"),
+                {
+                    "missing_heartbeat": 1,
+                    "missing_runtime_state_row": 1,
+                    "stale_heartbeat": 1,
+                },
+            )
             self.assertEqual(payload.get("operational_status"), "WARN")
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
