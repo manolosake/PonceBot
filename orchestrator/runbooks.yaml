@@ -86,6 +86,9 @@
     - PASS only if open_jobs==0
     - NO-GO if any required artifact file is missing or empty
     - NO-GO if any non-controller worker process is unexpectedly live
+    - Do not count this idle_no_open_jobs SRE job as open work; diagnostics exclude it.
+    - Treat tools/worker_telemetry.py and this runbook's own codex/sre process as controller-owned telemetry, not unexpected worker activity.
+    - Use idle_no_open_jobs/close_gate.txt as the source of truth for PASS/NO-GO; process_liveness.txt is supporting evidence only.
 
     Required evidence filenames:
     - idle_no_open_jobs/status_snapshot.json
