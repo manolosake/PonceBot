@@ -4116,6 +4116,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 return_value=(True, "feature/repo-secondary"),
             ), patch.object(
                 bot,
+                "_git_dirty_status_lines",
+                return_value=[],
+            ), patch.object(
+                bot,
                 "_order_command_text",
                 return_value="Order ord-merge-retry-01 auto-merged by Jarvis to main",
             ), patch.object(bot, "_send_chunked_text", return_value=None):
@@ -4203,6 +4207,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_order_trace_requires_merge",
                 return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ), patch.object(
                 bot,
                 "_order_command_text",
@@ -4321,6 +4329,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_order_trace_requires_merge",
                 return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ):
                 merged = bot._auto_merge_ready_orders_tick(
                     cfg=cfg,
@@ -4677,6 +4689,10 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                 bot,
                 "_git_is_ancestor",
                 return_value=True,
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
             ), patch.object(
                 bot,
                 "_order_command_text",

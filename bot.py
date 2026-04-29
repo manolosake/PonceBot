@@ -13472,44 +13472,46 @@ def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
     catalog = [
         {
             "key": "poncebot-core",
-            "title": "Proactive Sprint: PonceBot Reliability + Workflow Quality",
+            "title": "Proactive Sprint: PonceBot Product + Autonomy Upgrades",
             "lane": "bot",
             "project_hint": "/home/aponce/codexbot",
             "goal": (
-                "Improve orchestration reliability, reduce noisy notifications, tighten evidence gates, "
-                "ship useful new workflow features, and strengthen end-to-end Telegram traceability."
+                "Ship meaningful autonomy, product, or operator-workflow upgrades. Fix bugs only when there is "
+                "specific evidence of a high-impact failure; otherwise prefer a notable new capability or deeper "
+                "workflow improvement that makes PonceBot visibly more useful."
             ),
             "success": (
-                "Ship one concrete reliability, workflow-quality, or feature improvement inside /home/aponce/codexbot, "
-                "with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
+                "Ship one merged, pushed, and deployable PonceBot capability, workflow improvement, or substantial "
+                "bugfix with verifiable evidence such as tests, logs, branch diff, or measurable backlog reduction."
             ),
         },
         {
             "key": "executive-dashboard",
-            "title": "Proactive Sprint: Executive Dashboard UX + Observability",
+            "title": "Proactive Sprint: Executive Dashboard Features + UX",
             "lane": "dashboard",
             "project_hint": "/home/aponce/ExecutiveDashboard",
             "goal": (
-                "Improve executive readability, reduce visual friction, add useful operator features, "
-                "and strengthen live telemetry and agent-trace usability for daily operations."
+                "Ship visible operator features, clearer workflows, and useful live telemetry. Fix bugs only when "
+                "they block real operator value; otherwise prefer product improvements that make daily operations "
+                "more obvious and actionable."
             ),
             "success": (
-                "Ship one operator-facing UX, feature, or observability improvement with screenshots, telemetry proof, "
-                "or health evidence and no regression to auth/control paths."
+                "Ship one merged, pushed, deployed operator-facing UX, feature, or observability improvement with "
+                "screenshots, telemetry proof, or health evidence and no regression to auth/control paths."
             ),
         },
         {
             "key": "android-parity",
-            "title": "Proactive Sprint: Android App Parity + Product Polish",
+            "title": "Proactive Sprint: Android App Features + Product Polish",
             "lane": "android",
             "project_hint": mobile_path,
             "goal": (
-                "Close parity gaps versus web dashboard, improve native UX quality, and validate via "
-                "emulator evidence with concrete screenshots."
+                "Ship native Android features or product polish that make the app more useful. Fix bugs only when "
+                "there is evidence they block a real workflow; otherwise prefer visible native UX/capability gains."
             ),
             "success": (
-                "Ship one user-visible parity or polish improvement with emulator screenshots and a concise "
-                "validation note proving the change is real and regression-safe."
+                "Ship one merged, pushed, deployable user-visible feature, parity, or polish improvement with "
+                "emulator screenshots and a concise validation note proving the change is real and regression-safe."
             ),
         },
     ]
@@ -13850,19 +13852,26 @@ def _spawn_proactive_order(
             if repo_path
             else "- Work only inside this initiative scope; do not touch unrelated projects."
         ),
-        "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, or refactor slice that can be validated today.",
+        "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
+        "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
+        "- Bugfixes are allowed only with concrete evidence of a P0/P1 operator/customer-impacting failure, security risk, data loss risk, broken deploy, or failing required validation.",
+        "- If no P0/P1 bug is evidenced, default to FEATURE, PRODUCT_WORKFLOW, or NEW_PROJECT_PHASE rather than tiny maintenance.",
+        "- A valid feature must be notable to an operator or user: new workflow, new dashboard insight, new control surface, new integration, automation, or capability expansion.",
         "- Keep WIP bounded: max 3 running tasks, max 12 queued tasks.",
         "- Task selection priority (deterministic):",
-        "  1) repeated conversion failures in the local funnel,",
-        "  2) reliability/evidence tests currently failing or flaky,",
-        "  3) useful operator/customer-facing features or UX improvements,",
-        "  4) debt/refactors that measurably reduce operational noise or unlock better delivery.",
+        "  1) P0/P1 operator/customer-impacting failures with exact evidence,",
+        "  2) required validation, deploy, merge, or data-integrity failures currently reproducible,",
+        "  3) useful operator/customer-facing features, product workflows, or new-project phases,",
+        "  4) deeper refactors that unlock a concrete future feature or remove a delivery bottleneck,",
+        "  5) low-level maintenance only when it directly blocks delivery or removes measurable operational noise.",
         "- Do not seed a new local task for a role that already has open work on this ticket.",
         "- Prefer completing the oldest runnable implementer_local slice before creating another architect_local pass.",
         "- Prioritize impact/risk: P0 stability/security first, then P1 UX/quality, then P2 polish.",
         "- New capabilities, deeper refactors, and ambitious product ideas are allowed; decompose them into reversible, reviewable, deployable phases.",
         "- Ask the CEO first only for destructive/irreversible actions, credential or billing changes, public launches, high-risk data migrations, or external purchases.",
         "- Use evidence-first delivery: tests/logs/artifacts, and explicit residual risks.",
+        "- Delivery requirement: validated code changes must be merged to the repo default branch, pushed, and deployed through the registered deploy hook when available.",
+        "- Do not mark branch-only work as done. If merge, push, or deploy cannot happen, close as BLOCKED_WITH_ROOT_CAUSE with the exact blocker and next recovery step.",
         "- Do not close the sprint on analysis alone; a valid pass ends in VERIFIED_IMPROVEMENT, BLOCKED_WITH_ROOT_CAUSE, or LOCAL_REPLAN_REQUEST.",
         "- For UI/mobile work, validate in emulator/browser and attach screenshots before claiming done.",
         "- Default to one bounded local slice plus one validation slice; do not spray parallel tasks.",
@@ -14109,21 +14118,23 @@ def _proactive_lane_tick(
             repo_key = re.sub(r"[^a-z0-9_-]+", "_", repo_id)
             initiative = {
                 "key": f"repo_{repo_key}",
-                "title": f"Proactive Sprint: {Path(str(repo.get('path') or repo_id)).name} Reliability + Delivery",
+                "title": f"Proactive Sprint: {Path(str(repo.get('path') or repo_id)).name} Impact + Product Delivery",
                 "lane": "factory",
                 "project_hint": str(repo.get("path") or ""),
                 "goal": (
-                    "Ship one bounded bugfix, issue-resolution, reliability, quality, maintenance, feature, UX/product, "
-                    "or refactor improvement inside this registered repo, with real evidence and no cross-repo writes."
+                    "Ship one bounded, notable product, UX, automation, integration, or new-project phase inside this "
+                    "registered repo. Fix bugs only when exact evidence shows a high-impact failure; otherwise prefer "
+                    "a feature or deeper capability that makes the repo visibly more valuable."
                 ),
                 "success": (
-                    "Close one verified repo improvement or feature slice with concrete evidence such as tests, validation logs, screenshots, or a reviewed patch."
+                    "Close one verified repo feature or substantial improvement with concrete evidence such as tests, "
+                    "validation logs, screenshots, or a reviewed patch, then merge, push, and deploy if a deploy hook exists."
                 ),
                 "expected_measurable_delta": (
-                    "Increase validated improvements per repo while keeping local failure rate and queue pressure bounded."
+                    "Increase shipped visible value per repo while keeping local failure rate and queue pressure bounded."
                 ),
                 "stop_condition": (
-                    "Stop when one verified improvement is closed for this repo or when the repo is blocked with a concrete root cause."
+                    "Stop when one verified, merged/pushed/deployed improvement is closed for this repo or when the repo is blocked with a concrete root cause."
                 ),
             }
             ok = _spawn_proactive_order(

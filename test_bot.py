@@ -276,6 +276,84 @@ class TestStateHandling(unittest.TestCase):
         self.assertEqual(q.events[0]["event_type"], "factory.repo_autonomy_blocked")
         self.assertIn("feature/voice-out", str(q.events[0]["details"]))
 
+    def test_spawn_proactive_order_requires_feature_bias_and_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "manolosake"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "manolosake@gmail.com"], cwd=str(repo), check=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=str(repo), check=True, capture_output=True, text=True)
+            origin = root / "origin.git"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=str(repo), check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            cfg = self._cfg(root / "state.json")
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.submitted: list[bot.Task] = []
+                    self.orders: list[dict[str, object]] = []
+                    self.events: list[dict[str, object]] = []
+
+                def submit_task(self, task: bot.Task) -> None:
+                    self.submitted.append(task)
+
+                def upsert_order(self, **kwargs: object) -> None:
+                    self.orders.append(dict(kwargs))
+
+                def update_trace(self, *_args: object, **_kwargs: object) -> None:
+                    pass
+
+                def append_audit_event(self, **kwargs: object) -> None:
+                    self.events.append(dict(kwargs))
+
+                def upsert_agent_runtime_state(self, **_kwargs: object) -> None:
+                    pass
+
+                def append_agent_mailbox(self, **_kwargs: object) -> None:
+                    pass
+
+            q = _FakeQueue()
+            created = bot._spawn_proactive_order(
+                cfg=cfg,
+                orch_q=q,  # type: ignore[arg-type]
+                profiles={},
+                chat_id=1,
+                now=123.0,
+                initiative={
+                    "key": "repo_dashboard",
+                    "title": "Proactive Sprint: Dashboard Impact + Product Delivery",
+                    "goal": "Ship visible operator value.",
+                    "success": "Ship, merge, push, and deploy one visible improvement.",
+                },
+                repo_record={
+                    "repo_id": "dashboard-12345678",
+                    "path": str(repo),
+                    "default_branch": "main",
+                    "autonomy_enabled": True,
+                    "priority": 2,
+                    "runtime_mode": "ceo-bounded",
+                    "daily_budget": 0.0,
+                    "status": "active",
+                    "metadata": {},
+                },
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(len(q.submitted), 1)
+        prompt = q.submitted[0].input_text
+        self.assertIn("Required work classification", prompt)
+        self.assertIn("If no P0/P1 bug is evidenced", prompt)
+        self.assertIn("A valid feature must be notable", prompt)
+        self.assertIn("merged to the repo default branch, pushed, and deployed", prompt)
+        self.assertIn("Do not mark branch-only work as done", prompt)
+        self.assertEqual(q.orders[0]["title"], "Proactive Sprint: Dashboard Impact + Product Delivery")
+
     def test_local_slice_expected_validation_cmd_prefers_unittest_for_test_module_files(self) -> None:
         cmd = bot._local_slice_expected_validation_cmd(["tests/test_scheduler.py", "bot.py"])
         self.assertEqual(cmd, "python3 -m unittest -q tests/test_scheduler.py")
