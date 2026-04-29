@@ -36,6 +36,17 @@ def _parse_limit(qs: dict[str, list[str]], default: int, *, lo: int = 1, hi: int
     return max(int(lo), min(int(hi), v))
 
 
+def _parse_named_limit(qs: dict[str, list[str]], name: str, default: int, *, lo: int = 1, hi: int = 500) -> int:
+    raw = (qs.get(name) or [""])[0].strip()
+    if not raw:
+        return _parse_limit(qs, default, lo=lo, hi=hi)
+    try:
+        v = int(raw)
+    except Exception:
+        return int(default)
+    return max(int(lo), min(int(hi), v))
+
+
 def _parse_since_ts(qs: dict[str, list[str]]) -> float | None:
     raw = (qs.get("since_ts") or [""])[0].strip()
     if not raw:
@@ -310,6 +321,29 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             else:
                 items = self.server.status_service.orch_q.list_orders(chat_id=int(chat_id), status=status, limit=limit)
             self._send_json(200, {"api_version": _API_VERSION, "chat_id": chat_id, "status": status, "items": items})
+            return
+
+        if path in ("/api/v1/orchestration/orders/evidence", "/api/orchestration/orders/evidence"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            order_id = (qs.get("order_id") or [""])[0].strip()
+            if not order_id:
+                self._send_json(400, {"error": "missing_order_id"})
+                return
+            trace_limit = _parse_named_limit(qs, "trace_limit", 100, hi=5000)
+            child_limit = _parse_named_limit(qs, "child_limit", 200, hi=2000)
+            log_limit = _parse_named_limit(qs, "log_limit", 200, hi=2000)
+            packet = self.server.status_service.order_evidence_packet(
+                order_id,
+                trace_limit=trace_limit,
+                child_limit=child_limit,
+                log_limit=log_limit,
+            )
+            if not packet:
+                self._send_json(404, {"error": "order_not_found", "order_id": order_id})
+                return
+            self._send_json(200, packet)
             return
 
         if path in ("/api/v1/orchestration/projects", "/api/orchestration/projects"):

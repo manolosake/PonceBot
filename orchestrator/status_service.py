@@ -251,6 +251,63 @@ def _controller_failure_summary(task: Task | None) -> str | None:
     return None
 
 
+def _coerce_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        s = value.strip()
+        return [s] if s else []
+    if isinstance(value, (list, tuple)):
+        out: list[str] = []
+        for item in value:
+            s = str(item or "").strip()
+            if s:
+                out.append(s)
+        return out
+    return []
+
+
+def _artifact_refs_from_task(task: Task) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    base = {
+        "job_id": task.job_id,
+        "job_id_short": task.job_id[:8],
+        "role": str(task.role or "").strip().lower(),
+    }
+    artifacts_dir = str(task.artifacts_dir or "").strip()
+    if artifacts_dir:
+        refs.append({**base, "kind": "artifacts_dir", "path": artifacts_dir})
+
+    trace = task.trace or {}
+    for key in ("result_artifacts", "artifacts"):
+        for path in _coerce_str_list(trace.get(key)):
+            refs.append({**base, "kind": key, "path": path})
+    return refs
+
+
+def _artifact_refs_from_trace_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        base = {
+            "trace_event_id": event.get("id"),
+            "job_id": event.get("job_id"),
+            "job_id_short": (str(event.get("job_id"))[:8] if event.get("job_id") else None),
+            "role": event.get("agent_role"),
+        }
+        artifact_id = str(event.get("artifact_id") or "").strip()
+        if artifact_id:
+            refs.append({**base, "kind": "trace_artifact_id", "artifact_id": artifact_id})
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        for key in ("result_artifacts", "artifacts"):
+            for path in _coerce_str_list(payload.get(key)):
+                refs.append({**base, "kind": f"trace_payload_{key}", "path": path})
+    return refs
+
+
 def _derive_stage_status(
     *,
     running: bool,
@@ -465,6 +522,100 @@ class StatusService:
     role_profiles: dict[str, dict[str, Any]] | None = None
     cache_ttl_seconds: int = 2
     factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
+
+    def order_evidence_packet(
+        self,
+        order_id: str,
+        *,
+        trace_limit: int = 100,
+        child_limit: int = 200,
+        log_limit: int = 200,
+    ) -> dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {}
+
+        root_task = self.orch_q.get_job(oid)
+        if root_task is None:
+            return {}
+
+        child_lim = max(1, min(2000, int(child_limit)))
+        trace_lim = max(1, min(5000, int(trace_limit)))
+        log_lim = max(1, min(2000, int(log_limit)))
+
+        children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=child_lim) if t.job_id != oid]
+        order_row: dict[str, Any] | None = None
+        try:
+            order_row = self.orch_q.get_order(oid, chat_id=int(root_task.chat_id))
+        except Exception:
+            order_row = None
+        if not isinstance(order_row, dict):
+            order_row = {
+                "order_id": oid,
+                "chat_id": int(root_task.chat_id),
+                "status": str(root_task.state or ""),
+                "phase": "planning",
+                "intent_type": "",
+                "project_id": None,
+                "source_message_id": root_task.reply_to_message_id,
+                "reply_to_message_id": root_task.reply_to_message_id,
+                "priority": int(root_task.priority or 2),
+                "title": _task_title(root_task),
+                "updated_at": float(root_task.updated_at or 0.0),
+            }
+
+        traces = self.orch_q.list_trace_events(order_id=oid, limit=trace_lim)
+        decision_log = self.orch_q.list_decision_log(order_id=oid, limit=log_lim)
+        delegation_log = self.orch_q.list_delegation_log(root_ticket_id=oid, limit=log_lim)
+        tasks = [root_task, *children]
+        artifacts: list[dict[str, Any]] = []
+        for task in tasks:
+            artifacts.extend(_artifact_refs_from_task(task))
+        artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+        child_statuses = [_task_to_status(t) for t in children]
+        counts_by_state = _count_task_states(children)
+        counts_by_role: dict[str, int] = {}
+        for child in children:
+            role = str(child.role or "").strip().lower() or "unknown"
+            counts_by_role[role] = counts_by_role.get(role, 0) + 1
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": float(time.time()),
+            "order_id": oid,
+            "order_id_short": oid[:8],
+            "order": {
+                "order_id": oid,
+                "chat_id": int(order_row.get("chat_id") or root_task.chat_id),
+                "status": str(order_row.get("status") or ""),
+                "phase": str(order_row.get("phase") or "planning"),
+                "intent_type": str(order_row.get("intent_type") or ""),
+                "project_id": (str(order_row.get("project_id") or "").strip() or None),
+                "source_message_id": order_row.get("source_message_id"),
+                "reply_to_message_id": order_row.get("reply_to_message_id"),
+                "priority": int(order_row.get("priority") or root_task.priority or 2),
+                "title": str(order_row.get("title") or _task_title(root_task)),
+                "updated_at": float(order_row.get("updated_at") or root_task.updated_at or 0.0),
+            },
+            "root": _task_to_status(root_task),
+            "workflow": _build_order_workflow(order_row=order_row, root_task=root_task, children=children),
+            "children": child_statuses,
+            "traces": traces,
+            "decision_log": decision_log,
+            "delegation_log": delegation_log,
+            "artifacts": artifacts,
+            "counts": {
+                "children": len(child_statuses),
+                "children_by_state": counts_by_state,
+                "children_by_role": counts_by_role,
+                "traces": len(traces),
+                "decision_log": len(decision_log),
+                "delegation_log": len(delegation_log),
+                "artifacts": len(artifacts),
+            },
+        }
 
     def _build_alerts(
         self,
