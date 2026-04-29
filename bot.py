@@ -8873,6 +8873,43 @@ def _create_controller_snapshot_workdir(
     return snapshot
 
 
+def _controller_snapshot_safe_prompt(
+    prompt: str,
+    *,
+    snapshot_dir: Path,
+    source_paths: list[Path | str | None],
+) -> str:
+    snapshot = str(Path(snapshot_dir).resolve())
+    scrubbed = str(prompt or "")
+    replacements: list[str] = []
+    seen: set[str] = set()
+    for raw_path in source_paths:
+        if raw_path is None:
+            continue
+        raw_text = str(raw_path or "").strip()
+        if raw_text and raw_text != snapshot and raw_text not in seen:
+            seen.add(raw_text)
+            replacements.append(raw_text)
+        try:
+            path_text = str(Path(raw_path).resolve())
+        except Exception:
+            path_text = raw_text
+        if not path_text or path_text == snapshot or path_text in seen:
+            continue
+        seen.add(path_text)
+        replacements.append(path_text)
+    for path_text in sorted(replacements, key=len, reverse=True):
+        scrubbed = scrubbed.replace(path_text, snapshot)
+    guard = (
+        "CONTROLLER_SNAPSHOT_MODE\n"
+        f"CURRENT_WORKDIR: {snapshot}\n"
+        "Use only CURRENT_WORKDIR for repository inspection. It is a disposable snapshot.\n"
+        "Do not cd to, edit, commit, push, or inspect any source checkout outside CURRENT_WORKDIR.\n"
+        "Controllers must delegate implementation to write-enabled local specialists instead of changing files directly.\n"
+    )
+    return guard.rstrip() + "\n\n" + scrubbed.lstrip()
+
+
 def _stash_read_only_write_violation(
     repo_dir: Path,
     *,
@@ -25366,6 +25403,12 @@ def _orchestrator_run_codex(
         mode=mode,
         worktree_dir=(eff_cfg.codex_workdir if isinstance(eff_cfg.codex_workdir, Path) else Path(eff_cfg.codex_workdir)),
     )
+    if controller_snapshot_dir is not None:
+        prompt = _controller_snapshot_safe_prompt(
+            prompt,
+            snapshot_dir=controller_snapshot_dir,
+            source_paths=[repo_base_dir, repo_path, worktree_dir, lease_base_repo],
+        )
     try:
         # Safe logging: lengths only (never log prompt contents).
         LOG.debug(
@@ -25381,10 +25424,11 @@ def _orchestrator_run_codex(
     # Execution: optionally keep per-(chat, role) memory via `codex exec resume`.
     forced_mode = _orchestrator_forced_mode_for_role(eff_cfg, role=role, chat_id=int(task.chat_id))
     read_only_repo_baselines: dict[str, dict[str, Any]] = {}
+    read_only_targets: list[tuple[str, Path | None]] = []
     if worktree_dir is not None and _role_disallows_repo_writes(role):
         seen_target_dirs: set[str] = set()
         base_branch_blocker: str | None = None
-        read_only_targets: list[tuple[str, Path | None]] = [
+        read_only_targets = [
             ("controller_snapshot", controller_snapshot_dir),
             ("worktree", worktree_dir),
             ("base_repo", repo_base_dir),
@@ -25435,6 +25479,71 @@ def _orchestrator_run_codex(
                     "repo_default_branch": repo_default_branch,
                 },
             }
+
+    def _read_only_policy_violation_targets() -> list[tuple[str, Path, str, list[str], str, str, str, str]]:
+        if worktree_dir is None or not _role_disallows_repo_writes(role):
+            return []
+        targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
+        seen_target_dirs: set[str] = set()
+        for label, repo_dir in read_only_targets:
+            if repo_dir is None:
+                continue
+            try:
+                target_dir = Path(repo_dir).resolve()
+            except Exception:
+                target_dir = Path(repo_dir)
+            target_key = str(target_dir)
+            if target_key in seen_target_dirs:
+                continue
+            seen_target_dirs.add(target_key)
+            status_text = _git_status_porcelain(target_dir)
+            changed_paths = _git_changed_paths_from_porcelain(status_text)
+            baseline = read_only_repo_baselines.get(target_key) or {}
+            baseline_paths = {
+                str(path)
+                for path in (baseline.get("changed_paths") or [])
+                if str(path or "").strip()
+            }
+            baseline_head = str(baseline.get("head") or "").strip()
+            current_head = _git_head_rev(target_dir)
+            baseline_branch = str(baseline.get("branch") or "").strip()
+            current_branch = _git_current_branch(target_dir)
+            head_changed = bool(baseline_head) and bool(current_head) and current_head != baseline_head
+            branch_changed = (
+                str(label) == "base_repo"
+                and bool(baseline_branch)
+                and current_branch != baseline_branch
+            )
+            if str(label) == "base_repo" and baseline_paths and not (head_changed or branch_changed):
+                continue
+            new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
+            if head_changed:
+                for path in _git_changed_paths_between(target_dir, baseline_head, current_head):
+                    if path not in new_changed_paths:
+                        new_changed_paths.append(path)
+            if branch_changed:
+                branch_after = current_branch or "DETACHED"
+                branch_marker = f"BRANCH:{baseline_branch}..{branch_after}"
+                if branch_marker not in new_changed_paths:
+                    new_changed_paths.insert(0, branch_marker)
+            if head_changed:
+                head_marker = f"HEAD:{baseline_head[:12]}..{current_head[:12]}"
+                if head_marker not in new_changed_paths:
+                    new_changed_paths.insert(0, head_marker)
+            if new_changed_paths:
+                targets.append(
+                    (
+                        str(label),
+                        target_dir,
+                        status_text,
+                        new_changed_paths,
+                        baseline_head,
+                        current_head,
+                        baseline_branch,
+                        current_branch,
+                    )
+                )
+        return targets
 
     runner = CodexRunner(
         eff_cfg,
@@ -25527,6 +25636,7 @@ def _orchestrator_run_codex(
     timed_out = False
     canceled = False
     last_live_update = 0.0
+    last_write_guard_check = 0.0
     completed_stream_terminated = False
     completed_stream_since: float | None = None
     completed_stream_size = -1
@@ -25560,9 +25670,18 @@ def _orchestrator_run_codex(
                 timed_out = True
                 break
 
+            now = time.time()
+            if read_only_repo_baselines and now - last_write_guard_check >= 5.0:
+                last_write_guard_check = now
+                try:
+                    if _read_only_policy_violation_targets():
+                        _terminate_process(proc.proc)
+                        break
+                except Exception:
+                    LOG.exception("Failed controller write policy live check. job=%s role=%s", task.job_id, role)
+
             # Live progress for CEO visibility: update stdout/stderr tails periodically.
             if orch_q is not None and cfg.orchestrator_live_update_seconds > 0:
-                now = time.time()
                 if now - last_live_update >= float(cfg.orchestrator_live_update_seconds):
                     try:
                         stdout_tail = _strip_ansi(_tail_file_text(proc.stdout_path, max_chars=10000)).strip()
@@ -25833,81 +25952,7 @@ def _orchestrator_run_codex(
                 }
 
         if worktree_dir is not None and _role_disallows_repo_writes(role):
-            targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
-            seen_target_dirs: set[str] = set()
-            read_only_targets = [
-                ("controller_snapshot", controller_snapshot_dir),
-                ("worktree", worktree_dir),
-                ("base_repo", repo_base_dir),
-            ]
-            for label, repo_dir in read_only_targets:
-                if repo_dir is None:
-                    continue
-                try:
-                    target_dir = Path(repo_dir).resolve()
-                except Exception:
-                    target_dir = Path(repo_dir)
-                target_key = str(target_dir)
-                if target_key in seen_target_dirs:
-                    continue
-                seen_target_dirs.add(target_key)
-                status_text = _git_status_porcelain(target_dir)
-                changed_paths = _git_changed_paths_from_porcelain(status_text)
-                baseline = read_only_repo_baselines.get(target_key) or {}
-                baseline_paths = {
-                    str(path)
-
-                    for path in (baseline.get("changed_paths") or [])
-                    if str(path or "").strip()
-                }
-                baseline_head = str(baseline.get("head") or "").strip()
-                current_head = _git_head_rev(target_dir)
-                baseline_branch = str(baseline.get("branch") or "").strip()
-                current_branch = _git_current_branch(target_dir)
-                committed_changed_paths: list[str] = []
-                head_changed = (
-                    bool(baseline_head)
-                    and bool(current_head)
-                    and current_head != baseline_head
-                )
-                branch_changed = (
-                    str(label) == "base_repo"
-                    and bool(baseline_branch)
-                    and current_branch != baseline_branch
-                )
-                if str(label) == "base_repo" and baseline_paths and not (head_changed or branch_changed):
-                    # The controller runs in an isolated worktree. A dirty base
-                    # checkout can predate this job; do not stash or block the
-                    # sprint for unrelated operator/work-in-progress changes.
-                    continue
-                new_changed_paths = [path for path in changed_paths if path not in baseline_paths]
-                if head_changed:
-                    committed_changed_paths = _git_changed_paths_between(target_dir, baseline_head, current_head)
-                    for path in committed_changed_paths:
-                        if path not in new_changed_paths:
-                            new_changed_paths.append(path)
-                if branch_changed:
-                    branch_after = current_branch or "DETACHED"
-                    branch_marker = f"BRANCH:{baseline_branch}..{branch_after}"
-                    if branch_marker not in new_changed_paths:
-                        new_changed_paths.insert(0, branch_marker)
-                if head_changed:
-                    head_marker = f"HEAD:{baseline_head[:12]}..{current_head[:12]}"
-                    if head_marker not in new_changed_paths:
-                        new_changed_paths.insert(0, head_marker)
-                if new_changed_paths:
-                    targets.append(
-                        (
-                            str(label),
-                            target_dir,
-                            status_text,
-                            new_changed_paths,
-                            baseline_head,
-                            current_head,
-                            baseline_branch,
-                            current_branch,
-                        )
-                    )
+            targets = _read_only_policy_violation_targets()
             if targets:
                 violation_artifact = artifacts_dir / "controller_write_policy_violation.txt"
                 violation_lines = [

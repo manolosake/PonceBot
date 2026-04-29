@@ -813,6 +813,21 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[0].text)
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[1].text)
 
+    def test_controller_snapshot_safe_prompt_scrubs_source_paths(self) -> None:
+        prompt = (
+            "Registered repo root: /srv/codexbot\n"
+            "Use /tmp/worktrees/skynet/slot1 for inspection.\n"
+        )
+        safe = bot._controller_snapshot_safe_prompt(
+            prompt,
+            snapshot_dir=Path("/tmp/artifacts/job/controller_snapshot"),
+            source_paths=[Path("/srv/codexbot"), "/tmp/worktrees/skynet/slot1"],
+        )
+        self.assertIn("CONTROLLER_SNAPSHOT_MODE", safe)
+        self.assertIn("/tmp/artifacts/job/controller_snapshot", safe)
+        self.assertNotIn("/srv/codexbot", safe)
+        self.assertNotIn("/tmp/worktrees/skynet/slot1", safe)
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
