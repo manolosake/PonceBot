@@ -464,6 +464,15 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path in ("/api/status/proactive-priorities", f"/api/{_API_VERSION}/status/proactive-priorities"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 20, hi=200)
+            payload = self.server.status_service.proactive_priorities(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/status/stream", f"/api/{_API_VERSION}/status/stream"):
             if not self.server.sse_acquire(ip):
                 self._send_json(429, {"error": "too_many_streams"}, extra_headers={"Retry-After": "5"})
