@@ -621,10 +621,12 @@ def main() -> int:
     }
     enabled_repo_ids = set(enabled_repo_by_id.keys())
     stale_heartbeat_details = []
+    seen_enabled_repo_ids = set()
     for hb in heartbeat_rows:
         repo_id = str(hb.get('repo_id') or '').strip()
         if repo_id not in enabled_repo_ids:
             continue
+        seen_enabled_repo_ids.add(repo_id)
         try:
             heartbeat_at = float(hb.get('heartbeat_at') or 0.0)
         except Exception:
@@ -641,6 +643,18 @@ def main() -> int:
                 'updated_at': hb.get('updated_at'),
                 'reason': 'missing_heartbeat' if heartbeat_at <= 0 else 'stale_heartbeat',
             })
+    for repo_id in sorted(enabled_repo_ids - seen_enabled_repo_ids):
+        repo = enabled_repo_by_id.get(repo_id) or {}
+        stale_heartbeat_details.append({
+            'repo_id': repo_id,
+            'repo_path': str(repo.get('path') or ''),
+            'agent_key': '',
+            'role': '',
+            'heartbeat_at': None,
+            'heartbeat_age_s': None,
+            'updated_at': None,
+            'reason': 'missing_runtime_state_row',
+        })
     stale_heartbeat_details.sort(key=lambda item: (
         str(item.get('repo_id') or ''),
         str(item.get('role') or ''),
