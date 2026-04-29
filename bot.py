@@ -12687,6 +12687,26 @@ def _auto_merge_ready_orders_tick(
                     "merge_no_delta",
                 }
                 deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
+                if terminal_no_delivery:
+                    try:
+                        orch_q.set_order_status(oid, chat_id=chat_for_order, status="failed")
+                        orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="failed")
+                        orch_q.update_trace(
+                            oid,
+                            merge_ready=False,
+                            merge_no_delta_active=False,
+                            merge_no_delta_retired_at=float(now),
+                            merge_auto_error="merge_no_delta",
+                            live_at=float(now),
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.auto_merge_no_delta_retired",
+                            actor="jarvis",
+                            details={"order_id": oid, "reason": "merge_no_delta"},
+                        )
+                    except Exception:
+                        pass
+                    continue
                 merged_ok = (
                     not terminal_no_delivery
                     and not deploy_failed_after_merge
