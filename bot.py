@@ -8405,6 +8405,262 @@ def _git_branch_integrated_into_main(
     return anc.returncode == 0
 
 
+def _git_common_dir_for_path(path: Path) -> Path | None:
+    proc = _run_git(path, ["rev-parse", "--git-common-dir"], check=False)
+    raw = str(proc.stdout or "").strip()
+    if proc.returncode != 0 or not raw:
+        return None
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (path / common).resolve()
+    try:
+        return common.resolve()
+    except Exception:
+        return common
+
+
+def _path_is_relative_to(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _git_worktree_entries(repo: Path) -> list[dict[str, str]]:
+    proc = _run_git(repo, ["worktree", "list", "--porcelain"], check=False)
+    if proc.returncode != 0:
+        return []
+
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for raw_line in str(proc.stdout or "").splitlines():
+        line = raw_line.rstrip("\n")
+        if not line:
+            if current:
+                entries.append(current)
+                current = {}
+            continue
+        if line.startswith("worktree "):
+            current["path"] = line[len("worktree ") :]
+        elif line.startswith("HEAD "):
+            current["head"] = line[len("HEAD ") :]
+        elif line.startswith("branch "):
+            branch = line[len("branch ") :].strip()
+            current["branch"] = branch.removeprefix("refs/heads/")
+        elif line == "detached":
+            current["detached"] = "1"
+    if current:
+        entries.append(current)
+    return entries
+
+
+def _order_cleanup_workdirs_from_trace(*, orch_q: Any | None, order_id: str) -> list[Path]:
+    if orch_q is None or not str(order_id or "").strip():
+        return []
+
+    jobs: list[Any] = []
+    try:
+        root = orch_q.get_job(str(order_id))
+        if root is not None:
+            jobs.append(root)
+    except Exception:
+        pass
+    try:
+        jobs.extend(list(orch_q.jobs_by_parent(parent_job_id=str(order_id), limit=1000) or []))
+    except Exception:
+        pass
+
+    paths: dict[str, Path] = {}
+    for job in jobs:
+        trace = dict(getattr(job, "trace", None) or {})
+        for key in ("live_workdir", "source_workdir", "controller_source_workdir"):
+            raw = str(trace.get(key) or "").strip()
+            if not raw:
+                continue
+            try:
+                path = Path(raw).expanduser().resolve()
+            except Exception:
+                path = Path(raw).expanduser()
+            paths[str(path)] = path
+    return list(paths.values())
+
+
+def _order_has_open_children(*, orch_q: Any | None, order_id: str) -> list[str]:
+    if orch_q is None or not str(order_id or "").strip():
+        return []
+    terminal = {"done", "failed", "cancelled"}
+    open_children: list[str] = []
+    try:
+        children = list(orch_q.jobs_by_parent(parent_job_id=str(order_id), limit=1000) or [])
+    except Exception:
+        return []
+    for child in children:
+        state = str(getattr(child, "state", "") or "").strip().lower()
+        if state not in terminal:
+            jid = str(getattr(child, "job_id", "") or "").strip()
+            if jid:
+                open_children.append(jid)
+    return open_children
+
+
+def _cleanup_order_git_after_merge(
+    *,
+    repo: Path,
+    order_branch: str,
+    order_id: str,
+    default_branch: str = "main",
+    orch_q: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Post-delivery hygiene for a merged order.
+
+    Only removes branches/worktrees when Git proves the order branch is already
+    integrated into the configured default branch and no child jobs are still open.
+    """
+    b = str(order_branch or "").strip()
+    default = str(default_branch or "").strip() or "main"
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "reason": "",
+        "order_id": str(order_id or "").strip(),
+        "branch": b,
+        "default_branch": default,
+        "remote_branch_deleted": False,
+        "local_branch_deleted": False,
+        "worktrees_removed": [],
+        "managed_worktrees_reset": [],
+        "skipped_worktrees": [],
+        "errors": [],
+    }
+    if not b:
+        result["reason"] = "no_branch"
+        return result
+    if b == default:
+        result["reason"] = "refusing_default_branch"
+        result["errors"].append("refusing_default_branch")
+        result["status"] = "partial"
+        return result
+
+    open_children = _order_has_open_children(orch_q=orch_q, order_id=str(order_id or ""))
+    if open_children:
+        result["reason"] = "active_children"
+        result["active_children"] = open_children[:20]
+        return result
+
+    try:
+        repo = repo.expanduser().resolve()
+    except Exception:
+        repo = repo.expanduser()
+    repo_common = _git_common_dir_for_path(repo)
+    runtime_root = (repo / "data" / "runtime_worktrees").resolve()
+    merge_root = (repo / "data" / "merge_worktrees").resolve()
+    order_token = _slug_token(str(order_id or "")[:8]) or str(order_id or "")[:8]
+
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    remote_exists = (
+        _git_ref_exists(repo, f"refs/remotes/origin/{b}")
+        or _git_ref_exists(repo, f"origin/{b}")
+        or _git_remote_branch_exists(repo, b)
+    )
+    branch_safe_to_delete = True
+    if remote_exists and not _git_branch_integrated_into_main(repo=repo, branch=b, default_branch=default):
+        branch_safe_to_delete = False
+        result["errors"].append("branch_not_integrated")
+
+    for workdir in _order_cleanup_workdirs_from_trace(orch_q=orch_q, order_id=str(order_id or "")):
+        if not workdir.exists() or workdir == repo or _path_is_relative_to(workdir, runtime_root):
+            continue
+        common = _git_common_dir_for_path(workdir)
+        if repo_common is not None and common != repo_common:
+            result["skipped_worktrees"].append({"path": str(workdir), "reason": "different_git_common_dir"})
+            continue
+        try:
+            prepare_clean_workspace(workdir)
+            result["managed_worktrees_reset"].append(str(workdir))
+        except Exception as exc:
+            result["skipped_worktrees"].append({"path": str(workdir), "reason": str(exc)})
+
+    for entry in _git_worktree_entries(repo):
+        raw_path = str(entry.get("path") or "").strip()
+        if not raw_path:
+            continue
+        try:
+            wt_path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            wt_path = Path(raw_path).expanduser()
+        if wt_path == repo or _path_is_relative_to(wt_path, runtime_root):
+            continue
+        wt_branch = str(entry.get("branch") or "").strip()
+        temp_merge_branch = bool(
+            order_token
+            and _path_is_relative_to(wt_path, merge_root)
+            and (
+                wt_branch.startswith(f"poncebot/merge/{order_token}")
+                or wt_branch.startswith(f"poncebot/reconcile/{order_token}")
+            )
+        )
+        if wt_branch != b and not temp_merge_branch:
+            continue
+        status = _run_git(wt_path, ["status", "--porcelain"], check=False)
+        if status.returncode == 0 and str(status.stdout or "").strip():
+            result["skipped_worktrees"].append({"path": str(wt_path), "reason": "dirty"})
+            continue
+        rm = _run_git(repo, ["worktree", "remove", "--force", str(wt_path)], check=False)
+        if rm.returncode == 0:
+            result["worktrees_removed"].append(str(wt_path))
+        else:
+            result["errors"].append((rm.stderr or rm.stdout or "worktree_remove_failed").strip())
+
+    if branch_safe_to_delete and remote_exists:
+        rm_remote = _run_git(repo, ["push", "origin", "--delete", b], check=False)
+        if rm_remote.returncode == 0:
+            result["remote_branch_deleted"] = True
+        else:
+            detail = (rm_remote.stderr or rm_remote.stdout or "").strip()
+            low = detail.lower()
+            benign = "remote ref does not exist" in low or "not found" in low
+            if benign:
+                result["remote_branch_deleted"] = True
+            else:
+                result["errors"].append(detail or "remote_delete_failed")
+
+    if branch_safe_to_delete and _git_ref_exists(repo, f"refs/heads/{b}"):
+        rm_local = _run_git(repo, ["branch", "-D", b], check=False)
+        if rm_local.returncode == 0:
+            result["local_branch_deleted"] = True
+        else:
+            result["errors"].append((rm_local.stderr or rm_local.stdout or "local_delete_failed").strip())
+
+    _run_git(repo, ["worktree", "prune"], check=False)
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+
+    if result["errors"]:
+        result["status"] = "partial"
+        result["reason"] = "cleanup_partial"
+    else:
+        result["status"] = "ok"
+        result["reason"] = "cleanup_complete"
+    return result
+
+
+def _post_merge_cleanup_display(result: dict[str, Any] | None) -> str:
+    res = dict(result or {})
+    status = str(res.get("status") or "").strip().lower()
+    if not status:
+        return ""
+    if status == "ok":
+        removed = len(list(res.get("worktrees_removed") or []))
+        reset = len(list(res.get("managed_worktrees_reset") or []))
+        return f"Cleanup OK: branch retired; worktrees removed={removed}, reset={reset}."
+    if status == "partial":
+        errors = len(list(res.get("errors") or []))
+        skipped = len(list(res.get("skipped_worktrees") or []))
+        return f"Cleanup partial: errors={errors}, skipped_worktrees={skipped}."
+    reason = str(res.get("reason") or "").strip()
+    return f"Cleanup skipped{f' ({reason})' if reason else ''}."
+
+
 def _order_trace_requires_merge(
     trace: dict[str, Any] | None,
     *,
@@ -9200,9 +9456,6 @@ def _merge_order_branch_to_main(
 
             ps = _run_git(merge_dir, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False)
             if ps.returncode == 0:
-                # Hygiene: one branch per project/order, remove after successful merge.
-                _run_git(repo, ["push", "origin", "--delete", b], check=False)
-                _run_git(repo, ["branch", "-D", b], check=False)
                 _sync_repo_checkout_to_default_branch(repo=repo, default_branch=default_branch)
                 return True, "merged_to_main", (merge_commit or None)
 
@@ -11519,6 +11772,22 @@ def _order_command_text(
             )
             deploy_status = str(deploy_result.get("status") or "").strip().lower() or "skipped"
             deploy_summary = _deploy_result_display(deploy_result)
+            if deploy_status == "failed":
+                cleanup_result = {
+                    "status": "skipped",
+                    "reason": "deploy_failed",
+                    "branch": order_branch,
+                    "default_branch": default_branch,
+                }
+            else:
+                cleanup_result = _cleanup_order_git_after_merge(
+                    repo=repo_dir,
+                    order_branch=order_branch,
+                    order_id=root_id,
+                    default_branch=default_branch,
+                    orch_q=orch_q,
+                )
+            cleanup_summary = _post_merge_cleanup_display(cleanup_result)
             try:
                 orch_q.update_trace(
                     root_id,
@@ -11538,10 +11807,13 @@ def _order_command_text(
                     deployed_commit=deploy_result.get("deployed_commit"),
                     deployed_at=(time.time() if deploy_status in ("ok", "scheduled") else None),
                     deploy_error=(deploy_result.get("detail") if deploy_status == "failed" else None),
+                    post_merge_cleanup_status=str(cleanup_result.get("status") or ""),
+                    post_merge_cleanup_result=cleanup_result,
                     result_summary=(
                         f"Merged to {default_branch}"
                         + (f" commit={merge_commit}" if merge_commit else "")
                         + (f". {deploy_summary}" if deploy_summary else ".")
+                        + (f" {cleanup_summary}" if cleanup_summary and deploy_status != "failed" else "")
                     ),
                     result_next_action=(
                         "Inspect deployment failure and complete rollout."
@@ -11578,6 +11850,7 @@ def _order_command_text(
                             f"Merged to {default_branch}"
                             + (f" commit={merge_commit}" if merge_commit else "")
                             + (f". {deploy_summary}" if deploy_summary else ".")
+                            + (f" {cleanup_summary}" if cleanup_summary else "")
                         ),
                         result_next_action="Factory ready for next order.",
                     )
@@ -11596,15 +11869,17 @@ def _order_command_text(
                         "merge_commit": (merge_commit or None),
                         "result": str(merged_msg),
                         "deploy": deploy_result,
+                        "cleanup": cleanup_result,
                     },
                 )
             except Exception:
                 pass
             commit_part = f" commit={merge_commit}" if merge_commit else ""
             deploy_part = f" {_deploy_result_display(deploy_result)}" if deploy_summary else ""
+            cleanup_part = f" {cleanup_summary}" if cleanup_summary and deploy_status != "failed" else ""
             if actor_norm == "jarvis":
-                return f"Order {root_id[:8]} auto-merged by Jarvis to {default_branch}.{commit_part}{deploy_part}"
-            return f"Order {root_id[:8]} merged to {default_branch}.{commit_part}{deploy_part}"
+                return f"Order {root_id[:8]} auto-merged by Jarvis to {default_branch}.{commit_part}{deploy_part}{cleanup_part}"
+            return f"Order {root_id[:8]} merged to {default_branch}.{commit_part}{deploy_part}{cleanup_part}"
         try:
             err_txt = str(merged_msg or "")
             conflict_like = _merge_error_is_conflict_like(err_txt)

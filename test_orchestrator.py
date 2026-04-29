@@ -3517,6 +3517,130 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertEqual(merged_msg, "merged_to_main")
             self.assertTrue(bool(merge_commit))
 
+    def test_post_merge_cleanup_removes_integrated_order_branch_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "app.txt").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/order-cleanup")
+            (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(repo, "add", "feature.txt")
+            self._git(repo, "commit", "-m", "feature change")
+            self._git(repo, "push", "-u", "origin", "feature/order-cleanup")
+            self._git(repo, "checkout", "main")
+
+            order_worktree = td_path / "order-worktree"
+            self._git(repo, "worktree", "add", str(order_worktree), "feature/order-cleanup")
+
+            merged_ok, merged_msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/order-cleanup",
+                order_id="ord-cleanup-01",
+                default_branch="main",
+            )
+            self.assertTrue(merged_ok, merged_msg)
+            self.assertEqual(merged_msg, "merged_to_main")
+            self.assertTrue(bool(merge_commit))
+
+            result = bot._cleanup_order_git_after_merge(
+                repo=repo,
+                order_branch="feature/order-cleanup",
+                order_id="ord-cleanup-01",
+                default_branch="main",
+            )
+
+            self.assertEqual(str(result.get("status") or ""), "ok")
+            self.assertTrue(bool(result.get("remote_branch_deleted")))
+            self.assertTrue(bool(result.get("local_branch_deleted")))
+            self.assertIn(str(order_worktree.resolve()), list(result.get("worktrees_removed") or []))
+            self.assertFalse(order_worktree.exists())
+            remote_check = subprocess.run(
+                ["git", "ls-remote", "--heads", "origin", "feature/order-cleanup"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._git_env(),
+            )
+            self.assertEqual(remote_check.stdout.strip(), "")
+            local_check = subprocess.run(
+                ["git", "rev-parse", "--verify", "refs/heads/feature/order-cleanup"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._git_env(),
+            )
+            self.assertNotEqual(local_check.returncode, 0)
+
+    def test_post_merge_cleanup_refuses_unintegrated_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            remote = td_path / "remote.git"
+            repo = td_path / "repo"
+            remote.mkdir(parents=True, exist_ok=True)
+            repo.mkdir(parents=True, exist_ok=True)
+
+            self._git(remote, "init", "--bare")
+            self._git(repo, "init")
+            self._git(repo, "checkout", "-b", "main")
+            self._git(repo, "remote", "add", "origin", str(remote))
+
+            (repo / "app.txt").write_text("base\n", encoding="utf-8")
+            self._git(repo, "add", ".")
+            self._git(repo, "commit", "-m", "init")
+            self._git(repo, "push", "-u", "origin", "main")
+
+            self._git(repo, "checkout", "-b", "feature/order-not-merged")
+            (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(repo, "add", "feature.txt")
+            self._git(repo, "commit", "-m", "feature change")
+            self._git(repo, "push", "-u", "origin", "feature/order-not-merged")
+            self._git(repo, "checkout", "main")
+
+            result = bot._cleanup_order_git_after_merge(
+                repo=repo,
+                order_branch="feature/order-not-merged",
+                order_id="ord-not-merged",
+                default_branch="main",
+            )
+
+            self.assertEqual(str(result.get("status") or ""), "partial")
+            self.assertIn("branch_not_integrated", list(result.get("errors") or []))
+            self.assertFalse(bool(result.get("remote_branch_deleted")))
+            self.assertFalse(bool(result.get("local_branch_deleted")))
+            remote_check = subprocess.run(
+                ["git", "ls-remote", "--heads", "origin", "feature/order-not-merged"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._git_env(),
+            )
+            self.assertIn("refs/heads/feature/order-not-merged", remote_check.stdout)
+            local_check = subprocess.run(
+                ["git", "rev-parse", "--verify", "refs/heads/feature/order-not-merged"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._git_env(),
+            )
+            self.assertEqual(local_check.returncode, 0)
+
     def test_merge_order_branch_to_main_rejects_no_delta_branch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
