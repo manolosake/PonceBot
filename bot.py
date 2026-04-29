@@ -124,12 +124,12 @@ _TICKET_CARD_MIN_EDIT_INTERVAL_S = 2.0
 _APK_BUILD_LOCK = threading.Lock()
 _APK_BUILD_ACTIVE = False
 
-_MODEL_CEO_QUERY = "gpt-5.3-codex-spark"
-_MODEL_JARVIS_PLAN = "gpt-5.3-codex"
-_MODEL_AGENT_EXEC = "gpt-5.3-codex"
+_MODEL_CEO_QUERY = "gpt-5.5"
+_MODEL_JARVIS_PLAN = "gpt-5.5"
+_MODEL_AGENT_EXEC = "gpt-5.4"
 
 _EFFORT_CEO_QUERY = "high"
-_EFFORT_JARVIS_PLAN = "xhigh"
+_EFFORT_JARVIS_PLAN = "high"
 _EFFORT_AGENT_EXEC = "medium"
 
 

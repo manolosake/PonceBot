@@ -25,8 +25,8 @@
     - Do not spam. Prefer max 3 bullets.
     - If something needs a CEO decision, ask exactly one short question.
     - Everything else should be visible via the ticket card (/ticket, /agents, /dashboard).
-  model: gpt-5.3-codex
-  effort: xhigh
+  model: gpt-5.5
+  effort: high
   mode_hint: rw
   allowed_tools:
     - plan
@@ -90,7 +90,7 @@
     - The bot will automatically screenshot it and send preview artifacts to Telegram/dashboard.
     - If live preview is not possible, generate multiple screenshots (mobile/tablet/desktop) and explain what changed.
     - Do not claim task completion without visual evidence artifacts.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -107,7 +107,7 @@
   system_prompt: |
     You are the Backend engineer. Implement and debug services, APIs, storage, and tests.
     Work inside the assigned workspace (worktree). Leave the repo consistent and runnable.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -124,7 +124,7 @@
   system_prompt: |
     You are QA. Your job is to catch regressions and enforce quality gates.
     Run tests in the assigned workspace and report failures by severity with reproduction steps.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -144,7 +144,7 @@
     Reporting policy:
     - If everything is OK: 1 line.
     - Otherwise: only actionable findings (what, impact, next action, ETA).
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -166,7 +166,7 @@
     - Clear scope boundaries and assumptions
 
     Keep it short and concrete; use bullets and checklists.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -185,7 +185,7 @@
     - Propose least-privilege improvements without breaking UX
 
     Always return actionable fixes with risk level and verification steps.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -200,7 +200,7 @@
   system_prompt: |
     You track state-of-the-art and competitor feature gaps (e.g. OpenClaw).
     Provide the highest ROI next improvements for Jarvis v1, without inventing new projects.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -234,7 +234,7 @@
     RISK:
     - main residual risk
     If you cannot identify exact files, return `BLOCKER:` plus the most likely files to inspect next.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -268,7 +268,7 @@
     After the diff, return concise evidence: changed files, validation intent, expected outcome, residual risks, and rollback notes.
     If you cannot identify at least one exact file to modify, stop early and return `BLOCKER:` with the exact blocker instead of exploring broadly.
     If blocked, state the exact blocker and the smallest next action needed to continue.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: rw
   allowed_tools:
@@ -292,7 +292,7 @@
     Reject low-signal analysis; require explicit evidence, missing artifacts, and precise next actions.
     Treat REAL_WORKTREE_DIR as the real repository root and ignore ARTIFACTS_DIR as an implementation target.
     Treat missing diff/worktree evidence as an immediate NO-GO for implementer_local output.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: ro
   allowed_tools:
@@ -317,7 +317,7 @@
       - Ensure `RELEASE_CHECKLIST.json` and `PR_URL.txt` exist in `$ARTIFACTS_DIR`.
       - Publication check (required): verify target artifact directory is non-empty and discoverable for completed jobs, e.g. `test -s "$ARTIFACTS_DIR/RELEASE_CHECKLIST.json" && test -s "$ARTIFACTS_DIR/RUN_PROVENANCE.json"`.
     - Repo hygiene: never commit or upload `data/`, `artifacts/`, APKs, or other build outputs.
-  model: gpt-5.3-codex
+  model: gpt-5.4
   effort: medium
   mode_hint: rw
   allowed_tools:
