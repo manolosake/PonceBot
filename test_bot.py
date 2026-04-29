@@ -519,6 +519,7 @@ class TestStateHandling(unittest.TestCase):
 
     def test_response_signals_no_code_change_accepts_additional_change_wording(self) -> None:
         self.assertTrue(bot._response_signals_no_code_change("READY. No additional code change is required."))
+        self.assertTrue(bot._response_signals_no_code_change("No-op reapplication; patch is already present with no new delta."))
 
     def test_orchestrator_session_thread_id_prefers_repo_runtime_state(self) -> None:
         class _FakeQueue:
@@ -777,6 +778,10 @@ class TestStateHandling(unittest.TestCase):
             {
                 "summary": "Prepared a minimal reliability improvement in test_status_http.py.",
                 "order_branch": "feature/test-order",
+                "controller_recovery_artifacts": [
+                    "/tmp/artifacts/root/changes.patch",
+                    "/tmp/artifacts/root/write_policy_controller_snapshot_stash.txt",
+                ],
                 "write_policy_violation": {
                     "changed_paths": ["test_status_http.py"],
                 },
@@ -784,7 +789,11 @@ class TestStateHandling(unittest.TestCase):
         )
         self.assertEqual([spec.role for spec in specs], ["implementer_local", "reviewer_local"])
         self.assertIn("test_status_http.py", specs[0].text)
+        self.assertIn("/tmp/artifacts/root/changes.patch", specs[0].text)
+        self.assertIn("Do not use `stash@{0}`", specs[0].text)
+        self.assertIn("ticket-scoped no-op evidence", specs[0].text)
         self.assertIn("python3 -m unittest -q test_status_http", specs[0].text)
+        self.assertIn("policy-approved no-op", specs[1].text)
         self.assertEqual(specs[1].depends_on, [specs[0].key])
 
     def test_controller_local_recovery_specs_normalizes_scoped_write_policy_paths(self) -> None:
@@ -6019,6 +6028,94 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.submitted[1].depends_on, [q.submitted[0].job_id])
         self.assertEqual(q.phases[-1], "executing")
         self.assertEqual(q.trace_updates[-1]["local_rework_review_job_id"], q.submitted[1].job_id)
+
+    def test_recovery_rework_includes_original_controller_patch_artifacts(self) -> None:
+        class FakeQueue:
+            def __init__(self, children: list[SimpleNamespace]) -> None:
+                self.children = children
+                self.submitted: list[bot.Task] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 400):
+                return list(self.children)
+
+            def get_job(self, job_id: str):
+                return SimpleNamespace(
+                    job_id=job_id,
+                    trace={
+                        "order_branch": "feature/order-root",
+                        "result_artifacts": ["/tmp/root/changes.patch"],
+                        "structured_digest": {
+                            "write_policy_violation": {
+                                "status_artifact": "/tmp/root/controller_write_policy_violation.txt",
+                                "cleanup": [{"artifact": "/tmp/root/write_policy_controller_snapshot_stash.txt"}],
+                            }
+                        },
+                    },
+                )
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_recover_status_api"},
+                trace={
+                    "result_summary": "No-op reapplication; patch is already present with no new delta.",
+                    "result_status": "done",
+                },
+                artifacts_dir="/tmp/impl-artifacts",
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_review_recover_status_api"},
+                trace={
+                    "result_summary": "NEEDS_REWORK: recovery slice did not use ticket-scoped controller patch evidence.",
+                    "result_status": "done",
+                },
+                artifacts_dir="/tmp/qa-artifacts",
+                created_at=111.0,
+                updated_at=120.0,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue(children)
+            enqueued = bot._enqueue_reviewer_local_rework_if_due(
+                cfg=self._operational_gate_recovery_cfg(td),
+                orch_q=q,
+                profiles=None,
+                order_row={"order_id": "root", "title": "Proactive Sprint: PonceBot"},
+                chat_id=1,
+                now=130.0,
+            )
+
+        self.assertTrue(enqueued)
+        self.assertEqual([task.role for task in q.submitted], ["backend", "qa"])
+        prompt = q.submitted[0].input_text
+        self.assertIn("ORIGINAL_CONTROLLER_RECOVERY_ARTIFACTS", prompt)
+        self.assertIn("/tmp/root/changes.patch", prompt)
+        self.assertIn("controller_write_policy_violation.txt", prompt)
+        self.assertIn("Do not use stash@{0}", prompt)
+        self.assertIn("never replay stash@{0}", prompt)
 
     def test_worktree_pool_reclaims_same_namespace_legacy_branch(self) -> None:
         from orchestrator import workspaces

@@ -14773,6 +14773,17 @@ def _enqueue_reviewer_local_rework_if_due(
         else:
             validation_cmd = "git diff --stat"
 
+    root_trace: dict[str, Any] = {}
+    order_branch = ""
+    try:
+        root_job = orch_q.get_job(oid)
+        root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
+        order_branch = str(root_trace.get("order_branch") or "").strip()
+    except Exception:
+        root_trace = {}
+        order_branch = ""
+    controller_artifacts = _controller_recovery_artifact_paths(root_trace)
+
     evidence_block = ""
     if impl_summary:
         evidence_block += "\n\nLATEST_IMPLEMENTER_EVIDENCE:\n" + impl_summary
@@ -14780,6 +14791,12 @@ def _enqueue_reviewer_local_rework_if_due(
         evidence_block += "\n\nMANDATORY_FILE_SCOPE:\n- " + "\n- ".join(changed_files[:12])
     if impl_artifacts_dir:
         evidence_block += "\n\nIMPLEMENTER_ARTIFACTS_DIR:\n" + impl_artifacts_dir
+    if controller_artifacts:
+        evidence_block += (
+            "\n\nORIGINAL_CONTROLLER_RECOVERY_ARTIFACTS:\n- "
+            + "\n- ".join(controller_artifacts[:12])
+            + "\nUse changes.patch from these artifacts when present. Do not use stash@{0} from your own worktree."
+        )
 
     spec = TaskSpec(
         key=impl_key,
@@ -14797,6 +14814,7 @@ def _enqueue_reviewer_local_rework_if_due(
             "- Do not ask for another architecture pass.\n"
             "- If code changes are still required, return one single fenced ```diff``` block or explicit rewrite block(s).\n"
             f"- After the code block(s), add EXPECTED_VALIDATION: `{validation_cmd}`.\n"
+            "- For controller recovery, treat ORIGINAL_CONTROLLER_RECOVERY_ARTIFACTS/changes.patch as authoritative when present; never replay stash@{0} from this worktree.\n"
             "- If the reviewer is only missing validation/file evidence and the existing code is already correct, do not invent a diff. Say explicitly that no code change is required, provide exact file evidence, and add EXPECTED_VALIDATION.\n"
             "- If the prior approach is invalid, replace it with the smallest valid implementation that still satisfies the same objective.\n"
         ),
@@ -14845,13 +14863,6 @@ def _enqueue_reviewer_local_rework_if_due(
     }
     if not use_cli_roles:
         trace["execution_policy"] = "local_only"
-    order_branch = ""
-    try:
-        root_job = orch_q.get_job(oid)
-        root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
-        order_branch = str(root_trace.get("order_branch") or "").strip()
-    except Exception:
-        order_branch = ""
     if order_branch:
         trace["order_branch"] = str(order_branch)
     child = Task.new(
@@ -16496,6 +16507,44 @@ def _normalize_controller_write_policy_changed_path(path: Any) -> str:
     return rel_path
 
 
+def _controller_recovery_artifact_paths(*payloads: Any) -> list[str]:
+    paths: list[str] = []
+
+    def add(raw: Any) -> None:
+        path = str(raw or "").strip()
+        if path and path not in paths:
+            paths.append(path)
+
+    def walk(payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        for key in ("controller_recovery_artifacts", "result_artifacts", "artifacts"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    add(item)
+        write_policy = payload.get("write_policy_violation")
+        if isinstance(write_policy, dict):
+            add(write_policy.get("status_artifact"))
+            cleanup_items = write_policy.get("cleanup")
+            if isinstance(cleanup_items, list):
+                for cleanup in cleanup_items:
+                    if not isinstance(cleanup, dict):
+                        continue
+                    add(cleanup.get("artifact"))
+                    for nested_key in ("branch_restore", "head_restore"):
+                        nested = cleanup.get(nested_key)
+                        if isinstance(nested, dict):
+                            add(nested.get("artifact"))
+        structured = payload.get("structured_digest")
+        if isinstance(structured, dict):
+            walk(structured)
+
+    for payload in payloads:
+        walk(payload)
+    return paths
+
+
 def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     if not isinstance(structured_digest, dict):
         return []
@@ -16535,14 +16584,24 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     controller_intent = summary or (
         "Recreate the bounded patch the controller prepared, but do it through implementer_local so the change stays inside local-only policy."
     )
+    recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
+    recovery_artifact_block = ""
+    if recovery_artifacts:
+        recovery_artifact_block = (
+            "Authoritative controller recovery artifacts:\\n"
+            + "\\n".join(f"- `{path}`" for path in recovery_artifacts[:8])
+            + "\\nUse `changes.patch` from this list when present. Do not use `stash@{0}` from your own worktree; that stash is local to the wrong repo.\\n\\n"
+        )
     implementer_text = (
         "Local recovery for a controller write-policy violation.\\n"
         "The controller identified a bounded patch but cannot edit the repository directly.\\n"
         f"Target files:\\n{file_list}\\n\\n"
         f"Controller intent:\\n{controller_intent}\\n\\n"
+        f"{recovery_artifact_block}"
         "Rules:\\n"
         "- Work only in the listed files.\\n"
         "- Keep the patch bounded to the controller intent; do not expand scope.\\n"
+        "- If the authoritative patch is already present, do not create churn. Publish ticket-scoped no-op evidence that names this ticket, this recovery key, the existing commit/file evidence, and the validation command output.\\n"
         f"- Run this validation command before finishing: `{validation_cmd}`.\\n"
         "- Return the patch, changed files, and validation output/evidence.\\n"
         + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
@@ -16554,6 +16613,7 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
         "Rules:\\n"
         "- Review only the newest implementer_local recovery slice for this ticket.\\n"
         "- Require concrete validation evidence before READY.\\n"
+        "- READY is allowed for a policy-approved no-op only when the implementer names this ticket, this recovery key, the authoritative controller artifact, the existing commit/file evidence, and the validation result.\\n"
         "- Return READY or NEEDS_REWORK with one concrete next step.\\n"
     )
     return [
@@ -18053,10 +18113,16 @@ def _response_signals_no_code_change(text: str) -> bool:
         "already implemented",
         "already complete",
         "already correct",
+        "already present",
         "already satisfies",
         "already uses",
         "already use",
         "already matches",
+        "existing code is already correct",
+        "existing implementation already contains",
+        "no new delta",
+        "no-op reapplication",
+        "no-op recovery",
         "slice complete",
         "slice is complete",
         "request is satisfied by existing implementation",
@@ -26070,6 +26136,14 @@ def _orchestrator_run_codex(
                 violation_artifact_str = str(violation_artifact)
                 if violation_artifact_str not in artifacts_text:
                     artifacts_text.append(violation_artifact_str)
+                controller_recovery_artifacts = []
+                for raw_artifact in artifacts_text:
+                    artifact_name = Path(str(raw_artifact or "")).name.lower()
+                    if artifact_name in {"changes.patch", "controller_write_policy_violation.txt"} or artifact_name.startswith("write_policy_"):
+                        controller_recovery_artifacts.append(str(raw_artifact))
+                if controller_recovery_artifacts:
+                    structured["controller_recovery_artifacts"] = controller_recovery_artifacts[:12]
+                structured["result_artifacts"] = artifacts_text[:40]
                 structured["write_policy_violation"] = {
                     "role": role,
                     "reason": "controller_write_policy_violation",
