@@ -391,6 +391,32 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path in (
+            "/api/v1/orchestration/orders/handoff-digest",
+            "/api/orchestration/orders/handoff-digest",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            order_id = (qs.get("order_id") or [""])[0].strip()
+            if not order_id:
+                self._send_json(400, {"error": "missing_order_id"})
+                return
+            trace_limit = _parse_named_limit(qs, "trace_limit", 100, hi=5000)
+            child_limit = _parse_named_limit(qs, "child_limit", 200, hi=2000)
+            log_limit = _parse_named_limit(qs, "log_limit", 200, hi=2000)
+            digest = self.server.status_service.order_handoff_digest(
+                order_id,
+                trace_limit=trace_limit,
+                child_limit=child_limit,
+                log_limit=log_limit,
+            )
+            if not digest:
+                self._send_json(404, {"error": "order_not_found", "order_id": order_id})
+                return
+            self._send_json(200, digest)
+            return
+
+        if path in (
             "/api/v1/orchestration/orders/release-readiness",
             "/api/orchestration/orders/release-readiness",
         ):
