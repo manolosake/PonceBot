@@ -490,6 +490,14 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path in ("/api/status/proactive-health", f"/api/{_API_VERSION}/status/proactive-health"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            payload = self.server.status_service.proactive_health()
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/status/proactive-priorities", f"/api/{_API_VERSION}/status/proactive-priorities"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
