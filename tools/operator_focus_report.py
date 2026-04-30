@@ -36,6 +36,14 @@ def _one_line(value: Any, *, default: str = "-") -> str:
     return text or default
 
 
+def _one_line_list(value: Any, *, default: str = "-") -> str:
+    if isinstance(value, list):
+        parts = [_one_line(item, default="") for item in value]
+        text = ", ".join(part for part in parts if part)
+        return text or default
+    return _one_line(value, default=default)
+
+
 def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -92,6 +100,25 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("| - | - | - | No operator focus items. | - | - |")
+
+    lines.extend(["", "## Triage Details", ""])
+    if items:
+        for item in items:
+            lines.extend(
+                [
+                    f"### {_one_line(item.get('rank'))}. {_one_line(item.get('label'))}",
+                    "",
+                    f"- Reason: {_one_line(item.get('reason'))}",
+                    f"- Inspect path: {_one_line(item.get('inspect_path'))}",
+                    f"- Inspect target: {_one_line(item.get('inspect_target'))}",
+                    f"- Action target: {_one_line(item.get('action_target'))}",
+                    f"- Source: {_one_line(item.get('source'))}",
+                    f"- Source signals: {_one_line_list(item.get('source_signals'))}",
+                    "",
+                ]
+            )
+    else:
+        lines.append("- No triage details.")
 
     return "\n".join(lines) + "\n"
 
