@@ -211,6 +211,89 @@ def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
     return int((_WORKFLOW_STAGE_SLA_SECONDS_BY_TIER.get(tier) or {}).get(stage, 0) or 0)
 
 
+_TERMINAL_TASK_STATES = {"done", "failed", "cancelled"}
+
+
+def _workflow_stage_tasks(stage: str, root_task: Task | None, children: list[Task]) -> list[Task]:
+    stage_name = str(stage or "").strip()
+    if stage_name == "skynet_plan":
+        return [root_task] if root_task is not None else []
+    if stage_name == "delivery":
+        return [t for t in children if str(t.role or "").strip().lower() in _DELIVERY_ROLES]
+    if stage_name == "validation":
+        return [t for t in children if str(t.role or "").strip().lower() in (_VALIDATION_ROLES - {"release_mgr"})]
+    if stage_name == "skynet_review":
+        return [t for t in children if str(t.role or "").strip().lower() in _CONTROLLER_ROLES]
+    if stage_name == "deploy":
+        return [t for t in children if str(t.role or "").strip().lower() == "release_mgr"]
+    return []
+
+
+def _workflow_stage_sla_view(
+    *,
+    sla_tier: str | None,
+    stage: str,
+    root_task: Task | None,
+    children: list[Task],
+    order_row: dict[str, Any],
+    now: float,
+) -> dict[str, Any]:
+    tier = _normalize_sla_tier(sla_tier)
+    stage_name = str(stage or "").strip()
+    sla_seconds = _workflow_stage_sla_seconds(tier, stage_name)
+    stage_tasks = _workflow_stage_tasks(stage_name, root_task, children)
+
+    started_at: float | None = None
+    source = "none"
+
+    non_terminal = [
+        t
+        for t in stage_tasks
+        if str(t.state or "").strip().lower() not in _TERMINAL_TASK_STATES and _coerce_float(t.created_at) is not None
+    ]
+    if non_terminal:
+        task = min(non_terminal, key=lambda t: float(t.created_at or 0.0))
+        started_at = float(task.created_at or 0.0)
+        source = "oldest_non_terminal_stage_task_created_at"
+    else:
+        created_stage_tasks = [t for t in stage_tasks if _coerce_float(t.created_at) is not None]
+        if created_stage_tasks:
+            task = max(created_stage_tasks, key=lambda t: float(t.created_at or 0.0))
+            started_at = float(task.created_at or 0.0)
+            source = "latest_stage_task_created_at"
+
+    if started_at is None:
+        order_created_at = _coerce_float((order_row or {}).get("created_at"))
+        if order_created_at is not None:
+            started_at = order_created_at
+            source = "order_created_at"
+        elif root_task is not None:
+            root_created_at = _coerce_float(root_task.created_at)
+            if root_created_at is not None:
+                started_at = root_created_at
+                source = "root_task_created_at"
+
+    age_seconds: int | None = None
+    deadline_at: float | None = None
+    overdue_by_seconds = 0
+    if started_at is not None:
+        age_seconds = max(0, int(float(now) - float(started_at)))
+        deadline_at = float(started_at) + float(sla_seconds)
+        if sla_seconds > 0:
+            overdue_by_seconds = max(0, age_seconds - int(sla_seconds))
+
+    return {
+        "sla_tier": tier,
+        "sla_seconds": int(sla_seconds),
+        "started_at": started_at,
+        "age_seconds": age_seconds,
+        "deadline_at": deadline_at,
+        "overdue": overdue_by_seconds > 0,
+        "overdue_by_seconds": overdue_by_seconds,
+        "source": source,
+    }
+
+
 def _count_task_states(tasks: list[Task]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for t in tasks:
