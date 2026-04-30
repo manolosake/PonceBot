@@ -294,6 +294,40 @@ def _coerce_str_list(value: Any) -> list[str]:
     return []
 
 
+def _compact_jsonable_dict(value: Any, *, max_items: int = 20) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, item in list(value.items())[:max_items]:
+        if not isinstance(key, str):
+            key = str(key)
+        if isinstance(item, (str, int, float, bool)) or item is None:
+            out[key] = item
+        elif isinstance(item, dict):
+            out[key] = _compact_jsonable_dict(item, max_items=max_items)
+        elif isinstance(item, (list, tuple)):
+            out[key] = [
+                _compact_jsonable_dict(x, max_items=max_items) if isinstance(x, dict) else x
+                for x in list(item)[:max_items]
+                if isinstance(x, (str, int, float, bool, dict)) or x is None
+            ]
+    return out
+
+
+def _compact_jsonable_list(value: Any, *, max_items: int = 20) -> list[Any]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[Any] = []
+    for item in list(value)[:max_items]:
+        if isinstance(item, dict):
+            compact = _compact_jsonable_dict(item)
+            if compact:
+                out.append(compact)
+        elif isinstance(item, (str, int, float, bool)) or item is None:
+            out.append(item)
+    return out
+
+
 def _artifact_refs_from_task(task: Task) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     base = {
@@ -943,8 +977,12 @@ class StatusService:
     proactive_health_fn: Callable[[], dict[str, Any]] | None = None
 
     def proactive_health(self) -> dict[str, Any]:
+        generated_at = float(time.time())
         if self.proactive_health_fn is None:
             return {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": generated_at,
                 "status": "not_configured",
                 "operational_status": "not_configured",
                 "trend_status": "not_configured",
@@ -954,6 +992,13 @@ class StatusService:
                 "report_found": False,
                 "stale_report": False,
                 "report_age_s": None,
+                "report_path": None,
+                "recommended_actions": [],
+                "anomalies": [],
+                "trend_flags": [],
+                "autonomy_funnel": {},
+                "orders": [],
+                "factory": {},
             }
 
         try:
@@ -962,6 +1007,9 @@ class StatusService:
             raw = None
         if not isinstance(raw, dict):
             return {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": generated_at,
                 "status": "unavailable",
                 "operational_status": "unavailable",
                 "trend_status": "unavailable",
@@ -971,6 +1019,13 @@ class StatusService:
                 "report_found": False,
                 "stale_report": False,
                 "report_age_s": None,
+                "report_path": None,
+                "recommended_actions": [],
+                "anomalies": [],
+                "trend_flags": [],
+                "autonomy_funnel": {},
+                "orders": [],
+                "factory": {},
             }
 
         def _text(name: str, default: str) -> str:
@@ -994,6 +1049,9 @@ class StatusService:
             alert_level = "OK"
 
         return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
             "status": _text("status", "unavailable"),
             "operational_status": _text("operational_status", "unavailable"),
             "trend_status": _text("trend_status", "unavailable"),
@@ -1003,6 +1061,13 @@ class StatusService:
             "report_found": _bool("report_found", False),
             "stale_report": _bool("stale_report", False),
             "report_age_s": report_age_s,
+            "report_path": (_text("report_path", "") or None),
+            "recommended_actions": _compact_jsonable_list(raw.get("recommended_actions"), max_items=20),
+            "anomalies": _compact_jsonable_list(raw.get("anomalies"), max_items=20),
+            "trend_flags": _compact_jsonable_list(raw.get("trend_flags"), max_items=20),
+            "autonomy_funnel": _compact_jsonable_dict(raw.get("autonomy_funnel")),
+            "orders": _compact_jsonable_list(raw.get("orders") or raw.get("order_reports"), max_items=20),
+            "factory": _compact_jsonable_dict(raw.get("factory")),
         }
 
     def _proactive_health_alert(self, proactive_health: dict[str, Any]) -> dict[str, Any] | None:
@@ -1020,6 +1085,7 @@ class StatusService:
             "trend_status": proactive_health.get("trend_status"),
             "report_age_s": proactive_health.get("report_age_s"),
             "stale_report": bool(proactive_health.get("stale_report")),
+            "report_path": proactive_health.get("report_path"),
         }
 
     def autonomy_board(self, *, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
