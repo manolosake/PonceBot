@@ -47,6 +47,19 @@ def _parse_named_limit(qs: dict[str, list[str]], name: str, default: int, *, lo:
     return max(int(lo), min(int(hi), v))
 
 
+def _parse_filter_values(qs: dict[str, list[str]], name: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw in qs.get(name) or []:
+        for part in str(raw or "").split(","):
+            value = part.strip().lower()
+            if not value or value in seen:
+                continue
+            values.append(value)
+            seen.add(value)
+    return values
+
+
 def _parse_since_ts(qs: dict[str, list[str]]) -> float | None:
     raw = (qs.get("since_ts") or [""])[0].strip()
     if not raw:
@@ -372,7 +385,13 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
                 return
             limit = _parse_limit(qs, 5, hi=20)
-            payload = self.server.status_service.operator_focus(chat_id=chat_id, limit=limit)
+            payload = self.server.status_service.operator_focus(
+                chat_id=chat_id,
+                limit=limit,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+            )
             self._send_json(200, payload)
             return
 
