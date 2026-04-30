@@ -190,6 +190,7 @@ _WORKFLOW_STAGE_LABELS = {
     "skynet_review": "Skynet review",
     "deploy": "Deploy",
 }
+_DEFAULT_WORKFLOW_SLA_TIER = "P1"
 _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER = {
     "P1": {
         "skynet_plan": 15 * 60,
@@ -203,7 +204,27 @@ _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER = {
 
 def _normalize_sla_tier(sla_tier: str | None) -> str:
     tier = str(sla_tier or "").strip().upper()
-    return tier if tier in _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER else "P1"
+    aliases = {
+        "": _DEFAULT_WORKFLOW_SLA_TIER,
+        "1": "P1",
+        "HIGH": "P1",
+        "CRITICAL": "P1",
+    }
+    tier = aliases.get(tier, tier)
+    return tier if tier in _WORKFLOW_STAGE_SLA_SECONDS_BY_TIER else _DEFAULT_WORKFLOW_SLA_TIER
+
+
+def _derive_workflow_sla_tier(root_task: Task | None) -> tuple[str, str]:
+    trace = (root_task.trace or {}) if root_task is not None else {}
+    labels = (root_task.labels or {}) if root_task is not None else {}
+    for source, value in (
+        ("root_task.trace.workflow_sla_tier", trace.get("workflow_sla_tier")),
+        ("root_task.trace.sla_tier", trace.get("sla_tier")),
+        ("root_task.labels.sla_tier", labels.get("sla_tier")),
+    ):
+        if str(value or "").strip():
+            return _normalize_sla_tier(str(value)), source
+    return _DEFAULT_WORKFLOW_SLA_TIER, "default"
 
 
 def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
@@ -232,6 +253,7 @@ def _workflow_stage_tasks(stage: str, root_task: Task | None, children: list[Tas
 def _workflow_stage_sla_view(
     *,
     sla_tier: str | None,
+    tier_source: str,
     stage: str,
     root_task: Task | None,
     children: list[Task],
@@ -291,6 +313,7 @@ def _workflow_stage_sla_view(
         "overdue": overdue_by_seconds > 0,
         "overdue_by_seconds": overdue_by_seconds,
         "source": source,
+        "tier_source": tier_source,
     }
 
 
