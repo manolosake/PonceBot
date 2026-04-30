@@ -1051,6 +1051,153 @@ def _priority_next_action(order: dict[str, Any], decision: str, blocker: dict[st
     return existing or "Advance the proactive workflow evidence."
 
 
+def _handoff_action_profile(
+    *,
+    release_readiness: dict[str, Any],
+    workflow: dict[str, Any],
+) -> dict[str, Any]:
+    state = str(release_readiness.get("state") or "unknown").strip().lower()
+    verdict = str(release_readiness.get("verdict") or "unknown").strip().lower()
+    summary = str(release_readiness.get("summary") or "").strip()
+    current_stage = str(workflow.get("current_stage") or release_readiness.get("current_stage") or "skynet_plan")
+    blockers = [b for b in list(release_readiness.get("blockers") or workflow.get("blockers") or []) if isinstance(b, dict)]
+    next_action = str(release_readiness.get("next_action") or "").strip()
+
+    if state == "ready" or verdict == "go":
+        decision = "ready_go"
+        primary_action = next_action or "Release or merge the order branch."
+        operator_actions = [
+            "Confirm every handoff checklist item is pass.",
+            "Keep the order evidence packet open while release_mgr performs the release.",
+        ]
+        release_manager_actions = [
+            primary_action,
+            "Record release evidence when the release completes.",
+        ]
+    elif state == "released":
+        decision = "already_released"
+        primary_action = next_action or "Monitor deploy status and post-release evidence."
+        operator_actions = [
+            primary_action,
+            "Watch for deploy regressions or missing post-release evidence.",
+        ]
+        release_manager_actions = [
+            "Confirm release evidence is attached to the order.",
+        ]
+    elif state == "blocked" or verdict == "no_go":
+        decision = "blocked_no_go"
+        primary_blocker = blockers[0] if blockers else {}
+        blocker_summary = str(primary_blocker.get("summary") or "").strip()
+        primary_action = blocker_summary or next_action or "Clear the release blocker before handoff."
+        operator_actions = [
+            primary_action,
+            "Route the blocker to the owning role before release_mgr spends release capacity.",
+        ]
+        release_manager_actions = [
+            "Do not release until blockers are cleared and readiness is recomputed.",
+        ]
+    elif state == "not_applicable" or verdict == "n/a":
+        decision = "not_applicable"
+        primary_action = next_action or "Use the standard order workflow fields."
+        operator_actions = [
+            primary_action,
+            "Treat this as a non-proactive order handoff.",
+        ]
+        release_manager_actions = []
+    else:
+        decision = "not_ready_wait"
+        primary_action = next_action or f"Advance {current_stage} evidence before release handoff."
+        operator_actions = [
+            primary_action,
+            "Re-run this handoff after the pending readiness check changes state.",
+        ]
+        release_manager_actions = [
+            "Wait for readiness to become go before releasing.",
+        ]
+
+    return {
+        "state": state,
+        "verdict": verdict,
+        "decision": decision,
+        "summary": summary,
+        "primary_action": primary_action,
+        "operator_actions": operator_actions,
+        "release_manager_actions": release_manager_actions,
+        "blockers": blockers,
+    }
+
+
+def _handoff_evidence_refs(packet: dict[str, Any], *, max_items: int = 12) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+
+    def add(ref: dict[str, Any]) -> None:
+        if not isinstance(ref, dict) or len(refs) >= max_items:
+            return
+        compact: dict[str, Any] = {}
+        for key in (
+            "kind",
+            "key",
+            "value",
+            "role",
+            "job_id",
+            "job_id_short",
+            "state",
+            "path",
+            "artifact_id",
+            "trace_event_id",
+            "event_type",
+            "decision_kind",
+            "summary",
+        ):
+            value = ref.get(key)
+            if value is not None and value != "":
+                compact[key] = value
+        if compact and compact not in refs:
+            refs.append(compact)
+
+    readiness = packet.get("release_readiness") if isinstance(packet.get("release_readiness"), dict) else {}
+    for check in list((readiness or {}).get("checks") or []):
+        if not isinstance(check, dict):
+            continue
+        for evidence in list(check.get("evidence") or []):
+            if isinstance(evidence, dict):
+                add({"check": check.get("key"), **evidence})
+
+    for artifact in list(packet.get("artifacts") or []):
+        if isinstance(artifact, dict):
+            add({"kind": "artifact", **artifact})
+
+    for decision in list(packet.get("decision_log") or []):
+        if not isinstance(decision, dict):
+            continue
+        add(
+            {
+                "kind": "decision_log",
+                "decision_kind": decision.get("kind"),
+                "state": decision.get("state"),
+                "job_id": decision.get("job_id"),
+                "job_id_short": decision.get("job_id_short"),
+                "summary": str(decision.get("summary") or "").strip()[:280],
+            }
+        )
+
+    for trace in list(packet.get("traces") or []):
+        if isinstance(trace, dict):
+            add(
+                {
+                    "kind": "trace_event",
+                    "trace_event_id": trace.get("id"),
+                    "event_type": trace.get("event_type"),
+                    "job_id": trace.get("job_id"),
+                    "job_id_short": (str(trace.get("job_id"))[:8] if trace.get("job_id") else None),
+                    "role": trace.get("agent_role"),
+                    "artifact_id": trace.get("artifact_id"),
+                }
+            )
+
+    return refs
+
+
 @dataclass
 class StatusService:
     orch_q: OrchestratorQueue
