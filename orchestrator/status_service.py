@@ -2490,6 +2490,81 @@ class StatusService:
                     return item
             return {}
 
+        def _order_id_from_ref(ref: dict[str, Any]) -> str | None:
+            for key in ("order_id", "parent_job_id"):
+                value = _text(ref.get(key))
+                if value:
+                    return value
+            return None
+
+        def _append_chat_scope(path: str) -> str:
+            base = _text(path)
+            if not base or focus_chat_id is None:
+                return base
+            separator = "&" if "?" in base else "?"
+            return f"{base}{separator}chat_id={focus_chat_id}"
+
+        def _triage_targets(
+            *,
+            category: str,
+            target: str,
+            order_id: str | None,
+            job_id: str | None,
+        ) -> dict[str, Any]:
+            oid = _text(order_id)
+            jid = _text(job_id)
+            base_target = _text(target)
+
+            inspect_path = _append_chat_scope(base_target)
+            inspect_target = None
+            action_target = None
+
+            if oid:
+                inspect_target = f"order:{oid[:8]}"
+                if category.startswith("proactive_") and "order_id=" in base_target:
+                    inspect_path = base_target
+                else:
+                    inspect_path = f"/api/v1/orchestration/orders/evidence?order_id={oid}"
+            if jid:
+                action_target = f"job:{jid[:8]}"
+                if not inspect_target:
+                    inspect_target = action_target
+                    inspect_path = _append_chat_scope("/api/v1/status/snapshot")
+            if action_target is None and inspect_target is not None:
+                action_target = inspect_target
+            if inspect_target is None and base_target:
+                inspect_target = base_target
+            if action_target is None and base_target:
+                action_target = base_target
+
+            return {
+                "inspect_path": inspect_path or None,
+                "inspect_target": inspect_target,
+                "action_target": action_target,
+            }
+
+        def _focus_packet(item: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not item:
+                return None
+            keys = (
+                "rank",
+                "action_id",
+                "urgency",
+                "category",
+                "label",
+                "next_action",
+                "target",
+                "inspect_path",
+                "inspect_target",
+                "action_target",
+                "order_id",
+                "job_id",
+                "source",
+                "source_signals",
+                "count",
+            )
+            return {key: item.get(key) for key in keys if key in item}
+
         def _score(category: str, urgency: str, updated_at: float | None) -> int:
             category_rank = int(category_order.get(category, 99))
             urgency_rank = int(urgency_order.get(urgency, 9))
@@ -2514,6 +2589,7 @@ class StatusService:
             source_signals: list[str],
             updated_at: float | None = None,
         ) -> dict[str, Any]:
+            triage = _triage_targets(category=category, target=target, order_id=order_id, job_id=job_id)
             return {
                 "rank": 0,
                 "action_id": action_id,
@@ -2523,6 +2599,9 @@ class StatusService:
                 "reason": reason,
                 "next_action": next_action,
                 "target": target,
+                "inspect_path": triage.get("inspect_path"),
+                "inspect_target": triage.get("inspect_target"),
+                "action_target": triage.get("action_target"),
                 "count": int(max(1, count)),
                 "order_id": order_id,
                 "job_id": job_id,
@@ -2570,7 +2649,7 @@ class StatusService:
                     next_action=_text(action.get("label"), "Review operator action."),
                     target=_text(action.get("target"), "/api/v1/orchestration/control-room"),
                     count=count,
-                    order_id=(_text(ref.get("order_id")) or None) if isinstance(ref, dict) else None,
+                    order_id=(_order_id_from_ref(ref) if isinstance(ref, dict) else None),
                     job_id=(_text(ref.get("job_id")) or None) if isinstance(ref, dict) else None,
                     source="control_room",
                     source_signals=[source_action_id, category],
@@ -2690,6 +2769,7 @@ class StatusService:
             item["rank"] = idx
 
         top = returned[0] if returned else {}
+        top_focus = _focus_packet(top if top else None)
         return {
             "api_version": "v1",
             "schema_version": 1,
@@ -2701,8 +2781,10 @@ class StatusService:
                 "health_level": health_level if health_level in {"ok", "attention", "critical"} else "ok",
                 "top_action_id": top.get("action_id") if top else None,
                 "top_category": top.get("category") if top else None,
+                "top_focus": top_focus,
                 "source_counts": source_counts,
             },
+            "top_focus": top_focus,
             "items": returned,
         }
 
