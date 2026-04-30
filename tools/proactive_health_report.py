@@ -29,6 +29,8 @@ IGNORE_ARTIFACT_TOKENS = (
 STALE_LOCAL_S = 15 * 60
 STALE_HEARTBEAT_DETAIL_LIMIT = 25
 UNCOVERED_REPO_DETAIL_LIMIT = 25
+FACTORY_COVERAGE_DETAIL_LIMIT = 100
+FACTORY_COVERAGE_MARKDOWN_LIMIT = 25
 LOOKBACK_S = 24 * 3600
 AUTONOMY_MINIMUM_SLO = {
     'implementer_fail_rate_lte': 0.35,
@@ -648,6 +650,118 @@ def recommended_action_markdown(item: dict) -> str:
     return ' '.join(part for part in parts if part)
 
 
+def sortable_priority(value):
+    if value is None:
+        return (1, 0)
+    try:
+        return (0, int(value))
+    except (TypeError, ValueError):
+        return (0, str(value))
+
+
+def float_or_zero(value) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def runtime_heartbeat_summary(repo_id: str, heartbeat_rows_by_repo: dict, *, now: float) -> dict:
+    hb = heartbeat_rows_by_repo.get(repo_id)
+    if not hb:
+        return {
+            'agent_key': '',
+            'role': '',
+            'heartbeat_at': None,
+            'heartbeat_age_s': None,
+            'updated_at': None,
+            'state': 'missing_runtime_state_row',
+            'reason': 'missing_runtime_state_row',
+        }
+    heartbeat_at = float_or_zero(hb.get('heartbeat_at'))
+    if heartbeat_at <= 0:
+        state = 'missing'
+        heartbeat_age_s = None
+    else:
+        heartbeat_age_s = max(0, int(now - heartbeat_at))
+        state = 'stale' if heartbeat_age_s >= STALE_LOCAL_S else 'fresh'
+    return {
+        'agent_key': str(hb.get('agent_key') or ''),
+        'role': str(hb.get('role') or ''),
+        'heartbeat_at': heartbeat_at if heartbeat_at > 0 else None,
+        'heartbeat_age_s': heartbeat_age_s,
+        'updated_at': hb.get('updated_at'),
+        'state': state,
+        'reason': state,
+    }
+
+
+def build_factory_coverage_details(
+    enabled_repos: list,
+    proactive_orders: list,
+    heartbeat_rows: list,
+    order_activity_age_by_id: dict,
+    *,
+    now: float,
+) -> list:
+    latest_heartbeat_by_repo = {}
+    for hb in sorted(heartbeat_rows, key=lambda row: float_or_zero((row or {}).get('updated_at')), reverse=True):
+        repo_id = str((hb or {}).get('repo_id') or '').strip()
+        if repo_id and repo_id not in latest_heartbeat_by_repo:
+            latest_heartbeat_by_repo[repo_id] = hb
+
+    rows = []
+    for repo in enabled_repos:
+        repo_id = str((repo or {}).get('repo_id') or '').strip()
+        if not repo_id:
+            continue
+        matches = [order for order in proactive_orders if proactive_order_covers_repo(order, repo)]
+        selected_order = None
+        if matches:
+            selected_order = sorted(
+                matches,
+                key=lambda order: (
+                    0 if str((order or {}).get('status') or '').strip().lower() == 'active' else 1,
+                    -float_or_zero((order or {}).get('updated_at')),
+                ),
+            )[0]
+        order_status = str((selected_order or {}).get('status') or '').strip().lower()
+        if order_status == 'active':
+            coverage_state = 'covered_active'
+        elif order_status == 'paused':
+            coverage_state = 'covered_paused'
+        else:
+            coverage_state = 'uncovered'
+        order_id = str((selected_order or {}).get('order_id') or '').strip()
+        order_activity_age_s = order_activity_age_by_id.get(order_id) if order_id else None
+        if order_activity_age_s is None and selected_order:
+            updated_at = float_or_zero(selected_order.get('updated_at'))
+            if updated_at > 0:
+                order_activity_age_s = max(0, int(now - updated_at))
+        repo_path = str((repo or {}).get('path') or '')
+        rows.append({
+            'repo_id': repo_id,
+            'repo_path': repo_path,
+            'path': repo_path,
+            'priority': (repo or {}).get('priority'),
+            'status': str((repo or {}).get('status') or ''),
+            'coverage_state': coverage_state,
+            'order_id': order_id,
+            'order_status': order_status,
+            'order_phase': str((selected_order or {}).get('phase') or ''),
+            'order_activity_age_s': order_activity_age_s,
+            'runtime_heartbeat': runtime_heartbeat_summary(repo_id, latest_heartbeat_by_repo, now=now),
+        })
+
+    coverage_rank = {'uncovered': 0, 'covered_paused': 1, 'covered_active': 2}
+    rows.sort(key=lambda item: (
+        coverage_rank.get(str(item.get('coverage_state') or ''), 99),
+        sortable_priority(item.get('priority')),
+        str(item.get('repo_id') or ''),
+    ))
+    return rows
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -681,6 +795,7 @@ def main() -> int:
 
     since = now - LOOKBACK_S
     order_reports = []
+    order_activity_age_by_id = {}
     anomalies = []
     funnel_totals = {
         'slices_started': 0,
@@ -706,6 +821,7 @@ def main() -> int:
         activity_ts.extend(float(c.get('updated_at') or c.get('created_at') or 0.0) for c in children)
         last_activity_at = max((ts for ts in activity_ts if ts > 0), default=0.0)
         last_activity_age_s = max(0, int(now - last_activity_at)) if last_activity_at > 0 else None
+        order_activity_age_by_id[order_id] = last_activity_age_s
         counts_by_role = {}
         stale_local = []
         for child in open_children:
@@ -852,6 +968,16 @@ def main() -> int:
     uncovered_repo_count = len(uncovered_repo_details)
     uncovered_repo_details_limited = uncovered_repo_details[:UNCOVERED_REPO_DETAIL_LIMIT]
     uncovered_repo_details_truncated = uncovered_repo_count > len(uncovered_repo_details_limited)
+    coverage_details = build_factory_coverage_details(
+        enabled_repos,
+        proactive_orders,
+        heartbeat_rows,
+        order_activity_age_by_id,
+        now=now,
+    )
+    coverage_count = len(coverage_details)
+    coverage_details_limited = coverage_details[:FACTORY_COVERAGE_DETAIL_LIMIT]
+    coverage_truncated = coverage_count > len(coverage_details_limited)
     stale_heartbeat_details = []
     seen_enabled_repo_ids = set()
     for hb in heartbeat_rows:
@@ -1038,6 +1164,10 @@ def main() -> int:
             'stale_heartbeat_details': stale_heartbeat_details_limited,
             'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
             'stale_heartbeat_detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+            'coverage_details': coverage_details_limited,
+            'coverage_count': int(coverage_count),
+            'coverage_truncated': coverage_truncated,
+            'coverage_detail_limit': FACTORY_COVERAGE_DETAIL_LIMIT,
         },
         'metrics': metrics,
         'autonomy_funnel': {
@@ -1081,8 +1211,34 @@ def main() -> int:
         f"- Final sweeps (24h): {metrics['final_sweeps_24h']}",
         f"- Model fallbacks (24h): {metrics['factory_model_fallback_24h']}",
         '',
-        '## Recommended Actions',
+        '## Factory Coverage',
     ]
+    if not coverage_details:
+        lines.append('- No enabled repos.')
+    else:
+        for item in coverage_details[:FACTORY_COVERAGE_MARKDOWN_LIMIT]:
+            heartbeat = item.get('runtime_heartbeat') or {}
+            priority = item.get('priority')
+            priority_text = 'null' if priority is None else str(priority)
+            order_text = item.get('order_id') or 'none'
+            heartbeat_age = heartbeat.get('heartbeat_age_s')
+            heartbeat_age_text = 'null' if heartbeat_age is None else str(heartbeat_age)
+            lines.append(
+                f"- repo={item.get('repo_id')} state={item.get('coverage_state')} priority={priority_text} "
+                f"status={item.get('status')} order={order_text} order_status={item.get('order_status') or 'none'} "
+                f"phase={item.get('order_phase') or 'none'} order_activity_age_s={item.get('order_activity_age_s')} "
+                f"heartbeat={heartbeat.get('state')} heartbeat_age_s={heartbeat_age_text} "
+                f"agent={heartbeat.get('agent_key') or 'none'} role={heartbeat.get('role') or 'none'}"
+            )
+        if coverage_count > FACTORY_COVERAGE_MARKDOWN_LIMIT:
+            lines.append(
+                f"- Truncated: showing {FACTORY_COVERAGE_MARKDOWN_LIMIT} of {coverage_count} enabled repos "
+                f"(JSON limit {FACTORY_COVERAGE_DETAIL_LIMIT})."
+            )
+    lines.extend([
+        '',
+        '## Recommended Actions',
+    ])
     if not recommended_actions:
         lines.append('- None')
     else:
