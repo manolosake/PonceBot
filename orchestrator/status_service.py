@@ -1012,6 +1012,15 @@ _DECISION_RANK = {
     "monitor": 3,
 }
 _STAGE_RANK = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
+_HANDOFF_STAGE_ROLE = {
+    "delivery": "implementer_local",
+    "validation": "reviewer_local",
+    "skynet_review": "architect_local",
+    "deploy": "release_mgr",
+    "release": "release_mgr",
+    "release_evidence": "release_mgr",
+}
+_HANDOFF_ROLES = {"implementer_local", "reviewer_local", "release_mgr", "architect_local"}
 
 
 def _is_proactive_order(order_row: dict[str, Any], root_task: Task | None) -> bool:
@@ -1072,6 +1081,104 @@ def _priority_next_action(order: dict[str, Any], decision: str, blocker: dict[st
         if summary:
             return summary
     return existing or "Advance the proactive workflow evidence."
+
+
+def _handoff_role_for_stage(stage: str) -> str:
+    return _HANDOFF_STAGE_ROLE.get(str(stage or "").strip().lower(), "implementer_local")
+
+
+def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[str, Any]:
+    oid = str(order.get("order_id") or "").strip()
+    stage = str(order.get("current_stage") or "").strip().lower()
+    handoff_path = f"/api/v1/orchestration/orders/handoff-digest?order_id={oid}" if oid else "/api/v1/orchestration/orders/handoff-digest"
+
+    decision_key = str(decision or "").strip().lower()
+    primary_blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else None
+    blocker_stage = str((primary_blocker or {}).get("stage") or stage).strip().lower()
+    blocker_job = (primary_blocker or {}).get("job")
+    blocker_role = str((blocker_job or {}).get("role") or "").strip().lower() if isinstance(blocker_job, dict) else ""
+
+    if decision_key in {"release", "monitor"}:
+        suggested_role = "release_mgr"
+    elif decision_key == "unblock":
+        suggested_role = blocker_role if blocker_role in _HANDOFF_ROLES else _handoff_role_for_stage(blocker_stage)
+    else:
+        suggested_role = _handoff_role_for_stage(stage)
+
+    next_action = str(order.get("next_action") or "").strip() or "Advance the proactive workflow evidence."
+    title = str(order.get("title") or "").strip() or "proactive order"
+
+    if decision_key == "release":
+        definition_of_done = [
+            "Release or merge the order branch.",
+            "Record release evidence on the order.",
+            "Confirm the proactive order remains ready/go after release.",
+        ]
+        checklist = [
+            "Open the handoff digest.",
+            "Verify readiness checks are pass or explicitly accepted.",
+            "Perform the release action and attach evidence.",
+        ]
+        evidence_expectations = [
+            "release command or merge result",
+            "release evidence artifact or trace event",
+            "post-release status summary",
+        ]
+    elif decision_key == "monitor":
+        definition_of_done = [
+            "Confirm deployed or merged status is still healthy.",
+            "Attach post-release evidence or a no-action note.",
+        ]
+        checklist = [
+            "Open the handoff digest.",
+            "Inspect deploy and merge evidence.",
+            "Record follow-up only if a regression or missing evidence is found.",
+        ]
+        evidence_expectations = [
+            "deploy status",
+            "merge or release reference",
+            "post-release verification note",
+        ]
+    elif decision_key == "unblock":
+        definition_of_done = [
+            next_action,
+            "Recompute readiness after the blocker is cleared.",
+        ]
+        checklist = [
+            "Open the handoff digest.",
+            f"Inspect the blocker at {blocker_stage or stage or 'the current stage'}.",
+            "Complete the owning specialist task and attach evidence.",
+        ]
+        evidence_expectations = [
+            "blocker resolution summary",
+            "specialist task result",
+            "updated readiness or workflow status",
+        ]
+    else:
+        definition_of_done = [
+            next_action,
+            "Attach evidence that advances the proactive workflow.",
+        ]
+        checklist = [
+            "Open the handoff digest.",
+            f"Work the {stage or 'current'} stage for this order.",
+            "Record concrete evidence before handing back to the operator.",
+        ]
+        evidence_expectations = [
+            "implementation or review result",
+            "test or validation output when applicable",
+            "updated order next action",
+        ]
+
+    return {
+        "suggested_role": suggested_role,
+        "suggested_endpoint": handoff_path,
+        "inspect_path": handoff_path,
+        "definition_of_done": definition_of_done,
+        "checklist": checklist,
+        "evidence_expectations": evidence_expectations,
+        "title": title,
+    }
 
 
 def _handoff_action_profile(
