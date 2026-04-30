@@ -2447,6 +2447,265 @@ class StatusService:
             "staleness_seconds": snap.get("staleness_seconds"),
         }
 
+    def operator_focus(self, chat_id: int | None = None, limit: int = 5) -> dict[str, Any]:
+        lim = max(1, min(20, int(limit)))
+        generated_at = float(time.time())
+        focus_chat_id = int(chat_id) if chat_id is not None else None
+
+        category_order = {
+            "critical_alert": 0,
+            "approval": 1,
+            "proactive_release": 2,
+            "proactive_unblock": 3,
+            "stalled": 4,
+            "workflow_bottleneck": 5,
+            "queue": 6,
+            "proactive_advance": 7,
+            "proactive_monitor": 8,
+        }
+        urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        source_counts = {"control_room": 0, "proactive_priorities": 0, "proactive_health": 0}
+
+        def _text(value: Any, default: str = "") -> str:
+            s = str(value or "").strip()
+            return s if s else default
+
+        def _num(value: Any, default: int = 0) -> int:
+            try:
+                return int(value or 0)
+            except Exception:
+                return int(default)
+
+        def _float_or_none(value: Any) -> float | None:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except Exception:
+                return None
+
+        def _first_dict(items: Any) -> dict[str, Any]:
+            for item in list(items or []):
+                if isinstance(item, dict):
+                    return item
+            return {}
+
+        def _score(category: str, urgency: str, updated_at: float | None) -> int:
+            category_rank = int(category_order.get(category, 99))
+            urgency_rank = int(urgency_order.get(urgency, 9))
+            recency = 0
+            if updated_at is not None and generated_at > updated_at:
+                recency = max(0, min(99, int((generated_at - updated_at) // 60)))
+            return max(0, 10000 - category_rank * 1000 - urgency_rank * 100 - recency)
+
+        def _item(
+            *,
+            action_id: str,
+            category: str,
+            urgency: str,
+            label: str,
+            reason: str,
+            next_action: str,
+            target: str,
+            count: int,
+            order_id: str | None,
+            job_id: str | None,
+            source: str,
+            source_signals: list[str],
+            updated_at: float | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "rank": 0,
+                "action_id": action_id,
+                "category": category,
+                "urgency": urgency,
+                "label": label,
+                "reason": reason,
+                "next_action": next_action,
+                "target": target,
+                "count": int(max(1, count)),
+                "order_id": order_id,
+                "job_id": job_id,
+                "source": source,
+                "source_signals": source_signals,
+                "score": _score(category, urgency, updated_at),
+                "updated_at": updated_at,
+            }
+
+        items: list[dict[str, Any]] = []
+
+        control = self.control_room(chat_id=focus_chat_id)
+        control_health = control.get("health") if isinstance(control.get("health"), dict) else {}
+        health_level = _text(control_health.get("level"), "ok")
+        attention = control.get("attention") if isinstance(control.get("attention"), dict) else {}
+        first_blocked = _first_dict(attention.get("blocked_approvals"))
+        first_pending = _first_dict(attention.get("pending_decisions"))
+        first_stalled = _first_dict(attention.get("stalled_tasks"))
+
+        control_action_map = {
+            "inspect_critical_alerts": ("critical_alert", "critical", first_blocked or first_pending),
+            "approve_blocked_jobs": ("approval", "high", first_blocked),
+            "resolve_pending_decisions": ("approval", "high", first_pending),
+            "inspect_stalled_tasks": ("stalled", "high", first_stalled),
+            "reduce_queue_pressure": ("queue", "medium", {}),
+            "check_worker_availability": ("queue", "medium", {}),
+        }
+        for action in list(control.get("recommended_actions") or []):
+            if not isinstance(action, dict):
+                continue
+            source_action_id = _text(action.get("action_id"))
+            mapped = control_action_map.get(source_action_id)
+            if mapped is None:
+                continue
+            category, urgency, ref = mapped
+            updated_at = _float_or_none(ref.get("updated_at")) if isinstance(ref, dict) else None
+            count = _num(action.get("count"), 1)
+            items.append(
+                _item(
+                    action_id=source_action_id,
+                    category=category,
+                    urgency=urgency,
+                    label=_text(action.get("label"), source_action_id.replace("_", " ").title()),
+                    reason=_text(action.get("reason"), "Control room recommends operator attention."),
+                    next_action=_text(action.get("label"), "Review operator action."),
+                    target=_text(action.get("target"), "/api/v1/orchestration/control-room"),
+                    count=count,
+                    order_id=(_text(ref.get("order_id")) or None) if isinstance(ref, dict) else None,
+                    job_id=(_text(ref.get("job_id")) or None) if isinstance(ref, dict) else None,
+                    source="control_room",
+                    source_signals=[source_action_id, category],
+                    updated_at=updated_at,
+                )
+            )
+            source_counts["control_room"] += 1
+
+        workflow = control.get("workflow_bottleneck") if isinstance(control.get("workflow_bottleneck"), dict) else {}
+        bottleneck_score = _num(workflow.get("score"), 0)
+        if bottleneck_score > 0:
+            stage = _text(workflow.get("stage"), "workflow")
+            items.append(
+                _item(
+                    action_id=f"workflow_bottleneck:{stage}",
+                    category="workflow_bottleneck",
+                    urgency="medium",
+                    label="Clear workflow bottleneck",
+                    reason=f"{bottleneck_score} blocked or failed order(s) at {stage}.",
+                    next_action=_text(workflow.get("recommended_next_action"), "Inspect the bottleneck stage."),
+                    target="/api/v1/orchestration/workflow-bottlenecks",
+                    count=bottleneck_score,
+                    order_id=None,
+                    job_id=None,
+                    source="control_room",
+                    source_signals=["workflow_bottleneck", stage],
+                    updated_at=None,
+                )
+            )
+            source_counts["control_room"] += 1
+
+        priorities = self.proactive_priorities(chat_id=focus_chat_id, limit=20)
+        proactive_category = {
+            "release": ("proactive_release", "high", "Release proactive order"),
+            "unblock": ("proactive_unblock", "high", "Unblock proactive order"),
+            "advance": ("proactive_advance", "medium", "Advance proactive order"),
+            "monitor": ("proactive_monitor", "low", "Monitor proactive order"),
+        }
+        for order in list(priorities.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            decision = _text(order.get("decision"), "advance")
+            category, urgency, label = proactive_category.get(decision, proactive_category["advance"])
+            oid = _text(order.get("order_id"))
+            if not oid:
+                continue
+            updated_at = _float_or_none(order.get("updated_at"))
+            source_signals = [
+                f"decision:{decision}",
+                f"stage:{_text(order.get('current_stage'), 'unknown')}",
+                f"readiness:{_text(order.get('readiness_state'), 'unknown')}",
+            ]
+            items.append(
+                _item(
+                    action_id=f"{category}:{oid[:8]}",
+                    category=category,
+                    urgency=urgency,
+                    label=label,
+                    reason=_text(order.get("why"), "Proactive order needs operator focus."),
+                    next_action=_text(order.get("next_action"), "Review the proactive order."),
+                    target=f"/api/v1/orchestration/orders/release-readiness?order_id={oid}",
+                    count=1,
+                    order_id=oid,
+                    job_id=None,
+                    source="proactive_priorities",
+                    source_signals=source_signals,
+                    updated_at=updated_at,
+                )
+            )
+            source_counts["proactive_priorities"] += 1
+
+        health = self.proactive_health()
+        health_status = _text(health.get("status"), "not_configured")
+        if health_status != "not_configured" and bool(health.get("alert_active")):
+            alert_level = _text(health.get("alert_level"), "OK").upper()
+            urgency = "critical" if alert_level == "CRITICAL" else "high"
+            if alert_level == "CRITICAL":
+                health_level = "critical"
+            elif health_level == "ok":
+                health_level = "attention"
+            recommended = _first_dict(health.get("recommended_actions"))
+            recommended_text = _text(recommended.get("summary") or recommended.get("action")) if recommended else ""
+            items.append(
+                _item(
+                    action_id="proactive_health_alert",
+                    category="critical_alert",
+                    urgency=urgency,
+                    label="Inspect proactive health",
+                    reason=_text(health.get("summary_reason"), "Proactive health alert is active."),
+                    next_action=recommended_text or "Review the proactive health report.",
+                    target="/api/v1/status/proactive-health",
+                    count=1,
+                    order_id=None,
+                    job_id=None,
+                    source="proactive_health",
+                    source_signals=[
+                        f"alert_level:{alert_level}",
+                        f"operational:{_text(health.get('operational_status'), 'unknown')}",
+                        f"trend:{_text(health.get('trend_status'), 'unknown')}",
+                    ],
+                    updated_at=None,
+                )
+            )
+            source_counts["proactive_health"] += 1
+
+        items.sort(
+            key=lambda item: (
+                int(category_order.get(str(item.get("category") or ""), 99)),
+                int(urgency_order.get(str(item.get("urgency") or ""), 9)),
+                -int(item.get("score") or 0),
+                float(item.get("updated_at") or 0.0),
+                str(item.get("action_id") or ""),
+            )
+        )
+        returned = items[:lim]
+        for idx, item in enumerate(returned, start=1):
+            item["rank"] = idx
+
+        top = returned[0] if returned else {}
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": focus_chat_id,
+            "limit": lim,
+            "summary": {
+                "returned": len(returned),
+                "health_level": health_level if health_level in {"ok", "attention", "critical"} else "ok",
+                "top_action_id": top.get("action_id") if top else None,
+                "top_category": top.get("category") if top else None,
+                "source_counts": source_counts,
+            },
+            "items": returned,
+        }
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.
