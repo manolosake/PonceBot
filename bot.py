@@ -23664,6 +23664,16 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/orders":
         return _orch_marker("orders"), None
 
+    if text.startswith("/focus"):
+        tail = (text[len("/focus") :] or "").strip().lower()
+        if not tail:
+            return _orch_marker("focus"), None
+        if tail in ("all", "global", "company"):
+            return _orch_marker("focus", "all"), None
+        if tail in ("chat", "here"):
+            return _orch_marker("focus", "chat"), None
+        return "Usage: /focus [chat|all]", None
+
     if text.startswith("/order "):
         payload = text[len("/order ") :].strip()
         if not payload:
