@@ -1376,6 +1376,84 @@ class StatusService:
             "orders": orders,
         }
 
+    def proactive_action_plan(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
+        priorities = self.proactive_priorities(chat_id=chat_id, limit=limit)
+        generated_at = float(priorities.get("generated_at") or time.time())
+        lim = int(priorities.get("limit") or max(1, min(200, int(limit))))
+        lane_defs = [
+            ("release", "Release"),
+            ("unblock", "Unblock"),
+            ("advance", "Advance"),
+            ("monitor", "Monitor"),
+        ]
+        lanes_by_key: dict[str, list[dict[str, Any]]] = {key: [] for key, _label in lane_defs}
+
+        compact_keys = [
+            "rank",
+            "order_id",
+            "order_id_short",
+            "title",
+            "priority",
+            "phase",
+            "current_stage",
+            "readiness_state",
+            "readiness_verdict",
+            "why",
+            "primary_blocker",
+            "next_action",
+            "updated_at",
+            "merge_ready",
+            "merged_to_main",
+        ]
+        for order in list(priorities.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            lane = str(order.get("decision") or "").strip().lower()
+            if lane not in lanes_by_key:
+                lane = "advance"
+            lanes_by_key[lane].append({key: order.get(key) for key in compact_keys})
+
+        lanes: list[dict[str, Any]] = []
+        for lane, label in lane_defs:
+            orders = lanes_by_key[lane]
+            recommended = str((orders[0].get("next_action") if orders else "") or "")
+            lanes.append(
+                {
+                    "lane": lane,
+                    "label": label,
+                    "count": len(orders),
+                    "recommended_next_action": recommended,
+                    "orders": orders,
+                }
+            )
+
+        top_order = next((order for lane in lanes for order in lane["orders"]), None)
+        top_lane = None
+        if isinstance(top_order, dict):
+            top_rank = int(top_order.get("rank") or 0)
+            for lane in lanes:
+                if any(int((order or {}).get("rank") or 0) == top_rank for order in lane["orders"]):
+                    top_lane = str(lane.get("lane") or "")
+                    break
+
+        lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
+        returned = sum(lane_counts.values())
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "active_proactive_orders": int((priorities.get("summary") or {}).get("active_proactive_orders") or 0),
+                "returned": returned,
+                "lanes": lane_counts,
+                "top_lane": top_lane,
+                "top_action": (str(top_order.get("next_action") or "") if isinstance(top_order, dict) else None),
+            },
+            "lanes": lanes,
+        }
+
     def order_evidence_packet(
         self,
         order_id: str,
