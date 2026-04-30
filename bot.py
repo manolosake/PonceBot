@@ -8405,6 +8405,34 @@ def _git_branch_integrated_into_main(
     return anc.returncode == 0
 
 
+def _trace_has_operator_verified_deployment(trace: dict[str, Any] | None) -> bool:
+    tr = dict(trace or {})
+    try:
+        operator_resolved_at = float(tr.get("operator_resolved_at") or 0.0)
+    except Exception:
+        operator_resolved_at = 0.0
+    if operator_resolved_at <= 0.0:
+        return False
+
+    deployed_commit = str(tr.get("deployed_commit") or "").strip()
+    deployed_repo = str(tr.get("deployed_repo") or "").strip()
+    if not deployed_commit or not deployed_repo:
+        return False
+
+    quality_status = str(
+        tr.get("quality_gate_status")
+        or tr.get("proactive_quality_gate_status")
+        or ""
+    ).strip().lower()
+    return quality_status in {
+        "manual_verified",
+        "operator_verified",
+        "verified",
+        "validated",
+        "passed",
+    }
+
+
 def _git_common_dir_for_path(path: Path) -> Path | None:
     proc = _run_git(path, ["rev-parse", "--git-common-dir"], check=False)
     raw = str(proc.stdout or "").strip()
@@ -20366,6 +20394,9 @@ def _sync_order_phase_from_runtime(
         repo=(repo_dir if (repo_dir / ".git").exists() else None),
         default_branch=default_branch,
     )
+    operator_verified_deployment = _trace_has_operator_verified_deployment(root_trace)
+    if operator_verified_deployment:
+        merge_required = False
     proactive_order = bool(_is_proactive_order_record(order))
     proactive_verified_no_change = False
     if proactive_order:
@@ -20436,7 +20467,12 @@ def _sync_order_phase_from_runtime(
             orch_q=orch_q,
             root_ticket=rid,
         )
-        proactive_improvement_verified = bool(proactive_funnel.get("improvement_verified", False))
+        proactive_improvement_verified = bool(proactive_funnel.get("improvement_verified", False)) or operator_verified_deployment
+        proactive_quality_status = (
+            "operator_verified_deploy"
+            if operator_verified_deployment
+            else str(proactive_funnel.get("quality_gate_status") or "planned")
+        )
         try:
             orch_q.update_trace(
                 rid,
@@ -20447,8 +20483,9 @@ def _sync_order_phase_from_runtime(
                 proactive_implementer_fail_rate=float(proactive_funnel.get("implementer_fail_rate", 0.0) or 0.0),
                 proactive_mean_time_to_validated_improvement=proactive_funnel.get("mean_time_to_validated_improvement"),
                 proactive_loop_breaker_count=int(proactive_funnel.get("loop_breaker_count", 0) or 0),
-                proactive_quality_gate_status=str(proactive_funnel.get("quality_gate_status") or "planned"),
+                proactive_quality_gate_status=proactive_quality_status,
                 proactive_improvement_verified=bool(proactive_improvement_verified),
+                proactive_operator_verified_deployment=bool(operator_verified_deployment),
                 proactive_improvement_checked_at=time.time(),
                 live_at=time.time(),
             )
