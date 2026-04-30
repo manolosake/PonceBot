@@ -2573,11 +2573,12 @@ class StatusService:
             "approval": 1,
             "proactive_release": 2,
             "proactive_unblock": 3,
-            "stalled": 4,
-            "workflow_bottleneck": 5,
-            "queue": 6,
-            "proactive_advance": 7,
-            "proactive_monitor": 8,
+            "proactive_health": 4,
+            "stalled": 5,
+            "workflow_bottleneck": 6,
+            "queue": 7,
+            "proactive_advance": 8,
+            "proactive_monitor": 9,
         }
         urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         source_keys = ("control_room", "proactive_priorities", "proactive_health")
@@ -2696,8 +2697,12 @@ class StatusService:
                 "action_target",
                 "order_id",
                 "job_id",
+                "repo_id",
                 "source",
                 "source_signals",
+                "reason",
+                "evidence_type",
+                "priority",
                 "count",
                 "handoff",
             )
@@ -2723,10 +2728,13 @@ class StatusService:
             count: int,
             order_id: str | None,
             job_id: str | None,
+            repo_id: str | None = None,
             source: str,
             source_signals: list[str],
             updated_at: float | None = None,
             handoff: dict[str, Any] | None = None,
+            evidence_type: str | None = None,
+            priority: str | None = None,
         ) -> dict[str, Any]:
             triage = _triage_targets(category=category, target=target, order_id=order_id, job_id=job_id)
             packet = {
@@ -2744,11 +2752,16 @@ class StatusService:
                 "count": int(max(1, count)),
                 "order_id": order_id,
                 "job_id": job_id,
+                "repo_id": repo_id,
                 "source": source,
                 "source_signals": source_signals,
                 "score": _score(category, urgency, updated_at),
                 "updated_at": updated_at,
             }
+            if evidence_type:
+                packet["evidence_type"] = evidence_type
+            if priority:
+                packet["priority"] = priority
             if isinstance(handoff, dict) and handoff:
                 packet["handoff"] = handoff
             return packet
@@ -2868,35 +2881,92 @@ class StatusService:
         health_status = _text(health.get("status"), "not_configured")
         if health_status != "not_configured" and bool(health.get("alert_active")):
             alert_level = _text(health.get("alert_level"), "OK").upper()
-            urgency = "critical" if alert_level == "CRITICAL" else "high"
             if alert_level == "CRITICAL":
                 health_level = "critical"
             elif health_level == "ok":
                 health_level = "attention"
-            recommended = _first_dict(health.get("recommended_actions"))
-            recommended_text = _text(recommended.get("summary") or recommended.get("action")) if recommended else ""
-            items.append(
-                _item(
-                    action_id="proactive_health_alert",
-                    category="critical_alert",
-                    urgency=urgency,
-                    label="Inspect proactive health",
-                    reason=_text(health.get("summary_reason"), "Proactive health alert is active."),
-                    next_action=recommended_text or "Review the proactive health report.",
-                    target="/api/v1/status/proactive-health",
-                    count=1,
-                    order_id=None,
-                    job_id=None,
-                    source="proactive_health",
-                    source_signals=[
-                        f"alert_level:{alert_level}",
-                        f"operational:{_text(health.get('operational_status'), 'unknown')}",
-                        f"trend:{_text(health.get('trend_status'), 'unknown')}",
-                    ],
-                    updated_at=None,
+
+            def _health_urgency(priority: str) -> str:
+                mapped = {"P0": "critical", "P1": "high", "P2": "medium"}.get(priority.upper())
+                if mapped:
+                    return mapped
+                return {"CRITICAL": "critical", "WARN": "high"}.get(alert_level, "medium")
+
+            def _health_signals(action: dict[str, Any] | None = None) -> list[str]:
+                signals = [
+                    f"alert_level:{alert_level}",
+                    f"operational:{_text(health.get('operational_status'), 'unknown')}",
+                    f"trend:{_text(health.get('trend_status'), 'unknown')}",
+                ]
+                if action:
+                    priority = _text(action.get("priority"))
+                    evidence_type = _text(action.get("evidence_type"))
+                    order_id = _text(action.get("order_id"))
+                    repo_id = _text(action.get("repo_id"))
+                    if priority:
+                        signals.append(f"priority:{priority}")
+                    if evidence_type:
+                        signals.append(f"evidence_type:{evidence_type}")
+                    if order_id:
+                        signals.append(f"order_id:{order_id}")
+                    if repo_id:
+                        signals.append(f"repo_id:{repo_id}")
+                return signals
+
+            health_actions = [action for action in list(health.get("recommended_actions") or []) if isinstance(action, dict)]
+            seen_health_action_ids: set[str] = set()
+            for idx, action in enumerate(health_actions, start=1):
+                priority = _text(action.get("priority"))
+                evidence_type = _text(action.get("evidence_type"), "recommendation")
+                order_id = _text(action.get("order_id")) or None
+                repo_id = _text(action.get("repo_id")) or None
+                selector = order_id or repo_id or str(idx)
+                action_id = f"proactive_health:{evidence_type}:{selector}"
+                if action_id in seen_health_action_ids:
+                    action_id = f"{action_id}:{idx}"
+                seen_health_action_ids.add(action_id)
+                label_subject = evidence_type.replace("_", " ").strip() or "health recommendation"
+                items.append(
+                    _item(
+                        action_id=action_id,
+                        category="proactive_health",
+                        urgency=_health_urgency(priority),
+                        label=f"Triage {label_subject}",
+                        reason=_text(action.get("reason"), _text(health.get("summary_reason"), "Proactive health alert is active.")),
+                        next_action=_text(action.get("action") or action.get("summary"), "Review the proactive health report."),
+                        target="/api/v1/status/proactive-health",
+                        count=_num(action.get("count"), 1),
+                        order_id=order_id,
+                        job_id=None,
+                        repo_id=repo_id,
+                        source="proactive_health",
+                        source_signals=_health_signals(action),
+                        updated_at=None,
+                        evidence_type=evidence_type,
+                        priority=priority or None,
+                    )
                 )
-            )
-            source_counts["proactive_health"] += 1
+                source_counts["proactive_health"] += 1
+
+            if not health_actions:
+                items.append(
+                    _item(
+                        action_id="proactive_health_alert",
+                        category="proactive_health",
+                        urgency=_health_urgency(""),
+                        label="Inspect proactive health",
+                        reason=_text(health.get("summary_reason"), "Proactive health alert is active."),
+                        next_action="Review the proactive health report.",
+                        target="/api/v1/status/proactive-health",
+                        count=1,
+                        order_id=None,
+                        job_id=None,
+                        source="proactive_health",
+                        source_signals=_health_signals(),
+                        updated_at=None,
+                    )
+                )
+                source_counts["proactive_health"] += 1
 
         available_source_counts = {key: 0 for key in source_keys}
         for item in items:
