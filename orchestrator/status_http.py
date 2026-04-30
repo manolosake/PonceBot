@@ -358,6 +358,15 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in ("/api/v1/orchestration/proactive-action-plan", "/api/orchestration/proactive-action-plan"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 20, hi=200)
+            payload = self.server.status_service.proactive_action_plan(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/orders/evidence", "/api/orchestration/orders/evidence"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
