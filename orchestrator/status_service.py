@@ -1945,6 +1945,131 @@ class StatusService:
             },
         }
 
+    def order_handoff_digest(
+        self,
+        order_id: str,
+        trace_limit: int = 100,
+        child_limit: int = 200,
+        log_limit: int = 200,
+    ) -> dict[str, Any] | None:
+        packet = self.order_evidence_packet(
+            order_id,
+            trace_limit=trace_limit,
+            child_limit=child_limit,
+            log_limit=log_limit,
+        )
+        if not packet:
+            return None
+
+        order = packet.get("order") if isinstance(packet.get("order"), dict) else {}
+        workflow = packet.get("workflow") if isinstance(packet.get("workflow"), dict) else {}
+        readiness = packet.get("release_readiness") if isinstance(packet.get("release_readiness"), dict) else {}
+        counts = packet.get("counts") if isinstance(packet.get("counts"), dict) else {}
+        action_profile = _handoff_action_profile(release_readiness=readiness, workflow=workflow)
+
+        checks: list[dict[str, Any]] = []
+        check_counts: dict[str, int] = {}
+        for check in list(readiness.get("checks") or []):
+            if not isinstance(check, dict):
+                continue
+            status = str(check.get("status") or "unknown").strip().lower() or "unknown"
+            check_counts[status] = check_counts.get(status, 0) + 1
+            checks.append(
+                {
+                    "key": str(check.get("key") or ""),
+                    "status": status,
+                    "summary": str(check.get("summary") or "").strip()[:280] or None,
+                    "evidence_count": len([item for item in list(check.get("evidence") or []) if isinstance(item, dict)]),
+                }
+            )
+
+        recent_jobs: list[dict[str, Any]] = []
+        jobs = [j for j in [packet.get("root"), *list(packet.get("children") or [])] if isinstance(j, dict)]
+        for job in sorted(jobs, key=lambda j: float(j.get("updated_at") or 0.0), reverse=True)[:8]:
+            recent_jobs.append(
+                {
+                    "job_id": job.get("job_id"),
+                    "job_id_short": job.get("job_id_short"),
+                    "role": job.get("role"),
+                    "state": job.get("state"),
+                    "title": job.get("title"),
+                    "updated_at": job.get("updated_at"),
+                    "result_summary": job.get("result_summary"),
+                    "result_next_action": job.get("result_next_action"),
+                }
+            )
+
+        recent_artifacts: list[dict[str, Any]] = []
+        for artifact in list(packet.get("artifacts") or [])[:8]:
+            if not isinstance(artifact, dict):
+                continue
+            recent_artifacts.append(
+                {
+                    "kind": artifact.get("kind") or "artifact",
+                    "role": artifact.get("role"),
+                    "job_id": artifact.get("job_id"),
+                    "job_id_short": artifact.get("job_id_short"),
+                    "path": artifact.get("path"),
+                    "artifact_id": artifact.get("artifact_id"),
+                }
+            )
+
+        evidence_refs = _handoff_evidence_refs(packet, max_items=12)
+        state = str(action_profile.get("state") or readiness.get("state") or "unknown").strip().lower()
+        verdict = str(action_profile.get("verdict") or readiness.get("verdict") or "unknown").strip().lower()
+        current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
+        phase = str(workflow.get("phase") or readiness.get("phase") or order.get("phase") or "planning")
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": float(time.time()),
+            "order_id": str(packet.get("order_id") or ""),
+            "order_id_short": str(packet.get("order_id_short") or "")[:8],
+            "phase": phase,
+            "current_stage": current_stage,
+            "state": state,
+            "verdict": verdict,
+            "summary": str(action_profile.get("summary") or readiness.get("summary") or "").strip(),
+            "next_action": str(action_profile.get("primary_action") or readiness.get("next_action") or "").strip(),
+            "blockers": list(action_profile.get("blockers") or readiness.get("blockers") or workflow.get("blockers") or []),
+            "order": {
+                "status": order.get("status"),
+                "priority": order.get("priority"),
+                "title": order.get("title"),
+                "intent_type": order.get("intent_type"),
+                "project_id": order.get("project_id"),
+                "updated_at": order.get("updated_at"),
+            },
+            "readiness": {
+                "applies": bool(readiness.get("applies")),
+                "state": state,
+                "verdict": verdict,
+                "scope": readiness.get("scope"),
+                "merge_ready": bool(workflow.get("merge_ready")),
+                "merged_to_main": bool(workflow.get("merged_to_main")),
+                "deploy_status": workflow.get("deploy_status"),
+                "deploy_summary": workflow.get("deploy_summary"),
+                "deployed_commit": workflow.get("deployed_commit"),
+                "checks_total": len(checks),
+                "checks_by_status": check_counts,
+            },
+            "checks": checks,
+            "evidence_counts": {
+                "children": int(counts.get("children") or 0),
+                "traces": int(counts.get("traces") or 0),
+                "decision_log": int(counts.get("decision_log") or 0),
+                "delegation_log": int(counts.get("delegation_log") or 0),
+                "artifacts": int(counts.get("artifacts") or 0),
+                "handoff_refs": len(evidence_refs),
+            },
+            "recent_jobs": recent_jobs,
+            "recent_artifacts": recent_artifacts,
+            "evidence_refs": evidence_refs,
+            "operator_actions": list(action_profile.get("operator_actions") or []),
+            "release_manager_actions": list(action_profile.get("release_manager_actions") or []),
+        }
+
     def _build_alerts(
         self,
         *,
