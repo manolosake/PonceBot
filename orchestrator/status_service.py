@@ -1504,6 +1504,22 @@ class StatusService:
 
             readiness_state = str(readiness.get("state") or "unknown")
             current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
+            sla_tier, sla_tier_source = _derive_workflow_sla_tier(root_task)
+            stage_sla_by_name: dict[str, dict[str, Any]] = {}
+            for stage in list(workflow.get("stages") or []):
+                stage_name = str(stage.get("stage") or "")
+                if stage_name not in _WORKFLOW_STAGE_ORDER:
+                    continue
+                stage_sla_by_name[stage_name] = _workflow_stage_sla_view(
+                    sla_tier=sla_tier,
+                    tier_source=sla_tier_source,
+                    stage=stage_name,
+                    root_task=root_task,
+                    children=children,
+                    order_row=order_row,
+                    now=generated_at,
+                )
+            current_stage_sla = stage_sla_by_name.get(current_stage, {})
             readiness_counts[readiness_state] = readiness_counts.get(readiness_state, 0) + 1
             stage_counts[current_stage] = stage_counts.get(current_stage, 0) + 1
             blockers = list(readiness.get("blockers") or workflow.get("blockers") or [])
@@ -1518,11 +1534,23 @@ class StatusService:
                     "priority": int((order_row or {}).get("priority") or (root_task.priority if root_task is not None else 2) or 2),
                     "phase": str((order_row or {}).get("phase") or "planning"),
                     "current_stage": current_stage,
+                    "sla_tier": sla_tier,
+                    "sla_tier_source": sla_tier_source,
+                    "current_stage_overdue": bool(current_stage_sla.get("overdue")),
+                    "current_stage_overdue_by_seconds": int(current_stage_sla.get("overdue_by_seconds") or 0),
+                    "current_stage_deadline_at": current_stage_sla.get("deadline_at"),
                     "workflow_stages": [
                         {
                             "stage": str(stage.get("stage") or ""),
                             "status": str(stage.get("status") or "pending"),
                             "summary": stage.get("summary"),
+                            "sla_tier": (stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("sla_tier"),
+                            "sla_seconds": (stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("sla_seconds"),
+                            "started_at": (stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("started_at"),
+                            "deadline_at": (stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("deadline_at"),
+                            "elapsed_seconds": (stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("age_seconds"),
+                            "overdue": bool((stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("overdue")),
+                            "overdue_by_seconds": int((stage_sla_by_name.get(str(stage.get("stage") or "")) or {}).get("overdue_by_seconds") or 0),
                         }
                         for stage in list(workflow.get("stages") or [])
                         if str(stage.get("stage") or "") in _WORKFLOW_STAGE_ORDER
@@ -1566,6 +1594,7 @@ class StatusService:
                 "orders_count": 0,
                 "blocked_count": 0,
                 "failed_count": 0,
+                "overdue_count": 0,
                 "running_count": 0,
                 "pending_count": 0,
                 "oldest_updated_at": None,
@@ -1622,6 +1651,10 @@ class StatusService:
                 stage["running_count"] = int(stage["running_count"]) + 1
             elif status == "pending":
                 stage["pending_count"] = int(stage["pending_count"]) + 1
+            current_stage_overdue = bool(order.get("current_stage_overdue"))
+            current_stage_overdue_by_seconds = int(order.get("current_stage_overdue_by_seconds") or 0)
+            if current_stage_overdue:
+                stage["overdue_count"] = int(stage["overdue_count"]) + 1
 
             updated_at = _coerce_float(order.get("updated_at"))
             oldest = _coerce_float(stage.get("oldest_updated_at"))
@@ -1639,12 +1672,19 @@ class StatusService:
                 "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
                 "blocker_summary": _compact_blockers(order, current_stage),
                 "next_action": str(order.get("next_action") or ""),
+                "sla_tier": str(order.get("sla_tier") or ""),
+                "sla_tier_source": str(order.get("sla_tier_source") or ""),
+                "current_stage_overdue": current_stage_overdue,
+                "current_stage_overdue_by_seconds": current_stage_overdue_by_seconds,
+                "current_stage_deadline_at": order.get("current_stage_deadline_at"),
                 "updated_at": updated_at,
             }
             orders = list(stage.get("orders") or [])
             orders.append(compact_order)
             orders.sort(
                 key=lambda o: (
+                    0 if bool(o.get("current_stage_overdue")) else 1,
+                    -int(o.get("current_stage_overdue_by_seconds") or 0),
                     int(o.get("priority") or 2),
                     float(o.get("updated_at") or float("inf")),
                     str(o.get("order_id") or ""),
@@ -1656,16 +1696,22 @@ class StatusService:
             orders = list(stage.get("orders") or [])
             if orders:
                 first_action = str(orders[0].get("next_action") or orders[0].get("blocker_summary") or "").strip()
-                stage["recommended_next_action"] = first_action or f"Advance the oldest {stage_name} order."
+                if bool(orders[0].get("current_stage_overdue")):
+                    overdue_by = int(orders[0].get("current_stage_overdue_by_seconds") or 0)
+                    stage["recommended_next_action"] = first_action or f"Clear overdue {stage_name} order ({overdue_by}s past SLA)."
+                else:
+                    stage["recommended_next_action"] = first_action or f"Advance the oldest {stage_name} order."
 
         ordered_stages = [stages[stage] for stage in _WORKFLOW_STAGE_ORDER]
 
-        def _rank_key(stage: dict[str, Any]) -> tuple[int, int, float, int]:
+        def _rank_key(stage: dict[str, Any]) -> tuple[int, int, int, float, int]:
             name = str(stage.get("stage") or "")
             blocked_failed = int(stage.get("blocked_count") or 0) + int(stage.get("failed_count") or 0)
+            overdue = int(stage.get("overdue_count") or 0)
             oldest = _coerce_float(stage.get("oldest_updated_at"))
             return (
                 -blocked_failed,
+                -overdue,
                 -int(stage.get("orders_count") or 0),
                 oldest if oldest is not None else float("inf"),
                 stage_index.get(name, 999),
@@ -1673,6 +1719,8 @@ class StatusService:
 
         bottleneck = min(ordered_stages, key=_rank_key) if ordered_stages else None
         bottleneck_stage = str((bottleneck or {}).get("stage") or _WORKFLOW_STAGE_ORDER[0])
+        bottleneck_blocked_failed = int((bottleneck or {}).get("blocked_count") or 0) + int((bottleneck or {}).get("failed_count") or 0)
+        bottleneck_overdue = int((bottleneck or {}).get("overdue_count") or 0)
         return {
             "api_version": "v1",
             "schema_version": 1,
@@ -1682,7 +1730,8 @@ class StatusService:
             "summary": {
                 "orders_total": int((board.get("summary") or {}).get("orders_total") or 0),
                 "bottleneck_stage": bottleneck_stage,
-                "bottleneck_score": int((bottleneck or {}).get("blocked_count") or 0) + int((bottleneck or {}).get("failed_count") or 0),
+                "bottleneck_score": bottleneck_blocked_failed + bottleneck_overdue,
+                "bottleneck_overdue_count": bottleneck_overdue,
                 "recommended_next_action": str((bottleneck or {}).get("recommended_next_action") or ""),
             },
             "stages": ordered_stages,
