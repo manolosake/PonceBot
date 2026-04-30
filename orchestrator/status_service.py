@@ -2555,7 +2555,15 @@ class StatusService:
             "staleness_seconds": snap.get("staleness_seconds"),
         }
 
-    def operator_focus(self, chat_id: int | None = None, limit: int = 5) -> dict[str, Any]:
+    def operator_focus(
+        self,
+        chat_id: int | None = None,
+        limit: int = 5,
+        *,
+        categories: Any = None,
+        urgencies: Any = None,
+        sources: Any = None,
+    ) -> dict[str, Any]:
         lim = max(1, min(20, int(limit)))
         generated_at = float(time.time())
         focus_chat_id = int(chat_id) if chat_id is not None else None
@@ -2572,7 +2580,28 @@ class StatusService:
             "proactive_monitor": 8,
         }
         urgency_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        source_counts = {"control_room": 0, "proactive_priorities": 0, "proactive_health": 0}
+        source_keys = ("control_room", "proactive_priorities", "proactive_health")
+        source_counts = {key: 0 for key in source_keys}
+
+        def _normalize_filter(values: Any) -> list[str]:
+            if values is None:
+                return []
+            raw_values = [values] if isinstance(values, str) else list(values or [])
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for raw in raw_values:
+                value = str(raw or "").strip().lower()
+                if not value or value in seen:
+                    continue
+                normalized.append(value)
+                seen.add(value)
+            return normalized
+
+        active_filters = {
+            "categories": _normalize_filter(categories),
+            "urgencies": _normalize_filter(urgencies),
+            "sources": _normalize_filter(sources),
+        }
 
         def _text(value: Any, default: str = "") -> str:
             s = str(value or "").strip()
@@ -2869,7 +2898,32 @@ class StatusService:
             )
             source_counts["proactive_health"] += 1
 
-        items.sort(
+        available_source_counts = {key: 0 for key in source_keys}
+        for item in items:
+            source = str(item.get("source") or "").strip().lower()
+            if source:
+                available_source_counts[source] = int(available_source_counts.get(source, 0)) + 1
+        available = {
+            "total": len(items),
+            "categories": sorted({str(item.get("category") or "").strip().lower() for item in items if str(item.get("category") or "").strip()}),
+            "urgencies": sorted({str(item.get("urgency") or "").strip().lower() for item in items if str(item.get("urgency") or "").strip()}),
+            "sources": sorted({str(item.get("source") or "").strip().lower() for item in items if str(item.get("source") or "").strip()}),
+        }
+
+        filtered_items = [
+            item
+            for item in items
+            if (not active_filters["categories"] or str(item.get("category") or "").strip().lower() in active_filters["categories"])
+            and (not active_filters["urgencies"] or str(item.get("urgency") or "").strip().lower() in active_filters["urgencies"])
+            and (not active_filters["sources"] or str(item.get("source") or "").strip().lower() in active_filters["sources"])
+        ]
+        source_counts = {key: 0 for key in source_keys}
+        for item in filtered_items:
+            source = str(item.get("source") or "").strip().lower()
+            if source:
+                source_counts[source] = int(source_counts.get(source, 0)) + 1
+
+        filtered_items.sort(
             key=lambda item: (
                 int(category_order.get(str(item.get("category") or ""), 99)),
                 int(urgency_order.get(str(item.get("urgency") or ""), 9)),
@@ -2878,7 +2932,7 @@ class StatusService:
                 str(item.get("action_id") or ""),
             )
         )
-        returned = items[:lim]
+        returned = filtered_items[:lim]
         for idx, item in enumerate(returned, start=1):
             item["rank"] = idx
 
@@ -2896,7 +2950,11 @@ class StatusService:
                 "top_action_id": top.get("action_id") if top else None,
                 "top_category": top.get("category") if top else None,
                 "top_focus": top_focus,
+                "filters": active_filters,
+                "available": available,
+                "filtered_out": len(items) - len(filtered_items),
                 "source_counts": source_counts,
+                "available_source_counts": available_source_counts,
             },
             "top_focus": top_focus,
             "items": returned,
