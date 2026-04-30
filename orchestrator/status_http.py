@@ -367,6 +367,15 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in ("/api/v1/orchestration/operator-focus", "/api/orchestration/operator-focus"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 5, hi=20)
+            payload = self.server.status_service.operator_focus(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/orders/evidence", "/api/orchestration/orders/evidence"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
