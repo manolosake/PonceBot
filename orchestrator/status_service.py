@@ -1729,32 +1729,32 @@ class StatusService:
             decision_rank = int(_DECISION_RANK.get(decision, 9))
             updated_at = _coerce_float(order.get("updated_at")) or 0.0
 
-            ranked.append(
-                {
-                    "rank": 0,
-                    "order_id": oid,
-                    "order_id_short": str(order.get("order_id_short") or oid[:8]),
-                    "title": str(order.get("title") or ""),
+            priority_item = {
+                "rank": 0,
+                "order_id": oid,
+                "order_id_short": str(order.get("order_id_short") or oid[:8]),
+                "title": str(order.get("title") or ""),
+                "priority": priority,
+                "phase": str(order.get("phase") or "planning"),
+                "current_stage": current_stage,
+                "readiness_state": str(order.get("readiness_state") or "unknown"),
+                "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
+                "decision": decision,
+                "why": why,
+                "primary_blocker": primary_blocker,
+                "next_action": _priority_next_action(order, decision, blocker),
+                "score_breakdown": {
+                    "decision_rank": decision_rank,
                     "priority": priority,
-                    "phase": str(order.get("phase") or "planning"),
-                    "current_stage": current_stage,
-                    "readiness_state": str(order.get("readiness_state") or "unknown"),
-                    "readiness_verdict": str(order.get("readiness_verdict") or "unknown"),
-                    "decision": decision,
-                    "why": why,
-                    "primary_blocker": primary_blocker,
-                    "next_action": _priority_next_action(order, decision, blocker),
-                    "score_breakdown": {
-                        "decision_rank": decision_rank,
-                        "priority": priority,
-                        "stage_rank": stage_rank,
-                        "updated_at": updated_at,
-                    },
-                    "merge_ready": bool(order.get("merge_ready")),
-                    "merged_to_main": bool(order.get("merged_to_main")),
+                    "stage_rank": stage_rank,
                     "updated_at": updated_at,
-                }
-            )
+                },
+                "merge_ready": bool(order.get("merge_ready")),
+                "merged_to_main": bool(order.get("merged_to_main")),
+                "updated_at": updated_at,
+            }
+            priority_item["handoff"] = _proactive_handoff_metadata(priority_item, decision)
+            ranked.append(priority_item)
 
         ranked.sort(
             key=lambda order: (
@@ -1827,6 +1827,7 @@ class StatusService:
             "why",
             "primary_blocker",
             "next_action",
+            "handoff",
             "updated_at",
             "merge_ready",
             "merged_to_main",
@@ -2669,6 +2670,7 @@ class StatusService:
                 "source",
                 "source_signals",
                 "count",
+                "handoff",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -2695,9 +2697,10 @@ class StatusService:
             source: str,
             source_signals: list[str],
             updated_at: float | None = None,
+            handoff: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             triage = _triage_targets(category=category, target=target, order_id=order_id, job_id=job_id)
-            return {
+            packet = {
                 "rank": 0,
                 "action_id": action_id,
                 "category": category,
@@ -2717,6 +2720,9 @@ class StatusService:
                 "score": _score(category, urgency, updated_at),
                 "updated_at": updated_at,
             }
+            if isinstance(handoff, dict) and handoff:
+                packet["handoff"] = handoff
+            return packet
 
         items: list[dict[str, Any]] = []
 
@@ -2824,6 +2830,7 @@ class StatusService:
                     source="proactive_priorities",
                     source_signals=source_signals,
                     updated_at=updated_at,
+                    handoff=(order.get("handoff") if isinstance(order.get("handoff"), dict) else None),
                 )
             )
             source_counts["proactive_priorities"] += 1
