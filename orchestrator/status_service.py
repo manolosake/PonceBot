@@ -2730,6 +2730,85 @@ class StatusService:
                 "action_target": action_target,
             }
 
+        def _focus_handoff_metadata(
+            *,
+            source: str,
+            category: str,
+            action_id: str,
+            label: str,
+            next_action: str,
+            target: str,
+            reason: str,
+            evidence_type: str | None = None,
+        ) -> dict[str, Any]:
+            endpoint = _append_chat_scope(target) or "/api/v1/orchestration/operator-focus"
+            category_key = _text(category)
+            evidence_key = _text(evidence_type).lower()
+
+            if source == "control_room" and category_key == "approval":
+                suggested_role = "reviewer_local"
+                definition_of_done = [
+                    next_action,
+                    "Approve, reject, or annotate the blocked operator decision.",
+                ]
+                checklist = [
+                    "Open the decision endpoint.",
+                    "Inspect the blocked job or pending decision context.",
+                    "Record the approval decision and rationale.",
+                ]
+                evidence_expectations = [
+                    "approval or rejection decision",
+                    "decision rationale",
+                    "updated job or decision state",
+                ]
+            elif source == "proactive_health":
+                if any(token in evidence_key for token in ("release", "deploy", "merge")):
+                    suggested_role = "release_mgr"
+                elif any(token in evidence_key for token in ("qa", "review")):
+                    suggested_role = "reviewer_local"
+                else:
+                    suggested_role = "implementer_local"
+                definition_of_done = [
+                    next_action,
+                    "Attach evidence that resolves or explains the proactive health alert.",
+                ]
+                checklist = [
+                    "Open the proactive health endpoint.",
+                    "Inspect the recommended action and source signals.",
+                    "Record concrete evidence or a bounded follow-up.",
+                ]
+                evidence_expectations = [
+                    "proactive health report status",
+                    "recommended action result",
+                    "updated evidence or follow-up note",
+                ]
+            else:
+                suggested_role = "implementer_local"
+                definition_of_done = [
+                    next_action,
+                    "Record the operator-visible outcome before handing back.",
+                ]
+                checklist = [
+                    "Open the suggested endpoint.",
+                    "Inspect the referenced control-room signals.",
+                    "Complete the bounded operator action.",
+                ]
+                evidence_expectations = [
+                    "control-room signal review",
+                    "operator action result",
+                    "updated status snapshot or trace",
+                ]
+
+            return {
+                "suggested_role": suggested_role,
+                "suggested_endpoint": endpoint,
+                "inspect_path": endpoint,
+                "definition_of_done": definition_of_done,
+                "checklist": checklist,
+                "evidence_expectations": evidence_expectations,
+                "title": _text(label, action_id.replace("_", " ").title()),
+            }
+
         def _focus_packet(item: dict[str, Any] | None) -> dict[str, Any] | None:
             if not item:
                 return None
@@ -2843,21 +2922,34 @@ class StatusService:
             category, urgency, ref = mapped
             updated_at = _float_or_none(ref.get("updated_at")) if isinstance(ref, dict) else None
             count = _num(action.get("count"), 1)
+            label = _text(action.get("label"), source_action_id.replace("_", " ").title())
+            reason = _text(action.get("reason"), "Control room recommends operator attention.")
+            next_action = label or "Review operator action."
+            target = _text(action.get("target"), "/api/v1/orchestration/control-room")
             items.append(
                 _item(
                     action_id=source_action_id,
                     category=category,
                     urgency=urgency,
-                    label=_text(action.get("label"), source_action_id.replace("_", " ").title()),
-                    reason=_text(action.get("reason"), "Control room recommends operator attention."),
-                    next_action=_text(action.get("label"), "Review operator action."),
-                    target=_text(action.get("target"), "/api/v1/orchestration/control-room"),
+                    label=label,
+                    reason=reason,
+                    next_action=next_action,
+                    target=target,
                     count=count,
                     order_id=(_order_id_from_ref(ref) if isinstance(ref, dict) else None),
                     job_id=(_text(ref.get("job_id")) or None) if isinstance(ref, dict) else None,
                     source="control_room",
                     source_signals=[source_action_id, category],
                     updated_at=updated_at,
+                    handoff=_focus_handoff_metadata(
+                        source="control_room",
+                        category=category,
+                        action_id=source_action_id,
+                        label=label,
+                        next_action=next_action,
+                        target=target,
+                        reason=reason,
+                    ),
                 )
             )
             source_counts["control_room"] += 1
@@ -2866,21 +2958,34 @@ class StatusService:
         bottleneck_score = _num(workflow.get("score"), 0)
         if bottleneck_score > 0:
             stage = _text(workflow.get("stage"), "workflow")
+            label = "Clear workflow bottleneck"
+            reason = f"{bottleneck_score} blocked or failed order(s) at {stage}."
+            next_action = _text(workflow.get("recommended_next_action"), "Inspect the bottleneck stage.")
+            target = "/api/v1/orchestration/workflow-bottlenecks"
             items.append(
                 _item(
                     action_id=f"workflow_bottleneck:{stage}",
                     category="workflow_bottleneck",
                     urgency="medium",
-                    label="Clear workflow bottleneck",
-                    reason=f"{bottleneck_score} blocked or failed order(s) at {stage}.",
-                    next_action=_text(workflow.get("recommended_next_action"), "Inspect the bottleneck stage."),
-                    target="/api/v1/orchestration/workflow-bottlenecks",
+                    label=label,
+                    reason=reason,
+                    next_action=next_action,
+                    target=target,
                     count=bottleneck_score,
                     order_id=None,
                     job_id=None,
                     source="control_room",
                     source_signals=["workflow_bottleneck", stage],
                     updated_at=None,
+                    handoff=_focus_handoff_metadata(
+                        source="control_room",
+                        category="workflow_bottleneck",
+                        action_id=f"workflow_bottleneck:{stage}",
+                        label=label,
+                        next_action=next_action,
+                        target=target,
+                        reason=reason,
+                    ),
                 )
             )
             source_counts["control_room"] += 1
@@ -2975,15 +3080,19 @@ class StatusService:
                     action_id = f"{action_id}:{idx}"
                 seen_health_action_ids.add(action_id)
                 label_subject = evidence_type.replace("_", " ").strip() or "health recommendation"
+                label = f"Triage {label_subject}"
+                reason = _text(action.get("reason"), _text(health.get("summary_reason"), "Proactive health alert is active."))
+                next_action = _text(action.get("action") or action.get("summary"), "Review the proactive health report.")
+                target = "/api/v1/status/proactive-health"
                 items.append(
                     _item(
                         action_id=action_id,
                         category="proactive_health",
                         urgency=_health_urgency(priority),
-                        label=f"Triage {label_subject}",
-                        reason=_text(action.get("reason"), _text(health.get("summary_reason"), "Proactive health alert is active.")),
-                        next_action=_text(action.get("action") or action.get("summary"), "Review the proactive health report."),
-                        target="/api/v1/status/proactive-health",
+                        label=label,
+                        reason=reason,
+                        next_action=next_action,
+                        target=target,
                         count=_num(action.get("count"), 1),
                         order_id=order_id,
                         job_id=None,
@@ -2991,6 +3100,16 @@ class StatusService:
                         source="proactive_health",
                         source_signals=_health_signals(action),
                         updated_at=None,
+                        handoff=_focus_handoff_metadata(
+                            source="proactive_health",
+                            category="proactive_health",
+                            action_id=action_id,
+                            label=label,
+                            next_action=next_action,
+                            target=target,
+                            reason=reason,
+                            evidence_type=evidence_type,
+                        ),
                         evidence_type=evidence_type,
                         priority=priority or None,
                     )
@@ -2998,21 +3117,34 @@ class StatusService:
                 source_counts["proactive_health"] += 1
 
             if not health_actions:
+                label = "Inspect proactive health"
+                reason = _text(health.get("summary_reason"), "Proactive health alert is active.")
+                next_action = "Review the proactive health report."
+                target = "/api/v1/status/proactive-health"
                 items.append(
                     _item(
                         action_id="proactive_health_alert",
                         category="proactive_health",
                         urgency=_health_urgency(""),
-                        label="Inspect proactive health",
-                        reason=_text(health.get("summary_reason"), "Proactive health alert is active."),
-                        next_action="Review the proactive health report.",
-                        target="/api/v1/status/proactive-health",
+                        label=label,
+                        reason=reason,
+                        next_action=next_action,
+                        target=target,
                         count=1,
                         order_id=None,
                         job_id=None,
                         source="proactive_health",
                         source_signals=_health_signals(),
                         updated_at=None,
+                        handoff=_focus_handoff_metadata(
+                            source="proactive_health",
+                            category="proactive_health",
+                            action_id="proactive_health_alert",
+                            label=label,
+                            next_action=next_action,
+                            target=target,
+                            reason=reason,
+                        ),
                     )
                 )
                 source_counts["proactive_health"] += 1
