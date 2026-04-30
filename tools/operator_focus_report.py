@@ -44,16 +44,46 @@ def _one_line_list(value: Any, *, default: str = "-") -> str:
     return _one_line(value, default=default)
 
 
-def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str, Any]:
+def _parse_filter_values(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        for part in str(raw or "").split(","):
+            value = part.strip().lower()
+            if not value or value in seen:
+                continue
+            normalized.append(value)
+            seen.add(value)
+    return normalized
+
+
+def _format_filter_values(values: Any, *, default: str = "all") -> str:
+    if isinstance(values, list):
+        return _one_line_list(values, default=default)
+    return _one_line(values, default=default)
+
+
+def build_report(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    limit: int,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
     svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
-    return svc.operator_focus(chat_id=chat_id, limit=limit)
+    return svc.operator_focus(chat_id=chat_id, limit=limit, categories=categories, urgencies=urgencies, sources=sources)
 
 
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     source_counts = summary.get("source_counts") if isinstance(summary.get("source_counts"), dict) else {}
+    available_source_counts = summary.get("available_source_counts") if isinstance(summary.get("available_source_counts"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
     items = [item for item in list(report.get("items") or []) if isinstance(item, dict)]
 
     lines = [
@@ -70,11 +100,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Top action: {_one_line(summary.get('top_action_id'))}",
         f"- Top category: {_one_line(summary.get('top_category'))}",
         "",
+        "## Filters",
+        "",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        "",
         "## Counts",
         "",
         f"- Control room: {_one_line(source_counts.get('control_room'), default='0')}",
         f"- Proactive priorities: {_one_line(source_counts.get('proactive_priorities'), default='0')}",
         f"- Proactive health: {_one_line(source_counts.get('proactive_health'), default='0')}",
+        f"- Available control room: {_one_line(available_source_counts.get('control_room'), default='0')}",
+        f"- Available proactive priorities: {_one_line(available_source_counts.get('proactive_priorities'), default='0')}",
+        f"- Available proactive health: {_one_line(available_source_counts.get('proactive_health'), default='0')}",
         "",
         "## Focus Items",
         "",
@@ -129,6 +173,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--format", choices=("json", "md", "markdown"), default="json", help="Output format.")
     parser.add_argument("--limit", type=_positive_int, default=5, help="Maximum ranked focus items to return.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
+    parser.add_argument("--category", action="append", help="Filter by focus category. Repeat or use comma-separated values.")
+    parser.add_argument("--urgency", action="append", help="Filter by urgency. Repeat or use comma-separated values.")
+    parser.add_argument("--source", action="append", help="Filter by source. Repeat or use comma-separated values.")
     parser.add_argument("--output", type=Path, help="Optional output file path.")
     return parser.parse_args(argv)
 
@@ -143,8 +190,19 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         print(f"database not found: {db_path}", file=err)
         return 2
 
+    categories = _parse_filter_values(args.category)
+    urgencies = _parse_filter_values(args.urgency)
+    sources = _parse_filter_values(args.source)
+
     try:
-        report = build_report(db_path=db_path, chat_id=args.chat_id, limit=args.limit)
+        report = build_report(
+            db_path=db_path,
+            chat_id=args.chat_id,
+            limit=args.limit,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
     except Exception as exc:
         print(f"failed to render operator focus report: {exc}", file=err)
         return 2
