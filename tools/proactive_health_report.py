@@ -31,6 +31,7 @@ STALE_HEARTBEAT_DETAIL_LIMIT = 25
 UNCOVERED_REPO_DETAIL_LIMIT = 25
 FACTORY_COVERAGE_DETAIL_LIMIT = 100
 FACTORY_COVERAGE_MARKDOWN_LIMIT = 25
+FACTORY_NEXT_TARGET_LIMIT = 10
 LOOKBACK_S = 24 * 3600
 AUTONOMY_MINIMUM_SLO = {
     'implementer_fail_rate_lte': 0.35,
@@ -762,6 +763,60 @@ def build_factory_coverage_details(
     return rows
 
 
+def build_factory_next_targets(coverage_details: list) -> list:
+    target_rows = []
+    group_rank = {'uncovered': 0, 'covered_paused': 1, 'covered_active': 2}
+    unhealthy_heartbeat_reasons = {'missing_runtime_state_row', 'missing', 'stale', 'stale_heartbeat'}
+    for item in coverage_details:
+        coverage_state = str((item or {}).get('coverage_state') or '').strip()
+        heartbeat = (item or {}).get('runtime_heartbeat') or {}
+        heartbeat_state = str(heartbeat.get('state') or '').strip()
+        heartbeat_reason = str(heartbeat.get('reason') or heartbeat_state or '').strip()
+        normalized_heartbeat_reason = 'stale_heartbeat' if heartbeat_reason == 'stale' else heartbeat_reason
+
+        attention_reason = ''
+        recommended_action = ''
+        if coverage_state == 'uncovered':
+            attention_reason = 'uncovered'
+            recommended_action = 'seed_proactive_order'
+        elif coverage_state == 'covered_paused':
+            attention_reason = 'covered_paused'
+            recommended_action = 'resume_or_close_paused_order'
+        elif coverage_state == 'covered_active' and normalized_heartbeat_reason in unhealthy_heartbeat_reasons:
+            attention_reason = normalized_heartbeat_reason
+            recommended_action = 'restart_or_inspect_agent'
+        else:
+            continue
+
+        target_rows.append({
+            'repo_id': (item or {}).get('repo_id'),
+            'repo_path': (item or {}).get('repo_path') or (item or {}).get('path') or '',
+            'priority': (item or {}).get('priority'),
+            'coverage_state': coverage_state,
+            'attention_reason': attention_reason,
+            'recommended_action': recommended_action,
+            'order_id': (item or {}).get('order_id') or '',
+            'order_status': (item or {}).get('order_status') or '',
+            'order_phase': (item or {}).get('order_phase') or '',
+            'order_activity_age_s': (item or {}).get('order_activity_age_s'),
+            'heartbeat_state': heartbeat_state,
+            'heartbeat_age_s': heartbeat.get('heartbeat_age_s'),
+            'agent_key': heartbeat.get('agent_key') or '',
+            'role': heartbeat.get('role') or '',
+            '_group_rank': group_rank.get(coverage_state, 99),
+        })
+
+    target_rows.sort(key=lambda item: (
+        int(item.get('_group_rank') or 99),
+        sortable_priority(item.get('priority')),
+        str(item.get('repo_id') or ''),
+    ))
+    for rank, item in enumerate(target_rows, start=1):
+        item['rank'] = rank
+        item.pop('_group_rank', None)
+    return target_rows
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -978,6 +1033,10 @@ def main() -> int:
     coverage_count = len(coverage_details)
     coverage_details_limited = coverage_details[:FACTORY_COVERAGE_DETAIL_LIMIT]
     coverage_truncated = coverage_count > len(coverage_details_limited)
+    next_targets = build_factory_next_targets(coverage_details)
+    next_target_count = len(next_targets)
+    next_targets_limited = next_targets[:FACTORY_NEXT_TARGET_LIMIT]
+    next_targets_truncated = next_target_count > len(next_targets_limited)
     stale_heartbeat_details = []
     seen_enabled_repo_ids = set()
     for hb in heartbeat_rows:
@@ -1168,6 +1227,10 @@ def main() -> int:
             'coverage_count': int(coverage_count),
             'coverage_truncated': coverage_truncated,
             'coverage_detail_limit': FACTORY_COVERAGE_DETAIL_LIMIT,
+            'next_targets': next_targets_limited,
+            'next_target_count': int(next_target_count),
+            'next_targets_truncated': next_targets_truncated,
+            'next_target_limit': FACTORY_NEXT_TARGET_LIMIT,
         },
         'metrics': metrics,
         'autonomy_funnel': {
@@ -1211,8 +1274,33 @@ def main() -> int:
         f"- Final sweeps (24h): {metrics['final_sweeps_24h']}",
         f"- Model fallbacks (24h): {metrics['factory_model_fallback_24h']}",
         '',
-        '## Factory Coverage',
+        '## Factory Next Targets',
     ]
+    if not next_targets:
+        lines.append('- None')
+    else:
+        for item in next_targets_limited:
+            priority = item.get('priority')
+            priority_text = 'null' if priority is None else str(priority)
+            order_text = item.get('order_id') or 'none'
+            phase_text = item.get('order_phase') or 'none'
+            heartbeat_age = item.get('heartbeat_age_s')
+            heartbeat_age_text = 'null' if heartbeat_age is None else str(heartbeat_age)
+            lines.append(
+                f"- rank={item.get('rank')} repo={item.get('repo_id')} reason={item.get('attention_reason')} "
+                f"action={item.get('recommended_action')} priority={priority_text} state={item.get('coverage_state')} "
+                f"order={order_text} phase={phase_text} order_activity_age_s={item.get('order_activity_age_s')} "
+                f"heartbeat={item.get('heartbeat_state') or 'none'} heartbeat_age_s={heartbeat_age_text} "
+                f"agent={item.get('agent_key') or 'none'} role={item.get('role') or 'none'}"
+            )
+        if next_targets_truncated:
+            lines.append(
+                f"- Truncated: showing {FACTORY_NEXT_TARGET_LIMIT} of {next_target_count} targets."
+            )
+    lines.extend([
+        '',
+        '## Factory Coverage',
+    ])
     if not coverage_details:
         lines.append('- No enabled repos.')
     else:
