@@ -2349,6 +2349,38 @@ class StatusService:
             "Queued work exists while worker saturation is low.",
         )
 
+        bottleneck = self.workflow_bottlenecks(chat_id=chat_id, limit=50)
+        bottleneck_summary = bottleneck.get("summary") if isinstance(bottleneck.get("summary"), dict) else {}
+        workflow_bottleneck = {
+            "stage": str(bottleneck_summary.get("bottleneck_stage") or ""),
+            "score": int(bottleneck_summary.get("bottleneck_score") or 0),
+            "recommended_next_action": str(bottleneck_summary.get("recommended_next_action") or ""),
+            "orders_total": int(bottleneck_summary.get("orders_total") or 0),
+        }
+
+        action_plan = self.proactive_action_plan(chat_id=chat_id, limit=20)
+        action_plan_summary = action_plan.get("summary") if isinstance(action_plan.get("summary"), dict) else {}
+        lanes = action_plan_summary.get("lanes") if isinstance(action_plan_summary.get("lanes"), dict) else {}
+        proactive_action_plan = {
+            "active_proactive_orders": int(action_plan_summary.get("active_proactive_orders") or 0),
+            "top_lane": action_plan_summary.get("top_lane"),
+            "top_action": action_plan_summary.get("top_action"),
+            "lanes": {str(k): int(v or 0) for k, v in lanes.items()},
+        }
+
+        top_action = str(proactive_action_plan.get("top_action") or "").strip()
+        compact_recommended_actions = recommended_actions[:5]
+        if top_action:
+            compact_recommended_actions.append(
+                {
+                    "action_id": "follow_proactive_action_plan",
+                    "label": "Follow proactive action plan",
+                    "target": "/api/v1/orchestration/proactive-action-plan",
+                    "count": 1,
+                    "reason": f"Top proactive lane recommends: {top_action}",
+                }
+            )
+
         return {
             "api_version": "v1",
             "schema_version": 1,
@@ -2386,7 +2418,9 @@ class StatusService:
                 "risks": risks[:10],
                 "stalled_tasks": stalled_tasks[:10],
             },
-            "recommended_actions": recommended_actions[:5],
+            "workflow_bottleneck": workflow_bottleneck,
+            "proactive_action_plan": proactive_action_plan,
+            "recommended_actions": compact_recommended_actions,
             "staleness_seconds": snap.get("staleness_seconds"),
         }
 
