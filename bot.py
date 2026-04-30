@@ -10001,6 +10001,101 @@ def _send_chunked_text(
             LOG.exception("Failed to send chunked message. chat_id=%s", chat_id)
 
 
+def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 160, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    summary = focus.get("summary") if isinstance(focus.get("summary"), dict) else {}
+    items_raw = focus.get("items") or []
+    items: list[dict[str, Any]] = [item for item in items_raw if isinstance(item, dict)]
+    health = _clip(summary.get("health_level"), max_chars=24, default="unknown")
+    returned = len(items)
+    try:
+        returned = int(summary.get("returned", returned) or returned)
+    except Exception:
+        returned = len(items)
+
+    lines: list[str] = [
+        f"Jarvis: focus ({_ascii(scope_label)})",
+        f"health={health} returned={returned}",
+    ]
+    top_action = _clip(summary.get("top_action_id"), max_chars=80)
+    if top_action:
+        lines[-1] += f" top={top_action}"
+
+    if not items:
+        lines.extend(
+            [
+                "",
+                "No ranked operator actions for this scope.",
+                "Next: check /dashboard or /orders if you expected active work here.",
+            ]
+        )
+        return "\n".join(lines)
+
+    for idx, item in enumerate(items[:10], start=1):
+        rank = item.get("rank")
+        try:
+            rank_i = int(rank or idx)
+        except Exception:
+            rank_i = idx
+        urgency = _clip(item.get("urgency"), max_chars=24, default="n/a")
+        category = _clip(item.get("category"), max_chars=48, default="n/a")
+        label = _clip(item.get("label"), max_chars=120, default="Review operator action")
+        next_action = _clip(item.get("next_action"), max_chars=180, default="Review the item.")
+        target = _clip(item.get("target"), max_chars=180)
+        inspect_path = _clip(item.get("inspect_path"), max_chars=180)
+        action_target = _clip(item.get("action_target"), max_chars=96)
+        inspect_target = _clip(item.get("inspect_target"), max_chars=96)
+        order_id = _clip(item.get("order_id"), max_chars=96)
+        job_id = _clip(item.get("job_id"), max_chars=96)
+        source = _clip(item.get("source"), max_chars=48)
+        try:
+            count = int(item.get("count") or 0)
+        except Exception:
+            count = 0
+
+        lines.append("")
+        lines.append(f"{rank_i}. {urgency}/{category} - {label}")
+        if target or action_target:
+            detail = []
+            if target:
+                detail.append(f"target={target}")
+            if action_target:
+                detail.append(f"action={action_target}")
+            lines.append("   " + " ".join(detail))
+        lines.append(f"   next={next_action}")
+        if inspect_path or inspect_target:
+            detail = []
+            if inspect_path:
+                detail.append(f"inspect={inspect_path}")
+            if inspect_target:
+                detail.append(f"inspect_target={inspect_target}")
+            lines.append("   " + " ".join(detail))
+        ids = []
+        if order_id:
+            ids.append(f"order={order_id}")
+        if job_id:
+            ids.append(f"job={job_id}")
+        if count:
+            ids.append(f"count={count}")
+        if source:
+            ids.append(f"source={source}")
+        if ids:
+            lines.append("   " + " ".join(ids))
+
+    return "\n".join(lines)
+
+
 def _mobile_latest_apk(artifacts_dir: Path) -> Path | None:
     try:
         root = Path(artifacts_dir).expanduser().resolve()
