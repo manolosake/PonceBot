@@ -328,6 +328,34 @@ class TestOrchestratorEvidenceGate(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("QA evidence gate", str(reason))
 
+    def test_qa_accepts_ready_validation_language(self) -> None:
+        t = Task.new(
+            source="telegram",
+            role="qa",
+            input_text="Review recovery slice",
+            request_type="task",
+            priority=1,
+            model="gpt-5.4",
+            effort="medium",
+            mode_hint="ro",
+            requires_approval=False,
+            max_cost_window_usd=5.0,
+            chat_id=1,
+        )
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=t,
+            summary=(
+                "READY: validation checked the recovery commit and git diff --stat evidence; "
+                "no regression found and the slice is safe to continue."
+            ),
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertTrue(bool(meta.get("summary_substantial")))
+
 
 class TestOrchestratorMarkerResponse(unittest.TestCase):
     def test_invalid_role_is_rejected(self) -> None:

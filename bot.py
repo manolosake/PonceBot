@@ -16889,7 +16889,7 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
         "- Review only the newest implementer_local recovery slice for this ticket.\\n"
         "- Require concrete validation evidence before READY.\\n"
         "- READY is allowed for a policy-approved no-op only when the implementer names this ticket, this recovery key, the authoritative controller artifact, the existing commit/file evidence, and the validation result.\\n"
-        "- Return READY or NEEDS_REWORK with one concrete next step.\\n"
+        "- Return `PASS: READY ...` or `FAIL: NEEDS_REWORK ...` with concrete validation findings and one concrete next step.\\n"
     )
     return [
         TaskSpec(
@@ -16923,7 +16923,7 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
                 "Validation evidence is checked before READY.",
             ],
             definition_of_done=[
-                "Reviewer returns READY or NEEDS_REWORK with explicit rationale.",
+                "Reviewer returns PASS: READY or FAIL: NEEDS_REWORK with explicit rationale.",
             ],
             eta_minutes=20,
             sla_tier="high",
@@ -21447,11 +21447,23 @@ def _orchestrator_min_evidence_gate(
     }
 
     if role == "qa":
-        qa_tokens = ("pass", "fail", "blocked", "regression", "test", "coverage")
+        qa_tokens = (
+            "pass",
+            "fail",
+            "blocked",
+            "regression",
+            "test",
+            "coverage",
+            "ready",
+            "needs_rework",
+            "needs rework",
+            "validation",
+            "validated",
+        )
         if not any(tok in lower for tok in qa_tokens):
             return (
                 False,
-                "QA evidence gate not met. Include PASS/FAIL style validation with concrete findings.",
+                "QA evidence gate not met. Include PASS/FAIL or READY/NEEDS_REWORK validation with concrete findings.",
                 evidence_meta,
             )
 
