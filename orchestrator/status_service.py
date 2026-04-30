@@ -1560,6 +1560,95 @@ class StatusService:
             },
         }
 
+    def order_release_readiness(
+        self,
+        order_id: str,
+        *,
+        trace_limit: int = 100,
+        child_limit: int = 200,
+        log_limit: int = 200,
+    ) -> dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {}
+
+        root_task = self.orch_q.get_job(oid)
+        if root_task is None:
+            return {}
+
+        child_lim = max(1, min(2000, int(child_limit)))
+        trace_lim = max(1, min(5000, int(trace_limit)))
+        log_lim = max(1, min(2000, int(log_limit)))
+
+        children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=child_lim) if t.job_id != oid]
+        order_row: dict[str, Any] | None = None
+        try:
+            order_row = self.orch_q.get_order(oid, chat_id=int(root_task.chat_id))
+        except Exception:
+            order_row = None
+        if not isinstance(order_row, dict):
+            order_row = {
+                "order_id": oid,
+                "chat_id": int(root_task.chat_id),
+                "status": str(root_task.state or ""),
+                "phase": "planning",
+                "intent_type": "",
+                "project_id": None,
+                "source_message_id": root_task.reply_to_message_id,
+                "reply_to_message_id": root_task.reply_to_message_id,
+                "priority": int(root_task.priority or 2),
+                "title": _task_title(root_task),
+                "updated_at": float(root_task.updated_at or 0.0),
+            }
+
+        traces = self.orch_q.list_trace_events(order_id=oid, limit=trace_lim)
+        decision_log = self.orch_q.list_decision_log(order_id=oid, limit=log_lim)
+        tasks = [root_task, *children]
+        artifacts: list[dict[str, Any]] = []
+        for task in tasks:
+            artifacts.extend(_artifact_refs_from_task(task))
+        artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+        workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+        release_readiness = _build_release_readiness(
+            order_row=order_row,
+            root_task=root_task,
+            children=children,
+            workflow=workflow,
+            decision_log=decision_log,
+            traces=traces,
+            artifacts=artifacts,
+        )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": float(time.time()),
+            "order_id": oid,
+            "order_id_short": oid[:8],
+            "order": {
+                "order_id": oid,
+                "chat_id": int(order_row.get("chat_id") or root_task.chat_id),
+                "status": str(order_row.get("status") or ""),
+                "phase": str(order_row.get("phase") or "planning"),
+                "intent_type": str(order_row.get("intent_type") or ""),
+                "project_id": (str(order_row.get("project_id") or "").strip() or None),
+                "source_message_id": order_row.get("source_message_id"),
+                "reply_to_message_id": order_row.get("reply_to_message_id"),
+                "priority": int(order_row.get("priority") or root_task.priority or 2),
+                "title": str(order_row.get("title") or _task_title(root_task)),
+                "updated_at": float(order_row.get("updated_at") or root_task.updated_at or 0.0),
+            },
+            "workflow": workflow,
+            "release_readiness": release_readiness,
+            "counts": {
+                "children_considered": len(children),
+                "traces_considered": len(traces),
+                "decision_log_considered": len(decision_log),
+                "artifacts_considered": len(artifacts),
+            },
+        }
+
     def _build_alerts(
         self,
         *,
