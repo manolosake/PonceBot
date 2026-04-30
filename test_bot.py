@@ -6055,7 +6055,7 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 profiles=None,
                 order_row={"order_id": "root", "title": "Proactive Sprint: ExecutiveDashboard Reliability"},
                 chat_id=1,
-                now=130.0,
+                now=5000.0,
             )
 
         self.assertTrue(enqueued)

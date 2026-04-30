@@ -15084,6 +15084,13 @@ def _enqueue_reviewer_local_rework_if_due(
         for child in children
     ):
         return False
+    try:
+        rework_lookback_s = max(
+            3600.0,
+            min(7.0 * 24.0 * 3600.0, float(os.environ.get("BOT_REVIEWER_LOCAL_REWORK_LOOKBACK_SECONDS", "21600").strip() or "21600")),
+        )
+    except Exception:
+        rework_lookback_s = 21600.0
 
     latest_review = None
     latest_review_summary = ""
@@ -15097,7 +15104,7 @@ def _enqueue_reviewer_local_rework_if_due(
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
-        if ts <= 0 or (float(now) - ts) > 3600.0:
+        if ts <= 0 or (float(now) - ts) > rework_lookback_s:
             continue
         summary = _task_local_specialist_response(child, max_chars=5000) if role_norm == "reviewer_local" else ""
         if not summary:
@@ -15125,7 +15132,7 @@ def _enqueue_reviewer_local_rework_if_due(
         if str(getattr(child, "state", "") or "").strip().lower() != "done":
             continue
         ts = float(getattr(child, "updated_at", 0.0) or getattr(child, "created_at", 0.0) or 0.0)
-        if ts <= 0 or (float(now) - ts) > 3600.0:
+        if ts <= 0 or (float(now) - ts) > rework_lookback_s:
             continue
         trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
         if latest_impl_no_change_ts <= 0.0 and _trace_local_no_change(trace):
