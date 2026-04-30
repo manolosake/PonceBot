@@ -9194,6 +9194,58 @@ def _controller_snapshot_safe_prompt(
     return guard.rstrip() + "\n\n" + scrubbed.lstrip()
 
 
+def _read_only_status_untracked_paths(status_text: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in str(status_text or "").splitlines():
+        line = raw_line.rstrip("\n")
+        if not line.startswith("?? "):
+            continue
+        rel = line[3:].strip()
+        if rel and rel not in paths:
+            paths.append(rel)
+    return paths
+
+
+def _write_read_only_violation_recovery_patch(
+    repo_dir: Path,
+    *,
+    artifacts_dir: Path,
+    safe_label: str,
+    status_before: str,
+) -> Path | None:
+    """
+    Capture a patch before stashing a controller write-policy violation.
+
+    Plain `git diff` ignores untracked files, which made recovery impossible when
+    a controller created a new file. Intent-to-add exposes those files to diff
+    without actually staging content; the follow-up reset keeps stash behavior
+    unchanged.
+    """
+    untracked_paths = _read_only_status_untracked_paths(status_before)
+    intent_added = False
+    if untracked_paths:
+        add_proc = _run_git(repo_dir, ["add", "-N", "--", *untracked_paths], check=False)
+        intent_added = add_proc.returncode == 0
+
+    try:
+        diff_proc = _run_git(repo_dir, ["diff", "--binary", "HEAD", "--", "."], check=False)
+        patch_text = str(diff_proc.stdout or "")
+    finally:
+        if intent_added and untracked_paths:
+            _run_git(repo_dir, ["reset", "-q", "--", *untracked_paths], check=False)
+
+    if not patch_text.strip():
+        return None
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    canonical_patch = artifacts_dir / "changes.patch"
+    canonical_patch.write_text(patch_text, encoding="utf-8", errors="replace")
+    labelled_patch = artifacts_dir / f"write_policy_{safe_label}_recovery.patch"
+    if labelled_patch != canonical_patch:
+        labelled_patch.write_text(patch_text, encoding="utf-8", errors="replace")
+    return canonical_patch
+
+
 def _stash_read_only_write_violation(
     repo_dir: Path,
     *,
@@ -9214,6 +9266,12 @@ def _stash_read_only_write_violation(
         }
 
     safe_label = _SAFE_FILENAME_RE.sub("-", str(label or "repo").strip().lower()).strip("-._") or "repo"
+    recovery_patch_artifact = _write_read_only_violation_recovery_patch(
+        repo_dir,
+        artifacts_dir=artifacts_dir,
+        safe_label=safe_label,
+        status_before=status_before,
+    )
     stash_msg = f"codexbot-read-only-violation-{str(role or 'role')}-{str(job_id or '')[:8]}-{safe_label}-{int(time.time())}"
     proc = _run_git(
         repo_dir,
@@ -9258,6 +9316,7 @@ def _stash_read_only_write_violation(
         "stash_returncode": int(proc.returncode or 0),
         "status_after": status_after,
         "artifact": str(artifact),
+        "recovery_patch_artifact": str(recovery_patch_artifact) if recovery_patch_artifact else "",
     }
 
 
@@ -26508,6 +26567,9 @@ def _orchestrator_run_codex(
                     artifact = str(cleanup.get("artifact") or "").strip()
                     if artifact and artifact not in artifacts_text:
                         artifacts_text.append(artifact)
+                    recovery_patch_artifact = str(cleanup.get("recovery_patch_artifact") or "").strip()
+                    if recovery_patch_artifact and recovery_patch_artifact not in artifacts_text:
+                        artifacts_text.append(recovery_patch_artifact)
                 violation_artifact.write_text("\n".join(violation_lines).rstrip() + "\n", encoding="utf-8", errors="replace")
                 violation_artifact_str = str(violation_artifact)
                 if violation_artifact_str not in artifacts_text:

@@ -3232,6 +3232,43 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
             self.assertEqual(bot._git_status_porcelain(worktree), "")
             self.assertIn("Write policy violation", result["summary"])
 
+    def test_write_policy_stash_captures_untracked_recovery_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            artifacts_dir = Path(td) / "artifacts"
+            repo.mkdir(parents=True, exist_ok=True)
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("# repo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            new_file = repo / "tools" / "order_release_readiness_report.py"
+            new_file.parent.mkdir(parents=True, exist_ok=True)
+            new_file.write_text("def main():\n    return 'ready'\n", encoding="utf-8")
+
+            cleanup = bot._stash_read_only_write_violation(
+                repo,
+                role="skynet",
+                job_id="8125f62d-bb33-4f29-818f-26447593afff",
+                label="controller_snapshot",
+                artifacts_dir=artifacts_dir,
+            )
+
+            patch_path = Path(str(cleanup.get("recovery_patch_artifact") or ""))
+            self.assertTrue(patch_path.exists())
+            patch_text = patch_path.read_text(encoding="utf-8")
+            self.assertIn("diff --git a/tools/order_release_readiness_report.py b/tools/order_release_readiness_report.py", patch_text)
+            self.assertIn("new file mode", patch_text)
+            self.assertIn("return 'ready'", patch_text)
+            self.assertEqual(bot._git_status_porcelain(repo), "")
+            self.assertEqual(
+                subprocess.run(["git", "apply", "--check", str(patch_path)], cwd=str(repo), text=True).returncode,
+                0,
+            )
+
     def test_orchestrator_run_codex_blocks_controller_commits_with_clean_tree(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
