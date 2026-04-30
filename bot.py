@@ -11515,6 +11515,57 @@ def _orchestrator_daily_digest_text(orch_q: OrchestratorQueue) -> str:
     return "\n".join(lines)
 
 
+def _watch_proactive_plan_lines(orch_q: OrchestratorQueue) -> list[str]:
+    def _clean(value: object, max_chars: int) -> str:
+        text = str(value or "").strip().replace("\n", " ")
+        text = " ".join(text.split())
+        text = text.encode("ascii", errors="replace").decode("ascii")
+        if max_chars > 0 and len(text) > max_chars:
+            text = text[: max(0, max_chars - 3)].rstrip() + "..."
+        return text
+
+    try:
+        profiles = getattr(orch_q, "_profiles", {}) or {}
+        plan = StatusService(orch_q=orch_q, role_profiles=profiles, cache_ttl_seconds=0).proactive_action_plan(limit=5)
+        if not isinstance(plan, dict):
+            raise ValueError("malformed proactive action plan")
+        summary = plan.get("summary")
+        lanes = plan.get("lanes")
+        if not isinstance(summary, dict) or not isinstance(lanes, list):
+            raise ValueError("malformed proactive action plan")
+
+        lane_counts: dict[str, int] = {}
+        top_order: dict[str, Any] | None = None
+        for lane_obj in lanes:
+            if not isinstance(lane_obj, dict):
+                raise ValueError("malformed proactive action plan")
+            lane = _clean(lane_obj.get("lane"), 24) or "unknown"
+            count = int(lane_obj.get("count") or 0)
+            lane_counts[lane] = count
+            orders = lane_obj.get("orders") or []
+            if top_order is None and isinstance(orders, list):
+                top_order = next((order for order in orders if isinstance(order, dict)), None)
+
+        lanes_s = " ".join(f"{lane}={lane_counts[lane]}" for lane in sorted(lane_counts.keys()))
+        active = int(summary.get("active_proactive_orders") or sum(lane_counts.values()))
+        if active <= 0:
+            return ["proactive_plan: no active proactive orders", f"proactive_lanes: {lanes_s or 'none'}"]
+
+        top_lane = _clean(summary.get("top_lane"), 24) or "unknown"
+        top_action = _clean(summary.get("top_action"), 96) or "n/a"
+        order_part = ""
+        if isinstance(top_order, dict):
+            oid = _clean(top_order.get("order_id_short") or top_order.get("order_id"), 12)
+            title = _clean(top_order.get("title"), 48)
+            if oid or title:
+                order_part = f" order={oid or 'n/a'}"
+                if title:
+                    order_part += f" {title}"
+        return [f"proactive_plan: top={top_lane} action={top_action}{order_part}", f"proactive_lanes: {lanes_s or 'none'}"]
+    except Exception:
+        return ["proactive_plan: unavailable", "proactive_lanes: unavailable"]
+
+
 def _watch_status_text(cfg: BotConfig, orch_q: OrchestratorQueue) -> str:
     """
     Single-message "company status" snapshot intended to be edited in-place (no spam).
@@ -11531,6 +11582,7 @@ def _watch_status_text(cfg: BotConfig, orch_q: OrchestratorQueue) -> str:
         f"proactive_lane: {_proactive_lane_status_label(cfg)}",
         "",
     ]
+    lines[4:4] = _watch_proactive_plan_lines(orch_q)
 
     if health:
         lines.append("roles:")
