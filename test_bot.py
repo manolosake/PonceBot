@@ -3862,7 +3862,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             self.assertEqual(task.request_type, "query")
             self.assertEqual(task.mode_hint, "ro")
             self.assertEqual(task.effort, "high")
-            self.assertEqual(task.model, "gpt-5.3-codex-spark")
+            self.assertEqual(task.model, "gpt-5.5")
             self.assertFalse(task.requires_approval)
             self.assertEqual(int(task.priority), 1)
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
@@ -3895,7 +3895,7 @@ class TestJarvisFirstRouting(unittest.TestCase):
             self.assertEqual(task.request_type, "query")
             self.assertEqual(task.mode_hint, "ro")
             self.assertEqual(task.effort, "high")
-            self.assertEqual(task.model, "gpt-5.3-codex-spark")
+            self.assertEqual(task.model, "gpt-5.5")
             self.assertTrue(bool((task.trace or {}).get("suppress_ticket_card", False)))
 
 
