@@ -3962,19 +3962,85 @@ def _redact_codex_cmd_for_log(cmd: list[str]) -> list[str]:
 def _controller_git_write_guard_script() -> str:
     return """#!/bin/sh
 real_git="${PONCEBOT_REAL_GIT:-/usr/bin/git}"
+guard_roots="${PONCEBOT_GIT_WRITE_GUARD_ROOTS:-}"
 cmd=""
 skip_next=0
+target_cwd="$(pwd -P)"
+git_dir=""
+work_tree=""
+
+normalize_path() {
+  raw="$1"
+  if [ -z "$raw" ]; then
+    return 1
+  fi
+  if [ -d "$raw" ]; then
+    (cd "$raw" 2>/dev/null && pwd -P) && return 0
+  fi
+  parent="$(dirname "$raw")"
+  base="$(basename "$raw")"
+  if [ -d "$parent" ]; then
+    printf '%s/%s\n' "$(cd "$parent" 2>/dev/null && pwd -P)" "$base"
+    return 0
+  fi
+  printf '%s\n' "$raw"
+  return 0
+}
+
+path_is_protected() {
+  candidate="$(normalize_path "$1")" || return 1
+  old_ifs="$IFS"
+  IFS=":"
+  for root in $guard_roots; do
+    [ -n "$root" ] || continue
+    root_path="$(normalize_path "$root")" || continue
+    case "$candidate" in
+      "$root_path"|"$root_path"/*)
+        IFS="$old_ifs"
+        return 0
+        ;;
+    esac
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
 for arg in "$@"; do
   if [ "$skip_next" = "1" ]; then
+    case "$prev_arg" in
+      -C)
+        target_cwd="$(normalize_path "$arg")"
+        ;;
+      --git-dir)
+        git_dir="$arg"
+        ;;
+      --work-tree)
+        work_tree="$arg"
+        ;;
+    esac
     skip_next=0
     continue
   fi
   case "$arg" in
-    -C|-c|--git-dir|--work-tree|--namespace)
+    -C|--git-dir|--work-tree)
+      prev_arg="$arg"
       skip_next=1
       continue
       ;;
-    --git-dir=*|--work-tree=*|--namespace=*)
+    -c|--namespace)
+      prev_arg="$arg"
+      skip_next=1
+      continue
+      ;;
+    --git-dir=*)
+      git_dir="${arg#--git-dir=}"
+      continue
+      ;;
+    --work-tree=*)
+      work_tree="${arg#--work-tree=}"
+      continue
+      ;;
+    --namespace=*)
       continue
       ;;
     --*)
@@ -3992,8 +4058,14 @@ done
 
 case "$cmd" in
   add|am|apply|bisect|branch|checkout|cherry-pick|clean|clone|commit|fetch|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|worktree)
-    echo "PonceBot controller git write guard blocked: git $cmd" >&2
-    exit 126
+    if [ -n "$guard_roots" ] && {
+      path_is_protected "$target_cwd" ||
+      path_is_protected "$git_dir" ||
+      path_is_protected "$work_tree"
+    }; then
+      echo "PonceBot controller git write guard blocked: git $cmd" >&2
+      exit 126
+    fi
     ;;
 esac
 
@@ -4010,6 +4082,7 @@ class CodexRunner:
         allow_bypass: bool = True,
         forced_mode: str | None = None,
         guard_git_writes: bool = False,
+        guard_git_write_roots: list[Path] | None = None,
     ) -> None:
         self._cfg = cfg
         self._chat_id = chat_id
@@ -4018,6 +4091,17 @@ class CodexRunner:
             raise ValueError(f"Invalid forced mode: {forced_mode}")
         self._forced_mode = forced_mode
         self._guard_git_writes = bool(guard_git_writes)
+        default_roots = [self._cfg.codex_workdir] if self._guard_git_writes else []
+        raw_roots = list(guard_git_write_roots or default_roots)
+        resolved_roots: list[str] = []
+        for root in raw_roots:
+            try:
+                resolved = str(Path(root).resolve())
+            except Exception:
+                resolved = str(root)
+            if resolved and resolved not in resolved_roots:
+                resolved_roots.append(resolved)
+        self._guard_git_write_roots = resolved_roots
     
     def _bypass_sandbox(self) -> bool:
         if not self._allow_bypass:
@@ -4076,6 +4160,7 @@ class CodexRunner:
                 except Exception:
                     pass
                 env["PONCEBOT_REAL_GIT"] = real_git
+                env["PONCEBOT_GIT_WRITE_GUARD_ROOTS"] = os.pathsep.join(self._guard_git_write_roots)
                 env["PATH"] = str(git_guard_dir) + os.pathsep + str(env.get("PATH") or "")
         except Exception:
             pass
@@ -26166,6 +26251,14 @@ def _orchestrator_run_codex(
         allow_bypass=True,
         forced_mode=forced_mode,
         guard_git_writes=_role_disallows_repo_writes(role),
+        guard_git_write_roots=[
+            path
+            for path in (
+                controller_snapshot_dir or eff_cfg.codex_workdir,
+                worktree_dir,
+            )
+            if path is not None
+        ],
     )
     proc: CodexRunner.Running
     used_thread_id: str | None = None

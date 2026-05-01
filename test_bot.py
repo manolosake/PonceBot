@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -4287,6 +4288,7 @@ class TestBypassAwareEnforcement(unittest.TestCase):
             guard.chmod(0o755)
             env = dict(os.environ)
             env["PONCEBOT_REAL_GIT"] = "/bin/echo"
+            env["PONCEBOT_GIT_WRITE_GUARD_ROOTS"] = "/tmp/repo"
 
             ok = subprocess.run([str(guard), "status", "--short"], env=env, capture_output=True, text=True)
             self.assertEqual(ok.returncode, 0)
@@ -4295,6 +4297,75 @@ class TestBypassAwareEnforcement(unittest.TestCase):
             blocked = subprocess.run([str(guard), "-C", "/tmp/repo", "push", "origin", "main"], env=env, capture_output=True, text=True)
             self.assertEqual(blocked.returncode, 126)
             self.assertIn("blocked: git push", blocked.stderr)
+
+    def test_controller_git_write_guard_allows_temp_git_repos_outside_protected_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            guard = root / "git"
+            guard.write_text(bot._controller_git_write_guard_script(), encoding="utf-8")
+            guard.chmod(0o755)
+
+            protected = root / "protected"
+            protected.mkdir()
+            subprocess.run(["git", "-C", str(protected), "init"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(protected), "config", "user.name", "tester"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(protected), "config", "user.email", "tester@example.com"], check=True, capture_output=True, text=True)
+            (protected / "README.md").write_text("protected\n", encoding="utf-8")
+
+            env = dict(os.environ)
+            env["PONCEBOT_REAL_GIT"] = shutil.which("git") or "/usr/bin/git"
+            env["PONCEBOT_GIT_WRITE_GUARD_ROOTS"] = str(protected.resolve())
+
+            blocked = subprocess.run([str(guard), "-C", str(protected), "add", "README.md"], env=env, capture_output=True, text=True)
+            self.assertEqual(blocked.returncode, 126)
+            self.assertIn("blocked: git add", blocked.stderr)
+
+            repo = root / "temp_repo"
+            repo.mkdir()
+            subprocess.run([str(guard), "-C", str(repo), "init"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(repo), "config", "user.name", "tester"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(repo), "config", "user.email", "tester@example.com"], env=env, check=True, capture_output=True, text=True)
+            (repo / "app.txt").write_text("temp\n", encoding="utf-8")
+            subprocess.run([str(guard), "-C", str(repo), "add", "app.txt"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(repo), "commit", "-m", "init"], env=env, check=True, capture_output=True, text=True)
+
+            clone_dir = root / "clone_repo"
+            subprocess.run([str(guard), "clone", str(repo), str(clone_dir)], env=env, cwd=str(root), check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(clone_dir), "checkout", "-b", "feature/test"], env=env, check=True, capture_output=True, text=True)
+
+            branch = subprocess.run(
+                ["git", "-C", str(clone_dir), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(branch, "feature/test")
+
+    def test_codex_runner_exports_guard_roots_for_controller_git_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td) / "snapshot"
+            source = Path(td) / "source"
+            workdir.mkdir()
+            source.mkdir()
+            state_file = Path(td) / "state.json"
+            state_file.write_text("{}\n", encoding="utf-8")
+            cfg = TestStateHandling()._cfg(state_file)
+            cfg = bot.dataclasses.replace(cfg, codex_workdir=workdir)
+            runner = bot.CodexRunner(
+                cfg,
+                guard_git_writes=True,
+                guard_git_write_roots=[workdir, source],
+            )
+
+            with patch.object(bot.subprocess, "Popen") as popen:
+                popen.side_effect = FileNotFoundError("no codex in test")
+                with self.assertRaises(FileNotFoundError):
+                    runner.start_threaded_new(prompt="hi", mode_hint="ro")
+                env = popen.call_args.kwargs["env"]
+
+            exported = str(env.get("PONCEBOT_GIT_WRITE_GUARD_ROOTS") or "")
+            self.assertIn(str(workdir.resolve()), exported)
+            self.assertIn(str(source.resolve()), exported)
 
     def test_read_only_violation_stash_cleans_worktree(self) -> None:
 
