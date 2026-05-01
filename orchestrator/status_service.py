@@ -2809,6 +2809,51 @@ class StatusService:
                 "title": _text(label, action_id.replace("_", " ").title()),
             }
 
+        def _fallback_owner_role(*, source: str, category: str) -> str:
+            category_key = _text(category).lower()
+            source_key = _text(source).lower()
+            if category_key == "approval":
+                return "reviewer_local"
+            if category_key in {"proactive_release", "proactive_monitor"}:
+                return "release_mgr"
+            if category_key == "proactive_health":
+                return "implementer_local"
+            if category_key == "stalled":
+                return "sre"
+            if source_key == "proactive_priorities":
+                return "implementer_local"
+            if source_key == "control_room":
+                return "reviewer_local"
+            return "implementer_local"
+
+        def _compact_owner_action_evidence(item: dict[str, Any]) -> dict[str, Any]:
+            handoff = item.get("handoff") if isinstance(item.get("handoff"), dict) else {}
+            owner_role = _text((handoff or {}).get("suggested_role")) or _fallback_owner_role(
+                source=_text(item.get("source")),
+                category=_text(item.get("category")),
+            )
+            evidence_required = [
+                text
+                for text in (_text(value) for value in list((handoff or {}).get("evidence_expectations") or []))
+                if text
+            ][:3]
+            if not evidence_required:
+                category = _text(item.get("category"), "operator action").replace("_", " ")
+                evidence_required = [f"{category} completion evidence"]
+            inspect_path = (
+                _text((handoff or {}).get("inspect_path"))
+                or _text((handoff or {}).get("suggested_endpoint"))
+                or _text(item.get("inspect_path"))
+                or _text(item.get("target"))
+                or None
+            )
+            return {
+                "owner_role": owner_role,
+                "action": _text(item.get("next_action"), "Review operator focus item."),
+                "evidence_required": evidence_required,
+                "inspect_path": inspect_path,
+            }
+
         def _focus_packet(item: dict[str, Any] | None) -> dict[str, Any] | None:
             if not item:
                 return None
@@ -2833,6 +2878,7 @@ class StatusService:
                 "priority",
                 "count",
                 "handoff",
+                "owner_action_evidence",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -2892,6 +2938,7 @@ class StatusService:
                 packet["priority"] = priority
             if isinstance(handoff, dict) and handoff:
                 packet["handoff"] = handoff
+            packet["owner_action_evidence"] = _compact_owner_action_evidence(packet)
             return packet
 
         items: list[dict[str, Any]] = []
