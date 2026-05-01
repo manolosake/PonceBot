@@ -3420,23 +3420,13 @@ class StatusService:
             "items": returned,
         }
 
-    def operator_focus_handoff(
+    def _select_operator_focus_item(
         self,
+        report: dict[str, Any],
         *,
-        chat_id: int | None = None,
         action_id: str | None = None,
         rank: int | None = None,
-        categories: list[str] | None = None,
-        urgencies: list[str] | None = None,
-        sources: list[str] | None = None,
-    ) -> dict[str, Any]:
-        report = self.operator_focus(
-            chat_id=chat_id,
-            limit=20,
-            categories=categories,
-            urgencies=urgencies,
-            sources=sources,
-        )
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
         items = [item for item in list(report.get("items") or []) if isinstance(item, dict)]
         normalized_action_id = str(action_id or "").strip()
         selected: dict[str, Any] | None = None
@@ -3461,19 +3451,109 @@ class StatusService:
         elif items:
             selected = items[0]
 
+        selection = {
+            "action_id": normalized_action_id or None,
+            "rank": int(rank) if rank is not None else None,
+            "matched_by": matched_by if selected else None,
+        }
+        return selected, selection
+
+    def _operator_focus_item_identity(self, item: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not item:
+            return None
+        keys = ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id")
+        return {key: item.get(key) for key in keys if item.get(key) is not None}
+
+    def _fallback_operator_focus_briefing_packet(self, item: dict[str, Any]) -> dict[str, Any]:
+        def _text(value: Any, default: str = "") -> str:
+            text = str(value or "").strip()
+            return text if text else default
+
+        action_id = _text(item.get("action_id"), "unknown")
+        source = _text(item.get("source"), "operator_focus")
+        action = _text(item.get("next_action"), _text(item.get("label"), "Review operator focus item."))
+        inspect_endpoint = (
+            _text(item.get("inspect_path"))
+            or _text(item.get("target"))
+            or "/api/v1/orchestration/operator-focus"
+        )
+        handoff_endpoint = _text(item.get("target")) or inspect_endpoint
+
+        return {
+            "owner_role": "operator",
+            "action": action,
+            "inspect_endpoint": inspect_endpoint,
+            "handoff_endpoint": handoff_endpoint,
+            "evidence_required": ["completion summary"],
+            "suggested_validation": ["Re-read the inspect endpoint after the action."],
+            "definition_of_done": [action, "Record the operator-visible outcome before handing back."],
+            "assignment_prompt": (
+                f"Action: {action} Inspect {inspect_endpoint}; return evidence for "
+                f"{source} action {action_id}."
+            ),
+        }
+
+    def operator_focus_handoff(
+        self,
+        *,
+        chat_id: int | None = None,
+        action_id: str | None = None,
+        rank: int | None = None,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=20,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
         selected_packet = dict(selected) if selected else None
         return {
             "api_version": "v1",
             "schema_version": 1,
             "generated_at": report.get("generated_at"),
             "chat_id": report.get("chat_id"),
-            "selection": {
-                "action_id": normalized_action_id or None,
-                "rank": int(rank) if rank is not None else None,
-                "matched_by": matched_by if selected else None,
-            },
+            "selection": selection,
             "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
             "item": selected_packet,
+        }
+
+    def operator_focus_briefing(
+        self,
+        *,
+        chat_id: int | None = None,
+        action_id: str | None = None,
+        rank: int | None = None,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=20,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
+        briefing_packet = None
+        if selected:
+            existing = selected.get("briefing_packet")
+            briefing_packet = dict(existing) if isinstance(existing, dict) and existing else self._fallback_operator_focus_briefing_packet(selected)
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "selection": selection,
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "item_identity": self._operator_focus_item_identity(selected),
+            "briefing_packet": briefing_packet,
         }
 
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
