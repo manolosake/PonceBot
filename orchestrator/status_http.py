@@ -60,6 +60,19 @@ def _parse_filter_values(qs: dict[str, list[str]], name: str) -> list[str]:
     return values
 
 
+def _parse_positive_rank(qs: dict[str, list[str]]) -> tuple[int | None, bool]:
+    raw = (qs.get("rank") or [""])[0].strip()
+    if not raw:
+        return None, True
+    try:
+        rank = int(raw)
+    except Exception:
+        return None, False
+    if rank < 1:
+        return None, False
+    return rank, True
+
+
 def _parse_since_ts(qs: dict[str, list[str]]) -> float | None:
     raw = (qs.get("since_ts") or [""])[0].strip()
     if not raw:
@@ -392,6 +405,29 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
             )
+            self._send_json(200, payload)
+            return
+
+        if path in ("/api/v1/orchestration/operator-focus/handoff", "/api/orchestration/operator-focus/handoff"):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            action_id = (qs.get("action_id") or [""])[0].strip()
+            rank, rank_ok = _parse_positive_rank(qs)
+            if not action_id and not rank_ok:
+                self._send_json(400, {"error": "invalid_rank", "selection": {"rank": (qs.get("rank") or [""])[0].strip()}})
+                return
+            payload = self.server.status_service.operator_focus_handoff(
+                chat_id=chat_id,
+                action_id=action_id or None,
+                rank=rank,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+            )
+            if not payload.get("item"):
+                self._send_json(404, payload)
+                return
             self._send_json(200, payload)
             return
 
