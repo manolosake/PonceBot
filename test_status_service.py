@@ -109,6 +109,99 @@ class TestStatusService(unittest.TestCase):
                 self.assertEqual((top.get("item") or {}).get("action_id"), "focus:first")
                 self.assertEqual((top.get("selection") or {}).get("matched_by"), "top")
 
+    def test_operator_focus_briefing_preserves_existing_packet_for_action_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "summary": {"returned": 2},
+                "items": [
+                    {
+                        "rank": 1,
+                        "action_id": "focus:first",
+                        "label": "First",
+                        "next_action": "Do first",
+                        "source": "control_room",
+                        "briefing_packet": {
+                            "owner_role": "reviewer_local",
+                            "action": "Review first",
+                            "inspect_endpoint": "/inspect/first",
+                            "handoff_endpoint": "/handoff/first",
+                            "evidence_required": ["summary"],
+                            "suggested_validation": ["check first"],
+                            "definition_of_done": ["first done"],
+                            "assignment_prompt": "Use the first packet.",
+                        },
+                    },
+                    {
+                        "rank": 2,
+                        "action_id": "focus:second",
+                        "label": "Second",
+                        "next_action": "Do second",
+                        "source": "proactive_health",
+                    },
+                ],
+            }
+
+            with mock.patch.object(svc, "operator_focus", return_value=report):
+                briefing = svc.operator_focus_briefing(chat_id=7, action_id="focus:first")
+
+            self.assertEqual((briefing.get("selection") or {}).get("matched_by"), "action_id")
+            self.assertEqual((briefing.get("item_identity") or {}).get("action_id"), "focus:first")
+            packet = briefing.get("briefing_packet") or {}
+            self.assertEqual(packet.get("owner_role"), "reviewer_local")
+            self.assertEqual(packet.get("assignment_prompt"), "Use the first packet.")
+
+    def test_operator_focus_briefing_falls_back_when_packet_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "summary": {"returned": 2},
+                "items": [
+                    {
+                        "rank": 1,
+                        "action_id": "focus:first",
+                        "label": "First",
+                        "next_action": "Do first",
+                        "source": "control_room",
+                    },
+                    {
+                        "rank": 2,
+                        "action_id": "focus:second",
+                        "label": "Second",
+                        "next_action": "Do second",
+                        "source": "proactive_health",
+                        "inspect_path": "/inspect/second",
+                        "target": "/handoff/second",
+                    },
+                ],
+            }
+
+            with mock.patch.object(svc, "operator_focus", return_value=report):
+                briefing = svc.operator_focus_briefing(chat_id=7, rank=2)
+
+            self.assertEqual((briefing.get("selection") or {}).get("matched_by"), "rank")
+            self.assertEqual((briefing.get("item_identity") or {}).get("action_id"), "focus:second")
+            packet = briefing.get("briefing_packet") or {}
+            self.assertEqual(packet.get("owner_role"), "operator")
+            self.assertEqual(packet.get("inspect_endpoint"), "/inspect/second")
+            self.assertEqual(packet.get("handoff_endpoint"), "/handoff/second")
+            self.assertEqual(packet.get("evidence_required"), ["completion summary"])
+            self.assertIn("focus:second", str(packet.get("assignment_prompt")))
+
     def test_snapshot_assigns_current_and_next_by_worker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
