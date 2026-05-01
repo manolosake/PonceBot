@@ -59,6 +59,62 @@ def _running_status_http_server(*, wait_headers: dict[str, str] | None = None, *
 
 
 class TestStatusHTTP(unittest.TestCase):
+    def test_operator_focus_handoff_endpoint_supports_rank_and_invalid_rank(self) -> None:
+        class _FakeStatusService:
+            def snapshot(self, *, chat_id: int | None = None) -> dict[str, object]:
+                return {"api_version": "v1", "schema_version": 2, "chat_id": chat_id}
+
+            def operator_focus_handoff(
+                self,
+                *,
+                chat_id: int | None = None,
+                action_id: str | None = None,
+                rank: int | None = None,
+                categories: list[str] | None = None,
+                urgencies: list[str] | None = None,
+                sources: list[str] | None = None,
+            ) -> dict[str, object]:
+                return {
+                    "api_version": "v1",
+                    "schema_version": 1,
+                    "chat_id": chat_id,
+                    "selection": {
+                        "action_id": action_id,
+                        "rank": rank,
+                    },
+                    "item": {
+                        "action_id": action_id or "focus:first",
+                        "rank": rank or 1,
+                    },
+                }
+
+        with _running_status_http_server(
+            host="127.0.0.1",
+            port=0,
+            status_service=_FakeStatusService(),
+            stream_interval_s=0.5,
+            auth_token="secret",
+            snapshot_rate_per_s=0.0,
+            snapshot_burst=1.0,
+            max_sse_per_ip=2,
+            wait_headers={"Authorization": "Bearer secret"},
+        ) as (_http_srv, base):
+            headers = {"Authorization": "Bearer secret"}
+
+            req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/handoff?rank=1", headers=headers)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual((payload.get("item") or {}).get("rank"), 1)
+                self.assertEqual(((payload.get("selection") or {}).get("rank")), 1)
+
+            bad_req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/handoff?rank=0", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as bad_ctx:
+                urllib.request.urlopen(bad_req, timeout=2).read()
+            self.assertEqual(bad_ctx.exception.code, 400)
+            bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
+            self.assertEqual(bad_payload.get("error"), "invalid_rank")
+
     def test_send_json_ignores_client_disconnect_errors(self) -> None:
         class _DisconnectingWriter:
             def __init__(self, exc: BaseException) -> None:

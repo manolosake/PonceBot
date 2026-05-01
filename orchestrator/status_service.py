@@ -3258,6 +3258,62 @@ class StatusService:
             "items": returned,
         }
 
+    def operator_focus_handoff(
+        self,
+        *,
+        chat_id: int | None = None,
+        action_id: str | None = None,
+        rank: int | None = None,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=20,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        items = [item for item in list(report.get("items") or []) if isinstance(item, dict)]
+        normalized_action_id = str(action_id or "").strip()
+        selected: dict[str, Any] | None = None
+        matched_by = "top"
+
+        if normalized_action_id:
+            selected = next(
+                (item for item in items if str(item.get("action_id") or "").strip() == normalized_action_id),
+                None,
+            )
+            matched_by = "action_id"
+        elif rank is not None:
+            selected = next(
+                (
+                    item
+                    for item in items
+                    if isinstance(item.get("rank"), int) and int(item.get("rank")) == int(rank)
+                ),
+                None,
+            )
+            matched_by = "rank"
+        elif items:
+            selected = items[0]
+
+        selected_packet = dict(selected) if selected else None
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "selection": {
+                "action_id": normalized_action_id or None,
+                "rank": int(rank) if rank is not None else None,
+                "matched_by": matched_by if selected else None,
+            },
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "item": selected_packet,
+        }
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.

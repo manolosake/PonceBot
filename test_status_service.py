@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.schemas.task import Task
@@ -11,6 +12,49 @@ from orchestrator.storage import SQLiteTaskStorage
 
 
 class TestStatusService(unittest.TestCase):
+    def test_operator_focus_handoff_selects_by_rank_and_action_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "summary": {"returned": 2},
+                "items": [
+                    {
+                        "rank": 1,
+                        "action_id": "focus:first",
+                        "label": "First",
+                        "next_action": "Do first",
+                        "source": "control_room",
+                    },
+                    {
+                        "rank": 2,
+                        "action_id": "focus:second",
+                        "label": "Second",
+                        "next_action": "Do second",
+                        "source": "proactive_health",
+                    },
+                ],
+            }
+
+            with mock.patch.object(svc, "operator_focus", return_value=report):
+                by_rank = svc.operator_focus_handoff(chat_id=7, rank=2)
+                self.assertEqual((by_rank.get("item") or {}).get("action_id"), "focus:second")
+                self.assertEqual((by_rank.get("selection") or {}).get("matched_by"), "rank")
+
+                by_action = svc.operator_focus_handoff(chat_id=7, action_id="focus:first", rank=99)
+                self.assertEqual((by_action.get("item") or {}).get("action_id"), "focus:first")
+                self.assertEqual((by_action.get("selection") or {}).get("matched_by"), "action_id")
+
+                top = svc.operator_focus_handoff(chat_id=7)
+                self.assertEqual((top.get("item") or {}).get("action_id"), "focus:first")
+                self.assertEqual((top.get("selection") or {}).get("matched_by"), "top")
+
     def test_snapshot_assigns_current_and_next_by_worker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
