@@ -78,6 +78,29 @@ def build_report(
     return svc.operator_focus(chat_id=chat_id, limit=limit, categories=categories, urgencies=urgencies, sources=sources)
 
 
+def build_handoff(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    action_id: str | None = None,
+    rank: int | None = None,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.operator_focus_handoff(
+        chat_id=chat_id,
+        action_id=action_id,
+        rank=rank,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     source_counts = summary.get("source_counts") if isinstance(summary.get("source_counts"), dict) else {}
@@ -167,11 +190,127 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _append_list(lines: list[str], title: str, values: Any) -> None:
+    lines.extend([f"## {title}", ""])
+    if isinstance(values, list) and values:
+        for value in values:
+            lines.append(f"- {_one_line(value)}")
+    else:
+        text = _one_line(values)
+        if text != "-":
+            lines.append(f"- {text}")
+        else:
+            lines.append("- None.")
+    lines.append("")
+
+
+def render_handoff_markdown(handoff: dict[str, Any]) -> str:
+    selection = handoff.get("selection") if isinstance(handoff.get("selection"), dict) else {}
+    summary = handoff.get("summary") if isinstance(handoff.get("summary"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
+    item = handoff.get("item") if isinstance(handoff.get("item"), dict) else None
+
+    lines = [
+        "# Operator Focus Handoff",
+        "",
+        f"- Generated: {_one_line(handoff.get('generated_at'))}",
+        f"- Chat: {_one_line(handoff.get('chat_id'), default='all')}",
+        "",
+        "## Selection",
+        "",
+        f"- Action id: {_one_line(selection.get('action_id'))}",
+        f"- Rank: {_one_line(selection.get('rank'))}",
+        f"- Matched by: {_one_line(selection.get('matched_by'))}",
+        "",
+        "## Summary",
+        "",
+        f"- Returned: {_one_line(summary.get('returned'), default='0')}",
+        f"- Health: {_one_line(summary.get('health_level'))}",
+        f"- Top action: {_one_line(summary.get('top_action_id'))}",
+        f"- Top category: {_one_line(summary.get('top_category'))}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        "",
+    ]
+
+    if not item:
+        lines.extend(
+            [
+                "## Selected Item",
+                "",
+                "No handoff item matched the requested selector.",
+                "",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    delegate = item.get("delegate_contract") if isinstance(item.get("delegate_contract"), dict) else {}
+    lines.extend(
+        [
+            "## Selected Item",
+            "",
+            f"- Rank: {_one_line(item.get('rank'))}",
+            f"- Action id: {_one_line(item.get('action_id'))}",
+            f"- Urgency: {_one_line(item.get('urgency'))}",
+            f"- Category: {_one_line(item.get('category'))}",
+            f"- Label: {_one_line(item.get('label'))}",
+            f"- Next action: {_one_line(item.get('next_action'))}",
+            f"- Target: {_one_line(item.get('target'))}",
+            f"- Inspect path: {_one_line(item.get('inspect_path'))}",
+            f"- Inspect target: {_one_line(item.get('inspect_target'))}",
+            f"- Action target: {_one_line(item.get('action_target'))}",
+            f"- Order id: {_one_line(item.get('order_id'))}",
+            f"- Job id: {_one_line(item.get('job_id'))}",
+            f"- Repo id: {_one_line(item.get('repo_id'))}",
+            f"- Source: {_one_line(item.get('source'))}",
+            f"- Source signals: {_one_line_list(item.get('source_signals'))}",
+            f"- Reason: {_one_line(item.get('reason'))}",
+            "",
+            "## Delegate Contract",
+            "",
+            f"- Delegate role: {_one_line(delegate.get('delegate_role'))}",
+            f"- Task title: {_one_line(delegate.get('task_title'))}",
+            f"- Source action id: {_one_line(delegate.get('source_action_id'))}",
+            f"- Handoff endpoint: {_one_line(delegate.get('handoff_endpoint'))}",
+            f"- Inspect endpoint: {_one_line(delegate.get('inspect_endpoint'))}",
+            "",
+        ]
+    )
+
+    _append_list(lines, "Acceptance Criteria", delegate.get("acceptance_criteria"))
+    _append_list(lines, "Definition Of Done", delegate.get("definition_of_done"))
+    _append_list(lines, "Evidence Required", delegate.get("evidence_required"))
+    _append_list(lines, "Suggested Tests", delegate.get("suggested_tests"))
+    _append_list(lines, "Risk Notes", delegate.get("risk_notes"))
+
+    lines.extend(
+        [
+            "## Task Prompt",
+            "",
+            "```text",
+            _ascii(delegate.get("task_prompt")).rstrip(),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render an offline operator-focus report from the orchestrator SQLite database.")
     parser.add_argument("--db", required=True, type=Path, help="Path to the orchestrator SQLite database.")
     parser.add_argument("--format", choices=("json", "md", "markdown"), default="json", help="Output format.")
+    parser.add_argument("--handoff", action="store_true", help="Render the selected operator-focus handoff payload.")
     parser.add_argument("--limit", type=_positive_int, default=5, help="Maximum ranked focus items to return.")
+    parser.add_argument("--rank", type=_positive_int, help="Select a handoff focus item by rank.")
+    parser.add_argument("--action-id", help="Select a handoff focus item by action id. Takes precedence over --rank.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
     parser.add_argument("--category", action="append", help="Filter by focus category. Repeat or use comma-separated values.")
     parser.add_argument("--urgency", action="append", help="Filter by urgency. Repeat or use comma-separated values.")
@@ -195,20 +334,33 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
     sources = _parse_filter_values(args.source)
 
     try:
-        report = build_report(
-            db_path=db_path,
-            chat_id=args.chat_id,
-            limit=args.limit,
-            categories=categories,
-            urgencies=urgencies,
-            sources=sources,
-        )
+        if args.handoff:
+            report = build_handoff(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                action_id=args.action_id,
+                rank=args.rank,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+            )
+        else:
+            report = build_report(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                limit=args.limit,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+            )
     except Exception as exc:
         print(f"failed to render operator focus report: {exc}", file=err)
         return 2
 
     if args.format == "json":
         rendered = json.dumps(report, sort_keys=True, ensure_ascii=True, indent=2) + "\n"
+    elif args.handoff:
+        rendered = render_handoff_markdown(report)
     else:
         rendered = render_markdown(report)
 
