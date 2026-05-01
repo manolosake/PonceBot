@@ -75,6 +75,15 @@ def validate_evidence(
             "summary_path": str(summary_path),
         }
 
+    next_action = payload.get("next_action")
+    if next_action is not None:
+        return False, {
+            "ok": False,
+            "reason": "next_action_open",
+            "summary_path": str(summary_path),
+            "next_action": next_action,
+        }
+
     raw_artifacts = payload.get("artifacts")
     if not isinstance(raw_artifacts, list):
         return False, {

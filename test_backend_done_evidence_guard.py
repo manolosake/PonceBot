@@ -31,6 +31,69 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["artifact_count"], 1)
 
+    def test_validate_evidence_fails_when_next_action_is_string(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof = artifacts_dir / "proof.log"
+            proof.write_text("ok\n", encoding="utf-8")
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof.log"],
+                        "next_action": "follow up with reviewer",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "next_action_open")
+
+    def test_validate_evidence_fails_when_next_action_is_object(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof = artifacts_dir / "proof.log"
+            proof.write_text("ok\n", encoding="utf-8")
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof.log"],
+                        "next_action": {"step": "follow up"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "next_action_open")
+
+    def test_validate_evidence_fails_when_next_action_is_list(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            proof = artifacts_dir / "proof.log"
+            proof.write_text("ok\n", encoding="utf-8")
+            (artifacts_dir / "final_evidence.json").write_text(
+                json.dumps(
+                    {
+                        "summary": "verified improvement",
+                        "artifacts": ["proof.log"],
+                        "next_action": ["follow up"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "next_action_open")
+
     def test_validate_evidence_fails_when_summary_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             ok, payload = validate_evidence(artifacts_dir=Path(td))
