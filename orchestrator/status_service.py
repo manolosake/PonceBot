@@ -2854,6 +2854,101 @@ class StatusService:
                 "inspect_path": inspect_path,
             }
 
+        def _delegate_contract(item: dict[str, Any]) -> dict[str, Any]:
+            handoff = item.get("handoff") if isinstance(item.get("handoff"), dict) else {}
+            owner_evidence = item.get("owner_action_evidence") if isinstance(item.get("owner_action_evidence"), dict) else {}
+            delegate_role = (
+                _text(handoff.get("suggested_role"))
+                or _text(owner_evidence.get("owner_role"))
+                or _fallback_owner_role(source=_text(item.get("source")), category=_text(item.get("category")))
+            )
+            task_title = _text(handoff.get("title")) or _text(item.get("label")) or _text(item.get("action_id"), "Operator focus item")
+            action = _text(item.get("next_action"), _text(owner_evidence.get("action"), "Review operator focus item."))
+            handoff_endpoint = (
+                _text(handoff.get("suggested_endpoint"))
+                or _text(item.get("target"))
+                or "/api/v1/orchestration/operator-focus"
+            )
+            inspect_endpoint = (
+                _text(handoff.get("inspect_path"))
+                or _text(item.get("inspect_path"))
+                or handoff_endpoint
+            )
+            definition_of_done = [
+                text
+                for text in (_text(value) for value in list(handoff.get("definition_of_done") or []))
+                if text
+            ]
+            if not definition_of_done:
+                definition_of_done = [action, "Record the operator-visible outcome before handing back."]
+            acceptance_criteria = [
+                text
+                for text in (_text(value) for value in list(handoff.get("checklist") or []))
+                if text
+            ]
+            if not acceptance_criteria:
+                acceptance_criteria = [
+                    f"Inspect {inspect_endpoint}.",
+                    action,
+                    "Stay within the referenced order, job, endpoint, or focus item scope.",
+                ]
+            evidence_required = [
+                text
+                for text in (
+                    _text(value)
+                    for value in list(owner_evidence.get("evidence_required") or handoff.get("evidence_expectations") or [])
+                )
+                if text
+            ]
+            if not evidence_required:
+                evidence_required = ["completion summary", "updated status or trace evidence"]
+            suggested_tests = [
+                "Re-read the inspect endpoint after the action.",
+                "Verify the acceptance criteria and evidence expectations are satisfied.",
+            ]
+            risk_notes = [
+                "Do not edit outside the referenced endpoint, order, job, repository, or focus item scope.",
+                "Preserve existing endpoint, auth, filter, rank, and not-found behavior.",
+            ]
+
+            prompt_lines = [
+                f"ROLE: {delegate_role}.",
+                "",
+                f"Task: {task_title}",
+                f"Scope: Work only on action { _text(item.get('action_id'), 'unknown') } and the referenced endpoint/order/job context.",
+                f"Inspect endpoint: {inspect_endpoint}",
+                f"Handoff endpoint: {handoff_endpoint}",
+                f"Action: {action}",
+                "",
+                "Acceptance criteria:",
+                *(f"- {criterion}" for criterion in acceptance_criteria),
+                "",
+                "Definition of done:",
+                *(f"- {criterion}" for criterion in definition_of_done),
+                "",
+                "Evidence required:",
+                *(f"- {evidence}" for evidence in evidence_required),
+                "",
+                "Suggested validation:",
+                *(f"- {test}" for test in suggested_tests),
+                "",
+                "Warning: do not edit outside the referenced endpoint, order, job, repository, or focus item scope.",
+            ]
+
+            return {
+                "delegate_role": delegate_role,
+                "task_title": task_title,
+                "task_prompt": "\n".join(prompt_lines),
+                "handoff_endpoint": handoff_endpoint,
+                "inspect_endpoint": inspect_endpoint,
+                "acceptance_criteria": acceptance_criteria,
+                "definition_of_done": definition_of_done,
+                "evidence_required": evidence_required,
+                "suggested_tests": suggested_tests,
+                "risk_notes": risk_notes,
+                "source_action_id": _text(item.get("action_id")) or None,
+            }
+
         def _focus_packet(item: dict[str, Any] | None) -> dict[str, Any] | None:
             if not item:
                 return None
@@ -2879,6 +2974,7 @@ class StatusService:
                 "count",
                 "handoff",
                 "owner_action_evidence",
+                "delegate_contract",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -2939,6 +3035,7 @@ class StatusService:
             if isinstance(handoff, dict) and handoff:
                 packet["handoff"] = handoff
             packet["owner_action_evidence"] = _compact_owner_action_evidence(packet)
+            packet["delegate_contract"] = _delegate_contract(packet)
             return packet
 
         items: list[dict[str, Any]] = []
