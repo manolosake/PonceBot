@@ -80,6 +80,15 @@ def _build_entries(
     return entries
 
 
+def _manifest_size_bytes(entry: dict[str, Any]) -> tuple[int | None, str | None]:
+    value = entry.get('size_bytes')
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, 'size_bytes must be an integer'
+    if value < 0:
+        return None, 'size_bytes must be non-negative'
+    return value, None
+
+
 def cmd_write(args: argparse.Namespace) -> int:
     art = Path(args.artifacts_dir).expanduser().resolve()
     art.mkdir(parents=True, exist_ok=True)
@@ -173,8 +182,11 @@ def cmd_check(args: argparse.Namespace) -> int:
             continue
         size = p.stat().st_size
         sha = _sha256(p)
-        if int(entry.get('size_bytes', -1)) != int(size):
-            mismatches.append({'name': name, 'reason': 'size mismatch', 'manifest': entry.get('size_bytes'), 'actual': size})
+        manifest_size, size_error = _manifest_size_bytes(entry)
+        if size_error is not None:
+            mismatches.append({'name': name, 'reason': size_error, 'manifest': entry.get('size_bytes'), 'actual': size})
+        elif manifest_size != size:
+            mismatches.append({'name': name, 'reason': 'size mismatch', 'manifest': manifest_size, 'actual': size})
         if str(entry.get('sha256') or '') != sha:
             mismatches.append({'name': name, 'reason': 'sha256 mismatch', 'manifest': entry.get('sha256'), 'actual': sha})
 
