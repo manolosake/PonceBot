@@ -2949,6 +2949,69 @@ class StatusService:
                 "source_action_id": _text(item.get("action_id")) or None,
             }
 
+        def _briefing_packet(item: dict[str, Any]) -> dict[str, Any]:
+            handoff = item.get("handoff") if isinstance(item.get("handoff"), dict) else {}
+            owner_evidence = item.get("owner_action_evidence") if isinstance(item.get("owner_action_evidence"), dict) else {}
+            delegate = item.get("delegate_contract") if isinstance(item.get("delegate_contract"), dict) else {}
+            owner_role = (
+                _text(owner_evidence.get("owner_role"))
+                or _text(delegate.get("delegate_role"))
+                or _fallback_owner_role(source=_text(item.get("source")), category=_text(item.get("category")))
+            )
+            action = _text(owner_evidence.get("action")) or _text(item.get("next_action"), "Review operator focus item.")
+            inspect_endpoint = (
+                _text(delegate.get("inspect_endpoint"))
+                or _text(owner_evidence.get("inspect_path"))
+                or _text(handoff.get("inspect_path"))
+                or _text(item.get("inspect_path"))
+                or _text(item.get("target"))
+                or "/api/v1/orchestration/operator-focus"
+            )
+            handoff_endpoint = (
+                _text(delegate.get("handoff_endpoint"))
+                or _text(handoff.get("suggested_endpoint"))
+                or _text(item.get("target"))
+                or "/api/v1/orchestration/operator-focus"
+            )
+            evidence_required = [
+                text
+                for text in (
+                    _text(value)
+                    for value in list(delegate.get("evidence_required") or owner_evidence.get("evidence_required") or [])
+                )
+                if text
+            ][:3]
+            if not evidence_required:
+                evidence_required = ["completion summary"]
+            suggested_validation = [
+                text
+                for text in (_text(value) for value in list(delegate.get("suggested_tests") or []))
+                if text
+            ][:3]
+            if not suggested_validation:
+                suggested_validation = ["Re-read the inspect endpoint after the action."]
+            definition_of_done = [
+                text
+                for text in (_text(value) for value in list(delegate.get("definition_of_done") or handoff.get("definition_of_done") or []))
+                if text
+            ][:3]
+            if not definition_of_done:
+                definition_of_done = [action, "Record the operator-visible outcome before handing back."]
+            assignment_prompt = (
+                f"ROLE: {owner_role}. Action: {action} Inspect {inspect_endpoint}; "
+                f"handoff via {handoff_endpoint}; return evidence for action { _text(item.get('action_id'), 'unknown') }."
+            )
+            return {
+                "owner_role": owner_role,
+                "action": action,
+                "inspect_endpoint": inspect_endpoint,
+                "handoff_endpoint": handoff_endpoint,
+                "evidence_required": evidence_required,
+                "suggested_validation": suggested_validation,
+                "definition_of_done": definition_of_done,
+                "assignment_prompt": assignment_prompt,
+            }
+
         def _focus_packet(item: dict[str, Any] | None) -> dict[str, Any] | None:
             if not item:
                 return None
@@ -2975,6 +3038,7 @@ class StatusService:
                 "handoff",
                 "owner_action_evidence",
                 "delegate_contract",
+                "briefing_packet",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -3036,6 +3100,7 @@ class StatusService:
                 packet["handoff"] = handoff
             packet["owner_action_evidence"] = _compact_owner_action_evidence(packet)
             packet["delegate_contract"] = _delegate_contract(packet)
+            packet["briefing_packet"] = _briefing_packet(packet)
             return packet
 
         items: list[dict[str, Any]] = []
