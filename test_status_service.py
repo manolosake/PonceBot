@@ -12,6 +12,60 @@ from orchestrator.storage import SQLiteTaskStorage
 
 
 class TestStatusService(unittest.TestCase):
+    def test_operator_focus_delegate_contract_is_populated(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            control_room = {
+                "health": {"level": "attention"},
+                "attention": {
+                    "blocked_approvals": [
+                        {
+                            "order_id": "order-123",
+                            "job_id": "job-123",
+                            "updated_at": 111.0,
+                        }
+                    ],
+                    "pending_decisions": [],
+                    "stalled_tasks": [],
+                },
+                "recommended_actions": [
+                    {
+                        "action_id": "approve_blocked_jobs",
+                        "count": 1,
+                        "label": "Approve blocked jobs",
+                        "reason": "A blocked approval needs review.",
+                        "target": "/api/v1/orchestration/control-room",
+                    }
+                ],
+                "workflow_bottleneck": {"score": 0},
+            }
+
+            with mock.patch.object(svc, "control_room", return_value=control_room), \
+                 mock.patch.object(svc, "proactive_priorities", return_value={"orders": []}), \
+                 mock.patch.object(svc, "proactive_health", return_value={"status": "not_configured"}):
+                report = svc.operator_focus(chat_id=7, limit=5)
+
+            item = (report.get("items") or [None])[0]
+            self.assertIsInstance(item, dict)
+
+            delegate_contract = item.get("delegate_contract") if isinstance(item, dict) else None
+            self.assertIsInstance(delegate_contract, dict)
+            self.assertEqual(delegate_contract.get("delegate_role"), "reviewer_local")
+            self.assertEqual(delegate_contract.get("source_action_id"), "approve_blocked_jobs")
+            self.assertEqual(delegate_contract.get("handoff_endpoint"), "/api/v1/orchestration/control-room?chat_id=7")
+            self.assertEqual(delegate_contract.get("inspect_endpoint"), "/api/v1/orchestration/control-room?chat_id=7")
+            self.assertTrue(delegate_contract.get("task_title"))
+            self.assertTrue(delegate_contract.get("task_prompt"))
+            self.assertIn("approve_blocked_jobs", str(delegate_contract.get("task_prompt")))
+            self.assertTrue(delegate_contract.get("acceptance_criteria"))
+            self.assertTrue(delegate_contract.get("definition_of_done"))
+            self.assertTrue(delegate_contract.get("evidence_required"))
+            self.assertTrue(delegate_contract.get("suggested_tests"))
+            self.assertTrue(delegate_contract.get("risk_notes"))
+
     def test_operator_focus_handoff_selects_by_rank_and_action_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
