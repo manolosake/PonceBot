@@ -1823,6 +1823,172 @@ class StatusService:
             "orders": rows,
         }
 
+    def release_readiness_board(
+        self,
+        *,
+        chat_id: int | None = None,
+        limit: int = 50,
+        include_released: bool = False,
+    ) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        generated_at = float(time.time())
+        source_limit = max(lim, 2000)
+        if chat_id is None:
+            orders = self.orch_q.list_orders_global(status="active", limit=source_limit)
+        else:
+            orders = self.orch_q.list_orders(chat_id=int(chat_id), status="active", limit=source_limit)
+
+        lane_order = {"ready": 0, "blocked": 1, "not_ready": 2, "released": 3}
+        candidates: list[dict[str, Any]] = []
+        for order_row in orders:
+            oid = str((order_row or {}).get("order_id") or "").strip()
+            if not oid:
+                continue
+            try:
+                root_task = self.orch_q.get_job(oid)
+            except Exception:
+                root_task = None
+            if not _is_proactive_order(order_row, root_task):
+                continue
+
+            try:
+                children = [t for t in self.orch_q.jobs_by_parent(parent_job_id=oid, limit=200) if t.job_id != oid]
+            except Exception:
+                children = []
+            try:
+                traces = self.orch_q.list_trace_events(order_id=oid, limit=100)
+            except Exception:
+                traces = []
+            try:
+                decision_log = self.orch_q.list_decision_log(order_id=oid, limit=50)
+            except Exception:
+                decision_log = []
+
+            tasks = ([root_task] if root_task is not None else []) + children
+            artifacts: list[dict[str, Any]] = []
+            for task in tasks:
+                artifacts.extend(_artifact_refs_from_task(task))
+            artifacts.extend(_artifact_refs_from_trace_events(traces))
+
+            workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+            readiness = _build_release_readiness(
+                order_row=order_row,
+                root_task=root_task,
+                children=children,
+                workflow=workflow,
+                decision_log=decision_log,
+                traces=traces,
+                artifacts=artifacts,
+            )
+
+            readiness_state = str(readiness.get("state") or "unknown").strip().lower() or "unknown"
+            if readiness_state == "ready":
+                lane = "ready"
+            elif readiness_state == "blocked":
+                lane = "blocked"
+            elif readiness_state == "released":
+                lane = "released"
+            else:
+                lane = "not_ready"
+            if lane == "released" and not include_released:
+                continue
+
+            checks_by_status: dict[str, int] = {}
+            for check in list(readiness.get("checks") or []):
+                if not isinstance(check, dict):
+                    continue
+                status = str(check.get("status") or "unknown").strip().lower() or "unknown"
+                checks_by_status[status] = checks_by_status.get(status, 0) + 1
+
+            blockers = [b for b in list(readiness.get("blockers") or workflow.get("blockers") or []) if isinstance(b, dict)]
+            blocker = blockers[0] if blockers else None
+            primary_blocker: dict[str, Any] | None = None
+            if blocker is not None:
+                job = blocker.get("job") if isinstance(blocker.get("job"), dict) else {}
+                primary_blocker = {
+                    "stage": str(blocker.get("stage") or "").strip() or None,
+                    "summary": str(blocker.get("summary") or "").strip()[:280] or None,
+                    "job_id": job.get("job_id") if isinstance(job, dict) else None,
+                    "job_id_short": job.get("job_id_short") if isinstance(job, dict) else None,
+                    "role": job.get("role") if isinstance(job, dict) else None,
+                    "state": job.get("state") if isinstance(job, dict) else None,
+                }
+
+            updated_at = float((order_row or {}).get("updated_at") or (root_task.updated_at if root_task is not None else 0.0) or 0.0)
+            title = str((order_row or {}).get("title") or (_task_title(root_task) if root_task is not None else "")).strip()
+            priority = int((order_row or {}).get("priority") or (root_task.priority if root_task is not None else 2) or 2)
+            current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
+            candidates.append(
+                {
+                    "rank": 0,
+                    "order_id": oid,
+                    "order_id_short": oid[:8],
+                    "chat_id": int((order_row or {}).get("chat_id") or (root_task.chat_id if root_task is not None else 0) or 0),
+                    "title": title,
+                    "priority": priority,
+                    "phase": str((order_row or {}).get("phase") or readiness.get("phase") or workflow.get("phase") or "planning"),
+                    "current_stage": current_stage,
+                    "readiness_state": readiness_state,
+                    "readiness_verdict": str(readiness.get("verdict") or "unknown").strip().lower() or "unknown",
+                    "release_lane": lane,
+                    "summary": str(readiness.get("summary") or "").strip(),
+                    "next_action": str(readiness.get("next_action") or "").strip(),
+                    "primary_blocker": primary_blocker,
+                    "checks_by_status": checks_by_status,
+                    "handoff_endpoint": f"/api/v1/orchestration/orders/handoff-digest?order_id={oid}",
+                    "release_readiness_endpoint": f"/api/v1/orchestration/orders/release-readiness?order_id={oid}",
+                    "merge_ready": bool(workflow.get("merge_ready")),
+                    "merged_to_main": bool(workflow.get("merged_to_main")),
+                    "updated_at": updated_at,
+                }
+            )
+
+        candidates.sort(
+            key=lambda item: (
+                lane_order.get(str(item.get("release_lane") or ""), 99),
+                int(item.get("priority") or 2),
+                float(item.get("updated_at") or 0.0),
+                str(item.get("order_id") or ""),
+            )
+        )
+        returned = candidates[:lim]
+        for idx, item in enumerate(returned, start=1):
+            item["rank"] = idx
+
+        lanes = {
+            lane: {
+                "lane": lane,
+                "count": 0,
+                "orders": [],
+            }
+            for lane in ("ready", "blocked", "not_ready", "released")
+        }
+        for item in returned:
+            lane = str(item.get("release_lane") or "not_ready")
+            lanes.setdefault(lane, {"lane": lane, "count": 0, "orders": []})
+            lanes[lane]["orders"].append(item)
+            lanes[lane]["count"] = len(lanes[lane]["orders"])
+
+        by_lane = {lane: int(payload.get("count") or 0) for lane, payload in lanes.items()}
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "include_released": bool(include_released),
+            "summary": {
+                "orders_total": len(returned),
+                "returned": len(returned),
+                "by_lane": by_lane,
+                "ready": by_lane.get("ready", 0),
+                "blocked": by_lane.get("blocked", 0),
+                "not_ready": by_lane.get("not_ready", 0),
+                "released": by_lane.get("released", 0),
+            },
+            "lanes": lanes,
+        }
+
     def workflow_bottlenecks(self, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
         lim = max(1, min(200, int(limit)))
         board = self.autonomy_board(chat_id=chat_id, limit=lim)
