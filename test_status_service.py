@@ -349,6 +349,49 @@ class TestStatusService(unittest.TestCase):
             self.assertIn("live_view", snap)
             self.assertEqual(str((snap.get("live_view") or {}).get("transport")), "sse")
 
+    def test_control_room_includes_due_runbooks_and_recommended_action(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runbooks_path = root / "runbooks.yaml"
+            runbooks_path.write_text(
+                "\n".join(
+                    [
+                        "- id: due-a",
+                        "  role: sre",
+                        "  interval_seconds: 300",
+                        "  enabled: true",
+                        "  prompt: Check A.",
+                        "- id: due-b",
+                        "  role: qa",
+                        "  interval_seconds: 300",
+                        "  enabled: true",
+                        "  prompt: Check B.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            storage = SQLiteTaskStorage(root / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"sre": {"role": "sre"}, "qa": {"role": "qa"}})
+            svc = StatusService(
+                orch_q=q,
+                role_profiles={"sre": {"role": "sre"}, "qa": {"role": "qa"}},
+                cache_ttl_seconds=0,
+                runbooks_path=runbooks_path,
+            )
+
+            room = svc.control_room()
+
+            runbooks = room.get("runbooks") or {}
+            self.assertEqual((runbooks.get("summary") or {}).get("due"), 2)
+            due_ids = {str(item.get("runbook_id")) for item in list(runbooks.get("due_items") or [])}
+            self.assertEqual(due_ids, {"due-a", "due-b"})
+
+            actions = list(room.get("recommended_actions") or [])
+            action = next((item for item in actions if item.get("action_id") == "inspect_due_runbooks"), None)
+            self.assertIsNotNone(action)
+            self.assertEqual((action or {}).get("target"), "/api/v1/orchestration/runbooks")
+            self.assertEqual((action or {}).get("count"), 2)
+
     def test_snapshot_filters_by_chat_id(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

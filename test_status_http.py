@@ -502,6 +502,48 @@ class TestStatusHTTP(unittest.TestCase):
                     payload = json.loads(resp.read().decode("utf-8"))
                     self.assertEqual((payload.get("factory") or {}).get("status"), "soft_pause")
 
+    def test_runbooks_endpoint_requires_bearer_and_supports_current_and_legacy_paths(self) -> None:
+        class _FakeStatusService:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def runbook_status(self) -> dict[str, object]:
+                self.calls += 1
+                return {
+                    "api_version": "v1",
+                    "schema_version": 1,
+                    "summary": {"total": 1, "enabled": 1, "due": 1, "overdue": 1},
+                    "items": [{"runbook_id": "daily-check", "due": True, "overdue": True}],
+                }
+
+        fake = _FakeStatusService()
+        with _running_status_http_server(
+            host="127.0.0.1",
+            port=0,
+            status_service=fake,
+            stream_interval_s=0.5,
+            auth_token="secret",
+            snapshot_rate_per_s=0.0,
+            snapshot_burst=1.0,
+            max_sse_per_ip=2,
+        ) as (_http_srv, base):
+            url = base + "/api/v1/orchestration/runbooks"
+            with self.assertRaises(urllib.error.HTTPError) as unauth_ctx:
+                urllib.request.urlopen(url, timeout=2).read()
+            self.assertEqual(unauth_ctx.exception.code, 401)
+
+            headers = {"Authorization": "Bearer secret"}
+            for suffix in ("/api/v1/orchestration/runbooks", "/api/orchestration/runbooks"):
+                req = urllib.request.Request(base + suffix, headers=headers)
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(payload.get("api_version"), "v1")
+                    self.assertEqual((payload.get("summary") or {}).get("due"), 1)
+                    self.assertEqual(((payload.get("items") or [{}])[0]).get("runbook_id"), "daily-check")
+
+        self.assertEqual(fake.calls, 2)
+
     def test_order_evidence_endpoint_success_and_errors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

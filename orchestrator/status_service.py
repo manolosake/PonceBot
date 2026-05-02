@@ -2770,6 +2770,29 @@ class StatusService:
             "Queued work exists while worker saturation is low.",
         )
 
+        runbook_status = self.runbook_status()
+        runbook_summary = runbook_status.get("summary") if isinstance(runbook_status.get("summary"), dict) else {}
+        due_runbooks = [
+            item
+            for item in list(runbook_status.get("items") or [])
+            if isinstance(item, dict) and (bool(item.get("due")) or bool(item.get("overdue")))
+        ]
+        runbooks = {
+            "summary": runbook_summary,
+            "due_items": due_runbooks[:10],
+        }
+        due_or_overdue_runbooks = max(
+            int(runbook_summary.get("due") or 0),
+            int(runbook_summary.get("overdue") or 0),
+        )
+        _add_action(
+            "inspect_due_runbooks",
+            "Inspect due runbooks",
+            "/api/v1/orchestration/runbooks",
+            due_or_overdue_runbooks,
+            "Scheduled runbooks are due or overdue.",
+        )
+
         bottleneck = self.workflow_bottlenecks(chat_id=chat_id, limit=50)
         bottleneck_summary = bottleneck.get("summary") if isinstance(bottleneck.get("summary"), dict) else {}
         workflow_bottleneck = {
@@ -2839,6 +2862,7 @@ class StatusService:
                 "risks": risks[:10],
                 "stalled_tasks": stalled_tasks[:10],
             },
+            "runbooks": runbooks,
             "workflow_bottleneck": workflow_bottleneck,
             "proactive_action_plan": proactive_action_plan,
             "recommended_actions": compact_recommended_actions,
