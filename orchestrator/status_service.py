@@ -442,6 +442,7 @@ def _artifact_refs_from_task(task: Task) -> list[dict[str, Any]]:
         "job_id": task.job_id,
         "job_id_short": task.job_id[:8],
         "role": str(task.role or "").strip().lower(),
+        "ts": float(task.updated_at or task.created_at or 0.0),
     }
     artifacts_dir = str(task.artifacts_dir or "").strip()
     if artifacts_dir:
@@ -461,6 +462,7 @@ def _artifact_refs_from_trace_events(events: list[dict[str, Any]]) -> list[dict[
             continue
         base = {
             "trace_event_id": event.get("id"),
+            "ts": event.get("ts"),
             "job_id": event.get("job_id"),
             "job_id_short": (str(event.get("job_id"))[:8] if event.get("job_id") else None),
             "role": event.get("agent_role"),
@@ -475,6 +477,158 @@ def _artifact_refs_from_trace_events(events: list[dict[str, Any]]) -> list[dict[
             for path in _coerce_str_list(payload.get(key)):
                 refs.append({**base, "kind": f"trace_payload_{key}", "path": path})
     return refs
+
+
+def _recent_evidence_timeline(
+    *,
+    tasks: list[Task],
+    traces: list[dict[str, Any]],
+    decision_log: list[dict[str, Any]],
+    delegation_log: list[dict[str, Any]],
+    artifacts: list[dict[str, Any]],
+    max_items: int = 12,
+) -> list[dict[str, Any]]:
+    task_ts_by_job = {t.job_id: float(t.updated_at or t.created_at or 0.0) for t in tasks if t is not None}
+    task_role_by_job = {t.job_id: str(t.role or "").strip().lower() for t in tasks if t is not None}
+    trace_ts_by_event = {str(e.get("id")): _coerce_float(e.get("ts")) for e in traces if isinstance(e, dict) and e.get("id")}
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def add(
+        *,
+        ts: Any,
+        source: str,
+        kind: str,
+        role: Any = None,
+        job_id: Any = None,
+        job_id_short: Any = None,
+        summary: Any = None,
+        path: Any = None,
+        artifact_id: Any = None,
+    ) -> None:
+        ts_f = _coerce_float(ts)
+        if ts_f is None:
+            ts_f = 0.0
+        jid = str(job_id or "").strip()
+        jid_short = str(job_id_short or "").strip() or (jid[:8] if jid else None)
+        entry: dict[str, Any] = {
+            "ts": float(ts_f),
+            "source": str(source or "").strip().lower() or "evidence",
+            "kind": str(kind or "").strip().lower() or "evidence",
+        }
+        role_s = str(role or "").strip().lower()
+        if role_s:
+            entry["role"] = role_s
+        if jid_short:
+            entry["job_id_short"] = jid_short
+        summary_s = str(summary or "").replace("\r", " ").replace("\n", " ").strip()
+        if summary_s:
+            entry["summary"] = summary_s[:220]
+        path_s = str(path or "").strip()
+        if path_s:
+            entry["path"] = path_s
+        artifact_s = str(artifact_id or "").strip()
+        if artifact_s:
+            entry["artifact_id"] = artifact_s
+
+        key = (
+            entry.get("source"),
+            entry.get("kind"),
+            entry.get("role"),
+            entry.get("job_id_short"),
+            entry.get("summary"),
+            entry.get("path"),
+            entry.get("artifact_id"),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(entry)
+
+    for task in tasks:
+        if task is None:
+            continue
+        tr = task.trace or {}
+        summary = str(tr.get("result_summary") or tr.get("result_next_action") or _task_title(task)).strip()
+        add(
+            ts=task.updated_at or task.created_at,
+            source="job",
+            kind=str(task.state or "job"),
+            role=task.role,
+            job_id=task.job_id,
+            summary=summary,
+        )
+
+    for event in traces:
+        if not isinstance(event, dict):
+            continue
+        add(
+            ts=event.get("ts"),
+            source="trace",
+            kind=event.get("event_type") or "trace_event",
+            role=event.get("agent_role"),
+            job_id=event.get("job_id"),
+            summary=event.get("message"),
+            artifact_id=event.get("artifact_id"),
+        )
+
+    for item in decision_log:
+        if not isinstance(item, dict):
+            continue
+        add(
+            ts=item.get("ts"),
+            source="decision_log",
+            kind=item.get("kind") or "decision",
+            role=task_role_by_job.get(str(item.get("job_id") or "")),
+            job_id=item.get("job_id"),
+            job_id_short=item.get("job_id_short"),
+            summary=item.get("summary") or item.get("next_action"),
+        )
+
+    for item in delegation_log:
+        if not isinstance(item, dict):
+            continue
+        summary_bits = [
+            str(item.get("edge_type") or "delegated"),
+            str(item.get("to_key") or "").strip(),
+            f"to {str(item.get('to_job_id_short') or item.get('to_job_id') or '').strip()}",
+        ]
+        add(
+            ts=item.get("ts"),
+            source="delegation_log",
+            kind=item.get("edge_type") or "delegated",
+            role=item.get("to_role"),
+            job_id=item.get("to_job_id"),
+            job_id_short=item.get("to_job_id_short"),
+            summary=" ".join(bit for bit in summary_bits if bit.strip()),
+        )
+
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        job_id = str(artifact.get("job_id") or "").strip()
+        trace_event_id = str(artifact.get("trace_event_id") or "").strip()
+        ts = artifact.get("ts")
+        if _coerce_float(ts) is None and trace_event_id:
+            ts = trace_ts_by_event.get(trace_event_id)
+        if _coerce_float(ts) is None and job_id:
+            ts = task_ts_by_job.get(job_id)
+        path = artifact.get("path")
+        artifact_id = artifact.get("artifact_id")
+        add(
+            ts=ts,
+            source="artifact",
+            kind=artifact.get("kind") or "artifact",
+            role=artifact.get("role") or task_role_by_job.get(job_id),
+            job_id=job_id,
+            job_id_short=artifact.get("job_id_short"),
+            summary=path or artifact_id,
+            path=path,
+            artifact_id=artifact_id,
+        )
+
+    capped = max(1, min(100, int(max_items)))
+    return sorted(entries, key=lambda item: float(item.get("ts") or 0.0), reverse=True)[:capped]
 
 
 def _derive_stage_status(
