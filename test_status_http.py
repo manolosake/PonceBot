@@ -198,6 +198,89 @@ class TestStatusHTTP(unittest.TestCase):
             bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
             self.assertEqual(bad_payload.get("error"), "invalid_rank")
 
+    def test_operator_focus_briefings_endpoint_returns_bundle_and_filters(self) -> None:
+        class _FakeStatusService:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def snapshot(self, *, chat_id: int | None = None) -> dict[str, object]:
+                return {"api_version": "v1", "schema_version": 2, "chat_id": chat_id}
+
+            def operator_focus_briefing_bundle(
+                self,
+                *,
+                chat_id: int | None = None,
+                limit: int = 5,
+                categories: list[str] | None = None,
+                urgencies: list[str] | None = None,
+                sources: list[str] | None = None,
+            ) -> dict[str, object]:
+                self.calls.append(
+                    {
+                        "chat_id": chat_id,
+                        "limit": limit,
+                        "categories": categories,
+                        "urgencies": urgencies,
+                        "sources": sources,
+                    }
+                )
+                return {
+                    "api_version": "v1",
+                    "schema_version": 1,
+                    "chat_id": chat_id,
+                    "limit": limit,
+                    "summary": {"returned": 1},
+                    "briefings": [
+                        {
+                            "selection": {"action_id": "focus:first", "rank": 1, "matched_by": "rank"},
+                            "item_identity": {"action_id": "focus:first", "rank": 1},
+                            "briefing_packet": {
+                                "owner_role": "reviewer_local",
+                                "action": "Review first",
+                            },
+                        }
+                    ],
+                }
+
+        fake = _FakeStatusService()
+
+        with _running_status_http_server(
+            host="127.0.0.1",
+            port=0,
+            status_service=fake,
+            stream_interval_s=0.5,
+            auth_token="secret",
+            snapshot_rate_per_s=0.0,
+            snapshot_burst=1.0,
+            max_sse_per_ip=2,
+            wait_headers={"Authorization": "Bearer secret"},
+        ) as (_http_srv, base):
+            headers = {"Authorization": "Bearer secret"}
+            req = urllib.request.Request(
+                base + "/api/v1/orchestration/operator-focus/briefings?limit=2&category=blocked&urgency=high&source=control_room",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(payload.get("limit"), 2)
+                self.assertEqual((payload.get("summary") or {}).get("returned"), 1)
+                self.assertEqual(len(payload.get("briefings") or []), 1)
+                self.assertEqual(((payload.get("briefings") or [{}])[0].get("item_identity") or {}).get("action_id"), "focus:first")
+
+        self.assertEqual(
+            fake.calls,
+            [
+                {
+                    "chat_id": None,
+                    "limit": 2,
+                    "categories": ["blocked"],
+                    "urgencies": ["high"],
+                    "sources": ["control_room"],
+                }
+            ],
+        )
+
     def test_send_json_ignores_client_disconnect_errors(self) -> None:
         class _DisconnectingWriter:
             def __init__(self, exc: BaseException) -> None:
