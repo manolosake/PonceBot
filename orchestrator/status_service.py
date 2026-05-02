@@ -1016,7 +1016,11 @@ _DECISION_RANK = {
 _STAGE_RANK = {stage: idx for idx, stage in enumerate(_WORKFLOW_STAGE_ORDER)}
 _HANDOFF_STAGE_ROLE = {
     "delivery": "implementer_local",
+    "implementation": "implementer_local",
     "validation": "reviewer_local",
+    "qa": "reviewer_local",
+    "review": "reviewer_local",
+    "controller_signoff": "architect_local",
     "skynet_review": "architect_local",
     "deploy": "release_mgr",
     "release": "release_mgr",
@@ -1256,6 +1260,145 @@ def _handoff_action_profile(
         "operator_actions": operator_actions,
         "release_manager_actions": release_manager_actions,
         "blockers": blockers,
+    }
+
+
+def _order_handoff_contract(
+    *,
+    order_id: str,
+    title: str,
+    current_stage: str,
+    action_profile: dict[str, Any],
+) -> dict[str, Any]:
+    oid = str(order_id or "").strip()
+    display_oid = oid[:8] or "unknown"
+    title_text = str(title or "").strip() or "order"
+    stage = str(current_stage or "skynet_plan").strip() or "skynet_plan"
+    decision = str(action_profile.get("decision") or "not_ready_wait").strip().lower()
+    blockers = [b for b in list(action_profile.get("blockers") or []) if isinstance(b, dict)]
+    primary_blocker = blockers[0] if blockers else {}
+    blocker_stage = str(primary_blocker.get("stage") or stage).strip() or stage
+    blocker_job = primary_blocker.get("job") if isinstance(primary_blocker.get("job"), dict) else {}
+    blocker_role = str(blocker_job.get("role") or "").strip().lower()
+    inspect_endpoint = f"/api/v1/orchestration/orders/handoff-digest?order_id={oid}" if oid else "/api/v1/orchestration/orders/handoff-digest"
+    readiness_endpoint = f"/api/v1/orchestration/orders/release-readiness?order_id={oid}" if oid else "/api/v1/orchestration/orders/release-readiness"
+    action = str(action_profile.get("primary_action") or "").strip() or "Advance the order handoff."
+
+    if decision in {"ready_go", "already_released"}:
+        owner_role = "release_mgr"
+    elif decision == "blocked_no_go":
+        owner_role = blocker_role or _handoff_role_for_stage(blocker_stage or stage)
+    else:
+        owner_role = _handoff_role_for_stage(stage)
+
+    if decision == "ready_go":
+        evidence_required = [
+            "readiness remains go",
+            "release command or merge result",
+            "release evidence artifact or trace event",
+        ]
+        suggested_validation = [
+            "Inspect the handoff digest checks before release.",
+            "Verify the release-readiness endpoint still reports go.",
+        ]
+        definition_of_done = [
+            "Order is released or merged.",
+            "Release evidence is attached to the order.",
+            "Post-release status is recorded.",
+        ]
+        assignment_prompt = (
+            f"{owner_role}: release order {display_oid} ({title_text}) only while readiness is go. "
+            f"Inspect {inspect_endpoint}, validate {readiness_endpoint}, perform the release or merge, "
+            "and return release evidence plus post-release status."
+        )
+    elif decision == "already_released":
+        evidence_required = [
+            "release or merge reference",
+            "deploy status",
+            "post-release verification note",
+        ]
+        suggested_validation = [
+            "Confirm release evidence is present.",
+            "Check deploy status for regressions or missing post-release notes.",
+        ]
+        definition_of_done = [
+            "Released state is confirmed.",
+            "Any missing post-release evidence or regression is recorded as follow-up.",
+        ]
+        assignment_prompt = (
+            f"{owner_role}: verify released order {display_oid} ({title_text}). "
+            f"Inspect {inspect_endpoint}, confirm release evidence through {readiness_endpoint}, "
+            "and return a post-release verification note or bounded follow-up."
+        )
+    elif decision == "blocked_no_go":
+        action = action or "Clear the release blocker before handoff."
+        evidence_required = [
+            "blocker resolution summary",
+            "owning specialist task result",
+            "updated readiness status",
+        ]
+        suggested_validation = [
+            "Re-run or inspect release readiness after the blocker is cleared.",
+            "Confirm no_go changes before asking release_mgr to act.",
+        ]
+        definition_of_done = [
+            "Primary blocker is resolved or clearly reclassified.",
+            "Readiness is recomputed with fresh evidence.",
+            "Release remains held until readiness is go.",
+        ]
+        assignment_prompt = (
+            f"{owner_role}: clear the {blocker_stage} blocker for order {display_oid} ({title_text}). "
+            f"Inspect {inspect_endpoint}, validate with {readiness_endpoint}, attach blocker evidence, "
+            "and do not release unless readiness later becomes go."
+        )
+    elif decision == "not_applicable":
+        owner_role = _handoff_role_for_stage(stage)
+        evidence_required = [
+            "standard workflow status",
+            "next action note",
+        ]
+        suggested_validation = [
+            "Use the standard order workflow fields.",
+            "Confirm whether proactive release readiness applies before routing release work.",
+        ]
+        definition_of_done = [
+            "Standard handoff fields identify the next owner and action.",
+        ]
+        assignment_prompt = (
+            f"{owner_role}: inspect order {display_oid} ({title_text}) using {inspect_endpoint}; "
+            "return the standard workflow status and next action."
+        )
+    else:
+        evidence_required = [
+            f"{stage} progress evidence",
+            "updated readiness status",
+            "next action note",
+        ]
+        suggested_validation = [
+            "Inspect the handoff digest and current readiness checks.",
+            "Confirm the release-readiness endpoint does not permit release yet.",
+        ]
+        definition_of_done = [
+            f"{stage} evidence is advanced or a concrete blocker is recorded.",
+            "Readiness is recomputed after the stage work.",
+            "Release remains held until readiness is go.",
+        ]
+        assignment_prompt = (
+            f"{owner_role}: advance {stage} readiness for order {display_oid} ({title_text}). "
+            f"Inspect {inspect_endpoint}, validate current state with {readiness_endpoint}, attach evidence, "
+            "and do not release until readiness becomes go."
+        )
+
+    return {
+        "owner_role": owner_role,
+        "decision": decision,
+        "action": action,
+        "inspect_endpoint": inspect_endpoint,
+        "release_readiness_endpoint": readiness_endpoint,
+        "evidence_required": evidence_required,
+        "suggested_validation": suggested_validation,
+        "definition_of_done": definition_of_done,
+        "assignment_prompt": assignment_prompt,
     }
 
 
