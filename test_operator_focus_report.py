@@ -242,6 +242,119 @@ class TestOperatorFocusReport(unittest.TestCase):
             self.assertIn("No operator focus briefing packet matched the requested selector.", stdout.getvalue())
 
 
+class TestOperatorFocusReportReceipt(unittest.TestCase):
+    def test_render_receipt_markdown_includes_receipt_sections(self) -> None:
+        receipt_report = {
+            "generated_at": "2026-05-02T00:00:00Z",
+            "chat_id": 7,
+            "selection": {"action_id": "focus:first", "rank": 1, "matched_by": "action_id"},
+            "summary": {
+                "returned": 1,
+                "health_level": "attention",
+                "top_action_id": "focus:first",
+                "top_category": "release",
+                "filtered_out": 0,
+                "filters": {"categories": ["release"], "urgencies": ["high"], "sources": ["control_room"]},
+                "available": {"categories": ["release"], "urgencies": ["high"], "sources": ["control_room"], "total": 1},
+            },
+            "item_identity": {
+                "rank": 1,
+                "action_id": "focus:first",
+                "urgency": "high",
+                "category": "release",
+                "label": "Receipt item",
+                "source": "control_room",
+                "order_id": "order-123",
+                "job_id": "job-123",
+                "repo_id": "repo-123",
+            },
+            "receipt": {
+                "event_type": "operator_focus_receipt",
+                "state": "acknowledged",
+                "summary": "Receipt recorded.",
+                "next_action": "Proceed to implementation.",
+                "actor": "implementer_local",
+                "persisted": True,
+                "persistence_reason": "decision_log_written",
+                "recorded_at": "2026-05-02T00:00:01Z",
+                "order_id": "order-123",
+                "job_id": "job-123",
+                "details": {"ticket": "d0d6ea95", "attempt": 1},
+            },
+        }
+
+        rendered = report_tool.render_receipt_markdown(receipt_report)
+
+        self.assertIn("# Operator Focus Receipt", rendered)
+        self.assertIn("## Selected Item Identity", rendered)
+        self.assertIn("## Receipt", rendered)
+        self.assertIn("### Details", rendered)
+        self.assertIn("\"ticket\": \"d0d6ea95\"", rendered)
+        self.assertIn("- state: acknowledged", rendered)
+        self.assertIn("- actor: implementer_local", rendered)
+
+    def test_main_receipt_writes_json_output_and_validates_details_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            db.write_text("", encoding="utf-8")
+            output = root / "receipt.json"
+
+            selected = {
+                "generated_at": "2026-05-02T00:00:00Z",
+                "chat_id": 7,
+                "selection": {"action_id": "focus:first", "rank": 1, "matched_by": "action_id"},
+                "summary": {"returned": 1, "health_level": "attention", "top_action_id": "focus:first", "top_category": "release", "filtered_out": 0, "filters": {}, "available": {"total": 1}},
+                "item_identity": {"action_id": "focus:first", "label": "Receipt item"},
+                "receipt": {"state": "completed", "details": {"ticket": "d0d6ea95"}},
+            }
+
+            with mock.patch.object(report_tool, "build_receipt", return_value=selected) as mocked_build_receipt:
+                rc = report_tool.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--receipt",
+                        "--action-id",
+                        "focus:first",
+                        "--state",
+                        "completed",
+                        "--details-json",
+                        "{\"ticket\":\"d0d6ea95\"}",
+                        "--format",
+                        "json",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["receipt"]["state"], "completed")
+            self.assertEqual(mocked_build_receipt.call_args.kwargs["details"], {"ticket": "d0d6ea95"})
+
+            stderr = StringIO()
+            invalid_rc = report_tool.main(
+                [
+                    "--db",
+                    str(db),
+                    "--receipt",
+                    "--action-id",
+                    "focus:first",
+                    "--state",
+                    "completed",
+                    "--details-json",
+                    "[1,2,3]",
+                    "--format",
+                    "md",
+                ],
+                stderr=stderr,
+            )
+
+            self.assertEqual(invalid_rc, 2)
+            self.assertIn("--details-json must be a JSON object", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
 
