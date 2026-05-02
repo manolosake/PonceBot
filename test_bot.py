@@ -6681,3 +6681,57 @@ class TestRunningWatchdogEnvParsing(unittest.TestCase):
                         bot._parse_finite_float_env("BOT_LOCAL_RUNNING_WATCHDOG_SILENT_SECONDS", default),
                         default,
                     )
+
+
+class TestFocusReceiptHelpers(unittest.TestCase):
+    def test_parse_focus_command_tail_supports_receipt_commands(self) -> None:
+        marker, job = bot._parse_focus_command_tail("ack all 3 Need owner acknowledgement")
+
+        self.assertIsNone(job)
+        self.assertEqual(
+            marker,
+            bot._focus_payload_marker(
+                {
+                    "mode": "receipt",
+                    "scope": "all",
+                    "rank": 3,
+                    "state": "acknowledged",
+                    "summary": "Need owner acknowledgement",
+                }
+            ),
+        )
+
+    def test_parse_focus_command_tail_supports_briefing_aliases(self) -> None:
+        marker, job = bot._parse_focus_command_tail("brief chat 2")
+
+        self.assertIsNone(job)
+        self.assertEqual(
+            marker,
+            bot._focus_payload_marker({"mode": "briefing", "scope": "chat", "rank": 2}),
+        )
+
+    def test_operator_focus_receipt_text_formats_selected_item(self) -> None:
+        receipt_payload = {
+            "selection": {"rank": 2},
+            "item_identity": {
+                "urgency": "high",
+                "category": "release",
+                "label": "Confirm release owner",
+                "action_id": "focus:release-owner",
+            },
+            "receipt": {
+                "state": "completed",
+                "persisted": True,
+                "persistence_reason": "decision_log_written",
+                "summary": "Owner acknowledged the handoff.",
+                "next_action": "Proceed with the release checklist.",
+            },
+        }
+
+        rendered = bot._operator_focus_receipt_text(receipt_payload, scope_label="all", rank=1)
+
+        self.assertIn("Jarvis: focus receipt (all rank=2)", rendered)
+        self.assertIn("state=completed persisted=yes reason=decision_log_written", rendered)
+        self.assertIn("item: high/release - Confirm release owner (focus:release-owner)", rendered)
+        self.assertIn("summary: Owner acknowledged the handoff.", rendered)
+        self.assertIn("next: Proceed with the release checklist.", rendered)
