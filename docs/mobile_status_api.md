@@ -16,8 +16,8 @@ Back-compat aliases:
 ## Auth
 
 Con `BOT_STATUS_HTTP_TOKEN` activo:
-- `Authorization: Bearer <token>` (preferido)
-- `?token=<token>` (fallback)
+- `Authorization: Bearer <token>` (requerido por defecto)
+- `?token=<token>` es legacy temporal y solo se acepta con `BOT_STATUS_HTTP_LEGACY_AUTH=1` / `allow_query_token=True`
 
 Errores:
 - `401 unauthorized`
@@ -27,7 +27,7 @@ Errores:
 
 Todos los responses incluyen:
 - `api_version: "v1"`
-- `schema_version: 1`
+- `schema_version` (leer por respuesta; Snapshot actual usa `2`, algunos wrappers historicos/no-snapshot pueden seguir en `1`)
 - `generated_at`
 - `chat_id`
 

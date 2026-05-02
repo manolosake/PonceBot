@@ -16,7 +16,7 @@ Contrato de datos para Android (Live View, Snapshot, Alertas, Riesgos y Decision
 - Header: `X-ED-API-Version: v1`.
 - Payload:
   - `api_version: "v1"`
-  - `schema_version: 1`
+  - `schema_version`: leer por respuesta; Snapshot actual usa `2`. Algunos wrappers historicos/no-snapshot pueden seguir reportando `1`.
 
 Regla de compatibilidad:
 - Cambios aditivos: mismo `schema_version`.
@@ -25,8 +25,8 @@ Regla de compatibilidad:
 ## Auth ligera (token)
 
 Si `BOT_STATUS_HTTP_TOKEN` está definido:
-- Preferido: `Authorization: Bearer <token>`
-- Fallback: `?token=<token>`
+- Requerido por defecto: `Authorization: Bearer <token>`
+- Legacy temporal: `?token=<token>` solo se acepta cuando el servidor habilita `BOT_STATUS_HTTP_LEGACY_AUTH=1` / `allow_query_token=True`.
 
 Errores:
 - `401 {"error":"unauthorized"}`
@@ -106,7 +106,7 @@ Respuesta:
 ```json
 {
   "api_version": "v1",
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": 1760000000.25,
   "chat_id": 123,
   "snapshot_hash": "abc123",
