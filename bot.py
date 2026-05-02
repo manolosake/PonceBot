@@ -10181,6 +10181,130 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
     return "\n".join(lines)
 
 
+def _focus_usage_text() -> str:
+    return "Usage: /focus [chat|all|brief [all] [rank]|briefing [all] [rank]|handoff [all] [rank]]"
+
+
+def _operator_focus_packet_text(packet: dict[str, Any], *, mode: str, scope_label: str, rank: int) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 220, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    def _first_line(value: object, *, max_chars: int = 260, default: str = "") -> str:
+        s = _clip(value, max_chars=max_chars, default=default)
+        return " ".join(s.split())
+
+    def _list_lines(label: str, values: object, *, max_items: int = 3) -> list[str]:
+        out: list[str] = []
+        vals = values if isinstance(values, list) else []
+        compact = [_first_line(v, max_chars=180) for v in vals]
+        compact = [v for v in compact if v][:max_items]
+        if compact:
+            out.append(f"{label}:")
+            out.extend(f"- {v}" for v in compact)
+        return out
+
+    mode_label = "briefing" if mode in ("brief", "briefing") else "handoff"
+    selection = packet.get("selection") if isinstance(packet.get("selection"), dict) else {}
+    item_identity = packet.get("item_identity") if isinstance(packet.get("item_identity"), dict) else {}
+    item = packet.get("item") if isinstance(packet.get("item"), dict) else {}
+    focus_item = item_identity or item
+    briefing = packet.get("briefing_packet") if isinstance(packet.get("briefing_packet"), dict) else {}
+    owner_evidence = item.get("owner_action_evidence") if isinstance(item.get("owner_action_evidence"), dict) else {}
+    delegate = item.get("delegate_contract") if isinstance(item.get("delegate_contract"), dict) else {}
+
+    matched_by = _clip(selection.get("matched_by"), max_chars=32, default="none")
+    selected_rank = selection.get("rank")
+    try:
+        selected_rank_s = str(int(selected_rank)) if selected_rank is not None else str(int(rank))
+    except Exception:
+        selected_rank_s = str(int(rank))
+
+    lines = [
+        f"Jarvis: focus {mode_label} ({_ascii(scope_label)} rank={int(rank)})",
+        f"selection: rank={selected_rank_s} matched_by={matched_by}",
+    ]
+
+    if mode_label == "briefing" and not briefing:
+        lines.extend(
+            [
+                "",
+                "No focus briefing packet found for that rank.",
+                "Try /focus for the ranked list, or /focus brief all 1 for global scope.",
+            ]
+        )
+        return "\n".join(lines)
+    if mode_label == "handoff" and not item:
+        lines.extend(
+            [
+                "",
+                "No focus handoff item found for that rank.",
+                "Try /focus for the ranked list, or /focus handoff all 1 for global scope.",
+            ]
+        )
+        return "\n".join(lines)
+
+    if focus_item:
+        action_id = _clip(focus_item.get("action_id"), max_chars=120)
+        urgency = _clip(focus_item.get("urgency"), max_chars=24, default="n/a")
+        category = _clip(focus_item.get("category"), max_chars=48, default="n/a")
+        label = _clip(focus_item.get("label"), max_chars=140, default="Selected focus item")
+        item_line = f"item: {urgency}/{category} - {label}"
+        if action_id:
+            item_line += f" ({action_id})"
+        lines.append(item_line)
+
+    packet_body = briefing if mode_label == "briefing" else item
+    owner_role = (
+        _clip(packet_body.get("owner_role"), max_chars=80)
+        or _clip(owner_evidence.get("owner_role"), max_chars=80)
+        or _clip(delegate.get("delegate_role"), max_chars=80)
+    )
+    action = (
+        _first_line(packet_body.get("action"), max_chars=240)
+        or _first_line(item.get("next_action"), max_chars=240)
+        or _first_line(owner_evidence.get("action"), max_chars=240)
+    )
+    inspect = (
+        _clip(packet_body.get("inspect_endpoint"), max_chars=220)
+        or _clip(packet_body.get("inspect_path"), max_chars=220)
+        or _clip(item.get("inspect_path"), max_chars=220)
+        or _clip(delegate.get("inspect_endpoint"), max_chars=220)
+    )
+    handoff = (
+        _clip(packet_body.get("handoff_endpoint"), max_chars=220)
+        or _clip(item.get("target"), max_chars=220)
+        or _clip(delegate.get("handoff_endpoint"), max_chars=220)
+    )
+
+    if owner_role:
+        lines.append(f"owner: {owner_role}")
+    if action:
+        lines.append(f"action: {action}")
+    if inspect:
+        lines.append(f"inspect: {inspect}")
+    if handoff:
+        lines.append(f"handoff: {handoff}")
+
+    lines.extend(_list_lines("evidence", packet_body.get("evidence_required") or owner_evidence.get("evidence_required")))
+    lines.extend(_list_lines("validation", packet_body.get("suggested_validation") or delegate.get("suggested_tests")))
+    lines.extend(_list_lines("done", packet_body.get("definition_of_done") or delegate.get("definition_of_done")))
+
+    assignment = _first_line(packet_body.get("assignment_prompt") or delegate.get("task_prompt"), max_chars=360)
+    if assignment:
+        lines.append(f"assignment: {assignment}")
+
+    return "\n".join(lines)
+
+
 def _mobile_latest_apk(artifacts_dir: Path) -> Path | None:
     try:
         root = Path(artifacts_dir).expanduser().resolve()
