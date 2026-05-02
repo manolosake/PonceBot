@@ -202,6 +202,78 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(packet.get("evidence_required"), ["completion summary"])
             self.assertIn("focus:second", str(packet.get("assignment_prompt")))
 
+    def test_operator_focus_briefing_bundle_preserves_and_falls_back_packets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 2,
+                "summary": {"returned": 2},
+                "items": [
+                    {
+                        "rank": 1,
+                        "action_id": "focus:first",
+                        "label": "First",
+                        "next_action": "Do first",
+                        "source": "control_room",
+                        "briefing_packet": {
+                            "owner_role": "reviewer_local",
+                            "action": "Review first",
+                            "inspect_endpoint": "/inspect/first",
+                            "handoff_endpoint": "/handoff/first",
+                            "evidence_required": ["summary"],
+                            "suggested_validation": ["check first"],
+                            "definition_of_done": ["first done"],
+                            "assignment_prompt": "Use the first packet.",
+                        },
+                    },
+                    {
+                        "rank": 2,
+                        "action_id": "focus:second",
+                        "label": "Second",
+                        "next_action": "Do second",
+                        "source": "proactive_health",
+                        "inspect_path": "/inspect/second",
+                        "target": "/handoff/second",
+                    },
+                ],
+            }
+
+            with mock.patch.object(svc, "operator_focus", return_value=report):
+                bundle = svc.operator_focus_briefing_bundle(chat_id=7, limit=2)
+
+            self.assertEqual(bundle.get("api_version"), "v1")
+            self.assertEqual(bundle.get("schema_version"), 1)
+            self.assertEqual(bundle.get("chat_id"), 7)
+            self.assertEqual(bundle.get("limit"), 2)
+            self.assertEqual((bundle.get("summary") or {}).get("returned"), 2)
+
+            briefings = bundle.get("briefings") or []
+            self.assertEqual(len(briefings), 2)
+
+            first = briefings[0]
+            self.assertEqual((first.get("selection") or {}).get("matched_by"), "rank")
+            self.assertEqual((first.get("item_identity") or {}).get("action_id"), "focus:first")
+            first_packet = first.get("briefing_packet") or {}
+            self.assertEqual(first_packet.get("owner_role"), "reviewer_local")
+            self.assertEqual(first_packet.get("assignment_prompt"), "Use the first packet.")
+
+            second = briefings[1]
+            self.assertEqual((second.get("selection") or {}).get("matched_by"), "rank")
+            self.assertEqual((second.get("item_identity") or {}).get("action_id"), "focus:second")
+            second_packet = second.get("briefing_packet") or {}
+            self.assertEqual(second_packet.get("owner_role"), "operator")
+            self.assertEqual(second_packet.get("inspect_endpoint"), "/inspect/second")
+            self.assertEqual(second_packet.get("handoff_endpoint"), "/handoff/second")
+            self.assertEqual(second_packet.get("evidence_required"), ["completion summary"])
+            self.assertIn("focus:second", str(second_packet.get("assignment_prompt")))
+
     def test_snapshot_assigns_current_and_next_by_worker(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
