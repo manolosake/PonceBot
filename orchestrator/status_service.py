@@ -4152,6 +4152,96 @@ class StatusService:
             "briefing_packet": briefing_packet,
         }
 
+    def operator_focus_receipt(
+        self,
+        *,
+        chat_id: int | None = None,
+        state: str,
+        summary: str | None = None,
+        next_action: str | None = None,
+        actor: str | None = None,
+        details: dict[str, Any] | None = None,
+        action_id: str | None = None,
+        rank: int | None = None,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in _OPERATOR_FOCUS_RECEIPT_STATUSES:
+            raise ValueError("invalid_operator_focus_receipt_state")
+
+        def _text(value: Any, default: str = "") -> str:
+            text = str(value or "").strip()
+            return text if text else default
+
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=20,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
+        generated_at = float(time.time())
+        item_identity = self._operator_focus_item_identity(selected)
+
+        receipt_summary = _text(summary)
+        if not receipt_summary and selected:
+            receipt_summary = f"Operator focus item {normalized_state}: {_text(selected.get('label'), _text(selected.get('action_id'), 'selected item'))}"
+        receipt_next_action = _text(next_action) or None
+        receipt_details = dict(details) if isinstance(details, dict) else {}
+        actor_name = _text(actor) or None
+
+        persisted = False
+        persistence_reason = "focus_item_not_selected"
+        order_id = _text(selected.get("order_id")) if selected else ""
+        job_id = _text(selected.get("job_id")) if selected else ""
+        if selected and order_id:
+            persistence_details = {
+                "event_type": _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE,
+                "actor": actor_name,
+                "selection": dict(selection),
+                "item_identity": item_identity or {},
+                "operator_focus_details": receipt_details,
+            }
+            self.orch_q.append_decision_log(
+                order_id=order_id,
+                job_id=job_id or order_id,
+                kind=_OPERATOR_FOCUS_RECEIPT_EVENT_TYPE,
+                state=normalized_state,
+                summary=receipt_summary,
+                next_action=receipt_next_action,
+                details=persistence_details,
+            )
+            persisted = True
+            persistence_reason = "decision_log_appended"
+        elif selected:
+            persistence_reason = "focus_item_not_tied_to_order"
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "selection": selection,
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "item_identity": item_identity,
+            "receipt": {
+                "event_type": _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE,
+                "state": normalized_state,
+                "summary": receipt_summary,
+                "next_action": receipt_next_action,
+                "actor": actor_name,
+                "details": receipt_details,
+                "persisted": persisted,
+                "persistence_reason": persistence_reason,
+                "recorded_at": generated_at,
+                "order_id": order_id or None,
+                "job_id": (job_id or order_id or None) if selected else None,
+            },
+        }
+
     def operator_focus_briefing_bundle(
         self,
         *,
