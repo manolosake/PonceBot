@@ -2466,14 +2466,23 @@ class StatusService:
                 }
             )
 
-        top_order = next((order for lane in lanes for order in lane["orders"]), None)
+        top_order: dict[str, Any] | None = None
         top_lane = None
-        if isinstance(top_order, dict):
-            top_rank = int(top_order.get("rank") or 0)
-            for lane in lanes:
-                if any(int((order or {}).get("rank") or 0) == top_rank for order in lane["orders"]):
+        top_rank: int | None = None
+        for lane in lanes:
+            for order in lane["orders"]:
+                if not isinstance(order, dict):
+                    continue
+                try:
+                    rank = int(order.get("rank") or 0)
+                except Exception:
+                    continue
+                if rank <= 0:
+                    continue
+                if top_rank is None or rank < top_rank:
+                    top_rank = rank
+                    top_order = order
                     top_lane = str(lane.get("lane") or "")
-                    break
 
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())
