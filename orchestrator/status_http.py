@@ -60,6 +60,13 @@ def _parse_filter_values(qs: dict[str, list[str]], name: str) -> list[str]:
     return values
 
 
+def _parse_bool_flag(qs: dict[str, list[str]], name: str, *, default: bool = False) -> bool:
+    raw = (qs.get(name) or [""])[0].strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _parse_positive_rank(qs: dict[str, list[str]]) -> tuple[int | None, bool]:
     raw = (qs.get("rank") or [""])[0].strip()
     if not raw:
@@ -406,6 +413,22 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 return
             limit = _parse_limit(qs, 20, hi=200)
             payload = self.server.status_service.proactive_action_plan(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
+        if path in (
+            "/api/v1/orchestration/release-readiness-board",
+            "/api/orchestration/release-readiness-board",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 50, hi=200)
+            payload = self.server.status_service.release_readiness_board(
+                chat_id=chat_id,
+                limit=limit,
+                include_released=_parse_bool_flag(qs, "include_released", default=False),
+            )
             self._send_json(200, payload)
             return
 
