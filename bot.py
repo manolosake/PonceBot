@@ -7345,7 +7345,7 @@ def _help_text(cfg: BotConfig) -> str:
         "- /watch              Live company status (single message, auto-updated)",
         "- /unwatch            Disable /watch",
         "- /orders             List CEO orders (autopilot scope)",
-        "- /focus              Ranked operator next actions",
+        "- /focus              Ranked operator next actions; brief/handoff/ack/start/done by rank",
         "- /order show|pause|done|merge|rollback <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
@@ -10182,7 +10182,162 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
 
 
 def _focus_usage_text() -> str:
-    return "Usage: /focus [chat|all|brief [all] [rank]|briefing [all] [rank]|handoff [all] [rank]]"
+    return (
+        "Usage: /focus [chat|all] | "
+        "/focus brief|briefing|handoff [chat|all] [rank] | "
+        "/focus ack|start|done [chat|all] [rank] [summary...]"
+    )
+
+
+def _focus_scope_value(raw: str) -> str | None:
+    scope = str(raw or "").strip().lower()
+    if scope in ("all", "global", "company"):
+        return "all"
+    if scope in ("chat", "here", "this"):
+        return "chat"
+    return None
+
+
+def _focus_parse_rank(raw: str) -> int | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        rank = int(value, 10)
+    except Exception:
+        return None
+    if rank <= 0:
+        return None
+    return rank
+
+
+def _focus_payload_marker(payload: dict[str, Any]) -> str:
+    return _orch_marker("focus", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
+    tail = (raw_tail or "").strip()
+    if not tail:
+        return _orch_marker("focus"), None
+    try:
+        parts = shlex.split(tail)
+    except Exception:
+        return _focus_usage_text(), None
+    if not parts:
+        return _orch_marker("focus"), None
+
+    head = parts[0].strip().lower()
+    if len(parts) == 1:
+        scope = _focus_scope_value(head)
+        if scope == "all":
+            return _orch_marker("focus", "all"), None
+        if scope == "chat":
+            return _orch_marker("focus", "chat"), None
+
+    if head in ("brief", "briefing", "handoff"):
+        mode = "briefing" if head in ("brief", "briefing") else "handoff"
+        scope = "chat"
+        rank = 1
+        idx = 1
+        if idx < len(parts):
+            parsed_scope = _focus_scope_value(parts[idx])
+            if parsed_scope:
+                scope = parsed_scope
+                idx += 1
+        if idx < len(parts):
+            parsed_rank = _focus_parse_rank(parts[idx])
+            if parsed_rank is None:
+                return _focus_usage_text(), None
+            rank = parsed_rank
+            idx += 1
+        if idx != len(parts):
+            return _focus_usage_text(), None
+        return _focus_payload_marker({"mode": mode, "scope": scope, "rank": rank}), None
+
+    state_by_command = {
+        "ack": "acknowledged",
+        "start": "in_progress",
+        "doing": "in_progress",
+        "done": "completed",
+    }
+    if head in state_by_command:
+        scope = "chat"
+        rank = 1
+        idx = 1
+        if idx < len(parts):
+            parsed_scope = _focus_scope_value(parts[idx])
+            if parsed_scope:
+                scope = parsed_scope
+                idx += 1
+        if idx < len(parts):
+            parsed_rank = _focus_parse_rank(parts[idx])
+            if parsed_rank is not None:
+                rank = parsed_rank
+                idx += 1
+        summary = " ".join(parts[idx:]).strip()
+        return _focus_payload_marker(
+            {
+                "mode": "receipt",
+                "scope": scope,
+                "rank": rank,
+                "state": state_by_command[head],
+                "summary": summary,
+            }
+        ), None
+
+    return _focus_usage_text(), None
+
+
+def _operator_focus_receipt_text(receipt_payload: dict[str, Any], *, scope_label: str, rank: int) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 220, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    selection = receipt_payload.get("selection") if isinstance(receipt_payload.get("selection"), dict) else {}
+    item = receipt_payload.get("item_identity") if isinstance(receipt_payload.get("item_identity"), dict) else {}
+    receipt = receipt_payload.get("receipt") if isinstance(receipt_payload.get("receipt"), dict) else {}
+
+    selected_rank = selection.get("rank")
+    try:
+        rank_i = int(selected_rank) if selected_rank is not None else int(rank)
+    except Exception:
+        rank_i = int(rank)
+
+    state = _clip(receipt.get("state"), max_chars=32, default="recorded")
+    persisted = "yes" if bool(receipt.get("persisted")) else "no"
+    reason = _clip(receipt.get("persistence_reason"), max_chars=80)
+
+    lines = [
+        f"Jarvis: focus receipt ({_ascii(scope_label)} rank={rank_i})",
+        f"state={state} persisted={persisted}" + (f" reason={reason}" if reason else ""),
+    ]
+    if item:
+        urgency = _clip(item.get("urgency"), max_chars=24, default="n/a")
+        category = _clip(item.get("category"), max_chars=48, default="n/a")
+        label = _clip(item.get("label"), max_chars=140, default="Selected focus item")
+        action_id = _clip(item.get("action_id"), max_chars=120)
+        item_line = f"item: {urgency}/{category} - {label}"
+        if action_id:
+            item_line += f" ({action_id})"
+        lines.append(item_line)
+    else:
+        lines.append("No focus item found for that rank.")
+
+    summary = _clip(receipt.get("summary"), max_chars=300)
+    if summary:
+        lines.append(f"summary: {summary}")
+    next_action = _clip(receipt.get("next_action"), max_chars=220)
+    if next_action:
+        lines.append(f"next: {next_action}")
+    return "\n".join(lines)
 
 
 def _operator_focus_packet_text(packet: dict[str, Any], *, mode: str, scope_label: str, rank: int) -> str:
