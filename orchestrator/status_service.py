@@ -3556,6 +3556,54 @@ class StatusService:
             "briefing_packet": briefing_packet,
         }
 
+    def operator_focus_briefing_bundle(
+        self,
+        *,
+        chat_id: int | None = None,
+        limit: int = 5,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=limit,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        briefings: list[dict[str, Any]] = []
+        for item in list(report.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+            existing = item.get("briefing_packet")
+            briefing_packet = (
+                dict(existing)
+                if isinstance(existing, dict) and existing
+                else self._fallback_operator_focus_briefing_packet(item)
+            )
+            briefings.append(
+                {
+                    "selection": {
+                        "action_id": item.get("action_id"),
+                        "rank": item.get("rank"),
+                        "matched_by": "rank",
+                    },
+                    "item_identity": self._operator_focus_item_identity(item),
+                    "briefing_packet": briefing_packet,
+                }
+            )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "limit": report.get("limit"),
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "briefings": briefings,
+        }
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.
