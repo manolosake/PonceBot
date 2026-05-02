@@ -145,6 +145,39 @@ def build_briefing_bundle(
     )
 
 
+def build_receipt(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    state: str,
+    summary: str | None = None,
+    next_action: str | None = None,
+    actor: str | None = None,
+    details: dict[str, Any] | None = None,
+    action_id: str | None = None,
+    rank: int | None = None,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.operator_focus_receipt(
+        chat_id=chat_id,
+        action_id=action_id,
+        rank=rank,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+        state=state,
+        summary=summary,
+        next_action=next_action,
+        actor=actor,
+        details=details,
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     source_counts = summary.get("source_counts") if isinstance(summary.get("source_counts"), dict) else {}
@@ -434,6 +467,80 @@ def render_briefing_markdown(briefing: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_receipt_markdown(receipt_report: dict[str, Any]) -> str:
+    selection = receipt_report.get("selection") if isinstance(receipt_report.get("selection"), dict) else {}
+    summary = receipt_report.get("summary") if isinstance(receipt_report.get("summary"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
+    item_identity = receipt_report.get("item_identity") if isinstance(receipt_report.get("item_identity"), dict) else None
+    receipt = receipt_report.get("receipt") if isinstance(receipt_report.get("receipt"), dict) else {}
+    details = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
+
+    lines = [
+        "# Operator Focus Receipt",
+        "",
+        f"- Generated: {_one_line(receipt_report.get('generated_at'))}",
+        f"- Chat: {_one_line(receipt_report.get('chat_id'), default='all')}",
+        "",
+        "## Selection",
+        "",
+        f"- Action id: {_one_line(selection.get('action_id'))}",
+        f"- Rank: {_one_line(selection.get('rank'))}",
+        f"- Matched by: {_one_line(selection.get('matched_by'))}",
+        "",
+        "## Summary",
+        "",
+        f"- Returned: {_one_line(summary.get('returned'), default='0')}",
+        f"- Health: {_one_line(summary.get('health_level'))}",
+        f"- Top action: {_one_line(summary.get('top_action_id'))}",
+        f"- Top category: {_one_line(summary.get('top_category'))}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        "",
+        "## Selected Item Identity",
+        "",
+    ]
+
+    if item_identity:
+        for key in ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id"):
+            if key in item_identity:
+                lines.append(f"- {key}: {_one_line(item_identity.get(key))}")
+        lines.append("")
+    else:
+        lines.extend(["No operator focus receipt item matched the requested selector.", ""])
+
+    lines.extend(
+        [
+            "## Receipt",
+            "",
+            f"- event_type: {_one_line(receipt.get('event_type'))}",
+            f"- state: {_one_line(receipt.get('state'))}",
+            f"- summary: {_one_line(receipt.get('summary'))}",
+            f"- next_action: {_one_line(receipt.get('next_action'))}",
+            f"- actor: {_one_line(receipt.get('actor'))}",
+            f"- persisted: {_one_line(receipt.get('persisted'))}",
+            f"- persistence_reason: {_one_line(receipt.get('persistence_reason'))}",
+            f"- recorded_at: {_one_line(receipt.get('recorded_at'))}",
+            f"- order_id: {_one_line(receipt.get('order_id'))}",
+            f"- job_id: {_one_line(receipt.get('job_id'))}",
+            "",
+            "### Details",
+            "",
+            "```json",
+            json.dumps(details, sort_keys=True, ensure_ascii=True, indent=2),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_briefing_bundle_markdown(bundle: dict[str, Any]) -> str:
     summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
     filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
@@ -523,13 +630,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     output_kind.add_argument("--handoff", action="store_true", help="Render the selected operator-focus handoff payload.")
     output_kind.add_argument("--briefing", action="store_true", help="Render the selected operator-focus briefing payload.")
     output_kind.add_argument("--briefings", action="store_true", help="Render an operator-focus briefing bundle.")
+    output_kind.add_argument("--receipt", action="store_true", help="Record and render an operator-focus receipt payload.")
     parser.add_argument("--limit", type=_positive_int, default=5, help="Maximum ranked focus items to return.")
-    parser.add_argument("--rank", type=_positive_int, help="Select a handoff or single briefing focus item by rank.")
-    parser.add_argument("--action-id", help="Select a handoff or single briefing focus item by action id. Takes precedence over --rank.")
+    parser.add_argument("--rank", type=_positive_int, help="Select a handoff, briefing, or receipt focus item by rank.")
+    parser.add_argument("--action-id", help="Select a handoff, briefing, or receipt focus item by action id. Takes precedence over --rank.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
     parser.add_argument("--category", action="append", help="Filter by focus category. Repeat or use comma-separated values.")
     parser.add_argument("--urgency", action="append", help="Filter by urgency. Repeat or use comma-separated values.")
     parser.add_argument("--source", action="append", help="Filter by source. Repeat or use comma-separated values.")
+    parser.add_argument("--state", choices=("acknowledged", "in_progress", "completed"), help="Receipt state.")
+    parser.add_argument("--summary", help="Receipt summary.")
+    parser.add_argument("--next-action", help="Receipt next action.")
+    parser.add_argument("--actor", help="Receipt actor.")
+    parser.add_argument("--details-json", help="Receipt details as a JSON object.")
     parser.add_argument("--output", type=Path, help="Optional output file path.")
     return parser.parse_args(argv)
 
@@ -547,6 +660,25 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
     categories = _parse_filter_values(args.category)
     urgencies = _parse_filter_values(args.urgency)
     sources = _parse_filter_values(args.source)
+    details: dict[str, Any] | None = None
+
+    if args.receipt:
+        if not args.state:
+            print("receipt mode requires --state (acknowledged, in_progress, or completed)", file=err)
+            return 2
+        if not args.action_id and args.rank is None:
+            print("receipt mode requires either --action-id or --rank", file=err)
+            return 2
+        if args.details_json:
+            try:
+                parsed_details = json.loads(args.details_json)
+            except json.JSONDecodeError as exc:
+                print(f"--details-json must be a valid JSON object: {exc.msg}", file=err)
+                return 2
+            if not isinstance(parsed_details, dict):
+                print("--details-json must be a JSON object", file=err)
+                return 2
+            details = parsed_details
 
     try:
         if args.handoff:
@@ -578,6 +710,21 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
                 urgencies=urgencies,
                 sources=sources,
             )
+        elif args.receipt:
+            report = build_receipt(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                action_id=args.action_id,
+                rank=args.rank,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+                state=args.state,
+                summary=args.summary,
+                next_action=args.next_action,
+                actor=args.actor,
+                details=details,
+            )
         else:
             report = build_report(
                 db_path=db_path,
@@ -599,6 +746,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         rendered = render_briefing_markdown(report)
     elif args.briefings:
         rendered = render_briefing_bundle_markdown(report)
+    elif args.receipt:
+        rendered = render_receipt_markdown(report)
     else:
         rendered = render_markdown(report)
 
