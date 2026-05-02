@@ -101,6 +101,29 @@ def build_handoff(
     )
 
 
+def build_briefing(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    action_id: str | None = None,
+    rank: int | None = None,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.operator_focus_briefing(
+        chat_id=chat_id,
+        action_id=action_id,
+        rank=rank,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     source_counts = summary.get("source_counts") if isinstance(summary.get("source_counts"), dict) else {}
@@ -303,14 +326,103 @@ def render_handoff_markdown(handoff: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_briefing_markdown(briefing: dict[str, Any]) -> str:
+    selection = briefing.get("selection") if isinstance(briefing.get("selection"), dict) else {}
+    summary = briefing.get("summary") if isinstance(briefing.get("summary"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
+    item_identity = briefing.get("item_identity") if isinstance(briefing.get("item_identity"), dict) else None
+    packet = briefing.get("briefing_packet") if isinstance(briefing.get("briefing_packet"), dict) else None
+
+    lines = [
+        "# Operator Focus Briefing",
+        "",
+        f"- Generated: {_one_line(briefing.get('generated_at'))}",
+        f"- Chat: {_one_line(briefing.get('chat_id'), default='all')}",
+        "",
+        "## Selection",
+        "",
+        f"- Action id: {_one_line(selection.get('action_id'))}",
+        f"- Rank: {_one_line(selection.get('rank'))}",
+        f"- Matched by: {_one_line(selection.get('matched_by'))}",
+        "",
+        "## Summary",
+        "",
+        f"- Returned: {_one_line(summary.get('returned'), default='0')}",
+        f"- Health: {_one_line(summary.get('health_level'))}",
+        f"- Top action: {_one_line(summary.get('top_action_id'))}",
+        f"- Top category: {_one_line(summary.get('top_category'))}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        "",
+        "## Selected Item Identity",
+        "",
+    ]
+
+    if item_identity:
+        for key in ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id"):
+            if key in item_identity:
+                lines.append(f"- {key}: {_one_line(item_identity.get(key))}")
+        lines.append("")
+    else:
+        lines.extend(["No selected item identity matched the requested selector.", ""])
+
+    if not packet:
+        lines.extend(
+            [
+                "## Briefing Packet",
+                "",
+                "No operator focus briefing packet matched the requested selector.",
+                "",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    lines.extend(
+        [
+            "## Briefing Packet",
+            "",
+            f"- owner_role: {_one_line(packet.get('owner_role'))}",
+            f"- action: {_one_line(packet.get('action'))}",
+            f"- inspect_endpoint: {_one_line(packet.get('inspect_endpoint'))}",
+            f"- handoff_endpoint: {_one_line(packet.get('handoff_endpoint'))}",
+            "",
+        ]
+    )
+
+    _append_list(lines, "Evidence Required", packet.get("evidence_required"))
+    _append_list(lines, "Suggested Validation", packet.get("suggested_validation"))
+    _append_list(lines, "Definition Of Done", packet.get("definition_of_done"))
+
+    lines.extend(
+        [
+            "## Assignment Prompt",
+            "",
+            "```text",
+            _ascii(packet.get("assignment_prompt")).rstrip(),
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render an offline operator-focus report from the orchestrator SQLite database.")
     parser.add_argument("--db", required=True, type=Path, help="Path to the orchestrator SQLite database.")
     parser.add_argument("--format", choices=("json", "md", "markdown"), default="json", help="Output format.")
-    parser.add_argument("--handoff", action="store_true", help="Render the selected operator-focus handoff payload.")
+    output_kind = parser.add_mutually_exclusive_group()
+    output_kind.add_argument("--handoff", action="store_true", help="Render the selected operator-focus handoff payload.")
+    output_kind.add_argument("--briefing", action="store_true", help="Render the selected operator-focus briefing payload.")
     parser.add_argument("--limit", type=_positive_int, default=5, help="Maximum ranked focus items to return.")
-    parser.add_argument("--rank", type=_positive_int, help="Select a handoff focus item by rank.")
-    parser.add_argument("--action-id", help="Select a handoff focus item by action id. Takes precedence over --rank.")
+    parser.add_argument("--rank", type=_positive_int, help="Select a handoff or briefing focus item by rank.")
+    parser.add_argument("--action-id", help="Select a handoff or briefing focus item by action id. Takes precedence over --rank.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
     parser.add_argument("--category", action="append", help="Filter by focus category. Repeat or use comma-separated values.")
     parser.add_argument("--urgency", action="append", help="Filter by urgency. Repeat or use comma-separated values.")
@@ -344,6 +456,16 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
                 urgencies=urgencies,
                 sources=sources,
             )
+        elif args.briefing:
+            report = build_briefing(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                action_id=args.action_id,
+                rank=args.rank,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+            )
         else:
             report = build_report(
                 db_path=db_path,
@@ -361,6 +483,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         rendered = json.dumps(report, sort_keys=True, ensure_ascii=True, indent=2) + "\n"
     elif args.handoff:
         rendered = render_handoff_markdown(report)
+    elif args.briefing:
+        rendered = render_briefing_markdown(report)
     else:
         rendered = render_markdown(report)
 
