@@ -13,6 +13,7 @@ from .status_service import StatusService
 
 
 _API_VERSION = "v1"
+_OPERATOR_FOCUS_RECEIPT_STATES = {"acknowledged", "in_progress", "completed"}
 
 
 def _parse_chat_id(qs: dict[str, list[str]]) -> int | None:
@@ -245,10 +246,112 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         for k, v in cors_headers.items():
             self.send_header(str(k), str(v))
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("X-ED-API-Version", _API_VERSION)
         self.end_headers()
+
+    def _read_json_body(self) -> tuple[dict[str, Any] | None, str | None]:
+        raw_len = str(self.headers.get("Content-Length") or "0").strip()
+        try:
+            content_length = max(0, int(raw_len))
+        except Exception:
+            return None, "invalid_content_length"
+        if content_length <= 0:
+            return {}, None
+        try:
+            raw = self.rfile.read(content_length)
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, "invalid_json"
+        if not isinstance(parsed, dict):
+            return None, "invalid_json"
+        return parsed, None
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path or "/"
+        qs = urllib.parse.parse_qs(parsed.query or "")
+        chat_id = _parse_chat_id(qs)
+        ip = str(getattr(self, "client_address", ("unknown", 0))[0] or "unknown")
+        self._cors_headers = {}
+        cors_ok, cors_headers = self._resolve_cors()
+        self._cors_headers = cors_headers
+        if not cors_ok:
+            self._send_json(403, {"error": "cors_origin_denied"}, cors_headers={})
+            return
+
+        if self.server.auth_token:
+            tok = _extract_bearer_token(self)
+            if (not tok) and bool(getattr(self.server, "allow_query_token", False)):
+                tok = _extract_query_token(qs)
+            if not tok or tok != self.server.auth_token:
+                self._send_json(401, {"error": "unauthorized"})
+                return
+
+        if path in (
+            "/api/v1/orchestration/operator-focus/receipt",
+            "/api/orchestration/operator-focus/receipt",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            action_id = (qs.get("action_id") or [""])[0].strip()
+            rank, rank_ok = _parse_positive_rank(qs)
+            if not action_id and (not rank_ok or rank is None):
+                self._send_json(400, {"error": "invalid_rank", "selection": {"rank": (qs.get("rank") or [""])[0].strip()}})
+                return
+
+            body, body_error = self._read_json_body()
+            if body_error:
+                self._send_json(400, {"error": body_error})
+                return
+            body = body or {}
+            raw_state = str(body.get("state") or "").strip().lower()
+            if not raw_state:
+                self._send_json(400, {"error": "missing_state", "valid_states": sorted(_OPERATOR_FOCUS_RECEIPT_STATES)})
+                return
+            if raw_state not in _OPERATOR_FOCUS_RECEIPT_STATES:
+                self._send_json(
+                    400,
+                    {
+                        "error": "invalid_state",
+                        "state": raw_state,
+                        "valid_states": sorted(_OPERATOR_FOCUS_RECEIPT_STATES),
+                    },
+                )
+                return
+            details = body.get("details")
+            if details is not None and not isinstance(details, dict):
+                self._send_json(400, {"error": "invalid_details", "details": "expected_object"})
+                return
+
+            try:
+                payload = self.server.status_service.operator_focus_receipt(
+                    chat_id=chat_id,
+                    action_id=action_id or None,
+                    rank=rank,
+                    categories=_parse_filter_values(qs, "category"),
+                    urgencies=_parse_filter_values(qs, "urgency"),
+                    sources=_parse_filter_values(qs, "source"),
+                    state=raw_state,
+                    summary=body.get("summary"),
+                    next_action=body.get("next_action"),
+                    actor=body.get("actor"),
+                    details=details,
+                )
+            except ValueError as exc:
+                if str(exc) == "invalid_operator_focus_receipt_state":
+                    self._send_json(400, {"error": "invalid_state", "state": raw_state, "valid_states": sorted(_OPERATOR_FOCUS_RECEIPT_STATES)})
+                    return
+                raise
+            if not payload.get("item_identity") or not payload.get("selection"):
+                self._send_json(404, payload)
+                return
+            self._send_json(200, payload)
+            return
+
+        self._send_json(404, {"error": "not_found", "path": path})
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
