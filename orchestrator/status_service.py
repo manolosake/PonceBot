@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 import hashlib
 import json
 import time
 
 from .queue import OrchestratorQueue
+from .runbooks import load_runbooks
 from .schemas.task import Task
 
 
@@ -1335,6 +1337,102 @@ class StatusService:
     cache_ttl_seconds: int = 2
     factory_snapshot_fn: Callable[[int | None], dict[str, Any]] | None = None
     proactive_health_fn: Callable[[], dict[str, Any]] | None = None
+    runbooks_path: Path | None = None
+
+    def runbook_status(self, *, now: float | None = None, runbooks_path: Path | None = None) -> dict[str, Any]:
+        generated_at = float(time.time() if now is None else now)
+        path = runbooks_path or self.runbooks_path or (Path(__file__).with_name("runbooks.yaml"))
+        path_exists = path.exists()
+        runbooks = load_runbooks(path) if path_exists else []
+
+        summary = {
+            "total": 0,
+            "enabled": 0,
+            "disabled": 0,
+            "due": 0,
+            "overdue": 0,
+            "never_run_enabled": 0,
+        }
+        items: list[dict[str, Any]] = []
+
+        for rb in runbooks:
+            summary["total"] += 1
+            enabled = bool(rb.enabled)
+            if enabled:
+                summary["enabled"] += 1
+            else:
+                summary["disabled"] += 1
+
+            last_raw = self.orch_q.get_runbook_last_run(runbook_id=rb.runbook_id)
+            try:
+                last_run = float(last_raw)
+            except Exception:
+                last_run = 0.0
+            has_last_run = last_run > 0.0
+
+            if not enabled:
+                status = "disabled"
+                last_run_at = float(last_run) if has_last_run else None
+                next_run_at = None
+                due = False
+                overdue = False
+                due_in_seconds = None
+                overdue_by_seconds = None
+            elif not has_last_run:
+                status = "due"
+                last_run_at = None
+                next_run_at = generated_at
+                due = True
+                overdue = True
+                due_in_seconds = 0
+                overdue_by_seconds = 0
+                summary["never_run_enabled"] += 1
+            else:
+                last_run_at = float(last_run)
+                next_run_at = float(last_run + float(rb.interval_seconds))
+                due = generated_at >= next_run_at
+                overdue = bool(due)
+                if due:
+                    status = "due"
+                    due_in_seconds = 0
+                    overdue_by_seconds = max(0, int(generated_at - next_run_at))
+                else:
+                    status = "scheduled"
+                    due_in_seconds = max(0, int(next_run_at - generated_at))
+                    overdue_by_seconds = None
+
+            if due:
+                summary["due"] += 1
+            if overdue:
+                summary["overdue"] += 1
+
+            items.append(
+                {
+                    "runbook_id": rb.runbook_id,
+                    "role": rb.role,
+                    "enabled": enabled,
+                    "status": status,
+                    "interval_seconds": int(rb.interval_seconds),
+                    "last_run_at": last_run_at,
+                    "next_run_at": next_run_at,
+                    "due": bool(due),
+                    "overdue": bool(overdue),
+                    "due_in_seconds": due_in_seconds,
+                    "overdue_by_seconds": overdue_by_seconds,
+                    "mode_hint": rb.mode_hint,
+                    "priority": int(rb.priority),
+                }
+            )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "runbooks_path": str(path),
+            "runbooks_path_exists": bool(path_exists),
+            "summary": summary,
+            "items": items,
+        }
 
     def proactive_health(self) -> dict[str, Any]:
         generated_at = float(time.time())
