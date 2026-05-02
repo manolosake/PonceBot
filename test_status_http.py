@@ -115,6 +115,89 @@ class TestStatusHTTP(unittest.TestCase):
             bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
             self.assertEqual(bad_payload.get("error"), "invalid_rank")
 
+    def test_operator_focus_briefing_endpoint_supports_rank_and_missing_packet(self) -> None:
+        class _FakeStatusService:
+            def snapshot(self, *, chat_id: int | None = None) -> dict[str, object]:
+                return {"api_version": "v1", "schema_version": 2, "chat_id": chat_id}
+
+            def operator_focus_briefing(
+                self,
+                *,
+                chat_id: int | None = None,
+                action_id: str | None = None,
+                rank: int | None = None,
+                categories: list[str] | None = None,
+                urgencies: list[str] | None = None,
+                sources: list[str] | None = None,
+            ) -> dict[str, object]:
+                if action_id == "missing":
+                    return {
+                        "api_version": "v1",
+                        "schema_version": 1,
+                        "chat_id": chat_id,
+                        "selection": {
+                            "action_id": action_id,
+                            "rank": rank,
+                        },
+                        "item_identity": None,
+                        "briefing_packet": None,
+                    }
+                return {
+                    "api_version": "v1",
+                    "schema_version": 1,
+                    "chat_id": chat_id,
+                    "selection": {
+                        "action_id": action_id,
+                        "rank": rank,
+                    },
+                    "item_identity": {
+                        "action_id": action_id or "focus:first",
+                        "rank": rank or 1,
+                    },
+                    "briefing_packet": {
+                        "owner_role": "reviewer_local",
+                        "action": "Review first",
+                    },
+                }
+
+        with _running_status_http_server(
+            host="127.0.0.1",
+            port=0,
+            status_service=_FakeStatusService(),
+            stream_interval_s=0.5,
+            auth_token="secret",
+            snapshot_rate_per_s=0.0,
+            snapshot_burst=1.0,
+            max_sse_per_ip=2,
+            wait_headers={"Authorization": "Bearer secret"},
+        ) as (_http_srv, base):
+            headers = {"Authorization": "Bearer secret"}
+
+            req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/briefing?rank=1", headers=headers)
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                self.assertEqual(resp.status, 200)
+                payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual((payload.get("item_identity") or {}).get("rank"), 1)
+                self.assertEqual(((payload.get("selection") or {}).get("rank")), 1)
+                self.assertEqual((payload.get("briefing_packet") or {}).get("owner_role"), "reviewer_local")
+
+            missing_req = urllib.request.Request(
+                base + "/api/v1/orchestration/operator-focus/briefing?action_id=missing",
+                headers=headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as missing_ctx:
+                urllib.request.urlopen(missing_req, timeout=2).read()
+            self.assertEqual(missing_ctx.exception.code, 404)
+            missing_payload = json.loads(missing_ctx.exception.read().decode("utf-8"))
+            self.assertIsNone(missing_payload.get("briefing_packet"))
+
+            bad_req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/briefing?rank=0", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as bad_ctx:
+                urllib.request.urlopen(bad_req, timeout=2).read()
+            self.assertEqual(bad_ctx.exception.code, 400)
+            bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
+            self.assertEqual(bad_payload.get("error"), "invalid_rank")
+
     def test_send_json_ignores_client_disconnect_errors(self) -> None:
         class _DisconnectingWriter:
             def __init__(self, exc: BaseException) -> None:
