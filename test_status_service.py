@@ -696,8 +696,17 @@ class TestStatusService(unittest.TestCase):
             item = (report.get("items") or [None])[0]
             self.assertIsInstance(item, dict)
             self.assertEqual(item.get("receipt_state"), "completed")
+            self.assertEqual(item.get("receipt_count"), 2)
+            self.assertEqual(item.get("receipt_counts_by_state"), {"acknowledged": 1, "completed": 1})
+            receipt_history = item.get("receipt_history") or []
+            self.assertEqual(len(receipt_history), 2)
+            self.assertEqual(receipt_history[0].get("state"), "completed")
+            self.assertEqual(receipt_history[0].get("summary"), "Latest receipt")
+            self.assertEqual(receipt_history[1].get("state"), "acknowledged")
+            self.assertEqual(receipt_history[1].get("summary"), "Old receipt")
             latest_receipt = item.get("latest_receipt") or {}
             self.assertEqual(latest_receipt.get("state"), "completed")
             self.assertEqual(latest_receipt.get("summary"), "Latest receipt")
             self.assertEqual(latest_receipt.get("actor"), "implementer_local")
             self.assertEqual((latest_receipt.get("details") or {}).get("note"), "latest")
+            self.assertEqual(latest_receipt, receipt_history[0])
