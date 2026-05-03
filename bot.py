@@ -10185,6 +10185,7 @@ def _focus_usage_text() -> str:
     return (
         "Usage: /focus [chat|all] | "
         "/focus brief|briefing|handoff [chat|all] [rank] | "
+        "/focus briefings [chat|all] [limit] | "
         "/focus ack|start|done [chat|all] [rank] [summary...]"
     )
 
@@ -10253,6 +10254,25 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
         if idx != len(parts):
             return _focus_usage_text(), None
         return _focus_payload_marker({"mode": mode, "scope": scope, "rank": rank}), None
+
+    if head == "briefings":
+        scope = "chat"
+        limit = 5
+        idx = 1
+        if idx < len(parts):
+            parsed_scope = _focus_scope_value(parts[idx])
+            if parsed_scope:
+                scope = parsed_scope
+                idx += 1
+        if idx < len(parts):
+            parsed_limit = _focus_parse_rank(parts[idx])
+            if parsed_limit is None:
+                return _focus_usage_text(), None
+            limit = parsed_limit
+            idx += 1
+        if idx != len(parts):
+            return _focus_usage_text(), None
+        return _focus_payload_marker({"mode": "briefings", "scope": scope, "limit": limit}), None
 
     state_by_command = {
         "ack": "acknowledged",
@@ -10463,6 +10483,64 @@ def _operator_focus_packet_text(packet: dict[str, Any], *, mode: str, scope_labe
     assignment = _first_line(packet_body.get("assignment_prompt") or delegate.get("task_prompt"), max_chars=360)
     if assignment:
         lines.append(f"assignment: {assignment}")
+
+    return "\n".join(lines)
+
+
+def _operator_focus_briefing_bundle_text(bundle: dict[str, Any], *, scope_label: str, limit: int) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 160, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
+    briefings = [briefing for briefing in list(bundle.get("briefings") or []) if isinstance(briefing, dict)]
+    try:
+        limit_i = int(limit)
+    except Exception:
+        limit_i = 5
+    try:
+        returned = int(summary.get("returned", len(briefings)) or len(briefings))
+    except Exception:
+        returned = len(briefings)
+
+    health = _clip(summary.get("health_level"), max_chars=24, default="unknown")
+    top_action = _clip(summary.get("top_action_id"), max_chars=80)
+
+    lines = [
+        f"Jarvis: focus briefings ({_ascii(scope_label)} limit={limit_i})",
+        f"returned={returned} health={health}" + (f" top={top_action}" if top_action else ""),
+    ]
+
+    if not briefings:
+        lines.extend(["", "No operator focus briefing packets for this scope."])
+        return "\n".join(lines)
+
+    for idx, briefing in enumerate(briefings, start=1):
+        selection = briefing.get("selection") if isinstance(briefing.get("selection"), dict) else {}
+        selected_rank = selection.get("rank")
+        try:
+            rank_i = int(selected_rank) if selected_rank is not None else idx
+        except Exception:
+            rank_i = idx
+        lines.extend(
+            [
+                "",
+                _operator_focus_packet_text(
+                    briefing,
+                    mode="briefing",
+                    scope_label=scope_label,
+                    rank=rank_i,
+                ),
+            ]
+        )
 
     return "\n".join(lines)
 
