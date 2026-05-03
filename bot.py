@@ -7345,7 +7345,7 @@ def _help_text(cfg: BotConfig) -> str:
         "- /watch              Live company status (single message, auto-updated)",
         "- /unwatch            Disable /watch",
         "- /orders             List CEO orders (autopilot scope)",
-        "- /focus              Ranked operator next actions; brief/handoff/ack/start/done by rank",
+        "- /focus              Ranked operator next actions; brief/handoff/trail/ack/start/done by rank",
         "- /order show|pause|done|merge|rollback <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
         "- /daily              Show orchestrator digest now",
@@ -10184,7 +10184,7 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
 def _focus_usage_text() -> str:
     return (
         "Usage: /focus [chat|all] | "
-        "/focus brief|briefing|handoff [chat|all] [rank] | "
+        "/focus brief|briefing|handoff|trail|history [chat|all] [rank] | "
         "/focus briefings [chat|all] [limit] | "
         "/focus ack|start|done [chat|all] [rank] [summary...]"
     )
@@ -10235,8 +10235,13 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
         if scope == "chat":
             return _orch_marker("focus", "chat"), None
 
-    if head in ("brief", "briefing", "handoff"):
-        mode = "briefing" if head in ("brief", "briefing") else "handoff"
+    if head in ("brief", "briefing", "handoff", "trail", "history"):
+        if head in ("brief", "briefing"):
+            mode = "briefing"
+        elif head == "handoff":
+            mode = "handoff"
+        else:
+            mode = "trail"
         scope = "chat"
         rank = 1
         idx = 1
@@ -10364,6 +10369,105 @@ def _operator_focus_receipt_text(receipt_payload: dict[str, Any], *, scope_label
     next_action = _clip(receipt.get("next_action"), max_chars=220)
     if next_action:
         lines.append(f"next: {next_action}")
+    return "\n".join(lines)
+
+
+def _operator_focus_receipt_trail_text(trail_payload: dict[str, Any], *, scope_label: str, rank: int) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 220, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    def _compact_receipt(receipt: dict[str, Any]) -> str:
+        state = _clip(receipt.get("state"), max_chars=32, default="recorded")
+        actor = _clip(receipt.get("actor"), max_chars=48)
+        recorded_at = _clip(receipt.get("recorded_at") or receipt.get("ts"), max_chars=32)
+        summary = _clip(receipt.get("summary"), max_chars=140)
+        parts = [state]
+        if actor:
+            parts.append(f"by {actor}")
+        if recorded_at:
+            parts.append(f"at {recorded_at}")
+        line = " ".join(parts)
+        if summary:
+            line += f" - {summary}"
+        return line
+
+    selection = trail_payload.get("selection") if isinstance(trail_payload.get("selection"), dict) else {}
+    item = trail_payload.get("item_identity") if isinstance(trail_payload.get("item_identity"), dict) else {}
+    latest = trail_payload.get("latest_receipt") if isinstance(trail_payload.get("latest_receipt"), dict) else {}
+    receipts = [receipt for receipt in list(trail_payload.get("receipts") or []) if isinstance(receipt, dict)]
+    counts = trail_payload.get("receipt_counts_by_state") if isinstance(trail_payload.get("receipt_counts_by_state"), dict) else {}
+
+    selected_rank = selection.get("rank") or item.get("rank")
+    try:
+        rank_i = int(selected_rank) if selected_rank is not None else int(rank)
+    except Exception:
+        rank_i = int(rank)
+
+    try:
+        receipt_count = int(trail_payload.get("receipt_count") or len(receipts))
+    except Exception:
+        receipt_count = len(receipts)
+
+    count_bits = []
+    for state, count in sorted(counts.items(), key=lambda entry: str(entry[0])):
+        try:
+            count_i = int(count)
+        except Exception:
+            continue
+        count_bits.append(f"{_clip(state, max_chars=24)}={count_i}")
+
+    lines = [
+        f"Jarvis: focus receipt trail ({_ascii(scope_label)} rank={rank_i})",
+        f"receipts={receipt_count}" + (f" states={' '.join(count_bits)}" if count_bits else ""),
+    ]
+
+    if item:
+        urgency = _clip(item.get("urgency"), max_chars=24, default="n/a")
+        category = _clip(item.get("category"), max_chars=48, default="n/a")
+        label = _clip(item.get("label"), max_chars=140, default="Selected focus item")
+        action_id = _clip(item.get("action_id"), max_chars=120)
+        item_line = f"item: {urgency}/{category} - {label}"
+        if action_id:
+            item_line += f" ({action_id})"
+        lines.append(item_line)
+    else:
+        lines.extend(
+            [
+                "No focus item found for that rank.",
+                "Try /focus for the ranked list, or /focus trail all 1 for global scope.",
+            ]
+        )
+        return "\n".join(lines)
+
+    if latest:
+        lines.append(f"latest: {_compact_receipt(latest)}")
+        next_action = _clip(latest.get("next_action"), max_chars=180)
+        if next_action:
+            lines.append(f"next: {next_action}")
+    else:
+        lines.extend(
+            [
+                "No receipts recorded for this focus item yet.",
+                f"Use /focus ack chat {rank_i} <summary> when you take ownership.",
+            ]
+        )
+        return "\n".join(lines)
+
+    history = receipts[:5]
+    if history:
+        lines.append("history:")
+        for idx, receipt in enumerate(history, start=1):
+            lines.append(f"- {idx}. {_compact_receipt(receipt)}")
+
     return "\n".join(lines)
 
 
@@ -11103,6 +11207,9 @@ def _send_orchestrator_marker_response(
                     actor="jarvis",
                 )
                 text = _operator_focus_receipt_text(receipt_payload, scope_label=scope_label, rank=rank or 1)
+            elif mode in ("trail", "history"):
+                trail_payload = svc.operator_focus_receipt_trail(chat_id=scope_chat_id, rank=rank)
+                text = _operator_focus_receipt_trail_text(trail_payload, scope_label=scope_label, rank=rank or 1)
             else:
                 focus = svc.operator_focus(chat_id=scope_chat_id)
                 text = _operator_focus_text(focus, scope_label=scope_label)
