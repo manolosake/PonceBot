@@ -236,6 +236,7 @@ def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
 
 _TERMINAL_TASK_STATES = {"done", "failed", "cancelled"}
 _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE = "operator_focus_receipt"
+_OPERATOR_FOCUS_RECEIPT_HISTORY_LIMIT = 5
 _OPERATOR_FOCUS_RECEIPT_STATUSES = {"acknowledged", "in_progress", "completed"}
 
 
@@ -3637,6 +3638,9 @@ class StatusService:
                 "briefing_packet",
                 "receipt_state",
                 "latest_receipt",
+                "receipt_count",
+                "receipt_counts_by_state",
+                "receipt_history",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -4052,18 +4056,23 @@ class StatusService:
             compact["item_identity"] = dict(item_identity)
         return {key: value for key, value in compact.items() if value is not None}
 
-    def _latest_operator_focus_receipt(self, *, order_id: str, action_id: str) -> dict[str, Any] | None:
-        oid = str(order_id or "").strip()
+    def _operator_focus_receipt_rollup_from_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        action_id: str,
+        history_limit: int = _OPERATOR_FOCUS_RECEIPT_HISTORY_LIMIT,
+    ) -> dict[str, Any]:
         aid = str(action_id or "").strip()
-        if not oid or not aid:
-            return None
-        try:
-            rows = self.orch_q.list_decision_log(order_id=oid, limit=50)
-        except Exception:
-            return None
+        if not aid:
+            return {
+                "receipt_count": 0,
+                "receipt_counts_by_state": {},
+                "receipt_history": [],
+                "latest_receipt": None,
+            }
 
-        newest: dict[str, Any] | None = None
-        newest_ts: float | None = None
+        receipts: list[tuple[float, dict[str, Any]]] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -4075,12 +4084,61 @@ class StatusService:
                 ts = float(row.get("ts") or 0.0)
             except Exception:
                 ts = 0.0
-            if newest is None or newest_ts is None or ts > newest_ts:
-                newest = row
-                newest_ts = ts
-        return newest
+            receipts.append((ts, row))
+
+        receipts.sort(key=lambda item: item[0], reverse=True)
+        counts_by_state: dict[str, int] = {}
+        for _, receipt in receipts:
+            state = str(receipt.get("state") or "").strip().lower() or "unknown"
+            counts_by_state[state] = int(counts_by_state.get(state, 0)) + 1
+
+        history = [
+            self._compact_operator_focus_receipt(receipt)
+            for _, receipt in receipts[: max(1, int(history_limit))]
+        ]
+        latest = history[0] if history else None
+        return {
+            "receipt_count": len(receipts),
+            "receipt_counts_by_state": counts_by_state,
+            "receipt_history": history,
+            "latest_receipt": latest,
+        }
+
+    def _latest_operator_focus_receipt(self, *, order_id: str, action_id: str) -> dict[str, Any] | None:
+        oid = str(order_id or "").strip()
+        aid = str(action_id or "").strip()
+        if not oid or not aid:
+            return None
+        try:
+            rows = self.orch_q.list_decision_log(order_id=oid, limit=50)
+        except Exception:
+            return None
+
+        receipts = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("kind") or "").strip() == _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE
+            and self._operator_focus_receipt_action_id(row) == aid
+        ]
+        if not receipts:
+            return None
+        return max(receipts, key=lambda row: float(row.get("ts") or 0.0))
 
     def _decorate_operator_focus_receipts(self, items: list[dict[str, Any]]) -> None:
+        rows_by_order_id: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            order_id = str(item.get("order_id") or "").strip()
+            action_id = str(item.get("action_id") or "").strip()
+            if not order_id or not action_id or order_id in rows_by_order_id:
+                continue
+            try:
+                rows_by_order_id[order_id] = self.orch_q.list_decision_log(order_id=order_id, limit=500)
+            except Exception:
+                rows_by_order_id[order_id] = []
+
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -4089,12 +4147,19 @@ class StatusService:
             action_id = str(item.get("action_id") or "").strip()
             if not order_id or not action_id:
                 continue
-            latest = self._latest_operator_focus_receipt(order_id=order_id, action_id=action_id)
-            if not latest:
+            rollup = self._operator_focus_receipt_rollup_from_rows(
+                rows_by_order_id.get(order_id, []),
+                action_id=action_id,
+            )
+            item["receipt_count"] = rollup["receipt_count"]
+            item["receipt_counts_by_state"] = rollup["receipt_counts_by_state"]
+            item["receipt_history"] = rollup["receipt_history"]
+            latest = rollup.get("latest_receipt")
+            if not isinstance(latest, dict) or not latest:
                 continue
             state = str(latest.get("state") or "").strip().lower()
             item["receipt_state"] = state or "new"
-            item["latest_receipt"] = self._compact_operator_focus_receipt(latest)
+            item["latest_receipt"] = latest
 
     def _select_operator_focus_item(
         self,
@@ -4137,7 +4202,22 @@ class StatusService:
     def _operator_focus_item_identity(self, item: dict[str, Any] | None) -> dict[str, Any] | None:
         if not item:
             return None
-        keys = ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id", "receipt_state")
+        keys = (
+            "rank",
+            "action_id",
+            "urgency",
+            "category",
+            "label",
+            "source",
+            "order_id",
+            "job_id",
+            "repo_id",
+            "receipt_state",
+            "receipt_count",
+            "receipt_counts_by_state",
+            "receipt_history",
+            "latest_receipt",
+        )
         return {key: item.get(key) for key in keys if item.get(key) is not None}
 
     def _fallback_operator_focus_briefing_packet(self, item: dict[str, Any]) -> dict[str, Any]:
