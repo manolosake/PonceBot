@@ -178,6 +178,31 @@ def build_receipt(
     )
 
 
+def build_receipt_trail(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    action_id: str | None = None,
+    rank: int | None = None,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.operator_focus_receipt_trail(
+        chat_id=chat_id,
+        action_id=action_id,
+        rank=rank,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+        limit=limit,
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     source_counts = summary.get("source_counts") if isinstance(summary.get("source_counts"), dict) else {}
@@ -548,6 +573,152 @@ def render_receipt_markdown(receipt_report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _append_receipt_summary(lines: list[str], receipt: dict[str, Any]) -> None:
+    lines.extend(
+        [
+            f"- state: {_one_line(receipt.get('state'))}",
+            f"- summary: {_one_line(receipt.get('summary'))}",
+            f"- next_action: {_one_line(receipt.get('next_action'))}",
+            f"- actor: {_one_line(receipt.get('actor'))}",
+            f"- recorded_at: {_one_line(receipt.get('recorded_at'))}",
+            f"- order_id: {_one_line(receipt.get('order_id'))}",
+            f"- job_id: {_one_line(receipt.get('job_id'))}",
+        ]
+    )
+
+
+def render_receipt_trail_markdown(trail: dict[str, Any]) -> str:
+    selection = trail.get("selection") if isinstance(trail.get("selection"), dict) else {}
+    summary = trail.get("summary") if isinstance(trail.get("summary"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
+    item_identity = trail.get("item_identity") if isinstance(trail.get("item_identity"), dict) else None
+    counts_by_state = trail.get("receipt_counts_by_state") if isinstance(trail.get("receipt_counts_by_state"), dict) else {}
+    latest_receipt = trail.get("latest_receipt") if isinstance(trail.get("latest_receipt"), dict) else None
+    receipts = [receipt for receipt in list(trail.get("receipts") or []) if isinstance(receipt, dict)]
+
+    lines = [
+        "# Operator Focus Receipt Trail",
+        "",
+        f"- Generated: {_one_line(trail.get('generated_at'))}",
+        f"- Chat: {_one_line(trail.get('chat_id'), default='all')}",
+        "",
+        "## Selection",
+        "",
+        f"- Action id: {_one_line(selection.get('action_id'))}",
+        f"- Rank: {_one_line(selection.get('rank'))}",
+        f"- Matched by: {_one_line(selection.get('matched_by'))}",
+        "",
+        "## Summary And Filters",
+        "",
+        f"- Returned: {_one_line(summary.get('returned'), default='0')}",
+        f"- Health: {_one_line(summary.get('health_level'))}",
+        f"- Top action: {_one_line(summary.get('top_action_id'))}",
+        f"- Top category: {_one_line(summary.get('top_category'))}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        "",
+        "## Selected Item Identity",
+        "",
+    ]
+
+    if item_identity:
+        for key in (
+            "rank",
+            "action_id",
+            "urgency",
+            "category",
+            "label",
+            "source",
+            "order_id",
+            "job_id",
+            "repo_id",
+            "receipt_state",
+        ):
+            if key in item_identity:
+                lines.append(f"- {key}: {_one_line(item_identity.get(key))}")
+        lines.append("")
+    else:
+        lines.extend(["No operator focus receipt trail item matched the requested selector.", ""])
+
+    lines.extend(
+        [
+            "## Receipt Counts",
+            "",
+            f"- Total receipts: {_one_line(trail.get('receipt_count'), default='0')}",
+        ]
+    )
+    if counts_by_state:
+        for state in sorted(counts_by_state):
+            lines.append(f"- {state}: {_one_line(counts_by_state.get(state), default='0')}")
+    else:
+        lines.append("- By state: none")
+    lines.append("")
+
+    lines.extend(["## Latest Receipt", ""])
+    if latest_receipt:
+        _append_receipt_summary(lines, latest_receipt)
+        lines.append("")
+    else:
+        lines.extend(["No receipts have been recorded for this item.", ""])
+
+    lines.extend(
+        [
+            "## Receipt History",
+            "",
+            "| # | State | Actor | Recorded at | Summary | Next action |",
+            "| ---: | --- | --- | --- | --- | --- |",
+        ]
+    )
+    if receipts:
+        for index, receipt in enumerate(receipts, start=1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _one_line(index),
+                        _one_line(receipt.get("state")),
+                        _one_line(receipt.get("actor")),
+                        _one_line(receipt.get("recorded_at")),
+                        _one_line(receipt.get("summary")),
+                        _one_line(receipt.get("next_action")),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("| - | - | - | - | No receipt history. | - |")
+    lines.append("")
+
+    detailed_receipts = [
+        (index, receipt)
+        for index, receipt in enumerate(receipts, start=1)
+        if isinstance(receipt.get("details"), dict) and receipt.get("details")
+    ]
+    if detailed_receipts:
+        lines.extend(["## Receipt Details", ""])
+        for index, receipt in detailed_receipts:
+            title = _one_line(receipt.get("recorded_at"), default=f"receipt {index}")
+            lines.extend(
+                [
+                    f"### {index}. {title}",
+                    "",
+                    "```json",
+                    json.dumps(receipt.get("details"), sort_keys=True, ensure_ascii=True, indent=2),
+                    "```",
+                    "",
+                ]
+            )
+
+    return "\n".join(lines) + "\n"
+
+
 def render_briefing_bundle_markdown(bundle: dict[str, Any]) -> str:
     summary = bundle.get("summary") if isinstance(bundle.get("summary"), dict) else {}
     filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
@@ -638,9 +809,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     output_kind.add_argument("--briefing", action="store_true", help="Render the selected operator-focus briefing payload.")
     output_kind.add_argument("--briefings", action="store_true", help="Render an operator-focus briefing bundle.")
     output_kind.add_argument("--receipt", action="store_true", help="Record and render an operator-focus receipt payload.")
+    output_kind.add_argument("--receipt-trail", action="store_true", help="Render a read-only operator-focus receipt audit trail.")
     parser.add_argument("--limit", type=_positive_int, default=5, help="Maximum ranked focus items to return.")
-    parser.add_argument("--rank", type=_positive_int, help="Select a handoff, briefing, or receipt focus item by rank.")
-    parser.add_argument("--action-id", help="Select a handoff, briefing, or receipt focus item by action id. Takes precedence over --rank.")
+    parser.add_argument("--rank", type=_positive_int, help="Select a handoff, briefing, receipt, or receipt-trail focus item by rank.")
+    parser.add_argument("--action-id", help="Select a handoff, briefing, receipt, or receipt-trail focus item by action id. Takes precedence over --rank.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
     parser.add_argument("--category", action="append", help="Filter by focus category. Repeat or use comma-separated values.")
     parser.add_argument("--urgency", action="append", help="Filter by urgency. Repeat or use comma-separated values.")
@@ -686,6 +858,10 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
                 print("--details-json must be a JSON object", file=err)
                 return 2
             details = parsed_details
+    elif args.receipt_trail:
+        if not args.action_id and args.rank is None:
+            print("receipt-trail mode requires either --action-id or --rank", file=err)
+            return 2
 
     try:
         if args.handoff:
@@ -732,6 +908,17 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
                 actor=args.actor,
                 details=details,
             )
+        elif args.receipt_trail:
+            report = build_receipt_trail(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                action_id=args.action_id,
+                rank=args.rank,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+                limit=args.limit,
+            )
         else:
             report = build_report(
                 db_path=db_path,
@@ -755,6 +942,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         rendered = render_briefing_bundle_markdown(report)
     elif args.receipt:
         rendered = render_receipt_markdown(report)
+    elif args.receipt_trail:
+        rendered = render_receipt_trail_markdown(report)
     else:
         rendered = render_markdown(report)
 
