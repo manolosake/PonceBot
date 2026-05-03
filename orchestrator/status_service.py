@@ -238,6 +238,10 @@ _TERMINAL_TASK_STATES = {"done", "failed", "cancelled"}
 _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE = "operator_focus_receipt"
 _OPERATOR_FOCUS_RECEIPT_HISTORY_LIMIT = 5
 _OPERATOR_FOCUS_RECEIPT_STATUSES = {"acknowledged", "in_progress", "completed"}
+_OPERATOR_FOCUS_RECEIPT_STALE_AFTER_SECONDS = {
+    "acknowledged": 30 * 60,
+    "in_progress": 60 * 60,
+}
 
 
 def _workflow_stage_tasks(stage: str, root_task: Task | None, children: list[Task]) -> list[Task]:
@@ -3641,6 +3645,7 @@ class StatusService:
                 "receipt_count",
                 "receipt_counts_by_state",
                 "receipt_history",
+                "receipt_follow_up",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -3997,7 +4002,14 @@ class StatusService:
         returned = filtered_items[:lim]
         for idx, item in enumerate(returned, start=1):
             item["rank"] = idx
-        self._decorate_operator_focus_receipts(returned)
+        self._decorate_operator_focus_receipts(returned, now=generated_at)
+        receipt_follow_up_count = sum(1 for item in returned if isinstance(item.get("receipt_follow_up"), dict))
+        receipt_escalation_count = sum(
+            1
+            for item in returned
+            if isinstance(item.get("receipt_follow_up"), dict)
+            and str((item.get("receipt_follow_up") or {}).get("severity") or "") == "escalation"
+        )
 
         top = returned[0] if returned else {}
         top_focus = _focus_packet(top if top else None)
@@ -4018,6 +4030,8 @@ class StatusService:
                 "filtered_out": len(items) - len(filtered_items),
                 "source_counts": source_counts,
                 "available_source_counts": available_source_counts,
+                "receipt_follow_up_count": receipt_follow_up_count,
+                "receipt_escalation_count": receipt_escalation_count,
             },
             "top_focus": top_focus,
             "items": returned,
@@ -4104,6 +4118,42 @@ class StatusService:
             "latest_receipt": latest,
         }
 
+    def _operator_focus_receipt_follow_up(
+        self,
+        latest_receipt: dict[str, Any],
+        *,
+        now: float,
+    ) -> dict[str, Any] | None:
+        state = str(latest_receipt.get("state") or "").strip().lower()
+        stale_after_seconds = _OPERATOR_FOCUS_RECEIPT_STALE_AFTER_SECONDS.get(state)
+        if stale_after_seconds is None:
+            return None
+        try:
+            recorded_at = float(latest_receipt.get("recorded_at"))
+        except Exception:
+            return None
+        if recorded_at <= 0:
+            return None
+        age_seconds = max(0, int(float(now) - recorded_at))
+        if age_seconds < stale_after_seconds:
+            return None
+        severity = "escalation" if age_seconds >= stale_after_seconds * 2 else "follow_up"
+        if severity == "escalation":
+            message = f"Latest {state} receipt is stale beyond escalation threshold."
+            next_action = "Escalate for owner status or record a completed receipt."
+        else:
+            message = f"Latest {state} receipt is stale and needs operator follow-up."
+            next_action = "Follow up with the receipt owner for current status."
+        return {
+            "active": True,
+            "severity": severity,
+            "state": state,
+            "age_seconds": age_seconds,
+            "stale_after_seconds": int(stale_after_seconds),
+            "message": message,
+            "next_action": next_action,
+        }
+
     def _latest_operator_focus_receipt(self, *, order_id: str, action_id: str) -> dict[str, Any] | None:
         oid = str(order_id or "").strip()
         aid = str(action_id or "").strip()
@@ -4125,7 +4175,8 @@ class StatusService:
             return None
         return max(receipts, key=lambda row: float(row.get("ts") or 0.0))
 
-    def _decorate_operator_focus_receipts(self, items: list[dict[str, Any]]) -> None:
+    def _decorate_operator_focus_receipts(self, items: list[dict[str, Any]], *, now: float | None = None) -> None:
+        generated_at = float(time.time() if now is None else now)
         rows_by_order_id: dict[str, list[dict[str, Any]]] = {}
         for item in items:
             if not isinstance(item, dict):
@@ -4160,6 +4211,9 @@ class StatusService:
             state = str(latest.get("state") or "").strip().lower()
             item["receipt_state"] = state or "new"
             item["latest_receipt"] = latest
+            follow_up = self._operator_focus_receipt_follow_up(latest, now=generated_at)
+            if follow_up:
+                item["receipt_follow_up"] = follow_up
 
     def _select_operator_focus_item(
         self,
@@ -4217,6 +4271,7 @@ class StatusService:
             "receipt_counts_by_state",
             "receipt_history",
             "latest_receipt",
+            "receipt_follow_up",
         )
         return {key: item.get(key) for key in keys if item.get(key) is not None}
 
