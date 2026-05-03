@@ -3635,6 +3635,8 @@ class StatusService:
                 "owner_action_evidence",
                 "delegate_contract",
                 "briefing_packet",
+                "receipt_state",
+                "latest_receipt",
             )
             return {key: item.get(key) for key in keys if key in item}
 
@@ -3991,6 +3993,7 @@ class StatusService:
         returned = filtered_items[:lim]
         for idx, item in enumerate(returned, start=1):
             item["rank"] = idx
+        self._decorate_operator_focus_receipts(returned)
 
         top = returned[0] if returned else {}
         top_focus = _focus_packet(top if top else None)
@@ -4015,6 +4018,83 @@ class StatusService:
             "top_focus": top_focus,
             "items": returned,
         }
+
+    def _operator_focus_receipt_action_id(self, receipt: dict[str, Any]) -> str:
+        details = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
+        item_identity = details.get("item_identity") if isinstance(details.get("item_identity"), dict) else {}
+        selection = details.get("selection") if isinstance(details.get("selection"), dict) else {}
+        for value in (item_identity.get("action_id"), selection.get("action_id")):
+            action_id = str(value or "").strip()
+            if action_id:
+                return action_id
+        return ""
+
+    def _compact_operator_focus_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        details = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
+        persisted_details = details.get("operator_focus_details")
+        compact = {
+            "state": receipt.get("state"),
+            "summary": receipt.get("summary"),
+            "next_action": receipt.get("next_action"),
+            "actor": details.get("actor"),
+            "recorded_at": receipt.get("ts"),
+            "ts": receipt.get("ts"),
+            "order_id": receipt.get("order_id"),
+            "job_id": receipt.get("job_id"),
+        }
+        if isinstance(persisted_details, dict) and persisted_details:
+            compact["details"] = dict(persisted_details)
+        selection = details.get("selection")
+        if isinstance(selection, dict) and selection:
+            compact["selection"] = dict(selection)
+        item_identity = details.get("item_identity")
+        if isinstance(item_identity, dict) and item_identity:
+            compact["item_identity"] = dict(item_identity)
+        return {key: value for key, value in compact.items() if value is not None}
+
+    def _latest_operator_focus_receipt(self, *, order_id: str, action_id: str) -> dict[str, Any] | None:
+        oid = str(order_id or "").strip()
+        aid = str(action_id or "").strip()
+        if not oid or not aid:
+            return None
+        try:
+            rows = self.orch_q.list_decision_log(order_id=oid, limit=50)
+        except Exception:
+            return None
+
+        newest: dict[str, Any] | None = None
+        newest_ts: float | None = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or "").strip() != _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE:
+                continue
+            if self._operator_focus_receipt_action_id(row) != aid:
+                continue
+            try:
+                ts = float(row.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            if newest is None or newest_ts is None or ts > newest_ts:
+                newest = row
+                newest_ts = ts
+        return newest
+
+    def _decorate_operator_focus_receipts(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item["receipt_state"] = "new"
+            order_id = str(item.get("order_id") or "").strip()
+            action_id = str(item.get("action_id") or "").strip()
+            if not order_id or not action_id:
+                continue
+            latest = self._latest_operator_focus_receipt(order_id=order_id, action_id=action_id)
+            if not latest:
+                continue
+            state = str(latest.get("state") or "").strip().lower()
+            item["receipt_state"] = state or "new"
+            item["latest_receipt"] = self._compact_operator_focus_receipt(latest)
 
     def _select_operator_focus_item(
         self,
@@ -4057,7 +4137,7 @@ class StatusService:
     def _operator_focus_item_identity(self, item: dict[str, Any] | None) -> dict[str, Any] | None:
         if not item:
             return None
-        keys = ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id")
+        keys = ("rank", "action_id", "urgency", "category", "label", "source", "order_id", "job_id", "repo_id", "receipt_state")
         return {key: item.get(key) for key in keys if item.get(key) is not None}
 
     def _fallback_operator_focus_briefing_packet(self, item: dict[str, Any]) -> dict[str, Any]:
