@@ -6684,6 +6684,34 @@ class TestRunningWatchdogEnvParsing(unittest.TestCase):
 
 
 class TestFocusReceiptHelpers(unittest.TestCase):
+    def test_parse_job_routes_focus_receipt_command_to_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=7,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/focus ack all 3 Need owner acknowledgement",
+            )
+
+            resp, job = bot._parse_job(cfg, msg)
+
+        self.assertIsNone(job)
+        self.assertEqual(
+            resp,
+            bot._focus_payload_marker(
+                {
+                    "mode": "receipt",
+                    "scope": "all",
+                    "rank": 3,
+                    "state": "acknowledged",
+                    "summary": "need owner acknowledgement",
+                }
+            ),
+        )
+
     def test_parse_focus_command_tail_supports_receipt_commands(self) -> None:
         marker, job = bot._parse_focus_command_tail("ack all 3 Need owner acknowledgement")
 
@@ -6735,3 +6763,61 @@ class TestFocusReceiptHelpers(unittest.TestCase):
         self.assertIn("item: high/release - Confirm release owner (focus:release-owner)", rendered)
         self.assertIn("summary: Owner acknowledged the handoff.", rendered)
         self.assertIn("next: Proceed with the release checklist.", rendered)
+
+    def test_send_orchestrator_marker_response_focus_receipt_uses_global_scope(self) -> None:
+        api = _FakeAPI()
+        cfg = TestStateHandling()._cfg(Path(tempfile.mkdtemp()) / "state.json")
+        orch_q = object()
+        receipt_payload = {
+            "selection": {"rank": 3},
+            "item_identity": {
+                "urgency": "high",
+                "category": "release",
+                "label": "Confirm release owner",
+                "action_id": "focus:release-owner",
+            },
+            "receipt": {
+                "state": "acknowledged",
+                "persisted": True,
+                "persistence_reason": "decision_log_appended",
+                "summary": "Owner acknowledged the handoff.",
+                "next_action": "Proceed with the release checklist.",
+            },
+        }
+
+        with patch.object(bot, "StatusService") as status_service_cls:
+            svc = status_service_cls.return_value
+            svc.operator_focus_receipt.return_value = receipt_payload
+
+            handled = bot._send_orchestrator_marker_response(
+                "focus",
+                json.dumps(
+                    {
+                        "mode": "receipt",
+                        "scope": "all",
+                        "rank": 3,
+                        "state": "acknowledged",
+                        "summary": "Owner acknowledged the handoff.",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                cfg,
+                api,
+                chat_id=7,
+                user_id=2,
+                reply_to_message_id=10,
+                orch_q=orch_q,  # type: ignore[arg-type]
+                profiles=None,
+            )
+
+        self.assertTrue(handled)
+        svc.operator_focus_receipt.assert_called_once_with(
+            chat_id=None,
+            rank=3,
+            state="acknowledged",
+            summary="Owner acknowledged the handoff.",
+            actor="jarvis",
+        )
+        self.assertTrue(api.messages)
+        self.assertIn("Jarvis: focus receipt (global rank=3)", api.messages[-1])
