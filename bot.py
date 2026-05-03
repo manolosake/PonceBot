@@ -10099,6 +10099,63 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
             return s[: max(0, max_chars - 3)].rstrip() + "..."
         return s
 
+    def _release_lane_lines(summary_payload: dict[str, Any]) -> list[str]:
+        release_lanes = summary_payload.get("release_lanes")
+        if not isinstance(release_lanes, dict):
+            return []
+        by_lane = release_lanes.get("by_lane") if isinstance(release_lanes.get("by_lane"), dict) else {}
+
+        def _count(name: str) -> int:
+            try:
+                return int(by_lane.get(name, release_lanes.get(name, 0)) or 0)
+            except Exception:
+                return 0
+
+        try:
+            total = int(release_lanes.get("total", 0) or 0)
+        except Exception:
+            total = 0
+        readiness = (
+            "release readiness: "
+            f"total={total} ready={_count('ready')} blocked={_count('blocked')} "
+            f"not_ready={_count('not_ready')} released={_count('released')}"
+        )
+        endpoint = _clip(release_lanes.get("endpoint"), max_chars=180)
+        if endpoint:
+            readiness += f" board={endpoint}"
+
+        lines_out = [readiness]
+        top_order = release_lanes.get("top_order")
+        if isinstance(top_order, dict):
+            lane = _clip(top_order.get("release_lane") or top_order.get("readiness_state"), max_chars=32)
+            order_id = _clip(top_order.get("order_id_short") or top_order.get("order_id"), max_chars=48)
+            title = _clip(top_order.get("title"), max_chars=90)
+            next_action = _clip(top_order.get("next_action"), max_chars=120)
+            inspect = _clip(
+                top_order.get("inspect_endpoint") or top_order.get("endpoint") or top_order.get("handoff_endpoint"),
+                max_chars=180,
+            )
+            try:
+                rank = int(top_order.get("rank") or 0)
+            except Exception:
+                rank = 0
+            parts = ["top release:"]
+            if lane:
+                parts.append(f"lane={lane}")
+            if rank:
+                parts.append(f"rank={rank}")
+            if order_id:
+                parts.append(f"order={order_id}")
+            if title:
+                parts.append(f"title={title}")
+            if next_action:
+                parts.append(f"next={next_action}")
+            if inspect:
+                parts.append(f"inspect={inspect}")
+            if len(parts) > 1:
+                lines_out.append(" ".join(parts))
+        return lines_out
+
     summary = focus.get("summary") if isinstance(focus.get("summary"), dict) else {}
     items_raw = focus.get("items") or []
     items: list[dict[str, Any]] = [item for item in items_raw if isinstance(item, dict)]
@@ -10116,6 +10173,7 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
     top_action = _clip(summary.get("top_action_id"), max_chars=80)
     if top_action:
         lines[-1] += f" top={top_action}"
+    lines.extend(_release_lane_lines(summary))
 
     if not items:
         lines.extend(
