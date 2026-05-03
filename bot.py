@@ -10288,6 +10288,13 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
     return _focus_usage_text(), None
 
 
+def _focus_scope_context(scope: str, *, chat_id: int) -> tuple[int | None, str]:
+    normalized = _focus_scope_value(scope) or "chat"
+    if normalized == "all":
+        return None, "global"
+    return int(chat_id), f"chat:{int(chat_id)}"
+
+
 def _operator_focus_receipt_text(receipt_payload: dict[str, Any], *, scope_label: str, rank: int) -> str:
     def _ascii(value: object, default: str = "") -> str:
         s = str(value or "").strip()
