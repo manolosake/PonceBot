@@ -222,8 +222,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         "## Focus Items",
         "",
-        "| Rank | Urgency | Category | Label | Target | Next action |",
-        "| ---: | --- | --- | --- | --- | --- |",
+        "| Rank | Urgency | Category | Label | Target | Next action | Receipt status |",
+        "| ---: | --- | --- | --- | --- | --- | --- |",
     ]
 
     if items:
@@ -238,16 +238,18 @@ def render_markdown(report: dict[str, Any]) -> str:
                         _one_line(item.get("label")),
                         _one_line(item.get("target")),
                         _one_line(item.get("next_action")),
+                        _one_line(item.get("receipt_state"), default="new"),
                     ]
                 )
                 + " |"
             )
     else:
-        lines.append("| - | - | - | No operator focus items. | - | - |")
+        lines.append("| - | - | - | No operator focus items. | - | - | - |")
 
     lines.extend(["", "## Triage Details", ""])
     if items:
         for item in items:
+            latest_receipt = item.get("latest_receipt") if isinstance(item.get("latest_receipt"), dict) else {}
             lines.extend(
                 [
                     f"### {_one_line(item.get('rank'))}. {_one_line(item.get('label'))}",
@@ -258,6 +260,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                     f"- Action target: {_one_line(item.get('action_target'))}",
                     f"- Source: {_one_line(item.get('source'))}",
                     f"- Source signals: {_one_line_list(item.get('source_signals'))}",
+                    f"- Receipt state: {_one_line(item.get('receipt_state'), default='new')}",
+                    f"- Latest receipt summary: {_one_line(latest_receipt.get('summary'))}",
+                    f"- Latest receipt actor: {_one_line(latest_receipt.get('actor'))}",
+                    f"- Latest receipt next_action: {_one_line(latest_receipt.get('next_action'))}",
+                    f"- Latest receipt recorded_at: {_one_line(latest_receipt.get('recorded_at'))}",
                     "",
                 ]
             )
