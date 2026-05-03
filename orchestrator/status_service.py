@@ -4011,6 +4011,52 @@ class StatusService:
             and str((item.get("receipt_follow_up") or {}).get("severity") or "") == "escalation"
         )
 
+        release_board_endpoint = _append_chat_scope("/api/v1/orchestration/release-readiness-board?limit=20")
+        release_lanes: dict[str, Any] = {
+            "total": 0,
+            "by_lane": {"ready": 0, "blocked": 0, "not_ready": 0, "released": 0},
+            "endpoint": release_board_endpoint,
+        }
+        try:
+            release_board = self.release_readiness_board(chat_id=focus_chat_id, limit=20)
+        except Exception:
+            release_board = {}
+        if isinstance(release_board, dict):
+            release_summary = release_board.get("summary") if isinstance(release_board.get("summary"), dict) else {}
+            board_by_lane = release_summary.get("by_lane") if isinstance(release_summary.get("by_lane"), dict) else {}
+            by_lane = dict(release_lanes["by_lane"])
+            for lane in ("ready", "blocked", "not_ready", "released"):
+                by_lane[lane] = _num(board_by_lane.get(lane), 0)
+            release_lanes["by_lane"] = by_lane
+            release_lanes["total"] = _num(
+                release_summary.get("orders_total", release_summary.get("returned")),
+                sum(by_lane.values()),
+            )
+
+            top_order: dict[str, Any] | None = None
+            lanes = release_board.get("lanes") if isinstance(release_board.get("lanes"), dict) else {}
+            for lane in ("ready", "blocked", "not_ready", "released"):
+                lane_payload = lanes.get(lane) if isinstance(lanes.get(lane), dict) else {}
+                for order in list(lane_payload.get("orders") or []):
+                    if isinstance(order, dict):
+                        top_order = order
+                        break
+                if top_order is not None:
+                    break
+            if top_order is not None:
+                release_lanes["top_order"] = {
+                    "rank": top_order.get("rank"),
+                    "order_id": top_order.get("order_id"),
+                    "order_id_short": top_order.get("order_id_short"),
+                    "title": top_order.get("title"),
+                    "release_lane": top_order.get("release_lane"),
+                    "readiness_state": top_order.get("readiness_state"),
+                    "summary": top_order.get("summary"),
+                    "next_action": top_order.get("next_action"),
+                    "endpoint": top_order.get("release_readiness_endpoint"),
+                    "handoff_endpoint": top_order.get("handoff_endpoint"),
+                }
+
         top = returned[0] if returned else {}
         top_focus = _focus_packet(top if top else None)
         return {
@@ -4032,6 +4078,7 @@ class StatusService:
                 "available_source_counts": available_source_counts,
                 "receipt_follow_up_count": receipt_follow_up_count,
                 "receipt_escalation_count": receipt_escalation_count,
+                "release_lanes": release_lanes,
             },
             "top_focus": top_focus,
             "items": returned,
