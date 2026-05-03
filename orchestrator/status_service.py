@@ -4402,6 +4402,67 @@ class StatusService:
             },
         }
 
+    def operator_focus_receipt_trail(
+        self,
+        *,
+        chat_id: int | None = None,
+        action_id: str | None = None,
+        rank: int | None = None,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        try:
+            receipt_limit = int(limit)
+        except Exception:
+            receipt_limit = 20
+        receipt_limit = max(1, min(100, receipt_limit))
+
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=20,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
+        item_identity = self._operator_focus_item_identity(selected)
+        empty_rollup = {
+            "receipt_count": 0,
+            "receipt_counts_by_state": {},
+            "receipt_history": [],
+            "latest_receipt": None,
+        }
+        rollup = empty_rollup
+
+        order_id = str(selected.get("order_id") or "").strip() if selected else ""
+        action = str(selected.get("action_id") or "").strip() if selected else ""
+        if order_id and action:
+            try:
+                rows = self.orch_q.list_decision_log(order_id=order_id, limit=500)
+            except Exception:
+                rows = []
+            rollup = self._operator_focus_receipt_rollup_from_rows(
+                rows,
+                action_id=action,
+                history_limit=receipt_limit,
+            )
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "selection": selection,
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "item_identity": item_identity,
+            "receipt_count": rollup["receipt_count"],
+            "receipt_counts_by_state": rollup["receipt_counts_by_state"],
+            "latest_receipt": rollup["latest_receipt"],
+            "receipts": rollup["receipt_history"],
+        }
+
     def operator_focus_briefing_bundle(
         self,
         *,
