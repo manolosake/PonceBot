@@ -10977,6 +10977,69 @@ def _send_orchestrator_marker_response(
             api.send_message(chat_id, f"Dashboard failed: {e}", reply_to_message_id=reply_to_message_id)
         return True
 
+    if kind == "focus":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        parsed_payload: dict[str, Any] | None = None
+        raw_scope = (payload or "").strip().lower()
+        if payload:
+            try:
+                candidate = json.loads(payload)
+                if isinstance(candidate, dict):
+                    parsed_payload = candidate
+            except Exception:
+                parsed_payload = None
+
+        mode = str((parsed_payload or {}).get("mode") or "").strip().lower()
+        scope = str((parsed_payload or {}).get("scope") or raw_scope or "chat").strip().lower()
+        scope_chat_id, scope_label = _focus_scope_context(scope, chat_id=chat_id)
+
+        def _as_int(value: object) -> int | None:
+            try:
+                if value is None or str(value).strip() == "":
+                    return None
+                parsed = int(value)  # type: ignore[arg-type]
+                return parsed if parsed > 0 else None
+            except Exception:
+                return None
+
+        rank = _as_int((parsed_payload or {}).get("rank"))
+
+        try:
+            svc = StatusService(orch_q=orch_q, role_profiles=profiles, cache_ttl_seconds=0)
+            if mode in ("brief", "briefing", "handoff"):
+                packet = (
+                    svc.operator_focus_briefing(chat_id=scope_chat_id, rank=rank)
+                    if mode in ("brief", "briefing")
+                    else svc.operator_focus_handoff(chat_id=scope_chat_id, rank=rank)
+                )
+                text = _operator_focus_packet_text(packet, mode=mode, scope_label=scope_label, rank=rank or 1)
+            elif mode == "receipt":
+                receipt_payload = svc.operator_focus_receipt(
+                    chat_id=scope_chat_id,
+                    rank=rank,
+                    state=str((parsed_payload or {}).get("state") or "").strip().lower(),
+                    summary=str((parsed_payload or {}).get("summary") or "").strip() or None,
+                    actor="jarvis",
+                )
+                text = _operator_focus_receipt_text(receipt_payload, scope_label=scope_label, rank=rank or 1)
+            else:
+                focus = svc.operator_focus(chat_id=scope_chat_id)
+                text = _operator_focus_text(focus, scope_label=scope_label)
+        except Exception as e:
+            api.send_message(chat_id, f"Focus failed: {e}", reply_to_message_id=reply_to_message_id)
+            return True
+
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
 
     if kind == "apk_latest":
         if not _can_manage_orchestrator(cfg, chat_id=chat_id):
@@ -24132,13 +24195,7 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text.startswith("/focus"):
         tail = (text[len("/focus") :] or "").strip().lower()
-        if not tail:
-            return _orch_marker("focus"), None
-        if tail in ("all", "global", "company"):
-            return _orch_marker("focus", "all"), None
-        if tail in ("chat", "here"):
-            return _orch_marker("focus", "chat"), None
-        return "Usage: /focus [chat|all]", None
+        return _parse_focus_command_tail(tail)
 
     if text.startswith("/order "):
         payload = text[len("/order ") :].strip()
