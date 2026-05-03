@@ -623,3 +623,81 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(len(list(snap.get("repos") or [])), 1)
             self.assertEqual(len(list(snap.get("heartbeats") or [])), 1)
             self.assertTrue(any(str(item.get("kind") or "") == "factory_test" for item in list(snap.get("alerts") or [])))
+
+    def test_operator_focus_decorates_latest_receipt_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            control_room = {
+                "health": {"level": "attention"},
+                "attention": {
+                    "blocked_approvals": [
+                        {
+                            "order_id": "order-123",
+                            "job_id": "job-123",
+                            "updated_at": 111.0,
+                        }
+                    ],
+                    "pending_decisions": [],
+                    "stalled_tasks": [],
+                },
+                "recommended_actions": [
+                    {
+                        "action_id": "approve_blocked_jobs",
+                        "count": 1,
+                        "label": "Approve blocked jobs",
+                        "reason": "A blocked approval needs review.",
+                        "target": "/api/v1/orchestration/control-room",
+                    }
+                ],
+                "workflow_bottleneck": {"score": 0},
+            }
+            receipt_rows = [
+                {
+                    "kind": "operator_focus_receipt",
+                    "state": "acknowledged",
+                    "summary": "Old receipt",
+                    "next_action": "Wait",
+                    "order_id": "order-123",
+                    "job_id": "job-123",
+                    "ts": 100.0,
+                    "details": {
+                        "actor": "reviewer_local",
+                        "selection": {"action_id": "approve_blocked_jobs", "rank": 1},
+                        "item_identity": {"action_id": "approve_blocked_jobs", "label": "Approve blocked jobs"},
+                        "operator_focus_details": {"note": "old"},
+                    },
+                },
+                {
+                    "kind": "operator_focus_receipt",
+                    "state": "completed",
+                    "summary": "Latest receipt",
+                    "next_action": "Ship it",
+                    "order_id": "order-123",
+                    "job_id": "job-123",
+                    "ts": 200.0,
+                    "details": {
+                        "actor": "implementer_local",
+                        "selection": {"action_id": "approve_blocked_jobs", "rank": 1},
+                        "item_identity": {"action_id": "approve_blocked_jobs", "label": "Approve blocked jobs"},
+                        "operator_focus_details": {"note": "latest"},
+                    },
+                },
+            ]
+
+            with mock.patch.object(svc, "control_room", return_value=control_room), \
+                 mock.patch.object(svc, "proactive_priorities", return_value={"orders": []}), \
+                 mock.patch.object(svc, "proactive_health", return_value={"status": "not_configured"}), \
+                 mock.patch.object(q, "list_decision_log", return_value=receipt_rows):
+                report = svc.operator_focus(chat_id=7, limit=5)
+
+            item = (report.get("items") or [None])[0]
+            self.assertIsInstance(item, dict)
+            self.assertEqual(item.get("receipt_state"), "completed")
+            latest_receipt = item.get("latest_receipt") or {}
+            self.assertEqual(latest_receipt.get("state"), "completed")
+            self.assertEqual(latest_receipt.get("summary"), "Latest receipt")
+            self.assertEqual(latest_receipt.get("actor"), "implementer_local")
+            self.assertEqual((latest_receipt.get("details") or {}).get("note"), "latest")
