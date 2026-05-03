@@ -611,6 +611,34 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in (
+            "/api/v1/orchestration/operator-focus/receipt-trail",
+            "/api/orchestration/operator-focus/receipt-trail",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            action_id = (qs.get("action_id") or [""])[0].strip()
+            rank, rank_ok = _parse_positive_rank(qs)
+            if not action_id and (not rank_ok or rank is None):
+                self._send_json(400, {"error": "invalid_rank", "selection": {"rank": (qs.get("rank") or [""])[0].strip()}})
+                return
+            limit = _parse_limit(qs, 20, hi=100)
+            payload = self.server.status_service.operator_focus_receipt_trail(
+                chat_id=chat_id,
+                action_id=action_id or None,
+                rank=rank,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                limit=limit,
+            )
+            if not payload.get("item_identity"):
+                self._send_json(404, payload)
+                return
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/orders/evidence", "/api/orchestration/orders/evidence"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
