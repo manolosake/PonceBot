@@ -405,6 +405,72 @@ class TestOperatorFocusReportReceipt(unittest.TestCase):
         self.assertIn("- Latest receipt next_action: Move to the next release stage.", rendered)
         self.assertIn("- Latest receipt recorded_at: 2026-05-03T00:00:01Z", rendered)
 
+    def test_main_report_markdown_includes_receipt_status(self) -> None:
+        report = {
+            "generated_at": "2026-05-03T00:00:00Z",
+            "chat_id": 7,
+            "limit": 5,
+            "summary": {
+                "returned": 1,
+                "health_level": "attention",
+                "top_action_id": "focus:first",
+                "top_category": "release",
+                "filtered_out": 0,
+                "filters": {"categories": ["release"], "urgencies": ["high"], "sources": ["control_room"]},
+                "available": {"categories": ["release"], "urgencies": ["high"], "sources": ["control_room"], "total": 1},
+                "source_counts": {"control_room": 1, "proactive_priorities": 0, "proactive_health": 0},
+                "available_source_counts": {"control_room": 1, "proactive_priorities": 0, "proactive_health": 0},
+            },
+            "items": [
+                {
+                    "rank": 1,
+                    "urgency": "high",
+                    "category": "release",
+                    "label": "Follow up on release owner",
+                    "target": "/api/v1/orchestration/control-room",
+                    "next_action": "Confirm the release owner receipt.",
+                    "reason": "Receipt indicates the release owner is waiting.",
+                    "inspect_path": "/api/v1/orchestration/control-room",
+                    "inspect_target": "control_room",
+                    "action_target": "job",
+                    "source": "control_room",
+                    "source_signals": ["blocked", "receipt"],
+                    "receipt_state": "completed",
+                    "latest_receipt": {
+                        "summary": "Release owner acknowledged and completed the handoff.",
+                        "actor": "implementer_local",
+                        "next_action": "Move to the next release stage.",
+                        "recorded_at": "2026-05-03T00:00:01Z",
+                    },
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            db.write_text("", encoding="utf-8")
+            stdout = StringIO()
+
+            with mock.patch.object(report_tool, "build_report", return_value=report):
+                rc = report_tool.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--format",
+                        "md",
+                    ],
+                    stdout=stdout,
+                )
+
+        self.assertEqual(rc, 0)
+        rendered = stdout.getvalue()
+        self.assertIn("Receipt status", rendered)
+        self.assertIn("| 1 | high | release | Follow up on release owner | /api/v1/orchestration/control-room | Confirm the release owner receipt. | completed |", rendered)
+        self.assertIn("- Latest receipt summary: Release owner acknowledged and completed the handoff.", rendered)
+        self.assertIn("- Latest receipt actor: implementer_local", rendered)
+        self.assertIn("- Latest receipt next_action: Move to the next release stage.", rendered)
+        self.assertIn("- Latest receipt recorded_at: 2026-05-03T00:00:01Z", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
