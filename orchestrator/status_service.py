@@ -6,6 +6,7 @@ from typing import Any, Callable
 import hashlib
 import json
 import time
+import urllib.parse
 
 from .queue import OrchestratorQueue
 from .runbooks import load_runbooks
@@ -237,6 +238,7 @@ def _workflow_stage_sla_seconds(sla_tier: str, stage: str) -> int:
 _TERMINAL_TASK_STATES = {"done", "failed", "cancelled"}
 _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE = "operator_focus_receipt"
 _OPERATOR_FOCUS_RECEIPT_STATUSES = {"acknowledged", "in_progress", "completed"}
+_OPERATOR_FOCUS_RECEIPT_STATES = ["acknowledged", "in_progress", "completed"]
 
 
 def _workflow_stage_tasks(stage: str, root_task: Task | None, children: list[Task]) -> list[Task]:
