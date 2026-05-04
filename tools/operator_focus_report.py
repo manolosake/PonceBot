@@ -78,11 +78,19 @@ def build_report(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
     svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
-    return svc.operator_focus(chat_id=chat_id, limit=limit, categories=categories, urgencies=urgencies, sources=sources)
+    return svc.operator_focus(
+        chat_id=chat_id,
+        limit=limit,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+        receipt_states=receipt_states,
+    )
 
 
 def build_digest(
@@ -93,6 +101,7 @@ def build_digest(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -103,6 +112,7 @@ def build_digest(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
     )
 
 
@@ -115,6 +125,7 @@ def build_handoff(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -126,6 +137,7 @@ def build_handoff(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
     )
 
 
@@ -138,6 +150,7 @@ def build_briefing(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -149,6 +162,7 @@ def build_briefing(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
     )
 
 
@@ -160,6 +174,7 @@ def build_briefing_bundle(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -170,6 +185,7 @@ def build_briefing_bundle(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
     )
 
 
@@ -187,6 +203,7 @@ def build_receipt(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -198,6 +215,7 @@ def build_receipt(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
         state=state,
         summary=summary,
         next_action=next_action,
@@ -215,6 +233,7 @@ def build_receipt_trail(
     categories: list[str] | None = None,
     urgencies: list[str] | None = None,
     sources: list[str] | None = None,
+    receipt_states: list[str] | None = None,
     limit: int = 20,
 ) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
@@ -227,6 +246,7 @@ def build_receipt_trail(
         categories=categories,
         urgencies=urgencies,
         sources=sources,
+        receipt_states=receipt_states,
         limit=limit,
     )
 
