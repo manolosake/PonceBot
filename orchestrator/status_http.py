@@ -546,6 +546,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             self._send_json(200, payload)
             return
@@ -564,6 +565,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             self._send_json(200, payload)
             return
@@ -584,6 +586,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             if not payload.get("item"):
                 self._send_json(404, payload)
@@ -607,6 +610,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             if not payload.get("briefing_packet"):
                 self._send_json(404, payload)
@@ -625,6 +629,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             self._send_json(200, payload)
             return
@@ -649,6 +654,7 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 categories=_parse_filter_values(qs, "category"),
                 urgencies=_parse_filter_values(qs, "urgency"),
                 sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
                 limit=limit,
             )
             if not payload.get("item_identity"):
