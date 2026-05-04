@@ -565,6 +565,18 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in (
+            "/api/v1/orchestration/queue-pressure-board",
+            "/api/orchestration/queue-pressure-board",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 50, hi=200)
+            payload = self.server.status_service.queue_pressure_board(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/operator-focus", "/api/orchestration/operator-focus"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
