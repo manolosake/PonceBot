@@ -5194,6 +5194,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         try:
             lim = int(limit)
@@ -5209,6 +5210,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         briefing_bundle = self.operator_focus_briefing_bundle(
             chat_id=chat_id,
@@ -5216,6 +5218,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
 
         attention = control.get("attention") if isinstance(control.get("attention"), dict) else {}
