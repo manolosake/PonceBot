@@ -6694,6 +6694,98 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(root.trace["operational_gate_status"], "waiting")
         self.assertEqual(q.audit_events, [])
 
+    def test_autopilot_seeds_qa_rework_before_blocked_root_wait(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="blocked",
+            trace={},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_recover_casefix"},
+                trace={
+                    "result_summary": (
+                        "Applied the authoritative controller patch and captured validation evidence. "
+                        "Validation passed with git diff --stat and the resulting patch artifact."
+                    ),
+                    "result_artifacts": ["/tmp/impl-artifacts/changes.patch"],
+                },
+                artifacts_dir="/tmp/impl-artifacts",
+                created_at=100.0,
+                updated_at=110.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_review_recover_casefix"},
+                trace={"result_summary": "FAIL: NEEDS_REWORK. Remove unrelated guard file and wire the UI."},
+                artifacts_dir="/tmp/qa-artifacts",
+                created_at=111.0,
+                updated_at=120.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.submitted: list[bot.Task] = []
+                self.phases: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 200):
+                return list(children)
+
+            def get_job(self, job_id: str):
+                return root
+
+            def submit_task(self, task: bot.Task) -> None:
+                self.submitted.append(task)
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+                self.trace_updates.append(dict(kwargs))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        with tempfile.TemporaryDirectory() as td:
+            q = FakeQueue()
+            with patch.object(bot, "_order_has_pending_factory_ceo_strategy_proposal", return_value=False):
+                enqueued = bot._enqueue_order_autopilot_task(
+                    cfg=self._operational_gate_recovery_cfg(td),
+                    orch_q=q,
+                    profiles=None,
+                    order_row={
+                        "order_id": "root",
+                        "status": "active",
+                        "phase": "review",
+                        "title": "Proactive Sprint: ExecutiveDashboard Reliability",
+                        "body": "AUTONOMOUS PROACTIVE SPRINT",
+                    },
+                    chat_id=1,
+                    now=5000.0,
+                    reason="tick",
+                )
+
+        self.assertTrue(enqueued)
+        self.assertEqual([task.role for task in q.submitted], ["backend", "qa"])
+        self.assertEqual(q.phases[-1], "executing")
+        self.assertIn("local_rework_seeded_job_id", q.trace_updates[-1])
+        self.assertNotEqual(root.trace.get("operational_gate_status"), "waiting")
+
     def test_deploy_verify_retries_transient_startup_failure(self) -> None:
         calls: list[list[str]] = []
 

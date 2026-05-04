@@ -16720,6 +16720,15 @@ def _enqueue_order_autopilot_task(
     ):
         return False
     root_state_norm = str(getattr(root_job, "state", "") or "").strip().lower() if root_job is not None else ""
+    if is_proactive and _enqueue_reviewer_local_rework_if_due(
+        cfg=cfg,
+        orch_q=orch_q,
+        profiles=profiles,
+        order_row=order_row,
+        chat_id=int(chat_id),
+        now=float(now),
+    ):
+        return True
     if is_proactive and _operational_gate_is_live_state(root_state_norm):
         try:
             last_wait_at = float(root_trace.get("proactive_root_live_wait_at", 0.0) or 0.0)
