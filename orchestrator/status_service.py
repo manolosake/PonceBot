@@ -4935,6 +4935,103 @@ class StatusService:
             },
         }
 
+    def operator_shift_brief(
+        self,
+        chat_id: int | None = None,
+        limit: int = 5,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            lim = int(limit)
+        except Exception:
+            lim = 5
+        lim = max(1, min(20, lim))
+
+        control = self.control_room(chat_id=chat_id)
+        proactive_health = self.proactive_health()
+        digest = self.operator_focus_digest(
+            chat_id=chat_id,
+            limit=lim,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        briefing_bundle = self.operator_focus_briefing_bundle(
+            chat_id=chat_id,
+            limit=lim,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+
+        attention = control.get("attention") if isinstance(control.get("attention"), dict) else {}
+        queue = control.get("queue") if isinstance(control.get("queue"), dict) else {}
+        orders = control.get("orders") if isinstance(control.get("orders"), dict) else {}
+        runbooks = control.get("runbooks") if isinstance(control.get("runbooks"), dict) else {}
+        runbook_summary = runbooks.get("summary") if isinstance(runbooks.get("summary"), dict) else {}
+        health = control.get("health") if isinstance(control.get("health"), dict) else {}
+
+        top_actions: list[dict[str, Any]] = []
+        for item in list(digest.get("top_actions") or [])[:lim]:
+            if not isinstance(item, dict):
+                continue
+            compact = {
+                "rank": item.get("rank"),
+                "action_id": item.get("action_id"),
+                "urgency": item.get("urgency"),
+                "category": item.get("category"),
+                "label": item.get("label"),
+                "next_action": item.get("next_action"),
+                "target": item.get("target"),
+                "inspect_path": item.get("inspect_path"),
+                "handoff_endpoint": item.get("handoff_endpoint"),
+                "source": item.get("source"),
+                "receipt_state": item.get("receipt_state", "new"),
+            }
+            top_actions.append({key: value for key, value in compact.items() if value is not None})
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": digest.get("generated_at") or control.get("generated_at"),
+            "chat_id": digest.get("chat_id"),
+            "limit": lim,
+            "snapshot_summary": {
+                "health_level": health.get("level"),
+                "queue": {
+                    "queued_runnable": int(queue.get("queued_runnable") or 0),
+                    "waiting_deps": int(queue.get("waiting_deps") or 0),
+                    "blocked_approval": int(queue.get("blocked_approval") or 0),
+                    "running": int(queue.get("running") or 0),
+                    "blocked_legacy": int(queue.get("blocked_legacy") or 0),
+                },
+                "orders": {
+                    "active_count": int(orders.get("active_count") or 0),
+                },
+                "alerts": {
+                    "count": len(list(attention.get("alerts") or [])),
+                    "stalled_tasks": len(list(attention.get("stalled_tasks") or [])),
+                },
+                "risks": {
+                    "count": len(list(attention.get("risks") or [])),
+                },
+                "decisions": {
+                    "pending": len(list(attention.get("pending_decisions") or [])),
+                    "blocked_approvals": len(list(attention.get("blocked_approvals") or [])),
+                },
+                "runbooks": {
+                    "due": int(runbook_summary.get("due") or 0),
+                    "overdue": int(runbook_summary.get("overdue") or 0),
+                },
+            },
+            "proactive_health": proactive_health,
+            "operator_focus_digest": digest,
+            "briefings": list(briefing_bundle.get("briefings") or [])[:lim],
+            "next_actions": top_actions,
+        }
+
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
         """
         Compute a snapshot of worker/task status.
