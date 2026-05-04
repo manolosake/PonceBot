@@ -10,6 +10,7 @@ import time
 import urllib.parse
 
 from .status_service import StatusService
+from tools.operator_focus_report import render_shift_brief_markdown
 
 
 _API_VERSION = "v1"
@@ -220,6 +221,35 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-ED-API-Version", _API_VERSION)
+        use_cors = cors_headers
+        if use_cors is None:
+            use_cors = getattr(self, "_cors_headers", {})
+        if use_cors:
+            for k, v in use_cors.items():
+                self.send_header(str(k), str(v))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(str(k), str(v))
+        self.send_header("Content-Length", str(len(body)))
+        try:
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _send_markdown(
+        self,
+        code: int,
+        markdown: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        cors_headers: dict[str, str] | None = None,
+    ) -> None:
+        body = str(markdown or "").encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/markdown; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-ED-API-Version", _API_VERSION)
         use_cors = cors_headers
@@ -568,6 +598,25 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 receipt_states=_parse_filter_values(qs, "receipt_state"),
             )
             self._send_json(200, payload)
+            return
+
+        if path in (
+            "/api/v1/orchestration/operator-focus/shift-brief.md",
+            "/api/orchestration/operator-focus/shift-brief.md",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 5, hi=20)
+            payload = self.server.status_service.operator_shift_brief(
+                chat_id=chat_id,
+                limit=limit,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
+            )
+            self._send_markdown(200, render_shift_brief_markdown(payload))
             return
 
         if path in (
