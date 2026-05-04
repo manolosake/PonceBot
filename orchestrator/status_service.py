@@ -5160,24 +5160,32 @@ class StatusService:
                 }
             )
 
-        def _suggested_commands(rank: Any) -> dict[str, str]:
+        def _suggested_commands(rank: Any, *, inspect_path: Any = None) -> dict[str, str]:
             try:
                 rank_i = max(1, int(rank or 1))
             except Exception:
                 rank_i = 1
-            return {
-                "brief": f"/focus brief chat {rank_i}",
-                "handoff": f"/focus handoff chat {rank_i}",
-                "trail": f"/focus trail chat {rank_i}",
-                "ack": f"/focus ack chat {rank_i} <summary>",
-                "start": f"/focus start chat {rank_i} <summary>",
-                "done": f"/focus done chat {rank_i} <summary>",
-            }
+            commands = {}
+            inspect = str(inspect_path or "").strip()
+            if inspect:
+                commands["inspect"] = inspect
+            commands.update(
+                {
+                    "brief": f"/focus brief chat {rank_i}",
+                    "handoff": f"/focus handoff chat {rank_i}",
+                    "trail": f"/focus trail chat {rank_i}",
+                    "ack": f"/focus ack chat {rank_i} <summary>",
+                    "start": f"/focus start chat {rank_i} <summary>",
+                    "done": f"/focus done chat {rank_i} <summary>",
+                }
+            )
+            return commands
 
         def _compact_action(item: dict[str, Any]) -> dict[str, Any]:
             handoff = item.get("handoff") if isinstance(item.get("handoff"), dict) else {}
             delegate = item.get("delegate_contract") if isinstance(item.get("delegate_contract"), dict) else {}
             receipt_counts = item.get("receipt_counts_by_state") if isinstance(item.get("receipt_counts_by_state"), dict) else {}
+            inspect_path = item.get("inspect_path") or handoff.get("inspect_path") or delegate.get("inspect_endpoint")
             out = {
                 "rank": item.get("rank"),
                 "action_id": item.get("action_id"),
@@ -5186,7 +5194,7 @@ class StatusService:
                 "label": item.get("label"),
                 "next_action": item.get("next_action"),
                 "target": item.get("target"),
-                "inspect_path": item.get("inspect_path") or handoff.get("inspect_path") or delegate.get("inspect_endpoint"),
+                "inspect_path": inspect_path,
                 "inspect_target": item.get("inspect_target"),
                 "action_target": item.get("action_target"),
                 "handoff_endpoint": handoff.get("suggested_endpoint") or delegate.get("handoff_endpoint") or item.get("target"),
@@ -5198,7 +5206,7 @@ class StatusService:
                 "receipt_counts_by_state": receipt_counts,
                 "latest_receipt": item.get("latest_receipt"),
                 "receipt_follow_up": item.get("receipt_follow_up"),
-                "suggested_commands": _suggested_commands(item.get("rank")),
+                "suggested_commands": _suggested_commands(item.get("rank"), inspect_path=inspect_path),
             }
             return {key: value for key, value in out.items() if value is not None}
 
@@ -5290,6 +5298,9 @@ class StatusService:
         for item in list(digest.get("top_actions") or [])[:lim]:
             if not isinstance(item, dict):
                 continue
+            suggested_commands = (
+                item.get("suggested_commands") if isinstance(item.get("suggested_commands"), dict) else {}
+            )
             compact = {
                 "rank": item.get("rank"),
                 "action_id": item.get("action_id"),
@@ -5303,8 +5314,35 @@ class StatusService:
                 "source": item.get("source"),
                 "receipt_state": item.get("receipt_state", "new"),
                 "receipt_follow_up": item.get("receipt_follow_up") if isinstance(item.get("receipt_follow_up"), dict) else None,
+                "suggested_commands": suggested_commands,
             }
             top_actions.append({key: value for key, value in compact.items() if value is not None})
+
+        def _command_plan_for(item: dict[str, Any]) -> dict[str, Any]:
+            commands = item.get("suggested_commands") if isinstance(item.get("suggested_commands"), dict) else {}
+            plan_commands: dict[str, str] = {}
+            inspect = str(commands.get("inspect") or item.get("inspect_path") or "").strip()
+            if inspect:
+                plan_commands["inspect"] = inspect
+            for key in ("brief", "handoff", "trail", "ack", "start", "done"):
+                value = str(commands.get(key) or "").strip()
+                if value:
+                    plan_commands[key] = value
+            endpoints: dict[str, str] = {}
+            for key, source_key in (("inspect", "inspect_path"), ("handoff", "handoff_endpoint")):
+                value = str(item.get(source_key) or "").strip()
+                if value:
+                    endpoints[key] = value
+            out = {
+                "rank": item.get("rank"),
+                "action_id": item.get("action_id"),
+                "label": item.get("label"),
+                "commands": plan_commands,
+                "endpoints": endpoints,
+            }
+            return {key: value for key, value in out.items() if value}
+
+        command_plan = [_command_plan_for(item) for item in top_actions]
 
         return {
             "api_version": "v1",
@@ -5348,6 +5386,7 @@ class StatusService:
             },
             "briefings": list(briefing_bundle.get("briefings") or [])[:lim],
             "next_actions": top_actions,
+            "command_plan": command_plan,
         }
 
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
