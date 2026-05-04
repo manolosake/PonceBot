@@ -61,6 +61,9 @@ def _running_status_http_server(*, wait_headers: dict[str, str] | None = None, *
 class TestStatusHTTP(unittest.TestCase):
     def test_operator_focus_handoff_endpoint_supports_rank_and_invalid_rank(self) -> None:
         class _FakeStatusService:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
             def snapshot(self, *, chat_id: int | None = None) -> dict[str, object]:
                 return {"api_version": "v1", "schema_version": 2, "chat_id": chat_id}
 
@@ -73,7 +76,19 @@ class TestStatusHTTP(unittest.TestCase):
                 categories: list[str] | None = None,
                 urgencies: list[str] | None = None,
                 sources: list[str] | None = None,
+                receipt_states: list[str] | None = None,
             ) -> dict[str, object]:
+                self.calls.append(
+                    {
+                        "chat_id": chat_id,
+                        "action_id": action_id,
+                        "rank": rank,
+                        "categories": categories,
+                        "urgencies": urgencies,
+                        "sources": sources,
+                        "receipt_states": receipt_states,
+                    }
+                )
                 return {
                     "api_version": "v1",
                     "schema_version": 1,
@@ -88,10 +103,12 @@ class TestStatusHTTP(unittest.TestCase):
                     },
                 }
 
+        fake = _FakeStatusService()
+
         with _running_status_http_server(
             host="127.0.0.1",
             port=0,
-            status_service=_FakeStatusService(),
+            status_service=fake,
             stream_interval_s=0.5,
             auth_token="secret",
             snapshot_rate_per_s=0.0,
@@ -101,7 +118,10 @@ class TestStatusHTTP(unittest.TestCase):
         ) as (_http_srv, base):
             headers = {"Authorization": "Bearer secret"}
 
-            req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/handoff?rank=1", headers=headers)
+            req = urllib.request.Request(
+                base + "/api/v1/orchestration/operator-focus/handoff?rank=1&receipt_state=acknowledged,pending",
+                headers=headers,
+            )
             with urllib.request.urlopen(req, timeout=2) as resp:
                 self.assertEqual(resp.status, 200)
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -114,9 +134,26 @@ class TestStatusHTTP(unittest.TestCase):
             self.assertEqual(bad_ctx.exception.code, 400)
             bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
             self.assertEqual(bad_payload.get("error"), "invalid_rank")
+        self.assertEqual(
+            fake.calls,
+            [
+                {
+                    "chat_id": None,
+                    "action_id": None,
+                    "rank": 1,
+                    "categories": [],
+                    "urgencies": [],
+                    "sources": [],
+                    "receipt_states": ["acknowledged", "pending"],
+                }
+            ],
+        )
 
     def test_operator_focus_briefing_endpoint_supports_rank_and_missing_packet(self) -> None:
         class _FakeStatusService:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
             def snapshot(self, *, chat_id: int | None = None) -> dict[str, object]:
                 return {"api_version": "v1", "schema_version": 2, "chat_id": chat_id}
 
@@ -129,7 +166,19 @@ class TestStatusHTTP(unittest.TestCase):
                 categories: list[str] | None = None,
                 urgencies: list[str] | None = None,
                 sources: list[str] | None = None,
+                receipt_states: list[str] | None = None,
             ) -> dict[str, object]:
+                self.calls.append(
+                    {
+                        "chat_id": chat_id,
+                        "action_id": action_id,
+                        "rank": rank,
+                        "categories": categories,
+                        "urgencies": urgencies,
+                        "sources": sources,
+                        "receipt_states": receipt_states,
+                    }
+                )
                 if action_id == "missing":
                     return {
                         "api_version": "v1",
@@ -160,10 +209,12 @@ class TestStatusHTTP(unittest.TestCase):
                     },
                 }
 
+        fake = _FakeStatusService()
+
         with _running_status_http_server(
             host="127.0.0.1",
             port=0,
-            status_service=_FakeStatusService(),
+            status_service=fake,
             stream_interval_s=0.5,
             auth_token="secret",
             snapshot_rate_per_s=0.0,
@@ -173,7 +224,10 @@ class TestStatusHTTP(unittest.TestCase):
         ) as (_http_srv, base):
             headers = {"Authorization": "Bearer secret"}
 
-            req = urllib.request.Request(base + "/api/v1/orchestration/operator-focus/briefing?rank=1", headers=headers)
+            req = urllib.request.Request(
+                base + "/api/v1/orchestration/operator-focus/briefing?rank=1&receipt_state=acknowledged,pending",
+                headers=headers,
+            )
             with urllib.request.urlopen(req, timeout=2) as resp:
                 self.assertEqual(resp.status, 200)
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -197,6 +251,29 @@ class TestStatusHTTP(unittest.TestCase):
             self.assertEqual(bad_ctx.exception.code, 400)
             bad_payload = json.loads(bad_ctx.exception.read().decode("utf-8"))
             self.assertEqual(bad_payload.get("error"), "invalid_rank")
+        self.assertEqual(
+            fake.calls,
+            [
+                {
+                    "chat_id": None,
+                    "action_id": None,
+                    "rank": 1,
+                    "categories": [],
+                    "urgencies": [],
+                    "sources": [],
+                    "receipt_states": ["acknowledged", "pending"],
+                },
+                {
+                    "chat_id": None,
+                    "action_id": "missing",
+                    "rank": None,
+                    "categories": [],
+                    "urgencies": [],
+                    "sources": [],
+                    "receipt_states": [],
+                },
+            ],
+        )
 
     def test_operator_focus_briefings_endpoint_returns_bundle_and_filters(self) -> None:
         class _FakeStatusService:
@@ -214,6 +291,7 @@ class TestStatusHTTP(unittest.TestCase):
                 categories: list[str] | None = None,
                 urgencies: list[str] | None = None,
                 sources: list[str] | None = None,
+                receipt_states: list[str] | None = None,
             ) -> dict[str, object]:
                 self.calls.append(
                     {
@@ -222,6 +300,7 @@ class TestStatusHTTP(unittest.TestCase):
                         "categories": categories,
                         "urgencies": urgencies,
                         "sources": sources,
+                        "receipt_states": receipt_states,
                     }
                 )
                 return {
@@ -257,7 +336,9 @@ class TestStatusHTTP(unittest.TestCase):
         ) as (_http_srv, base):
             headers = {"Authorization": "Bearer secret"}
             req = urllib.request.Request(
-                base + "/api/v1/orchestration/operator-focus/briefings?limit=2&category=blocked&urgency=high&source=control_room",
+                base
+                + "/api/v1/orchestration/operator-focus/briefings"
+                + "?limit=2&category=blocked&urgency=high&source=control_room&receipt_state=acknowledged,pending",
                 headers=headers,
             )
             with urllib.request.urlopen(req, timeout=2) as resp:
@@ -277,6 +358,7 @@ class TestStatusHTTP(unittest.TestCase):
                     "categories": ["blocked"],
                     "urgencies": ["high"],
                     "sources": ["control_room"],
+                    "receipt_states": ["acknowledged", "pending"],
                 }
             ],
         )
