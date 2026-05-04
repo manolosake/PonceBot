@@ -16026,7 +16026,7 @@ def _enqueue_reviewer_local_rework_if_due(
         trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
         if latest_impl_no_change_ts <= 0.0 and _trace_local_no_change(trace):
             latest_impl_no_change_ts = ts
-        if _trace_has_validated_slice_evidence(trace):
+        if _trace_has_validated_slice_evidence(trace) or _task_has_skynet_delivery_validation_evidence(child, trace=trace):
             latest_impl = child
             latest_impl_ts = ts
             latest_impl_role = role_norm
@@ -16250,7 +16250,7 @@ def _enqueue_reviewer_local_rework_if_due(
         }
         if order_branch:
             review_trace["order_branch"] = str(order_branch)
-            review_child = Task.new(
+        review_child = Task.new(
             source="telegram",
             role=review_role,
             input_text=_compose_subtask_instruction(review_spec, root_ticket=oid),

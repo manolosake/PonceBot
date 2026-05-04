@@ -6200,7 +6200,7 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 return list(self.children)
 
             def get_job(self, job_id: str):
-                return SimpleNamespace(job_id=job_id, trace={"order_branch": "feature/order-root"})
+                return SimpleNamespace(job_id=job_id, trace={})
 
             def submit_task(self, task: bot.Task) -> None:
                 self.submitted.append(task)
@@ -6221,10 +6221,17 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
                 state="done",
                 labels={"key": "local_impl_recover_casefix"},
                 trace={
-                    "result_summary": "Applied patch. Validation passed.",
-                    "patch_info": {
-                        "changed_files": ["server/refresh.py", "test_refresh.py"],
-                        "validation_ok": True,
+                    "result_summary": (
+                        "Applied the authoritative controller patch and captured validation evidence. "
+                        "Validation passed with git diff --stat and the resulting patch artifact."
+                    ),
+                    "result_artifacts": ["/tmp/impl-artifacts/changes.patch"],
+                    "structured_digest": {
+                        "branch_sync": {
+                            "status": "ok",
+                            "branch": "feature/order-root",
+                            "commit": "abc1234",
+                        }
                     },
                 },
                 artifacts_dir="/tmp/impl-artifacts",
