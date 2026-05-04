@@ -585,3 +585,108 @@ class TestOperatorFocusReportBriefing(unittest.TestCase):
 
             self.assertEqual(missing_rc, 0)
             self.assertIn("No operator focus briefing packet matched the requested selector.", stdout.getvalue())
+
+
+class TestOperatorFocusReportShiftBrief(unittest.TestCase):
+    def test_main_shift_brief_markdown_includes_sections(self) -> None:
+        brief = {
+            "generated_at": "2026-05-04T00:00:00Z",
+            "chat_id": 7,
+            "limit": 3,
+            "snapshot_summary": {
+                "health_level": "attention",
+                "queue": {
+                    "queued_runnable": 2,
+                    "waiting_deps": 1,
+                    "blocked_approval": 1,
+                    "running": 1,
+                    "blocked_legacy": 0,
+                },
+                "orders": {"active_count": 4},
+                "alerts": {"count": 2, "stalled_tasks": 1},
+                "risks": {"count": 1},
+                "decisions": {"pending": 2, "blocked_approvals": 1},
+                "runbooks": {"due": 1, "overdue": 0},
+            },
+            "proactive_health": {
+                "status": "attention",
+                "summary": "One release lane needs follow-up.",
+            },
+            "operator_focus_digest": {
+                "summary": {
+                    "filters": {
+                        "categories": ["release"],
+                        "urgencies": ["high"],
+                        "sources": ["control_room"],
+                        "receipt_states": ["acknowledged", "in_progress"],
+                    }
+                }
+            },
+            "next_actions": [
+                {
+                    "rank": 1,
+                    "urgency": "high",
+                    "category": "release",
+                    "label": "Follow up on release owner",
+                    "next_action": "Confirm the blocked approval receipt.",
+                    "inspect_path": "/api/v1/orchestration/control-room/inspect?chat_id=7",
+                    "handoff_endpoint": "/api/v1/orchestration/control-room/handoff?chat_id=7",
+                    "receipt_state": "in_progress",
+                }
+            ],
+            "briefings": [
+                {
+                    "selection": {"action_id": "focus:first", "rank": 1},
+                    "item_identity": {
+                        "label": "Release approval follow-up",
+                        "rank": 1,
+                        "urgency": "high",
+                        "category": "release",
+                        "source": "control_room",
+                    },
+                    "briefing_packet": {
+                        "inspect_endpoint": "/inspect/path",
+                        "handoff_endpoint": "/handoff/path",
+                        "owner_role": "implementer_local",
+                        "action": "Unblock the pending approval.",
+                        "evidence_required": ["validation.log"],
+                        "suggested_validation": [
+                            "python3 -m unittest test_operator_focus_report.TestOperatorFocusReportShiftBrief.test_main_shift_brief_markdown_includes_sections"
+                        ],
+                        "definition_of_done": ["Approval owner has a clear next step."],
+                        "assignment_prompt": "Review the shift brief and unblock the release approval lane.",
+                    },
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            db.write_text("", encoding="utf-8")
+            stdout = StringIO()
+
+            with mock.patch.object(report_tool, "build_shift_brief", return_value=brief):
+                rc = report_tool.main(
+                    [
+                        "--db",
+                        str(db),
+                        "--shift-brief",
+                        "--format",
+                        "md",
+                    ],
+                    stdout=stdout,
+                )
+
+        self.assertEqual(rc, 0)
+        rendered = stdout.getvalue()
+        self.assertIn("# Operator Shift Brief", rendered)
+        self.assertIn("- Queue runnable: 2", rendered)
+        self.assertIn("- Alerts: 2", rendered)
+        self.assertIn("- Active receipt states: acknowledged, in_progress", rendered)
+        self.assertIn(
+            "| 1 | high | release | Follow up on release owner | Confirm the blocked approval receipt. | /api/v1/orchestration/control-room/inspect?chat_id=7 | /api/v1/orchestration/control-room/handoff?chat_id=7 | in_progress |",
+            rendered,
+        )
+        self.assertIn("## Briefing Packets", rendered)
+        self.assertIn("#### Assignment Prompt", rendered)
+        self.assertIn("Review the shift brief and unblock the release approval lane.", rendered)
