@@ -570,6 +570,25 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in (
+            "/api/v1/orchestration/operator-focus/shift-brief",
+            "/api/orchestration/operator-focus/shift-brief",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 5, hi=20)
+            payload = self.server.status_service.operator_shift_brief(
+                chat_id=chat_id,
+                limit=limit,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
+            )
+            self._send_json(200, payload)
+            return
+
         if path in ("/api/v1/orchestration/operator-focus/handoff", "/api/orchestration/operator-focus/handoff"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
