@@ -443,6 +443,60 @@ def _compact_jsonable_list(value: Any, *, max_items: int = 20) -> list[Any]:
     return out
 
 
+def _compact_factory_focus(proactive_health: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    factory = proactive_health.get("factory") if isinstance(proactive_health.get("factory"), dict) else {}
+
+    def _int_value(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    if bool(factory.get("hard_stop")):
+        state = "hard_stop"
+    elif bool(factory.get("soft_pause_active")):
+        state = "soft_pause"
+    else:
+        state = "active"
+
+    raw_targets = [item for item in list(factory.get("next_targets") or []) if isinstance(item, dict)]
+    target_count = _int_value(factory.get("next_target_count"), len(raw_targets))
+    target_limit = max(1, int(limit))
+    compact_targets: list[dict[str, Any]] = []
+    for index, target in enumerate(raw_targets[:target_limit], start=1):
+        heartbeat = target.get("runtime_heartbeat") if isinstance(target.get("runtime_heartbeat"), dict) else {}
+        compact_targets.append(
+            {
+                "rank": target.get("rank") if target.get("rank") is not None else index,
+                "repo_id": target.get("repo_id"),
+                "attention_reason": target.get("attention_reason"),
+                "recommended_action": target.get("recommended_action"),
+                "priority": target.get("priority"),
+                "coverage_state": target.get("coverage_state"),
+                "order_id": target.get("order_id"),
+                "order_phase": target.get("order_phase"),
+                "order_activity_age_s": target.get("order_activity_age_s"),
+                "heartbeat_state": target.get("heartbeat_state") or heartbeat.get("state"),
+                "heartbeat_age_s": target.get("heartbeat_age_s") or heartbeat.get("heartbeat_age_s"),
+                "agent_key": target.get("agent_key") or heartbeat.get("agent_key"),
+                "role": target.get("role") or heartbeat.get("role"),
+            }
+        )
+
+    return {
+        "state": state,
+        "pause_reason": factory.get("pause_reason"),
+        "soft_pause_until": factory.get("soft_pause_until"),
+        "registered_repos": _int_value(factory.get("registered_repos")),
+        "enabled_repos": _int_value(factory.get("enabled_repos")),
+        "uncovered_enabled_repos": _int_value(factory.get("uncovered_enabled_repos")),
+        "stale_heartbeats": _int_value(factory.get("stale_heartbeats")),
+        "next_target_count": target_count,
+        "next_targets_truncated": bool(factory.get("next_targets_truncated")) or target_count > len(compact_targets),
+        "next_targets": compact_targets,
+    }
+
+
 def _artifact_refs_from_task(task: Task) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
     base = {
