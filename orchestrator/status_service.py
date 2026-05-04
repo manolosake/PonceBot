@@ -1348,6 +1348,122 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     }
 
 
+def _proactive_packet_text(value: Any, default: str = "") -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", " ").strip()
+    return text or default
+
+
+def _proactive_packet_list(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        source = list(value)
+    elif value is None:
+        source = []
+    else:
+        source = [value]
+    return [_proactive_packet_text(item) for item in source if _proactive_packet_text(item)]
+
+
+def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: str) -> dict[str, Any]:
+    handoff = order.get("handoff") if isinstance(order.get("handoff"), dict) else {}
+    lane_key = _proactive_packet_text(lane, "advance").lower()
+    lane_label = _proactive_packet_text(label, lane_key.title())
+    oid = _proactive_packet_text(order.get("order_id"))
+    display_oid = _proactive_packet_text(order.get("order_id_short"), oid[:8] if oid else "unknown")
+    stage = _proactive_packet_text(order.get("current_stage"), "skynet_plan")
+    action = (
+        _proactive_packet_text(handoff.get("action"))
+        or _proactive_packet_text(order.get("next_action"))
+        or f"Advance the {lane_label.lower()} lane order."
+    )
+
+    owner_role = _proactive_packet_text(handoff.get("suggested_role"))
+    if not owner_role:
+        if lane_key in {"release", "monitor"}:
+            owner_role = "release_mgr"
+        else:
+            blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else {}
+            blocker_job = blocker.get("job") if isinstance(blocker.get("job"), dict) else {}
+            blocker_role = _proactive_packet_text(blocker_job.get("role")).lower()
+            owner_role = blocker_role if blocker_role in _HANDOFF_ROLES else _handoff_role_for_stage(stage)
+
+    fallback_handoff_endpoint = (
+        f"/api/v1/orchestration/orders/handoff-digest?order_id={oid}"
+        if oid
+        else "/api/v1/orchestration/orders/handoff-digest"
+    )
+    handoff_endpoint = _proactive_packet_text(handoff.get("suggested_endpoint"), fallback_handoff_endpoint)
+    inspect_endpoint = _proactive_packet_text(handoff.get("inspect_path"), handoff_endpoint)
+
+    acceptance_criteria = _proactive_packet_list(handoff.get("acceptance_criteria") or handoff.get("checklist"))
+    if not acceptance_criteria:
+        acceptance_criteria = [
+            f"Inspect {inspect_endpoint}.",
+            action,
+            f"Stay within proactive lane {lane_key} and order {display_oid}.",
+        ]
+
+    definition_of_done = _proactive_packet_list(handoff.get("definition_of_done"))
+    if not definition_of_done:
+        definition_of_done = [
+            action,
+            "Record the operator-visible outcome before handing back.",
+        ]
+
+    evidence_required = _proactive_packet_list(handoff.get("evidence_required") or handoff.get("evidence_expectations"))
+    if not evidence_required:
+        evidence_required = [
+            "completion summary",
+            "updated readiness or workflow status",
+        ]
+
+    suggested_validation = _proactive_packet_list(handoff.get("suggested_validation") or handoff.get("suggested_tests"))
+    if not suggested_validation:
+        suggested_validation = [
+            "Re-read the inspect endpoint after the action.",
+            "Verify acceptance criteria, definition of done, and evidence expectations are satisfied.",
+        ]
+
+    assignment_prompt = _proactive_packet_text(handoff.get("assignment_prompt"))
+    if not assignment_prompt:
+        prompt_lines = [
+            f"ROLE: {owner_role}.",
+            "",
+            f"Task: {_proactive_packet_text(handoff.get('title'), _proactive_packet_text(order.get('title'), 'Proactive order'))}",
+            f"Scope: Work only on proactive action-plan lane {lane_key} for order {display_oid}.",
+            f"Inspect endpoint: {inspect_endpoint}",
+            f"Handoff endpoint: {handoff_endpoint}",
+            f"Action: {action}",
+            "",
+            "Acceptance criteria:",
+            *(f"- {criterion}" for criterion in acceptance_criteria),
+            "",
+            "Definition of done:",
+            *(f"- {criterion}" for criterion in definition_of_done),
+            "",
+            "Evidence required:",
+            *(f"- {evidence}" for evidence in evidence_required),
+            "",
+            "Suggested validation:",
+            *(f"- {validation}" for validation in suggested_validation),
+        ]
+        assignment_prompt = "\n".join(prompt_lines)
+
+    return {
+        "owner_role": owner_role,
+        "action": action,
+        "inspect_endpoint": inspect_endpoint,
+        "handoff_endpoint": handoff_endpoint,
+        "acceptance_criteria": acceptance_criteria,
+        "definition_of_done": definition_of_done,
+        "evidence_required": evidence_required,
+        "suggested_validation": suggested_validation,
+        "assignment_prompt": assignment_prompt,
+        "order_id": oid or None,
+        "lane": lane_key,
+    }
+
+
 def _handoff_action_profile(
     *,
     release_readiness: dict[str, Any],
