@@ -4610,7 +4610,142 @@ class StatusService:
             "chat_id": report.get("chat_id"),
             "limit": report.get("limit"),
             "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
-            "briefings": briefings,
+                "briefings": briefings,
+        }
+
+    def operator_focus_digest(
+        self,
+        *,
+        chat_id: int | None = None,
+        limit: int = 5,
+        categories: list[str] | None = None,
+        urgencies: list[str] | None = None,
+        sources: list[str] | None = None,
+    ) -> dict[str, Any]:
+        report = self.operator_focus(
+            chat_id=chat_id,
+            limit=limit,
+            categories=categories,
+            urgencies=urgencies,
+            sources=sources,
+        )
+        summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+        items = [item for item in list(report.get("items") or []) if isinstance(item, dict)]
+
+        def _text(value: Any, default: str = "") -> str:
+            text = str(value or "").strip()
+            return text if text else default
+
+        def _count_by(key: str, *, default: str = "unknown") -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for item in items:
+                value = _text(item.get(key), default).lower()
+                counts[value] = int(counts.get(value, 0)) + 1
+            return dict(sorted(counts.items()))
+
+        follow_up_counts = {"active": 0, "follow_up": 0, "escalation": 0}
+        follow_ups: list[dict[str, Any]] = []
+        for item in items:
+            follow_up = item.get("receipt_follow_up") if isinstance(item.get("receipt_follow_up"), dict) else None
+            if not follow_up:
+                continue
+            severity = _text(follow_up.get("severity"), "follow_up").lower()
+            follow_up_counts["active"] += 1
+            follow_up_counts[severity] = int(follow_up_counts.get(severity, 0)) + 1
+            follow_ups.append(
+                {
+                    "rank": item.get("rank"),
+                    "action_id": item.get("action_id"),
+                    "urgency": item.get("urgency"),
+                    "category": item.get("category"),
+                    "label": item.get("label"),
+                    "receipt_state": item.get("receipt_state", "new"),
+                    "severity": severity,
+                    "message": follow_up.get("message"),
+                    "next_action": follow_up.get("next_action"),
+                    "age_seconds": follow_up.get("age_seconds"),
+                }
+            )
+
+        def _suggested_commands(rank: Any) -> dict[str, str]:
+            try:
+                rank_i = max(1, int(rank or 1))
+            except Exception:
+                rank_i = 1
+            return {
+                "brief": f"/focus brief chat {rank_i}",
+                "handoff": f"/focus handoff chat {rank_i}",
+                "trail": f"/focus trail chat {rank_i}",
+                "ack": f"/focus ack chat {rank_i} <summary>",
+                "start": f"/focus start chat {rank_i} <summary>",
+                "done": f"/focus done chat {rank_i} <summary>",
+            }
+
+        def _compact_action(item: dict[str, Any]) -> dict[str, Any]:
+            handoff = item.get("handoff") if isinstance(item.get("handoff"), dict) else {}
+            delegate = item.get("delegate_contract") if isinstance(item.get("delegate_contract"), dict) else {}
+            receipt_counts = item.get("receipt_counts_by_state") if isinstance(item.get("receipt_counts_by_state"), dict) else {}
+            out = {
+                "rank": item.get("rank"),
+                "action_id": item.get("action_id"),
+                "urgency": item.get("urgency"),
+                "category": item.get("category"),
+                "label": item.get("label"),
+                "next_action": item.get("next_action"),
+                "target": item.get("target"),
+                "inspect_path": item.get("inspect_path") or handoff.get("inspect_path") or delegate.get("inspect_endpoint"),
+                "inspect_target": item.get("inspect_target"),
+                "action_target": item.get("action_target"),
+                "handoff_endpoint": handoff.get("suggested_endpoint") or delegate.get("handoff_endpoint") or item.get("target"),
+                "source": item.get("source"),
+                "source_signals": item.get("source_signals"),
+                "reason": item.get("reason"),
+                "receipt_state": item.get("receipt_state", "new"),
+                "receipt_count": item.get("receipt_count", 0),
+                "receipt_counts_by_state": receipt_counts,
+                "latest_receipt": item.get("latest_receipt"),
+                "receipt_follow_up": item.get("receipt_follow_up"),
+                "suggested_commands": _suggested_commands(item.get("rank")),
+            }
+            return {key: value for key, value in out.items() if value is not None}
+
+        digest_summary = {
+            "returned": summary.get("returned", len(items)),
+            "health_level": summary.get("health_level"),
+            "top_action_id": summary.get("top_action_id"),
+            "top_category": summary.get("top_category"),
+            "filters": summary.get("filters") if isinstance(summary.get("filters"), dict) else {},
+            "available": summary.get("available") if isinstance(summary.get("available"), dict) else {},
+            "filtered_out": summary.get("filtered_out", 0),
+            "counts": {
+                "by_urgency": _count_by("urgency"),
+                "by_category": _count_by("category"),
+                "by_source": _count_by("source"),
+                "by_receipt_state": _count_by("receipt_state", default="new"),
+                "follow_ups": follow_up_counts,
+            },
+            "release_lanes": summary.get("release_lanes") if isinstance(summary.get("release_lanes"), dict) else {},
+        }
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "limit": report.get("limit"),
+            "summary": digest_summary,
+            "top_actions": [_compact_action(item) for item in items],
+            "follow_ups": follow_ups,
+            "suggested_commands": {
+                "refresh": "/focus digest chat",
+                "global": "/focus digest all",
+                "brief_top": "/focus brief chat 1",
+                "handoff_top": "/focus handoff chat 1",
+                "trail_top": "/focus trail chat 1",
+                "ack_top": "/focus ack chat 1 <summary>",
+                "start_top": "/focus start chat 1 <summary>",
+                "done_top": "/focus done chat 1 <summary>",
+            },
         }
 
     def snapshot(self, *, chat_id: int | None = None) -> dict[str, Any]:
