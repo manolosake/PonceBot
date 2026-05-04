@@ -4507,6 +4507,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         report = self.operator_focus(
             chat_id=chat_id,
@@ -4514,6 +4515,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
         selected_packet = dict(selected) if selected else None
@@ -4536,6 +4538,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         report = self.operator_focus(
             chat_id=chat_id,
@@ -4543,6 +4546,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
         briefing_packet = None
@@ -4575,6 +4579,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         normalized_state = str(state or "").strip().lower()
         if normalized_state not in _OPERATOR_FOCUS_RECEIPT_STATUSES:
@@ -4590,6 +4595,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
         generated_at = float(time.time())
@@ -4660,6 +4666,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
         limit: int = 20,
     ) -> dict[str, Any]:
         try:
@@ -4674,6 +4681,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         selected, selection = self._select_operator_focus_item(report, action_id=action_id, rank=rank)
         item_identity = self._operator_focus_item_identity(selected)
@@ -4720,6 +4728,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         report = self.operator_focus(
             chat_id=chat_id,
@@ -4727,6 +4736,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         briefings: list[dict[str, Any]] = []
         for item in list(report.get("items") or []):
@@ -4768,6 +4778,7 @@ class StatusService:
         categories: list[str] | None = None,
         urgencies: list[str] | None = None,
         sources: list[str] | None = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         report = self.operator_focus(
             chat_id=chat_id,
@@ -4775,6 +4786,7 @@ class StatusService:
             categories=categories,
             urgencies=urgencies,
             sources=sources,
+            receipt_states=receipt_states,
         )
         summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
         items = [item for item in list(report.get("items") or []) if isinstance(item, dict)]
