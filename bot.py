@@ -7425,7 +7425,7 @@ def _help_text(cfg: BotConfig) -> str:
         "- /unwatch            Disable /watch",
         "- /plan               Proactive lane-by-lane sprint action plan",
         "- /orders             List CEO orders (autopilot scope)",
-        "- /focus              Ranked operator next actions; brief/handoff/trail/ack/start/done by rank",
+        "- /focus              Operator next actions; digest/shift/brief/handoff/trail/ack/start/done",
         "- /shift              Shift-start brief: queue health, follow-ups, next actions",
         "- /order show|pause|done|merge|rollback <id>   Manage an order",
         "- /job <id>           Show task/job status by id",
@@ -10326,10 +10326,12 @@ def _operator_focus_text(focus: dict[str, Any], *, scope_label: str) -> str:
 def _focus_usage_text() -> str:
     return (
         "Usage: /focus [chat|all] | "
+        "/focus digest [chat|all] [limit] | "
         "/focus brief|briefing|handoff|trail|history [chat|all] [rank] | "
         "/focus shift|shift-brief [chat|all] [limit] | "
         "/focus briefings [chat|all] [limit] | "
-        "/focus ack|start|done [chat|all] [rank] [summary...]"
+        "/focus ack|start|doing|done [chat|all] [rank] [summary...] | "
+        "/shift [chat|all] [limit]"
     )
 
 
@@ -10359,6 +10361,26 @@ def _focus_payload_marker(payload: dict[str, Any]) -> str:
     return _orch_marker("focus", json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
+def _parse_focus_scoped_limit(parts: list[str], *, mode: str, default_limit: int = 5) -> tuple[str, Job | None]:
+    scope = "chat"
+    limit = default_limit
+    idx = 1
+    if idx < len(parts):
+        parsed_scope = _focus_scope_value(parts[idx])
+        if parsed_scope:
+            scope = parsed_scope
+            idx += 1
+    if idx < len(parts):
+        parsed_limit = _focus_parse_rank(parts[idx])
+        if parsed_limit is None:
+            return _focus_usage_text(), None
+        limit = parsed_limit
+        idx += 1
+    if idx != len(parts):
+        return _focus_usage_text(), None
+    return _focus_payload_marker({"mode": mode, "scope": scope, "limit": limit}), None
+
+
 def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
     tail = (raw_tail or "").strip()
     if not tail:
@@ -10377,6 +10399,9 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
             return _orch_marker("focus", "all"), None
         if scope == "chat":
             return _orch_marker("focus", "chat"), None
+
+    if head == "digest":
+        return _parse_focus_scoped_limit(parts, mode="digest")
 
     if head in ("brief", "briefing", "handoff", "trail", "history"):
         if head in ("brief", "briefing"):
@@ -10404,23 +10429,7 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
         return _focus_payload_marker({"mode": mode, "scope": scope, "rank": rank}), None
 
     if head in ("shift", "shift-brief", "shiftbrief"):
-        scope = "chat"
-        limit = 5
-        idx = 1
-        if idx < len(parts):
-            parsed_scope = _focus_scope_value(parts[idx])
-            if parsed_scope:
-                scope = parsed_scope
-                idx += 1
-        if idx < len(parts):
-            parsed_limit = _focus_parse_rank(parts[idx])
-            if parsed_limit is None:
-                return _focus_usage_text(), None
-            limit = parsed_limit
-            idx += 1
-        if idx != len(parts):
-            return _focus_usage_text(), None
-        return _focus_payload_marker({"mode": "shift", "scope": scope, "limit": limit}), None
+        return _parse_focus_scoped_limit(parts, mode="shift")
 
     if head == "briefings":
         scope = "chat"
