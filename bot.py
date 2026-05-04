@@ -11466,6 +11466,7 @@ def _send_orchestrator_marker_response(
                 return None
 
         rank = _as_int((parsed_payload or {}).get("rank"))
+        limit = _as_int((parsed_payload or {}).get("limit")) or 5
 
         try:
             svc = StatusService(orch_q=orch_q, role_profiles=profiles, cache_ttl_seconds=0)
@@ -11488,6 +11489,12 @@ def _send_orchestrator_marker_response(
             elif mode in ("trail", "history"):
                 trail_payload = svc.operator_focus_receipt_trail(chat_id=scope_chat_id, rank=rank)
                 text = _operator_focus_receipt_trail_text(trail_payload, scope_label=scope_label, rank=rank or 1)
+            elif mode == "shift":
+                brief = svc.operator_shift_brief(chat_id=scope_chat_id, limit=limit)
+                text = _operator_focus_shift_brief_text(brief, scope_label=scope_label, limit=limit)
+            elif mode == "briefings":
+                bundle = svc.operator_focus_briefing_bundle(chat_id=scope_chat_id, limit=limit)
+                text = _operator_focus_briefing_bundle_text(bundle, scope_label=scope_label, limit=limit)
             else:
                 focus = svc.operator_focus(chat_id=scope_chat_id)
                 text = _operator_focus_text(focus, scope_label=scope_label)
