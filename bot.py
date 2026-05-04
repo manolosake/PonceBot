@@ -2573,6 +2573,52 @@ def _factory_repo_id(repo_path: Path) -> str:
     return f"{slug}-{digest}"
 
 
+def _factory_repo_policy_priority(repo_path: Path, *, base_repo: Path | None = None) -> int:
+    try:
+        resolved = repo_path.expanduser().resolve()
+    except Exception:
+        resolved = repo_path.expanduser()
+    try:
+        base_resolved = base_repo.expanduser().resolve() if base_repo is not None else None
+    except Exception:
+        base_resolved = base_repo.expanduser() if base_repo is not None else None
+    name = str(resolved.name or "").strip().lower()
+    normalized_name = re.sub(r"[^a-z0-9]+", "", name)
+    normalized_path = re.sub(r"[^a-z0-9]+", "", str(resolved).strip().lower())
+    if base_resolved is not None and str(resolved) == str(base_resolved):
+        return 1
+    if name.startswith("codexbot") or "codexbot" in normalized_path:
+        return 1
+    if normalized_name == "executivedashboard" or "executivedashboard" in normalized_path:
+        return 1
+    if "omnicrew" in normalized_name or "android" in normalized_name:
+        return 2
+    return 3
+
+
+def _factory_repo_priority_for_sync(
+    *,
+    existing: dict[str, Any],
+    discovered: dict[str, Any],
+    metadata: dict[str, Any],
+    base_repo: Path,
+) -> int:
+    if bool(metadata.get("priority_pinned", False)):
+        try:
+            return int(existing.get("priority") or discovered.get("priority") or 2)
+        except Exception:
+            return 2
+    path = Path(str(discovered.get("path") or existing.get("path") or "")).expanduser()
+    priority = _factory_repo_policy_priority(path, base_repo=base_repo)
+    metadata["policy_priority"] = int(priority)
+    metadata["policy_priority_reason"] = {
+        1: "primary_repo",
+        2: "important_product_repo",
+        3: "standard_repo",
+    }.get(int(priority), "standard_repo")
+    return int(priority)
+
+
 def _git_default_branch(repo: Path) -> str:
     try:
         ref = _run_git(repo, ["symbolic-ref", "refs/remotes/origin/HEAD"], check=False)
@@ -2671,6 +2717,37 @@ def _factory_repo_autonomy_blocker(repo: Path, *, default_branch: str) -> str:
     return ""
 
 
+def _factory_repo_status_for_sync(
+    *,
+    existing: dict[str, Any],
+    discovered: dict[str, Any],
+    metadata: dict[str, Any],
+    default_branch: str,
+    autonomy_enabled: bool,
+    now: float,
+) -> str:
+    existing_status = str(existing.get("status") or "").strip().lower()
+    discovered_status = str(discovered.get("status") or "").strip().lower() or "active"
+    if not autonomy_enabled:
+        return existing_status or "disabled"
+    if existing_status in {"disabled", "paused"}:
+        return existing_status
+
+    repo_path = Path(str(discovered.get("path") or existing.get("path") or "")).expanduser()
+    blocker = _factory_repo_autonomy_blocker(repo_path, default_branch=default_branch)
+    metadata["last_autonomy_preflight_at"] = float(now)
+    if blocker:
+        metadata["last_autonomy_blocker"] = blocker
+        return "blocked"
+
+    previous_blocker = str(metadata.get("last_autonomy_blocker") or "").strip()
+    metadata.pop("last_autonomy_blocker", None)
+    if existing_status in {"blocked", "missing"} or previous_blocker:
+        metadata["autonomy_recovered_at"] = float(now)
+        metadata["autonomy_recovered_from"] = existing_status or "unknown"
+    return discovered_status if discovered_status not in {"blocked", "missing"} else "active"
+
+
 def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
     roots = _factory_repo_roots()
     all_skip_prefixes: list[Path] = []
@@ -2717,13 +2794,14 @@ def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
                 continue
             seen_paths.add(repo_key)
             repo_id = _factory_repo_id(current_resolved)
+            priority = _factory_repo_policy_priority(current_resolved, base_repo=Path(base_repo))
             discovered.append(
                 {
                     "repo_id": repo_id,
                     "path": repo_key,
                     "default_branch": _git_default_branch(current_resolved),
                     "autonomy_enabled": True,
-                    "priority": 1 if repo_key == base_repo else 2,
+                    "priority": int(priority),
                     "runtime_mode": "ceo-bounded",
                     "daily_budget": 0.0,
                     "status": "active",
@@ -2731,6 +2809,7 @@ def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
                         "repo_name": current_resolved.name,
                         "discovered_by": "factory_scan",
                         "discovered_at": time.time(),
+                        "policy_priority": int(priority),
                         **_discover_repo_deploy_metadata(cfg, current_resolved),
                     },
                 }
@@ -14771,17 +14850,48 @@ def _factory_sync_repo_registry(
             metadata=metadata,
             now=float(now),
         )
+        autonomy_enabled = bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True)))
+        priority = _factory_repo_priority_for_sync(
+            existing=existing,
+            discovered=row,
+            metadata=metadata,
+            base_repo=cfg.codex_workdir,
+        )
+        next_status = _factory_repo_status_for_sync(
+            existing=existing,
+            discovered=row,
+            metadata=metadata,
+            default_branch=default_branch,
+            autonomy_enabled=autonomy_enabled,
+            now=float(now),
+        )
         orch_q.upsert_repo(
             repo_id=repo_id,
             path=str(row.get("path") or ""),
             default_branch=default_branch,
-            autonomy_enabled=bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True))),
-            priority=int(existing.get("priority") or row.get("priority") or 2),
+            autonomy_enabled=autonomy_enabled,
+            priority=int(priority),
             runtime_mode=str(existing.get("runtime_mode") or row.get("runtime_mode") or "ceo-bounded"),
             daily_budget=float(existing.get("daily_budget") or row.get("daily_budget") or 0.0),
-            status=str(existing.get("status") or row.get("status") or "active"),
+            status=next_status,
             metadata=metadata,
         )
+        previous_status = str(existing.get("status") or "").strip().lower()
+        if previous_status and next_status != previous_status:
+            try:
+                orch_q.append_audit_event(
+                    event_type="repo.status_reconciled",
+                    actor="factory_sync",
+                    details={
+                        "repo_id": repo_id,
+                        "repo_path": str(row.get("path") or ""),
+                        "previous_status": previous_status,
+                        "status": next_status,
+                        "reason": str(metadata.get("last_autonomy_blocker") or "autonomy_preflight_clear"),
+                    },
+                )
+            except Exception:
+                pass
         if previous_default_branch and default_branch != previous_default_branch:
             try:
                 orch_q.append_audit_event(

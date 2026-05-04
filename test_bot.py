@@ -204,6 +204,134 @@ class TestStateHandling(unittest.TestCase):
         self.assertEqual(branch, "codex/codexbot-workflow-v2")
         self.assertNotIn("canonical_branch", metadata)
 
+    def test_factory_repo_policy_priority_promotes_primary_repos(self) -> None:
+        base_repo = Path("/home/aponce/codexbot")
+
+        self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/codexbot"), base_repo=base_repo), 1)
+        self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/ExecutiveDashboard"), base_repo=base_repo), 1)
+        self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/OmniCrewApp.android"), base_repo=base_repo), 2)
+        self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/Documents/ReceiptJury"), base_repo=base_repo), 3)
+
+    def test_factory_sync_recovers_blocked_repo_when_preflight_clears(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "ExecutiveDashboard"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "manolosake"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "manolosake@gmail.com"], cwd=str(repo), check=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=str(repo), check=True, capture_output=True, text=True)
+
+            cfg = self._cfg(root / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "codex_workdir": root / "codexbot"})
+            repo_id = "executivedashboard-12345678"
+            discovered = {
+                "repo_id": repo_id,
+                "path": str(repo.resolve()),
+                "default_branch": "main",
+                "autonomy_enabled": True,
+                "priority": 2,
+                "runtime_mode": "ceo-bounded",
+                "daily_budget": 0.0,
+                "status": "active",
+                "metadata": {"repo_name": "ExecutiveDashboard"},
+            }
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.rows = {
+                        repo_id: {
+                            **discovered,
+                            "status": "blocked",
+                            "metadata": {
+                                "repo_name": "ExecutiveDashboard",
+                                "last_autonomy_blocker": "repo checkout branch 'feature/x' differs from configured default_branch 'main'",
+                            },
+                        }
+                    }
+                    self.events: list[dict[str, object]] = []
+
+                def list_repos(self, limit: int = 5000):
+                    return list(self.rows.values())[:limit]
+
+                def upsert_repo(self, **kwargs: object) -> None:
+                    self.rows[str(kwargs["repo_id"])] = dict(kwargs)
+
+                def set_repo_status(self, *, repo_id: str, status: str) -> None:
+                    self.rows[repo_id]["status"] = status
+
+                def append_audit_event(self, **kwargs: object) -> None:
+                    self.events.append(dict(kwargs))
+
+            q = _FakeQueue()
+            with patch.object(bot, "_discover_factory_repos", return_value=[discovered]):
+                rows = bot._factory_sync_repo_registry(cfg=cfg, orch_q=q, now=123.0, force=True)  # type: ignore[arg-type]
+
+        synced = {str(row.get("repo_id")): row for row in rows}[repo_id]
+        self.assertEqual(synced["status"], "active")
+        self.assertEqual(synced["priority"], 1)
+        self.assertNotIn("last_autonomy_blocker", synced["metadata"])
+        self.assertEqual(synced["metadata"]["autonomy_recovered_from"], "blocked")
+        self.assertTrue(any(event.get("event_type") == "repo.status_reconciled" for event in q.events))
+
+    def test_factory_sync_blocks_repo_when_preflight_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "ExecutiveDashboard"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "manolosake"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.email", "manolosake@gmail.com"], cwd=str(repo), check=True)
+            subprocess.run(["git", "checkout", "-b", "main"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=str(repo), check=True, capture_output=True, text=True)
+            (repo / "README.md").write_text("dirty\n", encoding="utf-8")
+
+            cfg = self._cfg(root / "state.json")
+            cfg = bot.BotConfig(**{**cfg.__dict__, "codex_workdir": root / "codexbot"})
+            repo_id = "executivedashboard-12345678"
+            discovered = {
+                "repo_id": repo_id,
+                "path": str(repo.resolve()),
+                "default_branch": "main",
+                "autonomy_enabled": True,
+                "priority": 2,
+                "runtime_mode": "ceo-bounded",
+                "daily_budget": 0.0,
+                "status": "active",
+                "metadata": {"repo_name": "ExecutiveDashboard"},
+            }
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.rows = {repo_id: dict(discovered)}
+                    self.events: list[dict[str, object]] = []
+
+                def list_repos(self, limit: int = 5000):
+                    return list(self.rows.values())[:limit]
+
+                def upsert_repo(self, **kwargs: object) -> None:
+                    self.rows[str(kwargs["repo_id"])] = dict(kwargs)
+
+                def set_repo_status(self, *, repo_id: str, status: str) -> None:
+                    self.rows[repo_id]["status"] = status
+
+                def append_audit_event(self, **kwargs: object) -> None:
+                    self.events.append(dict(kwargs))
+
+            q = _FakeQueue()
+            with patch.object(bot, "_discover_factory_repos", return_value=[discovered]):
+                rows = bot._factory_sync_repo_registry(cfg=cfg, orch_q=q, now=123.0, force=True)  # type: ignore[arg-type]
+
+        synced = {str(row.get("repo_id")): row for row in rows}[repo_id]
+        self.assertEqual(synced["status"], "blocked")
+        self.assertIn("uncommitted changes", synced["metadata"]["last_autonomy_blocker"])
+        self.assertTrue(any(event.get("event_type") == "repo.status_reconciled" for event in q.events))
+
     def test_factory_repo_autonomy_blocker_rejects_branch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo"
