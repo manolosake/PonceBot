@@ -3329,6 +3329,7 @@ class StatusService:
         categories: Any = None,
         urgencies: Any = None,
         sources: Any = None,
+        receipt_states: list[str] | None = None,
     ) -> dict[str, Any]:
         lim = max(1, min(20, int(limit)))
         generated_at = float(time.time())
@@ -3357,17 +3358,19 @@ class StatusService:
             normalized: list[str] = []
             seen: set[str] = set()
             for raw in raw_values:
-                value = str(raw or "").strip().lower()
-                if not value or value in seen:
-                    continue
-                normalized.append(value)
-                seen.add(value)
+                for part in str(raw or "").split(","):
+                    value = part.strip().lower()
+                    if not value or value in seen:
+                        continue
+                    normalized.append(value)
+                    seen.add(value)
             return normalized
 
         active_filters = {
             "categories": _normalize_filter(categories),
             "urgencies": _normalize_filter(urgencies),
             "sources": _normalize_filter(sources),
+            "receipt_states": _normalize_filter(receipt_states),
         }
 
         def _text(value: Any, default: str = "") -> str:
@@ -4081,16 +4084,44 @@ class StatusService:
                 )
                 source_counts["proactive_health"] += 1
 
+        self._decorate_operator_focus_receipts(items, now=generated_at)
+
+        def _receipt_state_selectors(item: dict[str, Any]) -> set[str]:
+            selectors: set[str] = set()
+            receipt_state = str(item.get("receipt_state") or "").strip().lower() or "new"
+            if receipt_state:
+                selectors.add(receipt_state)
+            follow_up = item.get("receipt_follow_up") if isinstance(item.get("receipt_follow_up"), dict) else {}
+            severity = str((follow_up or {}).get("severity") or "").strip().lower()
+            if severity in {"follow_up", "escalation"}:
+                selectors.add(severity)
+            return selectors
+
+        def _matches_receipt_states(item: dict[str, Any]) -> bool:
+            filters = active_filters["receipt_states"]
+            if not filters:
+                return True
+            selectors = _receipt_state_selectors(item)
+            return any(value in selectors for value in filters)
+
         available_source_counts = {key: 0 for key in source_keys}
         for item in items:
             source = str(item.get("source") or "").strip().lower()
             if source:
                 available_source_counts[source] = int(available_source_counts.get(source, 0)) + 1
+        available_receipt_states = sorted(
+            {
+                selector
+                for item in items
+                for selector in _receipt_state_selectors(item)
+            }
+        )
         available = {
             "total": len(items),
             "categories": sorted({str(item.get("category") or "").strip().lower() for item in items if str(item.get("category") or "").strip()}),
             "urgencies": sorted({str(item.get("urgency") or "").strip().lower() for item in items if str(item.get("urgency") or "").strip()}),
             "sources": sorted({str(item.get("source") or "").strip().lower() for item in items if str(item.get("source") or "").strip()}),
+            "receipt_states": available_receipt_states,
         }
 
         filtered_items = [
@@ -4099,6 +4130,7 @@ class StatusService:
             if (not active_filters["categories"] or str(item.get("category") or "").strip().lower() in active_filters["categories"])
             and (not active_filters["urgencies"] or str(item.get("urgency") or "").strip().lower() in active_filters["urgencies"])
             and (not active_filters["sources"] or str(item.get("source") or "").strip().lower() in active_filters["sources"])
+            and _matches_receipt_states(item)
         ]
         source_counts = {key: 0 for key in source_keys}
         for item in filtered_items:
@@ -4118,7 +4150,6 @@ class StatusService:
         returned = filtered_items[:lim]
         for idx, item in enumerate(returned, start=1):
             item["rank"] = idx
-        self._decorate_operator_focus_receipts(returned, now=generated_at)
         receipt_follow_up_count = sum(1 for item in returned if isinstance(item.get("receipt_follow_up"), dict))
         receipt_escalation_count = sum(
             1
