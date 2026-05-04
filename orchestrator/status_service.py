@@ -5227,6 +5227,10 @@ class StatusService:
         runbooks = control.get("runbooks") if isinstance(control.get("runbooks"), dict) else {}
         runbook_summary = runbooks.get("summary") if isinstance(runbooks.get("summary"), dict) else {}
         health = control.get("health") if isinstance(control.get("health"), dict) else {}
+        digest_summary = digest.get("summary") if isinstance(digest.get("summary"), dict) else {}
+        digest_counts = digest_summary.get("counts") if isinstance(digest_summary.get("counts"), dict) else {}
+        follow_up_counts = digest_counts.get("follow_ups") if isinstance(digest_counts.get("follow_ups"), dict) else {}
+        follow_up_items = [item for item in list(digest.get("follow_ups") or [])[:lim] if isinstance(item, dict)]
 
         top_actions: list[dict[str, Any]] = []
         for item in list(digest.get("top_actions") or [])[:lim]:
@@ -5244,6 +5248,7 @@ class StatusService:
                 "handoff_endpoint": item.get("handoff_endpoint"),
                 "source": item.get("source"),
                 "receipt_state": item.get("receipt_state", "new"),
+                "receipt_follow_up": item.get("receipt_follow_up") if isinstance(item.get("receipt_follow_up"), dict) else None,
             }
             top_actions.append({key: value for key, value in compact.items() if value is not None})
 
@@ -5283,6 +5288,10 @@ class StatusService:
             },
             "proactive_health": proactive_health,
             "operator_focus_digest": digest,
+            "receipt_follow_ups": {
+                "counts": follow_up_counts,
+                "items": follow_up_items,
+            },
             "briefings": list(briefing_bundle.get("briefings") or [])[:lim],
             "next_actions": top_actions,
         }
