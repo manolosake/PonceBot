@@ -63,6 +63,13 @@ def _format_filter_values(values: Any, *, default: str = "all") -> str:
     return _one_line(values, default=default)
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_report(
     *,
     db_path: Path,
@@ -266,11 +273,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Available proactive priorities: {_one_line(available_source_counts.get('proactive_priorities'), default='0')}",
         f"- Available proactive health: {_one_line(available_source_counts.get('proactive_health'), default='0')}",
         "",
-        "## Focus Items",
-        "",
-        "| Rank | Urgency | Category | Label | Target | Next action | Receipt status |",
-        "| ---: | --- | --- | --- | --- | --- | --- |",
     ]
+    _append_release_readiness(lines, summary.get("release_lanes"))
+    lines.extend(
+        [
+            "## Focus Items",
+            "",
+            "| Rank | Urgency | Category | Label | Target | Next action | Receipt status |",
+            "| ---: | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
 
     if items:
         for item in items:
@@ -348,6 +360,51 @@ def _append_counts(lines: list[str], title: str, values: Any) -> None:
     _append_key_values(lines, values)
 
 
+def _release_lane_count(release_lanes: dict[str, Any], lane: str) -> int:
+    by_lane = release_lanes.get("by_lane") if isinstance(release_lanes.get("by_lane"), dict) else {}
+    return _int_value(by_lane.get(lane, release_lanes.get(lane, 0)), 0)
+
+
+def _append_release_readiness(lines: list[str], release_lanes_value: Any) -> None:
+    release_lanes = release_lanes_value if isinstance(release_lanes_value, dict) else {}
+    total = _int_value(release_lanes.get("total"), 0)
+    top_order = release_lanes.get("top_order") if isinstance(release_lanes.get("top_order"), dict) else {}
+
+    lines.extend(
+        [
+            "## Release Readiness",
+            "",
+            f"- Endpoint: {_one_line(release_lanes.get('endpoint'))}",
+            f"- Total: {_one_line(total, default='0')}",
+            f"- Ready: {_one_line(_release_lane_count(release_lanes, 'ready'), default='0')}",
+            f"- Blocked: {_one_line(_release_lane_count(release_lanes, 'blocked'), default='0')}",
+            f"- Not ready: {_one_line(_release_lane_count(release_lanes, 'not_ready'), default='0')}",
+            f"- Released: {_one_line(_release_lane_count(release_lanes, 'released'), default='0')}",
+        ]
+    )
+
+    if top_order:
+        lines.extend(["", "### Top Order", ""])
+        for key in (
+            "rank",
+            "order_id",
+            "order_id_short",
+            "title",
+            "release_lane",
+            "readiness_state",
+            "summary",
+            "next_action",
+            "endpoint",
+            "handoff_endpoint",
+        ):
+            if key in top_order:
+                label = key.replace("_", " ").capitalize()
+                lines.append(f"- {label}: {_one_line(top_order.get(key))}")
+    else:
+        lines.append("- Top order: None.")
+    lines.append("")
+
+
 def render_digest_markdown(digest: dict[str, Any]) -> str:
     summary = digest.get("summary") if isinstance(digest.get("summary"), dict) else {}
     filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
@@ -388,6 +445,7 @@ def render_digest_markdown(digest: dict[str, Any]) -> str:
     _append_counts(lines, "By Source", counts.get("by_source"))
     _append_counts(lines, "By Receipt State", counts.get("by_receipt_state"))
     _append_counts(lines, "Follow Ups", counts.get("follow_ups"))
+    _append_release_readiness(lines, summary.get("release_lanes"))
 
     lines.extend(
         [
