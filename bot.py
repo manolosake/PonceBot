@@ -10327,6 +10327,7 @@ def _focus_usage_text() -> str:
     return (
         "Usage: /focus [chat|all] | "
         "/focus brief|briefing|handoff|trail|history [chat|all] [rank] | "
+        "/focus shift|shift-brief [chat|all] [limit] | "
         "/focus briefings [chat|all] [limit] | "
         "/focus ack|start|done [chat|all] [rank] [summary...]"
     )
@@ -10401,6 +10402,25 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
         if idx != len(parts):
             return _focus_usage_text(), None
         return _focus_payload_marker({"mode": mode, "scope": scope, "rank": rank}), None
+
+    if head in ("shift", "shift-brief", "shiftbrief"):
+        scope = "chat"
+        limit = 5
+        idx = 1
+        if idx < len(parts):
+            parsed_scope = _focus_scope_value(parts[idx])
+            if parsed_scope:
+                scope = parsed_scope
+                idx += 1
+        if idx < len(parts):
+            parsed_limit = _focus_parse_rank(parts[idx])
+            if parsed_limit is None:
+                return _focus_usage_text(), None
+            limit = parsed_limit
+            idx += 1
+        if idx != len(parts):
+            return _focus_usage_text(), None
+        return _focus_payload_marker({"mode": "shift", "scope": scope, "limit": limit}), None
 
     if head == "briefings":
         scope = "chat"
@@ -10787,6 +10807,122 @@ def _operator_focus_briefing_bundle_text(bundle: dict[str, Any], *, scope_label:
                 ),
             ]
         )
+
+    return "\n".join(lines)
+
+
+def _operator_focus_shift_brief_text(brief: dict[str, Any], *, scope_label: str, limit: int) -> str:
+    def _ascii(value: object, default: str = "") -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = default
+        return s.encode("ascii", "replace").decode("ascii")
+
+    def _clip(value: object, *, max_chars: int = 180, default: str = "") -> str:
+        s = _ascii(value, default)
+        if len(s) > max_chars:
+            return s[: max(0, max_chars - 3)].rstrip() + "..."
+        return s
+
+    def _intish(value: object, default: int = 0) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except Exception:
+            return default
+
+    snapshot = brief.get("snapshot_summary") if isinstance(brief.get("snapshot_summary"), dict) else {}
+    queue = snapshot.get("queue") if isinstance(snapshot.get("queue"), dict) else {}
+    orders = snapshot.get("orders") if isinstance(snapshot.get("orders"), dict) else {}
+    alerts = snapshot.get("alerts") if isinstance(snapshot.get("alerts"), dict) else {}
+    risks = snapshot.get("risks") if isinstance(snapshot.get("risks"), dict) else {}
+    decisions = snapshot.get("decisions") if isinstance(snapshot.get("decisions"), dict) else {}
+    runbooks = snapshot.get("runbooks") if isinstance(snapshot.get("runbooks"), dict) else {}
+    proactive_health = brief.get("proactive_health") if isinstance(brief.get("proactive_health"), dict) else {}
+    receipt_follow_ups = brief.get("receipt_follow_ups") if isinstance(brief.get("receipt_follow_ups"), dict) else {}
+    receipt_counts = receipt_follow_ups.get("counts") if isinstance(receipt_follow_ups.get("counts"), dict) else {}
+    next_actions = [item for item in list(brief.get("next_actions") or []) if isinstance(item, dict)]
+
+    try:
+        limit_i = int(limit)
+    except Exception:
+        limit_i = 5
+
+    health = _clip(snapshot.get("health_level"), max_chars=24, default="unknown")
+    lines = [
+        f"Jarvis: operator shift brief ({_ascii(scope_label)} limit={limit_i})",
+        f"snapshot: health={health}",
+        (
+            "queue: "
+            f"runnable={_intish(queue.get('queued_runnable'))} "
+            f"waiting={_intish(queue.get('waiting_deps'))} "
+            f"approval={_intish(queue.get('blocked_approval'))} "
+            f"running={_intish(queue.get('running'))} "
+            f"legacy={_intish(queue.get('blocked_legacy'))}"
+        ),
+        (
+            "attention: "
+            f"orders={_intish(orders.get('active_count'))} "
+            f"alerts={_intish(alerts.get('count'))} "
+            f"stalled={_intish(alerts.get('stalled_tasks'))} "
+            f"risks={_intish(risks.get('count'))} "
+            f"decisions={_intish(decisions.get('pending'))} "
+            f"approvals={_intish(decisions.get('blocked_approvals'))} "
+            f"runbooks_due={_intish(runbooks.get('due'))} "
+            f"runbooks_overdue={_intish(runbooks.get('overdue'))}"
+        ),
+    ]
+
+    proactive_status = _clip(
+        proactive_health.get("status") or proactive_health.get("health") or proactive_health.get("level"),
+        max_chars=48,
+    )
+    proactive_summary = _clip(proactive_health.get("summary") or proactive_health.get("message"), max_chars=220)
+    if proactive_status or proactive_summary:
+        line = "proactive:"
+        if proactive_status:
+            line += f" status={proactive_status}"
+        if proactive_summary:
+            line += f" summary={proactive_summary}"
+        lines.append(line)
+
+    count_bits = []
+    for key in ("active", "follow_up", "escalation"):
+        if key in receipt_counts:
+            count_bits.append(f"{_clip(key, max_chars=32)}={_intish(receipt_counts.get(key))}")
+    for key in sorted(receipt_counts):
+        if key in {"active", "follow_up", "escalation"}:
+            continue
+        count_bits.append(f"{_clip(key, max_chars=32)}={_intish(receipt_counts.get(key))}")
+    if count_bits:
+        lines.append("receipt follow-ups: " + " ".join(count_bits))
+
+    if not next_actions:
+        lines.extend(["", "No shift next actions for this scope."])
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("next actions:")
+    for idx, item in enumerate(next_actions[:limit_i], start=1):
+        try:
+            rank_i = int(item.get("rank") or idx)
+        except Exception:
+            rank_i = idx
+        urgency = _clip(item.get("urgency"), max_chars=24, default="n/a")
+        category = _clip(item.get("category"), max_chars=48, default="n/a")
+        label = _clip(item.get("label"), max_chars=120, default="Review operator action")
+        next_action = _clip(item.get("next_action"), max_chars=220, default="Review the item.")
+        inspect = _clip(item.get("inspect_path") or item.get("target"), max_chars=180)
+        handoff = _clip(item.get("handoff_endpoint"), max_chars=180)
+        receipt_state = _clip(item.get("receipt_state"), max_chars=40, default="new")
+        lines.append(f"{rank_i}. {urgency}/{category} - {label}")
+        lines.append(f"   next={next_action}")
+        detail = []
+        if inspect:
+            detail.append(f"inspect={inspect}")
+        if handoff:
+            detail.append(f"handoff={handoff}")
+        detail.append(f"receipt={receipt_state}")
+        lines.append("   " + " ".join(detail))
 
     return "\n".join(lines)
 
