@@ -2294,6 +2294,258 @@ class StatusService:
             "lanes": lanes,
         }
 
+    def queue_pressure_board(
+        self,
+        *,
+        chat_id: int | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        snap = self.snapshot(chat_id=chat_id)
+        generated_at = float(snap.get("generated_at") or time.time())
+        max_parallel = _max_parallel_by_role(self.role_profiles)
+
+        role_rows: dict[str, dict[str, Any]] = {}
+        for row in list(snap.get("queue_by_role") or []):
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role") or "").strip().lower()
+            if role:
+                role_rows[role] = row
+
+        worker_capacity: dict[str, int] = {}
+        worker_running: dict[str, int] = {}
+        for worker in list(snap.get("workers") or []):
+            if not isinstance(worker, dict):
+                continue
+            role = str(worker.get("role") or "").strip().lower()
+            if not role:
+                continue
+            worker_capacity[role] = worker_capacity.get(role, 0) + 1
+            if isinstance(worker.get("current"), dict):
+                worker_running[role] = worker_running.get(role, 0) + 1
+
+        stalled_by_role: dict[str, int] = {}
+        for item in list(snap.get("stalled_tasks") or []):
+            if not isinstance(item, dict):
+                continue
+            if chat_id is not None:
+                try:
+                    if int(item.get("chat_id") or 0) != int(chat_id):
+                        continue
+                except Exception:
+                    continue
+            role = str(item.get("role") or "").strip().lower()
+            if role:
+                stalled_by_role[role] = stalled_by_role.get(role, 0) + 1
+
+        pressure_rows: list[dict[str, Any]] = []
+        roles = sorted(set(max_parallel) | set(role_rows) | set(worker_capacity))
+        for role in roles:
+            row = role_rows.get(role) or {}
+            capacity = max(1, int(worker_capacity.get(role) or max_parallel.get(role) or 1))
+            running = int(row.get("running", worker_running.get(role, 0)) or 0)
+            queued = int(row.get("queued", 0) or 0)
+            waiting = int(row.get("waiting_deps", 0) or 0)
+            blocked_approval = int(row.get("blocked_approval", 0) or 0)
+            blocked = int(row.get("blocked", 0) or 0)
+            stalled = int(stalled_by_role.get(role, 0) or 0)
+            idle = max(0, capacity - running)
+            waiting_total = waiting + blocked_approval + blocked
+            backlog_total = queued + waiting_total
+            saturation = round(min(1.0, float(running) / float(capacity)), 3)
+
+            if blocked_approval > 0 or stalled > 0 or (queued > 0 and idle == 0 and running >= capacity):
+                level = "critical"
+            elif backlog_total > 0 or saturation >= 0.75:
+                level = "attention"
+            else:
+                level = "ok"
+
+            if blocked_approval > 0:
+                next_action = f"Review {blocked_approval} blocked approval job(s) for {role}."
+            elif stalled > 0:
+                next_action = f"Inspect {stalled} stalled job(s) for {role}."
+            elif queued > 0 and idle == 0:
+                next_action = f"Role {role} is saturated; consider freeing a worker or reprioritizing queued work."
+            elif waiting > 0 or blocked > 0:
+                next_action = f"Resolve dependencies for {waiting_total} waiting/blocked job(s) in {role}."
+            elif queued > 0 and idle > 0:
+                next_action = f"Dispatch queued {role} work into {idle} idle slot(s)."
+            elif running > 0:
+                next_action = f"Monitor {running} running {role} job(s)."
+            else:
+                next_action = f"No queue action needed for {role}."
+
+            pressure_rows.append(
+                {
+                    "role": role,
+                    "pressure_level": level,
+                    "max_parallel": capacity,
+                    "running": running,
+                    "idle": idle,
+                    "saturation": saturation,
+                    "queued": queued,
+                    "waiting_deps": waiting,
+                    "blocked_approval": blocked_approval,
+                    "blocked": blocked,
+                    "waiting_total": waiting_total,
+                    "backlog_total": backlog_total,
+                    "stalled": stalled,
+                    "next_action": next_action,
+                }
+            )
+
+        level_rank = {"critical": 0, "attention": 1, "ok": 2}
+        pressure_rows.sort(
+            key=lambda item: (
+                level_rank.get(str(item.get("pressure_level") or "ok"), 9),
+                -int(item.get("backlog_total") or 0),
+                -float(item.get("saturation") or 0.0),
+                str(item.get("role") or ""),
+            )
+        )
+
+        queued_total = int(snap.get("queued_total") or 0)
+        waiting_deps_total = int(snap.get("waiting_deps_total") or 0)
+        blocked_approval_total = int(snap.get("blocked_approval_total") or 0)
+        blocked_total = int(snap.get("blocked_total") or 0)
+        running_total = int(snap.get("running_total") or 0)
+        stalled_total = sum(int(row.get("stalled") or 0) for row in pressure_rows)
+        total_capacity = sum(max(1, int(row.get("max_parallel") or 1)) for row in pressure_rows)
+        idle_total = max(0, total_capacity - running_total)
+        overall_saturation = round(min(1.0, float(running_total) / float(total_capacity)), 3) if total_capacity > 0 else 0.0
+
+        if blocked_approval_total > 0 or stalled_total > 0 or any(row.get("pressure_level") == "critical" for row in pressure_rows):
+            overall_level = "critical"
+        elif queued_total > 0 or waiting_deps_total > 0 or blocked_total > 0 or overall_saturation >= 0.75:
+            overall_level = "attention"
+        else:
+            overall_level = "ok"
+
+        recommended_actions: list[dict[str, Any]] = []
+
+        def _add_action(action_id: str, label: str, count: int, target: str, next_action: str, role: str | None = None) -> None:
+            if count <= 0:
+                return
+            recommended_actions.append(
+                {
+                    "action_id": action_id,
+                    "label": label,
+                    "role": role,
+                    "count": int(count),
+                    "target": target,
+                    "next_action": next_action,
+                }
+            )
+
+        _add_action(
+            "review_blocked_approvals",
+            "Review blocked approvals",
+            blocked_approval_total,
+            "/api/v1/orchestration/control-room",
+            "Approve, reject, or reroute jobs blocked on operator approval.",
+        )
+        _add_action(
+            "inspect_stalled_jobs",
+            "Inspect stalled jobs",
+            stalled_total,
+            "/api/v1/orchestration/agents-live",
+            "Inspect stalled waiting or approval-blocked jobs and clear the dependency.",
+        )
+        for row in pressure_rows:
+            if row.get("pressure_level") != "critical":
+                continue
+            role = str(row.get("role") or "")
+            if int(row.get("queued") or 0) > 0 and int(row.get("idle") or 0) == 0:
+                _add_action(
+                    f"relieve_saturated_{role}",
+                    f"Relieve saturated {role}",
+                    int(row.get("queued") or 0),
+                    "/api/v1/orchestration/overview",
+                    str(row.get("next_action") or ""),
+                    role=role,
+                )
+        _add_action(
+            "dispatch_idle_capacity",
+            "Dispatch idle capacity",
+            min(queued_total, idle_total),
+            "/api/v1/orchestration/agents-live",
+            "Use idle slots to pull forward queued runnable work.",
+        )
+        if not recommended_actions:
+            recommended_actions.append(
+                {
+                    "action_id": "monitor_queue",
+                    "label": "Monitor queue",
+                    "role": None,
+                    "count": 0,
+                    "target": "/api/v1/orchestration/overview",
+                    "next_action": "No immediate queue intervention is needed.",
+                }
+            )
+
+        samples: list[dict[str, Any]] = []
+        for state in ("blocked_approval", "waiting_deps", "queued"):
+            try:
+                tasks = self.orch_q.peek(state=state, limit=max(lim, 20), chat_id=chat_id)
+            except Exception:
+                tasks = []
+            if state == "queued":
+                tasks = sorted(tasks, key=lambda t: (int(t.priority or 2), float(t.created_at), str(t.job_id)))
+            else:
+                tasks = sorted(tasks, key=lambda t: (float(t.updated_at), int(t.priority or 2), str(t.job_id)))
+            for task in tasks:
+                item = _task_to_status(task)
+                item["sample_kind"] = "blocked" if state == "blocked_approval" else ("waiting" if state == "waiting_deps" else "queued")
+                item["next_action"] = (
+                    "Record an approval decision."
+                    if state == "blocked_approval"
+                    else ("Clear dependency or unblock parent work." if state == "waiting_deps" else "Dispatch when capacity is available.")
+                )
+                samples.append(item)
+                if len(samples) >= lim:
+                    break
+            if len(samples) >= lim:
+                break
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "summary": {
+                "pressure_level": overall_level,
+                "next_action": str(recommended_actions[0].get("next_action") or ""),
+                "roles_total": len(pressure_rows),
+                "roles_critical": sum(1 for row in pressure_rows if row.get("pressure_level") == "critical"),
+                "roles_attention": sum(1 for row in pressure_rows if row.get("pressure_level") == "attention"),
+                "max_parallel_total": total_capacity,
+                "running": running_total,
+                "idle": idle_total,
+                "saturation": overall_saturation,
+                "queued": queued_total,
+                "waiting_deps": waiting_deps_total,
+                "blocked_approval": blocked_approval_total,
+                "blocked": blocked_total,
+                "waiting_total": waiting_deps_total + blocked_approval_total + blocked_total,
+                "backlog_total": queued_total + waiting_deps_total + blocked_approval_total + blocked_total,
+                "stalled": stalled_total,
+                "samples_returned": len(samples),
+            },
+            "pressure_by_role": pressure_rows,
+            "recommended_actions": recommended_actions[:10],
+            "top_jobs": samples,
+            "backlog_samples": samples,
+            "signals": {
+                "alerts": list(snap.get("alerts") or [])[:10],
+                "risks": list(snap.get("risks") or [])[:10],
+                "blocked_approvals": list(snap.get("blocked_requires_approval") or [])[:10],
+                "stalled_tasks": list(snap.get("stalled_tasks") or [])[:10],
+            },
+        }
+
     def workflow_bottlenecks(self, chat_id: int | None = None, limit: int = 50) -> dict[str, Any]:
         lim = max(1, min(200, int(limit)))
         board = self.autonomy_board(chat_id=chat_id, limit=lim)
