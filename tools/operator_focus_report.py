@@ -1047,6 +1047,13 @@ def render_shift_brief_markdown(brief: dict[str, Any]) -> str:
     digest = brief.get("operator_focus_digest") if isinstance(brief.get("operator_focus_digest"), dict) else {}
     digest_summary = digest.get("summary") if isinstance(digest.get("summary"), dict) else {}
     filters = digest_summary.get("filters") if isinstance(digest_summary.get("filters"), dict) else {}
+    receipt_follow_ups = brief.get("receipt_follow_ups") if isinstance(brief.get("receipt_follow_ups"), dict) else {}
+    receipt_follow_up_counts = (
+        receipt_follow_ups.get("counts") if isinstance(receipt_follow_ups.get("counts"), dict) else {}
+    )
+    receipt_follow_up_items = [
+        item for item in list(receipt_follow_ups.get("items") or []) if isinstance(item, dict)
+    ]
     next_actions = [item for item in list(brief.get("next_actions") or []) if isinstance(item, dict)]
     briefings = [item for item in list(brief.get("briefings") or []) if isinstance(item, dict)]
 
@@ -1083,11 +1090,53 @@ def render_shift_brief_markdown(brief: dict[str, Any]) -> str:
         f"- Active sources: {_format_filter_values(filters.get('sources'))}",
         f"- Active receipt states: {_format_filter_values(filters.get('receipt_states'))}",
         "",
-        "## Next Actions",
+        "## Receipt Follow Ups",
         "",
-        "| Rank | Urgency | Category | Label | Next action | Inspect | Handoff | Receipt |",
-        "| ---: | --- | --- | --- | --- | --- | --- | --- |",
+        "### Counts",
+        "",
     ]
+
+    rendered_count_keys: set[str] = set()
+    for key in ("active", "follow_up", "escalation"):
+        if key in receipt_follow_up_counts:
+            lines.append(f"- {key}: {_one_line(receipt_follow_up_counts.get(key), default='0')}")
+            rendered_count_keys.add(key)
+    for key in sorted(receipt_follow_up_counts):
+        if key in rendered_count_keys:
+            continue
+        lines.append(f"- {_one_line(key)}: {_one_line(receipt_follow_up_counts.get(key), default='0')}")
+    if not receipt_follow_up_counts:
+        lines.append("- None.")
+
+    lines.extend(["", "### Items", ""])
+    if receipt_follow_up_items:
+        for item in receipt_follow_up_items:
+            lines.extend(
+                [
+                    f"#### {_one_line(item.get('rank'))}. {_one_line(item.get('label'))}",
+                    "",
+                    f"- Action id: {_one_line(item.get('action_id'))}",
+                    f"- Urgency: {_one_line(item.get('urgency'))}",
+                    f"- Category: {_one_line(item.get('category'))}",
+                    f"- Receipt state: {_one_line(item.get('receipt_state'), default='new')}",
+                    f"- Severity: {_one_line(item.get('severity'))}",
+                    f"- Message: {_one_line(item.get('message'))}",
+                    f"- Next action: {_one_line(item.get('next_action'))}",
+                    f"- Age seconds: {_one_line(item.get('age_seconds'))}",
+                    "",
+                ]
+            )
+    else:
+        lines.extend(["No receipt follow-ups matched the requested filters.", ""])
+
+    lines.extend(
+        [
+            "## Next Actions",
+            "",
+            "| Rank | Urgency | Category | Label | Next action | Inspect | Handoff | Receipt |",
+            "| ---: | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
 
     if next_actions:
         for item in next_actions:
