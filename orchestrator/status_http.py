@@ -10,7 +10,12 @@ import time
 import urllib.parse
 
 from .status_service import StatusService
-from tools.operator_focus_report import render_shift_brief_markdown
+from tools.operator_focus_report import (
+    render_briefing_bundle_markdown,
+    render_briefing_markdown,
+    render_handoff_markdown,
+    render_shift_brief_markdown,
+)
 
 
 _API_VERSION = "v1"
@@ -650,6 +655,33 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in (
+            "/api/v1/orchestration/operator-focus/handoff.md",
+            "/api/orchestration/operator-focus/handoff.md",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            action_id = (qs.get("action_id") or [""])[0].strip()
+            rank, rank_ok = _parse_positive_rank(qs)
+            if not action_id and not rank_ok:
+                self._send_json(400, {"error": "invalid_rank", "selection": {"rank": (qs.get("rank") or [""])[0].strip()}})
+                return
+            payload = self.server.status_service.operator_focus_handoff(
+                chat_id=chat_id,
+                action_id=action_id or None,
+                rank=rank,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
+            )
+            if not payload.get("item"):
+                self._send_markdown(404, render_handoff_markdown(payload))
+                return
+            self._send_markdown(200, render_handoff_markdown(payload))
+            return
+
         if path in ("/api/v1/orchestration/operator-focus/handoff", "/api/orchestration/operator-focus/handoff"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
@@ -674,6 +706,33 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path in (
+            "/api/v1/orchestration/operator-focus/briefing.md",
+            "/api/orchestration/operator-focus/briefing.md",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            action_id = (qs.get("action_id") or [""])[0].strip()
+            rank, rank_ok = _parse_positive_rank(qs)
+            if not action_id and not rank_ok:
+                self._send_json(400, {"error": "invalid_rank", "selection": {"rank": (qs.get("rank") or [""])[0].strip()}})
+                return
+            payload = self.server.status_service.operator_focus_briefing(
+                chat_id=chat_id,
+                action_id=action_id or None,
+                rank=rank,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
+            )
+            if not payload.get("briefing_packet"):
+                self._send_markdown(404, render_briefing_markdown(payload))
+                return
+            self._send_markdown(200, render_briefing_markdown(payload))
+            return
+
         if path in ("/api/v1/orchestration/operator-focus/briefing", "/api/orchestration/operator-focus/briefing"):
             if not self.server.allow_snapshot(ip):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
@@ -696,6 +755,25 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(404, payload)
                 return
             self._send_json(200, payload)
+            return
+
+        if path in (
+            "/api/v1/orchestration/operator-focus/briefings.md",
+            "/api/orchestration/operator-focus/briefings.md",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 5, hi=20)
+            payload = self.server.status_service.operator_focus_briefing_bundle(
+                chat_id=chat_id,
+                limit=limit,
+                categories=_parse_filter_values(qs, "category"),
+                urgencies=_parse_filter_values(qs, "urgency"),
+                sources=_parse_filter_values(qs, "source"),
+                receipt_states=_parse_filter_values(qs, "receipt_state"),
+            )
+            self._send_markdown(200, render_briefing_bundle_markdown(payload))
             return
 
         if path in ("/api/v1/orchestration/operator-focus/briefings", "/api/orchestration/operator-focus/briefings"):
