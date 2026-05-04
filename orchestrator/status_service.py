@@ -1188,6 +1188,34 @@ _HANDOFF_STAGE_ROLE = {
     "release_evidence": "release_mgr",
 }
 _HANDOFF_ROLES = {"implementer_local", "reviewer_local", "release_mgr", "architect_local"}
+RELEASE_READINESS_LANES = ("ready", "blocked", "not_ready", "released")
+_RELEASE_READINESS_LANE_SET = set(RELEASE_READINESS_LANES)
+
+
+def normalize_release_readiness_lanes(lanes: Any) -> list[str]:
+    if lanes is None:
+        return []
+    raw_values: list[Any]
+    if isinstance(lanes, str):
+        raw_values = [lanes]
+    else:
+        try:
+            raw_values = list(lanes)
+        except TypeError:
+            raw_values = [lanes]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for part in str(raw or "").split(","):
+            lane = part.strip().lower()
+            if not lane or lane in seen:
+                continue
+            if lane not in _RELEASE_READINESS_LANE_SET:
+                raise ValueError(f"invalid_release_readiness_lane:{lane}")
+            normalized.append(lane)
+            seen.add(lane)
+    return normalized
 
 
 def _is_proactive_order(order_row: dict[str, Any], root_task: Task | None) -> bool:
