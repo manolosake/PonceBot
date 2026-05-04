@@ -78,6 +78,27 @@ def build_report(
     return svc.operator_focus(chat_id=chat_id, limit=limit, categories=categories, urgencies=urgencies, sources=sources)
 
 
+def build_digest(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    limit: int,
+    categories: list[str] | None = None,
+    urgencies: list[str] | None = None,
+    sources: list[str] | None = None,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.operator_focus_digest(
+        chat_id=chat_id,
+        limit=limit,
+        categories=categories,
+        urgencies=urgencies,
+        sources=sources,
+    )
+
+
 def build_handoff(
     *,
     db_path: Path,
@@ -311,6 +332,119 @@ def _append_list(lines: list[str], title: str, values: Any) -> None:
         else:
             lines.append("- None.")
     lines.append("")
+
+
+def _append_key_values(lines: list[str], values: Any) -> None:
+    if isinstance(values, dict) and values:
+        for key in sorted(values):
+            lines.append(f"- {_one_line(key)}: {_one_line(values.get(key))}")
+    else:
+        lines.append("- None.")
+    lines.append("")
+
+
+def _append_counts(lines: list[str], title: str, values: Any) -> None:
+    lines.extend([f"### {title}", ""])
+    _append_key_values(lines, values)
+
+
+def render_digest_markdown(digest: dict[str, Any]) -> str:
+    summary = digest.get("summary") if isinstance(digest.get("summary"), dict) else {}
+    filters = summary.get("filters") if isinstance(summary.get("filters"), dict) else {}
+    available = summary.get("available") if isinstance(summary.get("available"), dict) else {}
+    counts = summary.get("counts") if isinstance(summary.get("counts"), dict) else {}
+    top_actions = [item for item in list(digest.get("top_actions") or []) if isinstance(item, dict)]
+    follow_ups = [item for item in list(digest.get("follow_ups") or []) if isinstance(item, dict)]
+    suggested_commands = digest.get("suggested_commands") if isinstance(digest.get("suggested_commands"), dict) else {}
+
+    lines = [
+        "# Operator Focus Digest",
+        "",
+        f"- Generated: {_one_line(digest.get('generated_at'))}",
+        f"- Chat: {_one_line(digest.get('chat_id'), default='all')}",
+        f"- Limit: {_one_line(digest.get('limit'))}",
+        "",
+        "## Summary",
+        "",
+        f"- Returned: {_one_line(summary.get('returned'), default=str(len(top_actions)))}",
+        f"- Health: {_one_line(summary.get('health_level'))}",
+        f"- Top action: {_one_line(summary.get('top_action_id'))}",
+        f"- Top category: {_one_line(summary.get('top_category'))}",
+        f"- Filtered out: {_one_line(summary.get('filtered_out'), default='0')}",
+        f"- Active categories: {_format_filter_values(filters.get('categories'))}",
+        f"- Active urgencies: {_format_filter_values(filters.get('urgencies'))}",
+        f"- Active sources: {_format_filter_values(filters.get('sources'))}",
+        f"- Available categories: {_format_filter_values(available.get('categories'))}",
+        f"- Available urgencies: {_format_filter_values(available.get('urgencies'))}",
+        f"- Available sources: {_format_filter_values(available.get('sources'))}",
+        f"- Available total: {_one_line(available.get('total'), default='0')}",
+        "",
+        "## Counts",
+        "",
+    ]
+
+    _append_counts(lines, "By Urgency", counts.get("by_urgency"))
+    _append_counts(lines, "By Category", counts.get("by_category"))
+    _append_counts(lines, "By Source", counts.get("by_source"))
+    _append_counts(lines, "By Receipt State", counts.get("by_receipt_state"))
+    _append_counts(lines, "Follow Ups", counts.get("follow_ups"))
+
+    lines.extend(
+        [
+            "## Top Actions",
+            "",
+            "| Rank | Urgency | Category | Label | Next action | Receipt | Commands |",
+            "| ---: | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    if top_actions:
+        for item in top_actions:
+            commands = item.get("suggested_commands") if isinstance(item.get("suggested_commands"), dict) else {}
+            command_text = "; ".join(f"{_one_line(key)}: {_one_line(commands.get(key))}" for key in sorted(commands))
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _one_line(item.get("rank")),
+                        _one_line(item.get("urgency")),
+                        _one_line(item.get("category")),
+                        _one_line(item.get("label")),
+                        _one_line(item.get("next_action")),
+                        _one_line(item.get("receipt_state"), default="new"),
+                        _one_line(command_text),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("| - | - | - | No top actions. | - | - | - |")
+    lines.append("")
+
+    lines.extend(["## Follow Ups", ""])
+    if follow_ups:
+        for item in follow_ups:
+            lines.extend(
+                [
+                    f"### {_one_line(item.get('rank'))}. {_one_line(item.get('label'))}",
+                    "",
+                    f"- Action id: {_one_line(item.get('action_id'))}",
+                    f"- Urgency: {_one_line(item.get('urgency'))}",
+                    f"- Category: {_one_line(item.get('category'))}",
+                    f"- Receipt state: {_one_line(item.get('receipt_state'), default='new')}",
+                    f"- Severity: {_one_line(item.get('severity'))}",
+                    f"- Message: {_one_line(item.get('message'))}",
+                    f"- Next action: {_one_line(item.get('next_action'))}",
+                    f"- Age seconds: {_one_line(item.get('age_seconds'))}",
+                    "",
+                ]
+            )
+    else:
+        lines.extend(["- None.", ""])
+
+    lines.extend(["## Suggested Commands", ""])
+    _append_key_values(lines, suggested_commands)
+
+    return "\n".join(lines) + "\n"
 
 
 def render_handoff_markdown(handoff: dict[str, Any]) -> str:
@@ -805,6 +939,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--db", required=True, type=Path, help="Path to the orchestrator SQLite database.")
     parser.add_argument("--format", choices=("json", "md", "markdown"), default="json", help="Output format.")
     output_kind = parser.add_mutually_exclusive_group()
+    output_kind.add_argument("--digest", action="store_true", help="Render an operator-focus digest payload.")
     output_kind.add_argument("--handoff", action="store_true", help="Render the selected operator-focus handoff payload.")
     output_kind.add_argument("--briefing", action="store_true", help="Render the selected operator-focus briefing payload.")
     output_kind.add_argument("--briefings", action="store_true", help="Render an operator-focus briefing bundle.")
@@ -864,7 +999,16 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
             return 2
 
     try:
-        if args.handoff:
+        if args.digest:
+            report = build_digest(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                limit=args.limit,
+                categories=categories,
+                urgencies=urgencies,
+                sources=sources,
+            )
+        elif args.handoff:
             report = build_handoff(
                 db_path=db_path,
                 chat_id=args.chat_id,
@@ -934,6 +1078,8 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
 
     if args.format == "json":
         rendered = json.dumps(report, sort_keys=True, ensure_ascii=True, indent=2) + "\n"
+    elif args.digest:
+        rendered = render_digest_markdown(report)
     elif args.handoff:
         rendered = render_handoff_markdown(report)
     elif args.briefing:
