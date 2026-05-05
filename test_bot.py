@@ -5620,6 +5620,61 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
             os.environ.pop("BOT_SKYNET_FACTORY_LOCAL_ONLY", None)
             self.assertFalse(bot._skynet_factory_local_only_enabled())
 
+    def test_proactive_catalog_includes_project_incubator(self) -> None:
+        cfg = SimpleNamespace(mobile_app_project_dir=Path("/tmp/mobile"))
+
+        with patch.dict(os.environ, {"BOT_PROJECT_INCUBATOR_ROOT": "/home/aponce"}, clear=False):
+            catalog = bot._proactive_initiatives_catalog(cfg)
+
+        incubator = next((item for item in catalog if item.get("key") == "project-incubator"), None)
+        self.assertIsNotNone(incubator)
+        if incubator is None:
+            self.fail("project-incubator initiative missing")
+        self.assertEqual(incubator["lane"], "incubator")
+        self.assertEqual(incubator["project_hint"], "/home/aponce")
+        self.assertIn("new project", f"{incubator['title']} {incubator['goal']}".lower())
+
+    def test_project_incubator_workspace_uses_requested_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+
+            workspace = bot._ensure_project_workspace(
+                project_id="abc12345",
+                title="New Useful Thing",
+                created_by="skynet",
+                root_dir=root,
+            )
+
+            path = Path(workspace["path"])
+            self.assertEqual(path.parent, root.resolve())
+            self.assertTrue((path / "PROJECT_MANIFEST.json").exists())
+
+    def test_project_incubator_due_after_repo_sprints(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = SimpleNamespace(state_file=Path(td) / "state.json")
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_PROACTIVE_PROJECT_INCUBATOR_ENABLED": "1",
+                    "BOT_PROACTIVE_PROJECT_INCUBATOR_EVERY_N_REPO_SPRINTS": "3",
+                },
+                clear=False,
+            ):
+                bot._update_state(
+                    cfg,
+                    lambda st: st.update(
+                        {
+                            "proactive_repo_index": 3,
+                            "proactive_project_incubator_index": 0,
+                        }
+                    ),
+                )
+                self.assertTrue(bot._project_incubator_due(cfg, occupied_keys=set()))
+                self.assertFalse(bot._project_incubator_due(cfg, occupied_keys={"project-incubator"}))
+
+                bot._mark_project_incubator_spawned(cfg)
+
+                self.assertFalse(bot._project_incubator_due(cfg, occupied_keys=set()))
 
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

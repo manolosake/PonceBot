@@ -8241,6 +8241,28 @@ def _projects_root_dir() -> Path:
         return base.expanduser()
 
 
+def _project_incubator_root_dir() -> Path:
+    raw = os.environ.get("BOT_PROJECT_INCUBATOR_ROOT", "").strip()
+    base = Path(raw) if raw else Path("/home/aponce")
+    try:
+        return base.expanduser().resolve()
+    except Exception:
+        return base.expanduser()
+
+
+def _project_incubator_enabled() -> bool:
+    raw = os.environ.get("BOT_PROACTIVE_PROJECT_INCUBATOR_ENABLED", "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _project_incubator_every_n_repo_sprints() -> int:
+    try:
+        value = int(os.environ.get("BOT_PROACTIVE_PROJECT_INCUBATOR_EVERY_N_REPO_SPRINTS", "3").strip() or "3")
+    except Exception:
+        value = 3
+    return max(1, min(50, int(value)))
+
+
 def _slug_token(value: str, *, max_len: int = 56) -> str:
     slug = _SAFE_FILENAME_RE.sub("-", (value or "").strip().lower())
     slug = re.sub(r"-{2,}", "-", slug).strip("-._")
@@ -9883,8 +9905,9 @@ def _ensure_project_workspace(
     title: str,
     created_by: str,
     runtime_mode: str = "venv",
+    root_dir: Path | None = None,
 ) -> dict[str, str]:
-    root = _projects_root_dir()
+    root = root_dir if root_dir is not None else _projects_root_dir()
     root.mkdir(parents=True, exist_ok=True)
 
     pid = (project_id or "").strip() or str(uuid.uuid4())
@@ -15487,6 +15510,30 @@ def _proactive_initiatives_catalog(cfg: BotConfig) -> list[dict[str, str]]:
                 "emulator screenshots and a concise validation note proving the change is real and regression-safe."
             ),
         },
+        {
+            "key": "project-incubator",
+            "title": "Proactive Sprint: New Project Incubator",
+            "lane": "incubator",
+            "project_hint": str(_project_incubator_root_dir()),
+            "goal": (
+                "Create or advance one valuable new project in a new sibling folder under the operator workspace. "
+                "Use bugfixes only when a registered project has exact high-impact evidence; otherwise prefer a "
+                "new visible feature, prototype, automation, integration, or product workflow that did not exist before."
+            ),
+            "success": (
+                "Ship one git-backed new project phase under /home/aponce with README, runnable/demoable behavior, "
+                "basic validation evidence, and a clear next milestone. If GitHub or deploy is not safe yet, document "
+                "the exact blocker instead of pretending it shipped."
+            ),
+            "expected_measurable_delta": (
+                "Increase visible product surface area: one new folder/repo or one substantial milestone in a newly "
+                "incubated project, with runnable evidence and a next milestone."
+            ),
+            "stop_condition": (
+                "Stop when one new-project phase is created or advanced with git history and validation evidence, or "
+                "when incubation is blocked by a concrete CEO decision such as credentials, billing, or public launch."
+            ),
+        },
     ]
 
     # Optional focus filter for proactive lane (comma-separated keys/lanes).
@@ -15673,6 +15720,43 @@ def _next_proactive_initiative(
     return chosen
 
 
+def _project_incubator_initiative(cfg: BotConfig) -> dict[str, str] | None:
+    for item in _proactive_initiatives_catalog(cfg):
+        if str(item.get("key") or "").strip().lower() == "project-incubator":
+            return item
+    return None
+
+
+def _project_incubator_due(cfg: BotConfig, *, occupied_keys: set[str]) -> bool:
+    if not _project_incubator_enabled():
+        return False
+    if "project-incubator" in {str(key or "").strip().lower() for key in occupied_keys}:
+        return False
+    every_n = _project_incubator_every_n_repo_sprints()
+    try:
+        state = _get_state(cfg)
+        repo_index = int(state.get("proactive_repo_index", 0) or 0)
+        incubator_index = int(state.get("proactive_project_incubator_index", 0) or 0)
+    except Exception:
+        repo_index = 0
+        incubator_index = 0
+    due_index = int(repo_index // every_n)
+    return bool(repo_index >= every_n and due_index > incubator_index)
+
+
+def _mark_project_incubator_spawned(cfg: BotConfig) -> None:
+    every_n = _project_incubator_every_n_repo_sprints()
+
+    def _m(st: dict[str, Any]) -> None:
+        try:
+            repo_index = int(st.get("proactive_repo_index", 0) or 0)
+        except Exception:
+            repo_index = every_n
+        st["proactive_project_incubator_index"] = max(1, int(repo_index // every_n))
+
+    _update_state(cfg, _m)
+
+
 def _spawn_proactive_order(
     *,
     cfg: BotConfig,
@@ -15702,6 +15786,7 @@ def _spawn_proactive_order(
         or "Stop this proactive order when at least one VERIFIED_IMPROVEMENT is closed with strict evidence gates."
     ).strip()
     lane = str(initiative.get("lane") or "general").strip().lower()
+    is_incubator_lane = lane == "incubator" or key == "project-incubator"
     project_hint = str(initiative.get("project_hint") or "").strip()
     sprint_day = 1 + int((int(now) // (24 * 60 * 60)) % 5)
     repo = dict(repo_record or {})
@@ -15715,11 +15800,13 @@ def _spawn_proactive_order(
         project_name = repo_name or title
         project_path = repo_path
     else:
+        workspace_root = _project_incubator_root_dir() if is_incubator_lane else None
         workspace = _ensure_project_workspace(
             project_id=str(uuid.uuid4()),
             title=title,
             created_by=controller_role,
             runtime_mode="venv",
+            root_dir=workspace_root,
         )
         project_id = str(workspace.get("project_id") or "").strip()
 
@@ -15804,6 +15891,26 @@ def _spawn_proactive_order(
     model = _orchestrator_model_for_profile(cfg, base_profile)
     effort = _orchestrator_effort_for_profile(base_profile, cfg)
     requires_approval = bool(base_profile.get("approval_required", False))
+    if repo_path:
+        scope_policy = "- Scope decisions to the registered repo root above; do not create new repos or touch sibling repos. Controller access is read-only."
+    elif is_incubator_lane:
+        scope_policy = (
+            f"- Project incubation is allowed under {_project_incubator_root_dir()}. "
+            "Create or advance exactly one sibling project folder there; do not touch unrelated folders."
+        )
+    else:
+        scope_policy = "- Work only inside this initiative scope; do not touch unrelated projects."
+    incubator_policy_lines = (
+        [
+            "- NEW_PROJECT_PHASE means a real project milestone: a new git-backed folder, README, runnable/demoable behavior, and validation evidence.",
+            "- Initialize new project folders on branch main and keep names clear, product-oriented, and safe for filesystem/GitHub use.",
+            "- Do not use secrets, external purchases, public launches, destructive migrations, or credential changes without CEO approval.",
+            "- If GitHub repo creation or deploy is not safely configured, leave a clear blocker and next step; do not count that as fully shipped.",
+            "- Because the factory scans /home/aponce, a new project must be discoverable as a git checkout after the next registry sync.",
+        ]
+        if is_incubator_lane
+        else []
+    )
 
     prompt_lines = [
         "AUTONOMOUS PROACTIVE SPRINT",
@@ -15824,12 +15931,9 @@ def _spawn_proactive_order(
         f"Stop condition: {stop_condition}",
         "",
         "Execution policy:",
-        (
-            "- Scope decisions to the registered repo root above; do not create new repos or touch sibling repos. Controller access is read-only."
-            if repo_path
-            else "- Work only inside this initiative scope; do not touch unrelated projects."
-        ),
+        scope_policy,
         "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
+        *incubator_policy_lines,
         "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",
         "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
         "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
@@ -16066,6 +16170,41 @@ def _proactive_lane_tick(
 
     occupied = _active_proactive_keys(countable_proactive_orders)
     created = 0
+    if _project_incubator_due(cfg, occupied_keys=occupied):
+        initiative = _project_incubator_initiative(cfg)
+        if initiative is not None:
+            ok = _spawn_proactive_order(
+                cfg=cfg,
+                orch_q=orch_q,
+                profiles=profiles,
+                chat_id=int(chat_id),
+                now=now,
+                initiative=initiative,
+            )
+            if ok:
+                created += 1
+                occupied.add("project-incubator")
+                try:
+                    _mark_project_incubator_spawned(cfg)
+                except Exception:
+                    pass
+                try:
+                    orch_q.append_audit_event(
+                        event_type="order.project_incubator.created",
+                        actor="skynet",
+                        details={
+                            "initiative": "project-incubator",
+                            "root": str(_project_incubator_root_dir()),
+                            "every_n_repo_sprints": int(_project_incubator_every_n_repo_sprints()),
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+                except Exception:
+                    pass
+                return created
     repo_candidates = [
         row
         for row in repos
