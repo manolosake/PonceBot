@@ -2468,6 +2468,47 @@ class StatusService:
             )
         )
 
+        idle_slots_by_role: dict[str, list[int]] = {}
+        for worker in list(snap.get("workers") or []):
+            if not isinstance(worker, dict) or isinstance(worker.get("current"), dict):
+                continue
+            role = str(worker.get("role") or "").strip().lower()
+            if not role:
+                continue
+            try:
+                slot = int(worker.get("slot") or 0)
+            except Exception:
+                slot = 0
+            if slot > 0:
+                idle_slots_by_role.setdefault(role, []).append(slot)
+        for slots in idle_slots_by_role.values():
+            slots.sort()
+
+        dispatch_candidates: list[tuple[int, float, str, str, int, Task]] = []
+        for row in pressure_rows:
+            role = str(row.get("role") or "").strip().lower()
+            idle = int(row.get("idle") or 0)
+            queued = int(row.get("queued") or 0)
+            if not role or idle <= 0 or queued <= 0:
+                continue
+            slots = idle_slots_by_role.get(role) or list(range(1, idle + 1))
+            try:
+                tasks = self.orch_q.list_role_tasks_for_status(role=role, state="queued", limit=max(lim, idle), chat_id=chat_id)
+            except Exception:
+                tasks = []
+            tasks = sorted(tasks, key=lambda t: (int(t.priority or 2), float(t.created_at), str(t.job_id)))
+            for slot, task in zip(slots[:idle], tasks):
+                dispatch_candidates.append((int(task.priority or 2), float(task.created_at), str(task.job_id), role, int(slot), task))
+
+        dispatch_plan: list[dict[str, Any]] = []
+        for plan_rank, (_, _, _, role, slot, task) in enumerate(sorted(dispatch_candidates, key=lambda item: item[:3])[:lim], start=1):
+            item = _task_to_status(task)
+            item["role"] = role
+            item["slot"] = slot
+            item["plan_rank"] = plan_rank
+            item["next_action"] = f"Dispatch this queued {role} job into idle slot {slot}."
+            dispatch_plan.append(item)
+
         queued_total = int(snap.get("queued_total") or 0)
         waiting_deps_total = int(snap.get("waiting_deps_total") or 0)
         blocked_approval_total = int(snap.get("blocked_approval_total") or 0)
@@ -2531,9 +2572,9 @@ class StatusService:
         _add_action(
             "dispatch_idle_capacity",
             "Dispatch idle capacity",
-            min(queued_total, idle_total),
-            "/api/v1/orchestration/agents-live",
-            "Use idle slots to pull forward queued runnable work.",
+            len(dispatch_plan),
+            "/api/v1/orchestration/queue-pressure-board#dispatch-plan",
+            f"Follow the dispatch plan for {len(dispatch_plan)} queued job(s) that match idle role capacity.",
         )
         if not recommended_actions:
             recommended_actions.append(
@@ -2594,10 +2635,13 @@ class StatusService:
                 "waiting_total": waiting_deps_total + blocked_approval_total + blocked_total,
                 "backlog_total": queued_total + waiting_deps_total + blocked_approval_total + blocked_total,
                 "stalled": stalled_total,
+                "dispatchable_jobs": len(dispatch_plan),
+                "dispatch_roles": len({str(item.get("role") or "") for item in dispatch_plan if str(item.get("role") or "")}),
                 "samples_returned": len(samples),
             },
             "pressure_by_role": pressure_rows,
             "recommended_actions": recommended_actions[:10],
+            "dispatch_plan": dispatch_plan,
             "top_jobs": samples,
             "backlog_samples": samples,
             "signals": {
