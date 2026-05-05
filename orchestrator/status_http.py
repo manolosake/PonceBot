@@ -68,6 +68,22 @@ def _parse_filter_values(qs: dict[str, list[str]], name: str) -> list[str]:
     return values
 
 
+def _parse_workflow_bottleneck_stage_error(exc: ValueError) -> dict[str, Any] | None:
+    message = str(exc)
+    if not message.startswith("invalid_stage:"):
+        return None
+    stage_part = message.split(";", 1)[0].split(":", 1)[1].strip()
+    valid_stages: list[str] = []
+    marker = "valid_stages="
+    if marker in message:
+        valid_stages = [
+            stage.strip()
+            for stage in message.split(marker, 1)[1].split(",")
+            if stage.strip()
+        ]
+    return {"error": "invalid_stage", "stage": stage_part, "valid_stages": valid_stages}
+
+
 def _parse_bool_flag(qs: dict[str, list[str]], name: str, *, default: bool = False) -> bool:
     raw = (qs.get(name) or [""])[0].strip().lower()
     if not raw:
@@ -534,6 +550,30 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 return
             limit = _parse_limit(qs, 50, hi=200)
             payload = self.server.status_service.workflow_bottlenecks(chat_id=chat_id, limit=limit)
+            self._send_json(200, payload)
+            return
+
+        if path in (
+            "/api/v1/orchestration/workflow-bottlenecks/handoff",
+            "/api/orchestration/workflow-bottlenecks/handoff",
+        ):
+            if not self.server.allow_snapshot(ip):
+                self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
+                return
+            limit = _parse_limit(qs, 10, hi=200)
+            stage = (qs.get("stage") or [""])[0].strip() or None
+            try:
+                payload = self.server.status_service.workflow_bottleneck_handoff(
+                    chat_id=chat_id,
+                    stage=stage,
+                    limit=limit,
+                )
+            except ValueError as exc:
+                error_payload = _parse_workflow_bottleneck_stage_error(exc)
+                if error_payload is not None:
+                    self._send_json(400, error_payload)
+                    return
+                raise
             self._send_json(200, payload)
             return
 
