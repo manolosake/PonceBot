@@ -1055,6 +1055,7 @@ def render_shift_brief_markdown(brief: dict[str, Any]) -> str:
         item for item in list(receipt_follow_ups.get("items") or []) if isinstance(item, dict)
     ]
     next_actions = [item for item in list(brief.get("next_actions") or []) if isinstance(item, dict)]
+    command_plan = [item for item in list(brief.get("command_plan") or []) if isinstance(item, dict)]
     briefings = [item for item in list(brief.get("briefings") or []) if isinstance(item, dict)]
 
     lines = [
@@ -1159,6 +1160,46 @@ def render_shift_brief_markdown(brief: dict[str, Any]) -> str:
     else:
         lines.append("| - | - | - | No next actions. | - | - | - | - |")
     lines.append("")
+
+    lines.extend(["## Command Plan", ""])
+    if command_plan:
+        command_order = ("inspect", "brief", "handoff", "trail", "ack", "start", "done")
+        for index, item in enumerate(command_plan, start=1):
+            commands = item.get("commands") if isinstance(item.get("commands"), dict) else {}
+            title = _one_line(item.get("label"), default=f"Command plan {index}")
+            lines.extend(
+                [
+                    f"### {index}. {title}",
+                    "",
+                    f"- Rank: {_one_line(item.get('rank'))}",
+                    f"- Action id: {_one_line(item.get('action_id'))}",
+                    f"- Label: {_one_line(item.get('label'))}",
+                    "",
+                ]
+            )
+            rendered_commands = False
+            for key in command_order:
+                value = commands.get(key) if isinstance(commands, dict) else None
+                if value is None:
+                    value = item.get(key)
+                command_text = _ascii(value).rstrip()
+                if not command_text:
+                    continue
+                rendered_commands = True
+                lines.extend(
+                    [
+                        f"#### {key}",
+                        "",
+                        "```text",
+                        command_text,
+                        "```",
+                        "",
+                    ]
+                )
+            if not rendered_commands:
+                lines.extend(["No commands recorded for this command plan item.", ""])
+    else:
+        lines.extend(["No command plan entries are available.", ""])
 
     lines.extend(["## Briefing Packets", ""])
     if not briefings:
