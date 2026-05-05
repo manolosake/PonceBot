@@ -10331,7 +10331,8 @@ def _focus_usage_text() -> str:
         "/focus shift|shift-brief [chat|all] [limit] | "
         "/focus briefings [chat|all] [limit] | "
         "/focus ack|start|doing|done [chat|all] [rank] [summary...] | "
-        "/shift [chat|all] [limit]"
+        "/shift [chat|all] [limit] | "
+        "filters: category=release,blocked urgency=high source=control_room receipt_state=in_progress"
     )
 
 
@@ -10361,7 +10362,76 @@ def _focus_payload_marker(payload: dict[str, Any]) -> str:
     return _orch_marker("focus", json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
-def _parse_focus_scoped_limit(parts: list[str], *, mode: str, default_limit: int = 5) -> tuple[str, Job | None]:
+_FOCUS_FILTER_KEYS = {
+    "category": "categories",
+    "categories": "categories",
+    "urgency": "urgencies",
+    "urgencies": "urgencies",
+    "source": "sources",
+    "sources": "sources",
+    "receipt": "receipt_states",
+    "receipt_state": "receipt_states",
+    "receipt_states": "receipt_states",
+}
+
+
+def _focus_filter_values(raw: str) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw or "").split(","):
+        value = part.strip().lower()
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values
+
+
+def _split_focus_filter_tokens(parts: list[str]) -> tuple[list[str], dict[str, list[str]], bool]:
+    filters: dict[str, list[str]] = {}
+    idx = len(parts)
+    while idx > 0 and "=" in parts[idx - 1]:
+        token = parts[idx - 1]
+        raw_key, raw_value = token.split("=", 1)
+        key = _FOCUS_FILTER_KEYS.get(raw_key.strip().lower())
+        values = _focus_filter_values(raw_value)
+        if not key or not values:
+            return parts, {}, False
+        existing = filters.setdefault(key, [])
+        seen = set(existing)
+        for value in values:
+            if value not in seen:
+                existing.append(value)
+                seen.add(value)
+        idx -= 1
+    return parts[:idx], {key: filters[key] for key in sorted(filters)}, True
+
+
+def _focus_payload(
+    *,
+    mode: str | None = None,
+    scope: str = "chat",
+    filters: dict[str, list[str]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if mode:
+        payload["mode"] = mode
+    payload["scope"] = scope
+    payload.update(extra)
+    clean_filters = {key: list(value) for key, value in (filters or {}).items() if value}
+    if clean_filters:
+        payload["filters"] = clean_filters
+    return payload
+
+
+def _parse_focus_scoped_limit(
+    parts: list[str],
+    *,
+    mode: str,
+    default_limit: int = 5,
+    filters: dict[str, list[str]] | None = None,
+) -> tuple[str, Job | None]:
     scope = "chat"
     limit = default_limit
     idx = 1
@@ -10378,7 +10448,7 @@ def _parse_focus_scoped_limit(parts: list[str], *, mode: str, default_limit: int
         idx += 1
     if idx != len(parts):
         return _focus_usage_text(), None
-    return _focus_payload_marker({"mode": mode, "scope": scope, "limit": limit}), None
+    return _focus_payload_marker(_focus_payload(mode=mode, scope=scope, limit=limit, filters=filters)), None
 
 
 def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
@@ -10392,16 +10462,24 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
     if not parts:
         return _orch_marker("focus"), None
 
+    parts, filters, filters_ok = _split_focus_filter_tokens(parts)
+    if not filters_ok:
+        return _focus_usage_text(), None
+    if not parts:
+        return _focus_payload_marker(_focus_payload(scope="chat", filters=filters)), None
+
     head = parts[0].strip().lower()
     if len(parts) == 1:
         scope = _focus_scope_value(head)
-        if scope == "all":
+        if scope == "all" and not filters:
             return _orch_marker("focus", "all"), None
-        if scope == "chat":
+        if scope == "chat" and not filters:
             return _orch_marker("focus", "chat"), None
+        if scope:
+            return _focus_payload_marker(_focus_payload(scope=scope, filters=filters)), None
 
     if head == "digest":
-        return _parse_focus_scoped_limit(parts, mode="digest")
+        return _parse_focus_scoped_limit(parts, mode="digest", filters=filters)
 
     if head in ("brief", "briefing", "handoff", "trail", "history"):
         if head in ("brief", "briefing"):
@@ -10426,10 +10504,10 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
             idx += 1
         if idx != len(parts):
             return _focus_usage_text(), None
-        return _focus_payload_marker({"mode": mode, "scope": scope, "rank": rank}), None
+        return _focus_payload_marker(_focus_payload(mode=mode, scope=scope, rank=rank, filters=filters)), None
 
     if head in ("shift", "shift-brief", "shiftbrief"):
-        return _parse_focus_scoped_limit(parts, mode="shift")
+        return _parse_focus_scoped_limit(parts, mode="shift", filters=filters)
 
     if head == "briefings":
         scope = "chat"
@@ -10448,7 +10526,7 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
             idx += 1
         if idx != len(parts):
             return _focus_usage_text(), None
-        return _focus_payload_marker({"mode": "briefings", "scope": scope, "limit": limit}), None
+        return _focus_payload_marker(_focus_payload(mode="briefings", scope=scope, limit=limit, filters=filters)), None
 
     state_by_command = {
         "ack": "acknowledged",
@@ -10472,13 +10550,14 @@ def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
                 idx += 1
         summary = " ".join(parts[idx:]).strip()
         return _focus_payload_marker(
-            {
-                "mode": "receipt",
-                "scope": scope,
-                "rank": rank,
-                "state": state_by_command[head],
-                "summary": summary,
-            }
+            _focus_payload(
+                mode="receipt",
+                scope=scope,
+                rank=rank,
+                state=state_by_command[head],
+                summary=summary,
+                filters=filters,
+            )
         ), None
 
     return _focus_usage_text(), None
