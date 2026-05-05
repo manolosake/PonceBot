@@ -36,6 +36,10 @@ def _one_line(value: Any, *, default: str = "-") -> str:
     return text or default
 
 
+def _table_cell(value: Any, *, default: str = "-") -> str:
+    return _one_line(value, default=default).replace("|", r"\|")
+
+
 def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -58,6 +62,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     pressure_rows = [row for row in list(report.get("pressure_by_role") or []) if isinstance(row, dict)]
     actions = [row for row in list(report.get("recommended_actions") or []) if isinstance(row, dict)]
+    dispatch_plan = [row for row in list(report.get("dispatch_plan") or []) if isinstance(row, dict)]
     top_jobs = [row for row in list(report.get("top_jobs") or report.get("backlog_samples") or []) if isinstance(row, dict)]
 
     lines = [
@@ -148,6 +153,36 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("| - | - | - | 0 | - | No recommended actions returned. |")
+
+    lines.extend(
+        [
+            "",
+            "## Dispatch Plan",
+            "",
+            "| Rank | Job | Role | Slot | Priority | Chat | Updated/Created | Next action |",
+            "| ---: | --- | --- | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    if dispatch_plan:
+        for item in dispatch_plan:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _table_cell(item.get("plan_rank"), default="0"),
+                        _table_cell(item.get("job_id_short") or item.get("job_id")),
+                        _table_cell(item.get("role")),
+                        _table_cell(item.get("slot"), default="0"),
+                        _table_cell(item.get("priority"), default="0"),
+                        _table_cell(item.get("chat_id")),
+                        _table_cell(item.get("updated_at") or item.get("created_at")),
+                        _table_cell(item.get("next_action")),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("| - | - | - | 0 | 0 | - | - | No dispatchable queued jobs. |")
 
     lines.extend(
         [
