@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.parse
 
-from .status_service import StatusService
+from .status_service import RELEASE_READINESS_LANES, StatusService
 from tools.operator_focus_report import (
     render_briefing_bundle_markdown,
     render_briefing_markdown,
@@ -563,11 +563,27 @@ class StatusAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(429, {"error": "rate_limited"}, extra_headers={"Retry-After": "1"})
                 return
             limit = _parse_limit(qs, 50, hi=200)
-            payload = self.server.status_service.release_readiness_board(
-                chat_id=chat_id,
-                limit=limit,
-                include_released=_parse_bool_flag(qs, "include_released", default=False),
-            )
+            try:
+                payload = self.server.status_service.release_readiness_board(
+                    chat_id=chat_id,
+                    limit=limit,
+                    include_released=_parse_bool_flag(qs, "include_released", default=False),
+                    lanes=_parse_filter_values(qs, "lane"),
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if message.startswith("invalid_release_readiness_lane:"):
+                    lane = message.split(":", 1)[1]
+                    self._send_json(
+                        400,
+                        {
+                            "error": "invalid_release_readiness_lane",
+                            "lane": lane,
+                            "valid_lanes": list(RELEASE_READINESS_LANES),
+                        },
+                    )
+                    return
+                raise
             self._send_json(200, payload)
             return
 
