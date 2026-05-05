@@ -5572,6 +5572,47 @@ class TestOrderBranchGitHelpers(unittest.TestCase):
             self.assertEqual(run(["git", "rev-parse", "--short", "HEAD"], cwd=repo), merge_commit)
             self.assertEqual(run(["git", "rev-parse", "--short", "origin/main"], cwd=repo), merge_commit)
 
+    def test_merge_order_branch_rejects_whitespace_only_delta(self) -> None:
+        def run(cmd: list[str], cwd: Path | None = None) -> str:
+            return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            origin = root / "origin.git"
+            seed = root / "seed"
+            repo = root / "repo"
+
+            run(["git", "init", "--bare", str(origin)])
+            run(["git", "clone", str(origin), str(seed)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=seed)
+            run(["git", "config", "user.name", "test"], cwd=seed)
+            (seed / "README.md").write_text("alpha\n\nbeta\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=seed)
+            run(["git", "commit", "-m", "main"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:main"], cwd=seed)
+
+            run(["git", "checkout", "-b", "feature/order-whitespace"], cwd=seed)
+            (seed / "README.md").write_text("alpha\nbeta\n", encoding="utf-8")
+            run(["git", "commit", "-am", "remove blank line"], cwd=seed)
+            run(["git", "push", "origin", "HEAD:feature/order-whitespace"], cwd=seed)
+
+            run(["git", "clone", "--branch", "main", str(origin), str(repo)])
+            run(["git", "config", "user.email", "test@example.com"], cwd=repo)
+            run(["git", "config", "user.name", "test"], cwd=repo)
+            before = run(["git", "rev-parse", "origin/main"], cwd=repo)
+
+            ok, msg, merge_commit = bot._merge_order_branch_to_main(
+                repo=repo,
+                order_branch="feature/order-whitespace",
+                order_id="order-whitespace",
+                default_branch="main",
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(msg, "branch_has_no_material_delta_vs_main")
+            self.assertIsNone(merge_commit)
+            self.assertEqual(run(["git", "rev-parse", "origin/main"], cwd=repo), before)
+
 
 class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
     def test_skynet_factory_local_only_disabled_by_default(self) -> None:

@@ -9700,6 +9700,23 @@ def _merge_order_branch_to_main(
         if diff_check.returncode != 1:
             detail = (diff_check.stderr or diff_check.stdout or "").strip()
             return False, detail or "branch_diff_check_failed", None
+        material_check = _run_git(
+            repo,
+            [
+                "diff",
+                "--quiet",
+                "--ignore-all-space",
+                "--ignore-blank-lines",
+                f"{base_ref}..{branch_ref}",
+                "--",
+            ],
+            check=False,
+        )
+        if material_check.returncode == 0:
+            return False, "branch_has_no_material_delta_vs_main", None
+        if material_check.returncode != 1:
+            detail = (material_check.stderr or material_check.stdout or "").strip()
+            return False, detail or "branch_material_diff_check_failed", None
 
         try:
             add = _run_git(repo, ["worktree", "add", "-B", tmp_branch, str(merge_dir), branch_ref], check=False)
