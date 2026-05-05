@@ -6,6 +6,7 @@ from typing import Any, Callable
 import hashlib
 import json
 import time
+import urllib.parse
 
 from .queue import OrchestratorQueue
 from .runbooks import load_runbooks
@@ -2805,6 +2806,132 @@ class StatusService:
                 "recommended_next_action": str((bottleneck or {}).get("recommended_next_action") or ""),
             },
             "stages": ordered_stages,
+        }
+
+    def workflow_bottleneck_handoff(
+        self,
+        chat_id: int | None = None,
+        stage: str | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        lim = max(1, min(200, int(limit)))
+        board = self.workflow_bottlenecks(chat_id=chat_id, limit=lim)
+        summary = board.get("summary") if isinstance(board.get("summary"), dict) else {}
+        raw_stage = "" if stage is None else str(stage).strip()
+        selected_stage = raw_stage.lower() if raw_stage else str(summary.get("bottleneck_stage") or _WORKFLOW_STAGE_ORDER[0])
+        if raw_stage and selected_stage not in _WORKFLOW_STAGE_ORDER:
+            valid = ",".join(_WORKFLOW_STAGE_ORDER)
+            raise ValueError(f"invalid_stage:{raw_stage}; valid_stages={valid}")
+
+        stages = [item for item in list(board.get("stages") or []) if isinstance(item, dict)]
+        stage_by_name = {str(item.get("stage") or ""): item for item in stages}
+        stage_payload = stage_by_name.get(selected_stage)
+        if stage_payload is None:
+            stage_payload = {
+                "stage": selected_stage,
+                "label": _WORKFLOW_STAGE_LABELS.get(selected_stage, selected_stage),
+                "orders_count": 0,
+                "blocked_count": 0,
+                "failed_count": 0,
+                "overdue_count": 0,
+                "running_count": 0,
+                "pending_count": 0,
+                "oldest_updated_at": None,
+                "recommended_next_action": "No active orders at this stage.",
+                "orders": [],
+            }
+        orders = [item for item in list(stage_payload.get("orders") or []) if isinstance(item, dict)][:lim]
+        query: dict[str, str] = {"stage": selected_stage, "limit": str(lim)}
+        if chat_id is not None:
+            query["chat_id"] = str(int(chat_id))
+        query_string = urllib.parse.urlencode(query)
+        inspect_endpoint = f"/api/v1/orchestration/workflow-bottlenecks?{query_string}"
+        handoff_endpoint = f"/api/v1/orchestration/workflow-bottlenecks/handoff?{query_string}"
+
+        owner_by_stage = {
+            "skynet_plan": "skynet",
+            "delivery": "implementer_local",
+            "validation": "qa",
+            "skynet_review": "skynet",
+            "deploy": "release_mgr",
+        }
+        action_by_stage = {
+            "skynet_plan": "Clarify the plan, scope, and delegation path for the selected orders.",
+            "delivery": "Unblock implementation and move the selected orders toward validation.",
+            "validation": "Run focused validation and produce actionable pass/fail evidence.",
+            "skynet_review": "Resolve review blockers and decide whether the selected orders can advance.",
+            "deploy": "Prepare release evidence and complete deployment readiness checks.",
+        }
+        validation_by_stage = {
+            "skynet_plan": "Confirm each selected order has bounded scope, owner, and next delegated job.",
+            "delivery": "Run the focused unit or integration command covering the implemented slice.",
+            "validation": "Run the acceptance test command and capture pass/fail output.",
+            "skynet_review": "Review evidence, blockers, and final-sweep output before advancing.",
+            "deploy": "Run release-readiness checks and verify evidence links are present.",
+        }
+        stage_label = str(stage_payload.get("label") or _WORKFLOW_STAGE_LABELS.get(selected_stage, selected_stage))
+        if orders:
+            action = str(stage_payload.get("recommended_next_action") or action_by_stage.get(selected_stage) or "Advance selected orders.")
+            top_order_ids = ", ".join(str(order.get("order_id_short") or order.get("order_id") or "") for order in orders[:3]).strip(", ")
+            assignment_prompt = (
+                f"ROLE: {owner_by_stage.get(selected_stage, 'skynet')}. Take the workflow bottleneck handoff for "
+                f"{stage_label}. Inspect {inspect_endpoint}, prioritize the top orders ({top_order_ids or 'listed'}), "
+                "perform the action, and report evidence against the acceptance criteria."
+            )
+        else:
+            action = f"No active orders are currently selected for {stage_label}; monitor the stage and re-run the handoff if demand appears."
+            assignment_prompt = (
+                f"ROLE: {owner_by_stage.get(selected_stage, 'skynet')}. No orders are currently selected for "
+                f"{stage_label}. Inspect {inspect_endpoint} and confirm there is no active handoff work before closing this packet."
+            )
+
+        handoff_packet = {
+            "owner_role": owner_by_stage.get(selected_stage, "skynet"),
+            "action": action,
+            "inspect_endpoint": inspect_endpoint,
+            "handoff_endpoint": handoff_endpoint,
+            "acceptance_criteria": [
+                "Selected orders are inspected and triaged in priority order.",
+                "Each blocker or failed stage has a recorded next action or resolution.",
+                "The selected stage can advance, or the remaining blocker is explicit and assigned.",
+            ]
+            if orders
+            else ["No selected orders exist for this stage, and the empty state is confirmed."],
+            "definition_of_done": [
+                "Top selected orders have current status, owner, and next action updated.",
+                "Validation or review evidence is attached where the stage requires it.",
+                "The workflow bottleneck score is reduced or the residual risk is documented.",
+            ]
+            if orders
+            else ["The handoff is closed as no-op with the inspected stage and timestamp recorded."],
+            "evidence_required": [
+                "Order ids handled and their resulting states.",
+                "Commands, checks, review notes, or release evidence used to validate the action.",
+                "Any remaining blocker summary with owner and follow-up endpoint.",
+            ]
+            if orders
+            else ["Confirmation that the stage has no selected orders."],
+            "suggested_validation": validation_by_stage.get(selected_stage, "Inspect the stage and capture the resulting evidence."),
+            "assignment_prompt": assignment_prompt,
+        }
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": board.get("generated_at"),
+            "chat_id": (int(chat_id) if chat_id is not None else None),
+            "limit": lim,
+            "selection": {
+                "requested_stage": (raw_stage or None),
+                "selected_stage": selected_stage,
+                "defaulted": not bool(raw_stage),
+                "valid_stages": list(_WORKFLOW_STAGE_ORDER),
+                "orders_selected": len(orders),
+            },
+            "summary": summary,
+            "stage": {k: v for k, v in stage_payload.items() if k != "orders"},
+            "orders": orders,
+            "handoff_packet": handoff_packet,
         }
 
     def proactive_priorities(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
