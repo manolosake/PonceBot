@@ -2188,8 +2188,12 @@ class StatusService:
         chat_id: int | None = None,
         limit: int = 50,
         include_released: bool = False,
+        lanes: Any = None,
     ) -> dict[str, Any]:
         lim = max(1, min(200, int(limit)))
+        active_lanes = normalize_release_readiness_lanes(lanes)
+        active_lane_set = set(active_lanes)
+        show_released = bool(include_released or "released" in active_lane_set)
         generated_at = float(time.time())
         source_limit = max(lim, 2000)
         if chat_id is None:
@@ -2249,7 +2253,9 @@ class StatusService:
                 lane = "released"
             else:
                 lane = "not_ready"
-            if lane == "released" and not include_released:
+            if lane == "released" and not show_released:
+                continue
+            if active_lane_set and lane not in active_lane_set:
                 continue
 
             checks_by_status: dict[str, int] = {}
@@ -2336,9 +2342,11 @@ class StatusService:
             "chat_id": (int(chat_id) if chat_id is not None else None),
             "limit": lim,
             "include_released": bool(include_released),
+            "lane_filters": active_lanes,
             "summary": {
                 "orders_total": len(returned),
                 "returned": len(returned),
+                "active_lanes": active_lanes,
                 "by_lane": by_lane,
                 "ready": by_lane.get("ready", 0),
                 "blocked": by_lane.get("blocked", 0),
