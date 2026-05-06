@@ -10496,6 +10496,14 @@ def _focus_payload_marker(payload: dict[str, Any]) -> str:
     return _orch_marker("focus", json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
+def _plan_usage_text() -> str:
+    return "Usage: /plan [chat|all] [limit]"
+
+
+def _plan_payload_marker(payload: dict[str, Any]) -> str:
+    return _orch_marker("plan", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
 _FOCUS_FILTER_KEYS = {
     "category": "categories",
     "categories": "categories",
@@ -10583,6 +10591,32 @@ def _parse_focus_scoped_limit(
     if idx != len(parts):
         return _focus_usage_text(), None
     return _focus_payload_marker(_focus_payload(mode=mode, scope=scope, limit=limit, filters=filters)), None
+
+
+def _parse_plan_command_tail(raw_tail: str) -> tuple[str, Job | None]:
+    tail = (raw_tail or "").strip()
+    try:
+        parts = shlex.split(tail)
+    except Exception:
+        return _plan_usage_text(), None
+
+    scope = "chat"
+    limit = 5
+    idx = 0
+    if idx < len(parts):
+        parsed_scope = _focus_scope_value(parts[idx])
+        if parsed_scope:
+            scope = parsed_scope
+            idx += 1
+    if idx < len(parts):
+        parsed_limit = _focus_parse_rank(parts[idx])
+        if parsed_limit is None:
+            return _plan_usage_text(), None
+        limit = parsed_limit
+        idx += 1
+    if idx != len(parts):
+        return _plan_usage_text(), None
+    return _plan_payload_marker({"scope": scope, "limit": limit}), None
 
 
 def _parse_focus_command_tail(raw_tail: str) -> tuple[str, Job | None]:
@@ -11145,6 +11179,66 @@ def _operator_focus_shift_brief_text(brief: dict[str, Any], *, scope_label: str,
             detail.append(f"handoff={handoff}")
         detail.append(f"receipt={receipt_state}")
         lines.append("   " + " ".join(detail))
+
+    return "\n".join(lines)
+
+
+def _proactive_action_plan_text(plan: dict[str, Any], *, scope_label: str, limit: int) -> str:
+    def _one_line(value: object, *, default: str = "-") -> str:
+        text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+        text = " ".join(text.split())
+        if not text:
+            return default
+        return text.encode("ascii", errors="replace").decode("ascii") or default
+
+    summary = plan.get("summary") if isinstance(plan.get("summary"), dict) else {}
+    lanes = [lane for lane in list(plan.get("lanes") or []) if isinstance(lane, dict)]
+    lane_counts = summary.get("lanes") if isinstance(summary.get("lanes"), dict) else {}
+    lines = [
+        f"Jarvis: proactive action plan ({_one_line(scope_label)} limit={limit})",
+        f"active_proactive_orders={_one_line(summary.get('active_proactive_orders'), default='0')}"
+        f" returned={_one_line(summary.get('returned'), default='0')}",
+        f"top_lane={_one_line(summary.get('top_lane'))} top_action={_one_line(summary.get('top_action'))}",
+        "",
+        "lane counts:",
+    ]
+    if lanes:
+        for lane in lanes:
+            lane_key = str(lane.get("lane") or "").strip()
+            label = _one_line(lane.get("label") or lane_key)
+            count = lane_counts.get(lane_key, lane.get("count"))
+            lines.append(f"- {label}: {_one_line(count, default='0')}")
+    else:
+        lines.append("- no lanes returned")
+
+    for lane in lanes:
+        label = _one_line(lane.get("label") or lane.get("lane"))
+        orders = [order for order in list(lane.get("orders") or []) if isinstance(order, dict)]
+        lines.extend(
+            [
+                "",
+                label,
+                "-" * len(label),
+                f"recommended_next_action: {_one_line(lane.get('recommended_next_action'))}",
+            ]
+        )
+        if not orders:
+            lines.append("- no orders in this lane")
+            continue
+        for order in orders:
+            order_label = _one_line(order.get("order_id_short") or order.get("order_id"))
+            lines.append(
+                "- "
+                + " | ".join(
+                    [
+                        f"rank={_one_line(order.get('rank'))}",
+                        f"order={order_label}",
+                        f"stage={_one_line(order.get('current_stage'))}",
+                        f"verdict={_one_line(order.get('readiness_verdict'))}",
+                        f"next={_one_line(order.get('next_action'))}",
+                    ]
+                )
+            )
 
     return "\n".join(lines)
 
@@ -11722,6 +11816,46 @@ def _send_orchestrator_marker_response(
                 text = _operator_focus_text(focus, scope_label=scope_label)
         except Exception as e:
             api.send_message(chat_id, f"Focus failed: {e}", reply_to_message_id=reply_to_message_id)
+            return True
+
+        _send_chunked_text(
+            api,
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+
+    if kind == "plan":
+        if orch_q is None:
+            api.send_message(chat_id, "Jarvis disabled.", reply_to_message_id=reply_to_message_id)
+            return True
+
+        parsed_payload: dict[str, Any] | None = None
+        raw_scope = (payload or "").strip().lower()
+        if payload:
+            try:
+                candidate = json.loads(payload)
+                if isinstance(candidate, dict):
+                    parsed_payload = candidate
+            except Exception:
+                parsed_payload = None
+
+        scope = str((parsed_payload or {}).get("scope") or raw_scope or "chat").strip().lower()
+        scope_chat_id, scope_label = _focus_scope_context(scope, chat_id=chat_id)
+        try:
+            limit_raw = (parsed_payload or {}).get("limit")
+            limit = int(limit_raw) if limit_raw is not None else 5
+            limit = max(1, min(200, limit))
+        except Exception:
+            limit = 5
+
+        try:
+            svc = StatusService(orch_q=orch_q, role_profiles=profiles, cache_ttl_seconds=0)
+            plan = svc.proactive_action_plan(chat_id=scope_chat_id, limit=limit)
+            text = _proactive_action_plan_text(plan, scope_label=scope_label, limit=limit)
+        except Exception as e:
+            api.send_message(chat_id, f"Plan failed: {e}", reply_to_message_id=reply_to_message_id)
             return True
 
         _send_chunked_text(
@@ -25381,6 +25515,10 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
 
     if text == "/orders":
         return _orch_marker("orders"), None
+
+    if text.startswith("/plan"):
+        tail = (text[len("/plan") :] or "").strip()
+        return _parse_plan_command_tail(tail)
 
     if text.startswith("/focus"):
         tail = (text[len("/focus") :] or "").strip().lower()
