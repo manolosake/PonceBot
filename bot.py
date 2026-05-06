@@ -25178,6 +25178,78 @@ def _orchestrator_runbooks_text(cfg: BotConfig, orch_q: OrchestratorQueue) -> st
     return "\n".join(lines)
 
 
+def _run_idle_no_open_jobs_runbook(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    now: float | None = None,
+) -> tuple[bool, Path]:
+    """
+    Execute the idle close gate deterministically.
+
+    This runbook is evidence collection, not agentic work. Running it through an
+    LLM produced false NO-GO summaries even when close_gate.txt said PASS.
+    """
+    from orchestrator.diagnostics.close_gate import evaluate_gate, render_gate
+    from orchestrator.diagnostics.common import json_dumps
+    from orchestrator.diagnostics.job_liveness import build_liveness_payload
+    from orchestrator.diagnostics.status_snapshot import build_snapshot
+
+    checked_at = time.time() if now is None else float(now)
+    artifact_id = str(uuid.uuid4())
+    artifacts_dir = (cfg.artifacts_root / artifact_id).resolve()
+    idle_dir = artifacts_dir / "idle_no_open_jobs"
+    idle_dir.mkdir(parents=True, exist_ok=True)
+
+    status_payload = build_snapshot(cfg.orchestrator_db_path, now=checked_at)
+    jobs_payload = build_liveness_payload(cfg.orchestrator_db_path, now=checked_at)
+
+    status_path = idle_dir / "status_snapshot.json"
+    jobs_path = idle_dir / "job_liveness.txt"
+    process_path = idle_dir / "process_liveness.txt"
+    gate_path = idle_dir / "close_gate.txt"
+    status_path.write_text(json_dumps(status_payload) + "\n", encoding="utf-8")
+    jobs_path.write_text(json_dumps(jobs_payload) + "\n", encoding="utf-8")
+
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-af", "python|codex|orchestrator|jarvis|skynet"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        process_text = proc.stdout or ""
+        if not process_text.strip():
+            process_text = f"pgrep returned {proc.returncode}; no matching processes captured\n"
+    except Exception as exc:
+        process_text = f"process_liveness_error: {type(exc).__name__}: {exc}\n"
+    process_path.write_text(process_text, encoding="utf-8")
+
+    ok, reasons = evaluate_gate(status_payload, jobs_payload)
+    rendered = render_gate(status_payload, jobs_payload, ok=ok, reasons=reasons)
+    gate_path.write_text(rendered + "\n", encoding="utf-8")
+
+    try:
+        orch_q.append_audit_event(
+            event_type="runbook.idle_no_open_jobs.deterministic",
+            actor="scheduler",
+            details={
+                "artifact_id": artifact_id,
+                "artifacts_dir": str(artifacts_dir),
+                "gate": "PASS" if ok else "NO-GO",
+                "status_open_jobs": int(status_payload.get("open_jobs") or 0),
+                "jobs_open_jobs": int(jobs_payload.get("open_jobs_count") or 0),
+                "reasons": list(reasons),
+                "source_of_truth": str(gate_path),
+            },
+        )
+    except Exception:
+        LOG.exception("Failed to audit deterministic idle_no_open_jobs runbook")
+    return bool(ok), artifacts_dir
+
+
 def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     """
     Returns (response_text, job)
@@ -34348,6 +34420,17 @@ def main() -> None:
                                 )
                             except Exception:
                                 LOG.exception("Autopilot tick failed")
+                            orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
+                            continue
+                        if rb.runbook_id == "idle_no_open_jobs":
+                            try:
+                                _run_idle_no_open_jobs_runbook(
+                                    cfg=cfg,
+                                    orch_q=orchestrator_queue,
+                                    now=now,
+                                )
+                            except Exception:
+                                LOG.exception("Deterministic idle_no_open_jobs runbook failed")
                             orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
                             continue
                         t = runbook_to_task(rb, chat_id=int(notify_chat_id))

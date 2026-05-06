@@ -995,6 +995,62 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("NO_CODE_CHANGE", specs[0].text)
         self.assertIn("Do not fail only because the workspace is not on a `local_*` slice", specs[1].text)
 
+    def test_idle_no_open_jobs_runbook_writes_deterministic_pass_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT PRIMARY KEY,
+                        parent_job_id TEXT,
+                        role TEXT,
+                        state TEXT,
+                        owner TEXT,
+                        input_text TEXT,
+                        created_at REAL,
+                        updated_at REAL,
+                        due_at REAL,
+                        stalled_since REAL,
+                        retry_count INTEGER,
+                        max_retries INTEGER
+                    )
+                    """
+                )
+                con.execute(
+                    "INSERT INTO jobs(job_id, role, state, input_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("done-1", "sre", "done", "closed", 10.0, 20.0),
+                )
+
+            events: list[dict[str, object]] = []
+
+            class FakeQueue:
+                def append_audit_event(self, *, event_type: str, actor: str = "system", details: dict[str, object] | None = None) -> None:
+                    events.append({"event_type": event_type, "actor": actor, "details": details or {}})
+
+            cfg = SimpleNamespace(orchestrator_db_path=db, artifacts_root=root / "artifacts")
+            fake_proc = SimpleNamespace(stdout="python /home/aponce/codexbot/bot.py\n", returncode=0)
+
+            with patch.object(bot.subprocess, "run", return_value=fake_proc):
+                ok, artifacts_dir = bot._run_idle_no_open_jobs_runbook(
+                    cfg=cfg,
+                    orch_q=FakeQueue(),
+                    now=1234.0,
+                )
+
+            gate_path = artifacts_dir / "idle_no_open_jobs" / "close_gate.txt"
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            self.assertTrue(ok)
+            self.assertEqual(gate["gate"], "PASS")
+            self.assertEqual(gate["status_open_jobs"], 0)
+            self.assertEqual(gate["jobs_open_jobs"], 0)
+            self.assertTrue((artifacts_dir / "idle_no_open_jobs" / "status_snapshot.json").exists())
+            self.assertTrue((artifacts_dir / "idle_no_open_jobs" / "job_liveness.txt").exists())
+            self.assertTrue((artifacts_dir / "idle_no_open_jobs" / "process_liveness.txt").exists())
+            self.assertEqual(events[0]["event_type"], "runbook.idle_no_open_jobs.deterministic")
+            self.assertEqual(events[0]["details"]["gate"], "PASS")
+
     def test_controller_snapshot_safe_prompt_scrubs_source_paths(self) -> None:
         prompt = (
             "Registered repo root: /srv/codexbot\n"
