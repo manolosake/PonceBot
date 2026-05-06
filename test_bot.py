@@ -5676,6 +5676,40 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
 
                 self.assertFalse(bot._project_incubator_due(cfg, occupied_keys=set()))
 
+    def test_project_incubator_external_delivery_satisfies_merge_gate(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+            project = root / "local-ops-briefboard"
+            project.mkdir(parents=True)
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Local Ops Briefboard\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+
+            trace = {
+                "initiative_key": "project-incubator",
+                "initiative_lane": "incubator",
+                "order_branch": "feature/order-incubator",
+                "result_summary": (
+                    f"VERIFIED_IMPROVEMENT: `NEW_PROJECT_PHASE`. Created and validated `{project}`, "
+                    "a new git-backed local operator project with README and validation evidence."
+                ),
+            }
+
+            with patch.dict(os.environ, {"BOT_PROJECT_INCUBATOR_ROOT": str(root)}, clear=False):
+                evidence = bot._trace_project_incubator_delivery_evidence(trace)
+                merge_required, branch = bot._order_trace_requires_merge(trace)
+
+            self.assertTrue(evidence["ok"], evidence)
+            self.assertEqual(evidence["project_path"], str(project.resolve()))
+            self.assertFalse(merge_required)
+            self.assertEqual(branch, "feature/order-incubator")
+
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)

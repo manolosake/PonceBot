@@ -8626,6 +8626,98 @@ def _trace_has_operator_verified_deployment(trace: dict[str, Any] | None) -> boo
     }
 
 
+def _is_project_incubator_trace(trace: dict[str, Any] | None) -> bool:
+    tr = dict(trace or {})
+    key = str(tr.get("initiative_key") or "").strip().lower()
+    lane = str(tr.get("initiative_lane") or "").strip().lower()
+    return key == "project-incubator" or lane == "incubator"
+
+
+def _project_incubator_summary_blob(trace: dict[str, Any] | None) -> str:
+    tr = dict(trace or {})
+    parts = [
+        str(tr.get("result_status") or ""),
+        str(tr.get("result_summary") or ""),
+        str(tr.get("summary") or ""),
+    ]
+    digest = tr.get("structured_digest")
+    if isinstance(digest, dict):
+        parts.extend(
+            [
+                str(digest.get("status") or ""),
+                str(digest.get("summary") or ""),
+                str(digest.get("classification") or ""),
+            ]
+        )
+    return "\n".join(part for part in parts if part)
+
+
+def _project_incubator_candidate_paths_from_trace(trace: dict[str, Any] | None) -> list[Path]:
+    blob = _project_incubator_summary_blob(trace)
+    if not blob:
+        return []
+    root = _project_incubator_root_dir()
+    root_s = str(root)
+    pattern = re.compile(re.escape(root_s.rstrip("/")) + r"/[A-Za-z0-9][A-Za-z0-9._/-]*")
+    out: list[Path] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(blob):
+        raw = match.group(0).rstrip(".,;:)'\"]`")
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> dict[str, Any]:
+    if not _is_project_incubator_trace(trace):
+        return {"ok": False, "reason": "not_project_incubator"}
+    blob = _project_incubator_summary_blob(trace)
+    blob_l = blob.lower()
+    if "verified_improvement" not in blob_l or "new_project_phase" not in blob_l:
+        return {"ok": False, "reason": "missing_verified_new_project_signal"}
+
+    root = _project_incubator_root_dir()
+    for path in _project_incubator_candidate_paths_from_trace(trace):
+        if path.name.startswith("."):
+            continue
+        if not _path_is_relative_to(path, root) or path.parent.resolve() != root.resolve():
+            continue
+        if not path.exists() or not path.is_dir():
+            continue
+        if not (path / ".git").exists():
+            continue
+        readmes = [p for p in path.glob("README*") if p.is_file()]
+        if not readmes:
+            continue
+        head = _run_git(path, ["rev-parse", "--short", "HEAD"], check=False)
+        if head.returncode != 0 or not str(head.stdout or "").strip():
+            continue
+        status = _run_git(path, ["status", "--short"], check=False)
+        return {
+            "ok": True,
+            "reason": "git_backed_project_verified",
+            "project_path": str(path),
+            "project_head": str(head.stdout or "").strip(),
+            "project_status": str(status.stdout or "").strip(),
+            "readme": str(readmes[0]),
+        }
+    return {"ok": False, "reason": "no_git_backed_project_path"}
+
+
+def _trace_has_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> bool:
+    return bool(_trace_project_incubator_delivery_evidence(trace).get("ok", False))
+
+
 def _git_common_dir_for_path(path: Path) -> Path | None:
     proc = _run_git(path, ["rev-parse", "--git-common-dir"], check=False)
     raw = str(proc.stdout or "").strip()
@@ -8892,6 +8984,8 @@ def _order_trace_requires_merge(
     branch = str(tr.get("order_branch") or "").strip()
     if not branch:
         return False, ""
+    if _trace_has_project_incubator_delivery_evidence(tr):
+        return False, branch
     if str(tr.get("superseded_by") or "").strip():
         return False, branch
     if bool(tr.get("merge_cancelled", False)):
@@ -13168,6 +13262,64 @@ def _order_command_text(
                 merge_no_delta_detected_at=(failed_at if no_delta else None),
             )
             if no_delta:
+                project_delivery = _trace_project_incubator_delivery_evidence(trace)
+                if bool(project_delivery.get("ok", False)):
+                    cleanup_result = _retire_order_branch_without_merge(repo=repo_dir, order_branch=order_branch)
+                    delivery_summary = str(trace.get("result_summary") or "").strip() or (
+                        "Project incubator external delivery verified; no controller branch merge required."
+                    )
+                    orch_q.update_trace(
+                        root_id,
+                        merge_ready=False,
+                        merge_required=False,
+                        merge_error=err_txt,
+                        merge_no_delta_active=False,
+                        merge_no_delta_retired_at=failed_at,
+                        project_incubator_external_delivery=True,
+                        project_incubator_external_delivery_at=failed_at,
+                        project_incubator_delivery=project_delivery,
+                        proactive_improvement_verified=True,
+                        proactive_improvement_closed=True,
+                        proactive_improvement_closed_at=failed_at,
+                        post_merge_cleanup_status=str(cleanup_result.get("status") or ""),
+                        post_merge_cleanup_result=cleanup_result,
+                        result_status="done",
+                        result_summary=delivery_summary,
+                        result_next_action="Factory ready for next order.",
+                    )
+                    orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                    orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+                    orch_q.update_state(
+                        root_id,
+                        "done",
+                        blocked_reason=None,
+                        merge_ready=False,
+                        merge_required=False,
+                        result_status="done",
+                        result_summary=delivery_summary,
+                        result_next_action="Factory ready for next order.",
+                        project_incubator_external_delivery=True,
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.project_incubator_external_delivery_closed",
+                        actor=actor_norm,
+                        details={
+                            "order_id": root_id,
+                            "order_branch": order_branch,
+                            "project_delivery": project_delivery,
+                            "cleanup": cleanup_result,
+                            "reason": "controller_branch_no_delta_but_external_project_verified",
+                        },
+                    )
+                    if actor_norm == "jarvis":
+                        return (
+                            f"Jarvis closed incubator order {root_id[:8]} as external project delivery. "
+                            f"Project={project_delivery.get('project_path')}."
+                        )
+                    return (
+                        f"Order {root_id[:8]} closed as external project delivery. "
+                        f"Project={project_delivery.get('project_path')}."
+                    )
                 orch_q.update_state(
                     root_id,
                     "failed",
@@ -17012,6 +17164,53 @@ def _close_proactive_terminal_root_failure(
     if bool(root_trace.get("proactive_no_change_validated", False)) or bool(root_trace.get("proactive_blocked_with_root_cause", False)):
         return False
 
+    project_delivery = _trace_project_incubator_delivery_evidence(root_trace)
+    if bool(project_delivery.get("ok", False)):
+        summary = str(root_trace.get("result_summary") or "").strip() or (
+            "Project incubator external delivery verified; no controller branch merge required."
+        )
+        try:
+            orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
+            orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
+            orch_q.update_trace(
+                oid,
+                merge_ready=False,
+                merge_required=False,
+                project_incubator_external_delivery=True,
+                project_incubator_external_delivery_at=float(now),
+                project_incubator_delivery=project_delivery,
+                proactive_improvement_verified=True,
+                proactive_improvement_closed=True,
+                proactive_improvement_closed_at=float(now),
+                result_status="done",
+                result_summary=summary,
+                result_next_action="Factory ready for next order.",
+                live_at=float(now),
+            )
+            orch_q.update_state(
+                oid,
+                "done",
+                blocked_reason=None,
+                merge_ready=False,
+                merge_required=False,
+                result_status="done",
+                result_summary=summary,
+                result_next_action="Factory ready for next order.",
+                project_incubator_external_delivery=True,
+            )
+            orch_q.append_audit_event(
+                event_type="order.project_incubator_external_delivery_closed",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "project_delivery": project_delivery,
+                    "reason": "terminal_controller_with_external_project_verified",
+                },
+            )
+            return True
+        except Exception:
+            return False
+
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
     if any(str(getattr(child, "state", "") or "").strip().lower() in active_states for child in children):
         return False
@@ -20028,6 +20227,8 @@ def _order_has_meaningful_improvement(
     root_trace = dict((root_job.trace or {}) if root_job and isinstance(root_job.trace, dict) else {})
     if bool(root_trace.get("merged_to_main", False)):
         return True
+    if _trace_has_project_incubator_delivery_evidence(root_trace):
+        return True
 
     funnel = _collect_order_local_autonomy_funnel(
         orch_q=orch_q,
@@ -21802,6 +22003,7 @@ def _sync_order_phase_from_runtime(
         merge_required = False
     proactive_order = bool(_is_proactive_order_record(order))
     proactive_verified_no_change = False
+    project_incubator_delivery_verified = _trace_has_project_incubator_delivery_evidence(root_trace)
     if proactive_order:
         proactive_verified_no_change = _order_has_verified_no_change_resolution(
             orch_q=orch_q,
@@ -21854,6 +22056,62 @@ def _sync_order_phase_from_runtime(
         now=time.time(),
     ):
         return
+    if proactive_order and project_incubator_delivery_verified and not phase_children:
+        now_ts = time.time()
+        cleanup_result: dict[str, Any] = {"status": "skipped", "reason": "no_order_branch"}
+        if _order_branch:
+            try:
+                cleanup_result = _retire_order_branch_without_merge(repo=repo_dir, order_branch=_order_branch)
+            except Exception as exc:
+                cleanup_result = {"status": "failed", "reason": f"cleanup_exception:{type(exc).__name__}"}
+        summary = str(root_trace.get("result_summary") or "").strip() or (
+            "Project incubator external delivery verified; no controller branch merge required."
+        )
+        delivery = _trace_project_incubator_delivery_evidence(root_trace)
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                merge_required=False,
+                project_incubator_external_delivery=True,
+                project_incubator_external_delivery_at=now_ts,
+                project_incubator_delivery=delivery,
+                proactive_improvement_verified=True,
+                proactive_improvement_closed=True,
+                proactive_improvement_closed_at=now_ts,
+                post_merge_cleanup_status=str(cleanup_result.get("status") or ""),
+                post_merge_cleanup_result=cleanup_result,
+                result_status="done",
+                result_summary=summary,
+                result_next_action="Factory ready for next order.",
+                live_at=now_ts,
+            )
+            orch_q.update_state(
+                rid,
+                "done",
+                blocked_reason=None,
+                merge_ready=False,
+                merge_required=False,
+                result_status="done",
+                result_summary=summary,
+                result_next_action="Factory ready for next order.",
+                project_incubator_external_delivery=True,
+            )
+            orch_q.append_audit_event(
+                event_type="order.project_incubator_external_delivery_closed",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "project_delivery": delivery,
+                    "cleanup": cleanup_result,
+                    "reason": "active_controller_with_external_project_verified",
+                },
+            )
+        except Exception:
+            pass
+        return
     if not phase_children:
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="planning")
         return
@@ -21870,9 +22128,15 @@ def _sync_order_phase_from_runtime(
             orch_q=orch_q,
             root_ticket=rid,
         )
-        proactive_improvement_verified = bool(proactive_funnel.get("improvement_verified", False)) or operator_verified_deployment
+        proactive_improvement_verified = (
+            bool(proactive_funnel.get("improvement_verified", False))
+            or operator_verified_deployment
+            or project_incubator_delivery_verified
+        )
         proactive_quality_status = (
-            "operator_verified_deploy"
+            "project_incubator_external_delivery"
+            if project_incubator_delivery_verified
+            else "operator_verified_deploy"
             if operator_verified_deployment
             else str(proactive_funnel.get("quality_gate_status") or "planned")
         )
@@ -21889,6 +22153,7 @@ def _sync_order_phase_from_runtime(
                 proactive_quality_gate_status=proactive_quality_status,
                 proactive_improvement_verified=bool(proactive_improvement_verified),
                 proactive_operator_verified_deployment=bool(operator_verified_deployment),
+                proactive_project_incubator_external_delivery=bool(project_incubator_delivery_verified),
                 proactive_improvement_checked_at=time.time(),
                 live_at=time.time(),
             )
