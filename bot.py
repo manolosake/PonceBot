@@ -18501,34 +18501,65 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
             + ("- Keep the patch bounded to 1-3 files and avoid expanding scope.\\n" if cli_recovery else "- Keep the handoff bounded to 1-3 files and avoid expanding scope.\\n")
             + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
         )
-        return [
-            TaskSpec(
-                key=recovery_key,
-                role=("backend" if cli_recovery else "architect_local"),
-                text=recovery_text,
-                mode_hint=("rw" if cli_recovery else "ro"),
-                priority=1,
-                depends_on=[],
-                requires_approval=False,
-                acceptance_criteria=[
-                    "Reject trivial/unwired controller patches as NO_CODE_CHANGE with evidence.",
-                    (
-                        "Or implement one small wired change with validation evidence."
-                        if cli_recovery
-                        else "Or produce one implementer-ready handoff with exact files and one validation command."
-                    ),
-                ],
-                definition_of_done=[
-                    (
-                        "Controller violation is converted into a verified CLI change or no-op."
-                        if cli_recovery
-                        else "Controller violation is converted into a grounded local handoff or a verified no-op."
-                    ),
-                ],
-                eta_minutes=20,
-                sla_tier="high",
-            )
-        ]
+        backend_spec = TaskSpec(
+            key=recovery_key,
+            role=("backend" if cli_recovery else "architect_local"),
+            text=recovery_text,
+            mode_hint=("rw" if cli_recovery else "ro"),
+            priority=1,
+            depends_on=[],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Reject trivial/unwired controller patches as NO_CODE_CHANGE with evidence.",
+                (
+                    "Or implement one small wired change with validation evidence."
+                    if cli_recovery
+                    else "Or produce one implementer-ready handoff with exact files and one validation command."
+                ),
+            ],
+            definition_of_done=[
+                (
+                    "Controller violation is converted into a verified CLI change or no-op."
+                    if cli_recovery
+                    else "Controller violation is converted into a grounded local handoff or a verified no-op."
+                ),
+            ],
+            eta_minutes=20,
+            sla_tier="high",
+        )
+        if not cli_recovery:
+            return [backend_spec]
+        qa_key = f"{recovery_key}_qa"
+        qa_text = (
+            "QA for CLI recovery from a controller write-policy violation.\\n"
+            f"Backend recovery key: `{recovery_key}`\\n"
+            f"Files touched by the rejected controller attempt:\\n{file_list}\\n\\n"
+            f"{artifact_block}"
+            "Rules:\\n"
+            "- Validate the backend recovery result, not a local-only slice workspace.\\n"
+            "- If backend returned NO_CODE_CHANGE, verify that the rejected controller patch is cosmetic, unwired, duplicate, or not tied to the sprint objective.\\n"
+            "- Do not fail only because the workspace is not on a `local_*` slice; this is CLI-promotion recovery.\\n"
+            "- Return PASS if no code change is justified with concrete file/artifact evidence, or FAIL with exact next backend instruction.\\n"
+        )
+        qa_spec = TaskSpec(
+            key=qa_key,
+            role="qa",
+            text=qa_text,
+            mode_hint="ro",
+            priority=1,
+            depends_on=[recovery_key],
+            requires_approval=False,
+            acceptance_criteria=[
+                "Validate backend recovery or NO_CODE_CHANGE using concrete file/artifact evidence.",
+                "Do not require a local-only slice workspace for CLI-promotion recovery.",
+            ],
+            definition_of_done=[
+                "QA returns PASS/FAIL for the CLI recovery path with exact evidence.",
+            ],
+            eta_minutes=20,
+            sla_tier="high",
+        )
+        return [backend_spec, qa_spec]
 
     validation_cmd = "git diff --stat"
     if len(changed_paths) == 1 and changed_paths[0].endswith(".py"):

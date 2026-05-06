@@ -987,11 +987,13 @@ class TestStateHandling(unittest.TestCase):
                 }
             )
 
-        self.assertEqual([spec.role for spec in specs], ["backend"])
+        self.assertEqual([spec.role for spec in specs], ["backend", "qa"])
         self.assertEqual(specs[0].mode_hint, "rw")
+        self.assertEqual(specs[1].depends_on, [specs[0].key])
         self.assertIn("Do not replay the controller patch", specs[0].text)
         self.assertIn("implement the smallest wired change", specs[0].text)
         self.assertIn("NO_CODE_CHANGE", specs[0].text)
+        self.assertIn("Do not fail only because the workspace is not on a `local_*` slice", specs[1].text)
 
     def test_controller_snapshot_safe_prompt_scrubs_source_paths(self) -> None:
         prompt = (
