@@ -18473,8 +18473,9 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     order_branch = str(structured_digest.get("order_branch") or "").strip()
     recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
     if not summary:
+        cli_recovery = bool(_proactive_cli_promotion_enabled() and not _skynet_factory_local_only_enabled())
         digest = hashlib.sha1("\\n".join(changed_paths).encode("utf-8", errors="ignore")).hexdigest()[:10]
-        arch_key = f"local_arch_recover_{digest}"
+        recovery_key = f"{'local_impl_recover' if cli_recovery else 'local_arch_recover'}_{digest}"
         file_list = "\\n".join(f"- `{path}`" for path in changed_paths[:8])
         artifact_block = ""
         if recovery_artifacts:
@@ -18483,33 +18484,46 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
                 + "\\n".join(f"- `{path}`" for path in recovery_artifacts[:8])
                 + "\\nDo not apply `changes.patch` blindly; use it only to understand the controller's attempted intent.\\n\\n"
             )
-        architect_text = (
-            "Architect recovery for a controller write-policy violation.\\n"
+        recovery_text = (
+            ("CLI recovery" if cli_recovery else "Architect recovery")
+            + " for a controller write-policy violation.\\n"
             "The controller modified files directly without a structured, reviewable intent.\\n"
             f"Files touched by the rejected controller attempt:\\n{file_list}\\n\\n"
             f"{artifact_block}"
             "Rules:\\n"
             "- Do not replay the controller patch. First decide whether it is a meaningful, wired improvement.\\n"
             "- If the attempted patch is cosmetic, unwired, duplicate, or not tied to the sprint objective, return NO_CODE_CHANGE with concrete evidence.\\n"
-            "- If there is a real improvement to pursue, return one implementer-ready handoff with exact files, the smallest concrete change, and one validation command.\\n"
-            "- Keep the handoff bounded to 1-3 files and avoid expanding scope.\\n"
+            + (
+                "- If there is a real improvement to pursue, implement the smallest wired change directly and include validation evidence.\\n"
+                if cli_recovery
+                else "- If there is a real improvement to pursue, return one implementer-ready handoff with exact files, the smallest concrete change, and one validation command.\\n"
+            )
+            + ("- Keep the patch bounded to 1-3 files and avoid expanding scope.\\n" if cli_recovery else "- Keep the handoff bounded to 1-3 files and avoid expanding scope.\\n")
             + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
         )
         return [
             TaskSpec(
-                key=arch_key,
-                role="architect_local",
-                text=architect_text,
-                mode_hint="ro",
+                key=recovery_key,
+                role=("backend" if cli_recovery else "architect_local"),
+                text=recovery_text,
+                mode_hint=("rw" if cli_recovery else "ro"),
                 priority=1,
                 depends_on=[],
                 requires_approval=False,
                 acceptance_criteria=[
                     "Reject trivial/unwired controller patches as NO_CODE_CHANGE with evidence.",
-                    "Or produce one implementer-ready handoff with exact files and one validation command.",
+                    (
+                        "Or implement one small wired change with validation evidence."
+                        if cli_recovery
+                        else "Or produce one implementer-ready handoff with exact files and one validation command."
+                    ),
                 ],
                 definition_of_done=[
-                    "Controller violation is converted into a grounded local handoff or a verified no-op.",
+                    (
+                        "Controller violation is converted into a verified CLI change or no-op."
+                        if cli_recovery
+                        else "Controller violation is converted into a grounded local handoff or a verified no-op."
+                    ),
                 ],
                 eta_minutes=20,
                 sla_tier="high",

@@ -968,6 +968,31 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("app/src/main/java/com/example/MainActivity.kt", specs[0].text)
         self.assertIn("/tmp/artifacts/root/changes.patch", specs[0].text)
 
+    def test_controller_local_recovery_routes_cli_promotion_to_backend_triage(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "BOT_PROACTIVE_ALLOW_CLI_PROMOTION": "1",
+                "BOT_SKYNET_FACTORY_LOCAL_ONLY": "0",
+            },
+            clear=False,
+        ):
+            specs = bot._controller_local_recovery_specs(
+                {
+                    "order_branch": "feature/test-order",
+                    "controller_recovery_artifacts": ["/tmp/artifacts/root/changes.patch"],
+                    "write_policy_violation": {
+                        "changed_paths": ["controller_snapshot:server/app.py"],
+                    },
+                }
+            )
+
+        self.assertEqual([spec.role for spec in specs], ["backend"])
+        self.assertEqual(specs[0].mode_hint, "rw")
+        self.assertIn("Do not replay the controller patch", specs[0].text)
+        self.assertIn("implement the smallest wired change", specs[0].text)
+        self.assertIn("NO_CODE_CHANGE", specs[0].text)
+
     def test_controller_snapshot_safe_prompt_scrubs_source_paths(self) -> None:
         prompt = (
             "Registered repo root: /srv/codexbot\n"
