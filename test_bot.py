@@ -951,6 +951,23 @@ class TestStateHandling(unittest.TestCase):
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[0].text)
         self.assertIn("python3 -m py_compile bot.py tools/health.py", specs[1].text)
 
+    def test_controller_local_recovery_routes_unexplained_write_policy_to_architect(self) -> None:
+        specs = bot._controller_local_recovery_specs(
+            {
+                "order_branch": "feature/test-order",
+                "controller_recovery_artifacts": ["/tmp/artifacts/root/changes.patch"],
+                "write_policy_violation": {
+                    "changed_paths": ["controller_snapshot:app/src/main/java/com/example/MainActivity.kt"],
+                },
+            }
+        )
+
+        self.assertEqual([spec.role for spec in specs], ["architect_local"])
+        self.assertIn("Do not replay the controller patch", specs[0].text)
+        self.assertIn("NO_CODE_CHANGE", specs[0].text)
+        self.assertIn("app/src/main/java/com/example/MainActivity.kt", specs[0].text)
+        self.assertIn("/tmp/artifacts/root/changes.patch", specs[0].text)
+
     def test_controller_snapshot_safe_prompt_scrubs_source_paths(self) -> None:
         prompt = (
             "Registered repo root: /srv/codexbot\n"

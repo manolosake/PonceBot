@@ -18471,6 +18471,51 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
 
     summary = str(structured_digest.get("summary") or "").strip()
     order_branch = str(structured_digest.get("order_branch") or "").strip()
+    recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
+    if not summary:
+        digest = hashlib.sha1("\\n".join(changed_paths).encode("utf-8", errors="ignore")).hexdigest()[:10]
+        arch_key = f"local_arch_recover_{digest}"
+        file_list = "\\n".join(f"- `{path}`" for path in changed_paths[:8])
+        artifact_block = ""
+        if recovery_artifacts:
+            artifact_block = (
+                "Controller recovery artifacts for inspection only:\\n"
+                + "\\n".join(f"- `{path}`" for path in recovery_artifacts[:8])
+                + "\\nDo not apply `changes.patch` blindly; use it only to understand the controller's attempted intent.\\n\\n"
+            )
+        architect_text = (
+            "Architect recovery for a controller write-policy violation.\\n"
+            "The controller modified files directly without a structured, reviewable intent.\\n"
+            f"Files touched by the rejected controller attempt:\\n{file_list}\\n\\n"
+            f"{artifact_block}"
+            "Rules:\\n"
+            "- Do not replay the controller patch. First decide whether it is a meaningful, wired improvement.\\n"
+            "- If the attempted patch is cosmetic, unwired, duplicate, or not tied to the sprint objective, return NO_CODE_CHANGE with concrete evidence.\\n"
+            "- If there is a real improvement to pursue, return one implementer-ready handoff with exact files, the smallest concrete change, and one validation command.\\n"
+            "- Keep the handoff bounded to 1-3 files and avoid expanding scope.\\n"
+            + (f"- Preserve the order branch context: `{order_branch}`.\\n" if order_branch else "")
+        )
+        return [
+            TaskSpec(
+                key=arch_key,
+                role="architect_local",
+                text=architect_text,
+                mode_hint="ro",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=[
+                    "Reject trivial/unwired controller patches as NO_CODE_CHANGE with evidence.",
+                    "Or produce one implementer-ready handoff with exact files and one validation command.",
+                ],
+                definition_of_done=[
+                    "Controller violation is converted into a grounded local handoff or a verified no-op.",
+                ],
+                eta_minutes=20,
+                sla_tier="high",
+            )
+        ]
+
     validation_cmd = "git diff --stat"
     if len(changed_paths) == 1 and changed_paths[0].endswith(".py"):
         name = Path(changed_paths[0]).name
@@ -18489,7 +18534,6 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     controller_intent = summary or (
         "Recreate the bounded patch the controller prepared, but do it through implementer_local so the change stays inside local-only policy."
     )
-    recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
     recovery_artifact_block = ""
     if recovery_artifacts:
         recovery_artifact_block = (
