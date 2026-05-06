@@ -989,6 +989,7 @@ class TestStateHandling(unittest.TestCase):
 
         self.assertEqual([spec.role for spec in specs], ["backend", "qa"])
         self.assertEqual(specs[0].mode_hint, "rw")
+        self.assertTrue(specs[1].key.startswith("local_review_recover_"))
         self.assertEqual(specs[1].depends_on, [specs[0].key])
         self.assertIn("Do not replay the controller patch", specs[0].text)
         self.assertIn("implement the smallest wired change", specs[0].text)
@@ -5911,6 +5912,69 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
             def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
                 return list(children) if parent_job_id == "root" else []
 
+        funnel = bot._collect_order_local_autonomy_funnel(orch_q=FakeQueue(), root_ticket="root", now=140.0)
+
+        self.assertEqual(funnel["quality_gate_status"], "closed")
+        self.assertEqual(funnel["slices_closed"], 1)
+        self.assertTrue(funnel["improvement_verified"])
+        self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
+    def test_recovery_funnel_closes_legacy_cli_qa_suffix_after_write_policy_block(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="blocked",
+            trace={
+                "result_summary": (
+                    "Write policy violation: skynet modified repository files directly. "
+                    "Skynet factory work must delegate code changes to local specialists."
+                ),
+                "structured_digest": {
+                    "write_policy_violation": {
+                        "changed_paths": ["controller_snapshot:server/app.py"],
+                    },
+                },
+            },
+            labels={},
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                job_id="impl",
+                role="backend",
+                state="done",
+                labels={"key": "local_impl_recover_e78acab431"},
+                trace={
+                    "result_summary": "Implemented a bounded backend recovery with validation evidence.",
+                    "slice_patch_applied": True,
+                    "slice_validation_ok": True,
+                    "patch_info": {"changed_files": ["server/app.py"], "validation_ok": True},
+                },
+                created_at=110.0,
+                updated_at=120.0,
+            ),
+            SimpleNamespace(
+                job_id="qa",
+                role="qa",
+                state="done",
+                labels={"key": "local_impl_recover_e78acab431_qa"},
+                trace={
+                    "result_summary": "PASS: READY because compile and focused regression tests passed.",
+                },
+                created_at=125.0,
+                updated_at=130.0,
+            ),
+        ]
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 600):
+                return list(children) if parent_job_id == "root" else []
+
+        self.assertEqual(bot._slice_id_from_local_key("local_impl_recover_e78acab431_qa"), "e78acab431")
         funnel = bot._collect_order_local_autonomy_funnel(orch_q=FakeQueue(), root_ticket="root", now=140.0)
 
         self.assertEqual(funnel["quality_gate_status"], "closed")

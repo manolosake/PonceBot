@@ -18529,7 +18529,7 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
         )
         if not cli_recovery:
             return [backend_spec]
-        qa_key = f"{recovery_key}_qa"
+        qa_key = f"local_review_recover_{digest}"
         qa_text = (
             "QA for CLI recovery from a controller write-policy violation.\\n"
             f"Backend recovery key: `{recovery_key}`\\n"
@@ -19479,9 +19479,6 @@ def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
     key_norm = str(key or "").strip().lower()
     if not key_norm:
         return _sanitize_slice_token(fallback, fallback="slice")
-    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground|recover)_(.+)$", key_norm)
-    if m:
-        return _sanitize_slice_token(m.group(1), fallback=fallback)
     for suffix in (
         "_qa",
         "_review",
@@ -19492,7 +19489,11 @@ def _slice_id_from_local_key(key: str, *, fallback: str = "slice") -> str:
         "_validation",
     ):
         if key_norm.endswith(suffix) and len(key_norm) > len(suffix):
-            return _sanitize_slice_token(key_norm[: -len(suffix)], fallback=fallback)
+            key_norm = key_norm[: -len(suffix)].rstrip("_")
+            break
+    m = re.match(r"local_(?:arch|impl|review)_(?:guard|blocker|ground|recover)_(.+)$", key_norm)
+    if m:
+        return _sanitize_slice_token(m.group(1), fallback=fallback)
     return _sanitize_slice_token(key_norm, fallback=fallback)
 
 
@@ -19807,10 +19808,18 @@ def _collect_order_local_autonomy_funnel(
             or _summary_has_verified_improvement_signal(root_digest_summary)
         )
     )
-    if root_has_verified_signal:
+    root_has_write_policy_recovery_signal = bool(
+        root_state == "blocked"
+        and (
+            "write policy violation" in root_summary.lower()
+            or isinstance(root_trace.get("write_policy_violation"), dict)
+            or (isinstance(root_digest, dict) and isinstance(root_digest.get("write_policy_violation"), dict))
+        )
+    )
+    if root_has_verified_signal or root_has_write_policy_recovery_signal:
         # A controller write-policy recovery can leave the root blocked after it
-        # identifies the improvement. Once backend + QA validate the replayed
-        # slice, this root signal acts as the controller verification.
+        # identifies or triggers the improvement. Once backend + QA validate the
+        # recovery slice, this root signal acts as controller verification.
         controller_verifications_no_slice.append(now_ts)
 
     for child in children:
