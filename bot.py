@@ -8795,13 +8795,6 @@ def _github_api_json(
 
 def _project_incubator_github_repo_name(project_path: Path) -> str:
     candidates: list[str] = []
-    manifest_path = project_path / "PROJECT_MANIFEST.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if isinstance(manifest, dict):
-            candidates.append(str(manifest.get("name") or ""))
-    except Exception:
-        pass
     for readme in sorted(project_path.glob("README*")):
         if not readme.is_file():
             continue
@@ -8813,6 +8806,13 @@ def _project_incubator_github_repo_name(project_path: Path) -> str:
                     break
         except Exception:
             continue
+    manifest_path = project_path / "PROJECT_MANIFEST.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest, dict):
+            candidates.append(str(manifest.get("name") or ""))
+    except Exception:
+        pass
     candidates.append(project_path.name)
     for candidate in candidates:
         slug = _slug_token(candidate, max_len=80)

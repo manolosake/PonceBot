@@ -569,6 +569,10 @@ class TestStateHandling(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             project = Path(td) / "20260511-studio-cycle-new-product-incubator-abcd1234"
             project.mkdir(parents=True, exist_ok=True)
+            (project / "PROJECT_MANIFEST.json").write_text(
+                json.dumps({"name": "Studio Cycle New Product Incubator"}),
+                encoding="utf-8",
+            )
             (project / "README.md").write_text("# BidPulse Local\n\nDemo project.\n", encoding="utf-8")
 
             self.assertEqual(bot._project_incubator_github_repo_name(project), "bidpulse-local")
