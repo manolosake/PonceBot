@@ -7387,3 +7387,54 @@ class TestFocusReceiptHelpers(unittest.TestCase):
         )
         self.assertTrue(api.messages)
         self.assertIn("Jarvis: focus receipt (global rank=3)", api.messages[-1])
+
+
+class TestPlanCommandHelpers(unittest.TestCase):
+    def test_parse_job_routes_action_plan_alias_to_plan_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=7,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/action_plan all 7",
+            )
+
+            resp, job = bot._parse_job(cfg, msg)
+
+        self.assertIsNone(job)
+        self.assertEqual(resp, bot._plan_payload_marker({"scope": "all", "limit": 7}))
+
+    def test_send_orchestrator_marker_response_handles_plan_marker(self) -> None:
+        api = _FakeAPI()
+        cfg = TestStateHandling()._cfg(Path(tempfile.mkdtemp()) / "state.json")
+        orch_q = object()
+
+        with patch.object(bot, "_send_chunked_text") as send_mock, patch.object(
+            bot, "StatusService"
+        ) as status_service_cls:
+            svc = status_service_cls.return_value
+            svc.proactive_action_plan.return_value = {
+                "generated_at": "2026-05-11T00:00:00Z",
+                "window": {"hours": 12},
+                "lanes": [],
+                "top_actions": [],
+            }
+
+            handled = bot._send_orchestrator_marker_response(
+                "plan",
+                json.dumps({"scope": "chat", "limit": 5}, sort_keys=True, separators=(",", ":")),
+                cfg,
+                api,
+                chat_id=7,
+                user_id=2,
+                reply_to_message_id=10,
+                orch_q=orch_q,  # type: ignore[arg-type]
+                profiles=None,
+            )
+
+        self.assertTrue(handled)
+        svc.proactive_action_plan.assert_called_once_with(chat_id=7, limit=5)
+        send_mock.assert_called_once()

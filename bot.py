@@ -26234,6 +26234,10 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
         tail = (text[len("/plan") :] or "").strip()
         return _parse_plan_command_tail(tail)
 
+    if text.startswith("/action_plan"):
+        tail = (text[len("/action_plan") :] or "").strip()
+        return _parse_plan_command_tail(tail)
+
     if text.startswith("/focus"):
         tail = (text[len("/focus") :] or "").strip().lower()
         return _parse_focus_command_tail(tail)
