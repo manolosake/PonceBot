@@ -18672,7 +18672,10 @@ def _proactive_lane_tick(
         try:
             memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
             governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
-            urgent_studio_repair = str(governor.get("mode") or "").strip().lower() == "repair_delivery_contract"
+            urgent_studio_repair = str(governor.get("mode") or "").strip().lower() in {
+                "repair_delivery_contract",
+                "repair_loop_breaker",
+            }
         except Exception:
             urgent_studio_repair = False
 
