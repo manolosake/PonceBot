@@ -14977,6 +14977,11 @@ _STUDIO_SELF_IMPROVEMENT_GOAL = (
     "Continuous improvement counts only when it measurably improves selection quality, delivery reliability, "
     "speed, deployability, learning, or revenue potential; never as work-for-work's-sake."
 )
+_STUDIO_R530_RESOURCE_POLICY = (
+    "r530 local CPU, memory, disk, tools, containers, and local models are available for high-value work; "
+    "use them when they improve product quality, validation depth, or shipping speed, while keeping core services "
+    "responsive and avoiding waste, runaway jobs, destructive actions, public exposure, or external spend."
+)
 
 
 def _studio_enabled() -> bool:
@@ -15496,6 +15501,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "Factory objective:",
             f"- Money: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
             f"- Self-improvement: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
+            f"- r530 resources: {_STUDIO_R530_RESOURCE_POLICY}",
             "",
             "Candidate bets:",
             *rows,
@@ -15509,6 +15515,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "Mandatory internal debate before delegation:",
             "- Would Alejandro notice this result without reading raw logs?",
             "- Can this make money, save money, increase sellability/rentability, or improve the factory's ability to create monetizable assets?",
+            "- Would using more local r530 compute, memory, disk, validation, repo search, or local models materially improve the outcome?",
             "- Does this avoid repeating prior no-delta, write-policy, or low-value work?",
             "- Can it finish in main/published/deployed form with concrete evidence?",
             "- What would make this fail, and what is the smallest safe phase?",
@@ -17126,7 +17133,10 @@ def _spawn_proactive_order(
         *incubator_policy_lines,
         f"- Factory business objective: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
         f"- Self-improvement bar: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
+        f"- r530 resource policy: {_STUDIO_R530_RESOURCE_POLICY}",
         "- Every proactive bet must state a credible path to make money, save money, increase sellability/rentability, or improve the factory's ability to create monetizable assets.",
+        "- Do not under-scope useful work just to save local CPU/RAM/disk; use r530 for deeper repo scans, tests, local demos, model-assisted research, and validation when that increases delivery quality.",
+        "- Resource-heavy work must stay bounded, observable, and clean: preserve SSH/dashboard/codexbot responsiveness, avoid runaway loops, and clean temporary artifacts after they stop adding evidence.",
         "- New project work must include a target buyer/user, problem, offer, pricing or rental hypothesis, MVP/demo, README, validation evidence, and private GitHub publication or exact blocker.",
         "- Internal platform work is valid only when it changes a measurable factory capability: better selection quality, fewer ghost deliveries, faster safe shipping, stronger deploy/release confidence, or clearer learning.",
         "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",

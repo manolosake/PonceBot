@@ -1312,6 +1312,26 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("Selected monetization path", packet)
         self.assertIn("Can this make money", packet)
 
+    def test_prompt_packet_includes_r530_resource_policy(self) -> None:
+        selected = {
+            "type": "DEEP_IMPROVEMENT",
+            "repo_name": "codexbot",
+            "score": 94,
+            "thesis": "Use deeper local validation to improve shipping quality.",
+            "operator_visible_outcome": "A safer autonomous delivery loop.",
+            "business_model": "Factory leverage.",
+            "monetization_path": "Better shipping for revenue projects.",
+            "commercial_evidence_target": "fewer failed shipments.",
+        }
+
+        packet = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory={})
+
+        self.assertIn("r530 resources", packet)
+        self.assertIn("local CPU, memory, disk", packet)
+        self.assertIn("local models", packet)
+        self.assertIn("keeping core services responsive", packet)
+        self.assertIn("Would using more local r530 compute", packet)
+
     def test_recent_same_surface_shipment_penalizes_repetition(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
