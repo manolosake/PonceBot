@@ -15408,8 +15408,34 @@ def _studio_ensure_schema(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_portfolio_projects (
+                project_key TEXT PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                project_path TEXT,
+                github_repo TEXT,
+                github_url TEXT,
+                default_branch TEXT,
+                latest_head TEXT,
+                private INTEGER,
+                status TEXT NOT NULL,
+                source_order_id TEXT,
+                latest_order_id TEXT,
+                latest_outcome_status TEXT,
+                latest_summary TEXT,
+                validation_summary TEXT,
+                monetization_summary TEXT,
+                next_milestone TEXT,
+                first_seen_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_ts ON studio_cycles(ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_status ON studio_cycles(status, updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_updated ON studio_portfolio_projects(updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_github ON studio_portfolio_projects(github_repo)")
         conn.commit()
 
 
@@ -15511,6 +15537,10 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         "studio_outcomes_by_key": {},
         "studio_outcomes_by_repo": {},
         "studio_outcomes_by_type": {},
+        "studio_portfolio_total": 0,
+        "studio_portfolio_recent_projects": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
     }
     cutoff = float(now) - 72.0 * 3600.0
     try:
@@ -15583,6 +15613,50 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
     memory["recent_studio_outcomes"] = list(dict.fromkeys(memory["recent_studio_outcomes"]))[:8]
     memory["recent_studio_negative_outcomes"] = memory["recent_studio_negative_outcomes"][:12]
     memory["recent_studio_positive_outcomes"] = memory["recent_studio_positive_outcomes"][:8]
+    try:
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            total = conn.execute(
+                "SELECT COUNT(*) AS c FROM studio_portfolio_projects WHERE status LIKE 'published%'"
+            ).fetchone()
+            memory["studio_portfolio_total"] = int(total["c"] if total else 0)
+            portfolio_rows = conn.execute(
+                """
+                SELECT project_name, project_path, github_repo, latest_head, latest_summary, updated_at
+                FROM studio_portfolio_projects
+                WHERE status LIKE 'published%'
+                ORDER BY updated_at DESC
+                LIMIT 12
+                """
+            ).fetchall()
+    except sqlite3.OperationalError:
+        portfolio_rows = []
+    except Exception:
+        portfolio_rows = []
+    recent_projects: list[str] = []
+    for row in portfolio_rows or []:
+        try:
+            updated_at = float(row["updated_at"] or 0.0)
+        except Exception:
+            updated_at = 0.0
+        age_s = max(0.0, float(now) - updated_at)
+        if age_s <= 6.0 * 3600.0:
+            memory["studio_portfolio_recent_count_6h"] = int(memory["studio_portfolio_recent_count_6h"]) + 1
+        if age_s <= 24.0 * 3600.0:
+            memory["studio_portfolio_recent_count_24h"] = int(memory["studio_portfolio_recent_count_24h"]) + 1
+        name = str(row["project_name"] or "").strip()
+        repo = str(row["github_repo"] or "").strip()
+        head = str(row["latest_head"] or "").strip()
+        summary = _studio_one_line(row["latest_summary"], max_chars=90, default="")
+        bits = [name or repo or "portfolio project"]
+        if repo:
+            bits.append(repo)
+        if head:
+            bits.append(f"head {head}")
+        if summary:
+            bits.append(summary)
+        recent_projects.append(_studio_one_line(" · ".join(bits), max_chars=180))
+    memory["studio_portfolio_recent_projects"] = list(dict.fromkeys(recent_projects))[:8]
     return memory
 
 
@@ -15788,6 +15862,33 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
 
 def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[str, Any]) -> dict[str, Any]:
     root = _project_incubator_root_dir()
+    portfolio_total = int(memory.get("studio_portfolio_total", 0) or 0)
+    recent_6h = int(memory.get("studio_portfolio_recent_count_6h", 0) or 0)
+    recent_projects = [
+        str(item)
+        for item in (memory.get("studio_portfolio_recent_projects", []) or [])[:3]
+        if str(item).strip()
+    ]
+    score = 96
+    thesis = "Create or advance one small but real sellable, rentable, or automated-revenue product beside PonceBot and ExecutiveDashboard."
+    outcome = f"A git-backed project under {root} with README, target buyer, pricing/rental hypothesis, runnable/demoable behavior, validation evidence, and private GitHub publication when safe."
+    why = "It creates visible portfolio growth and revenue optionality when no urgent fix is evidenced."
+    risk = "avoid public launch, billing, credentials, destructive actions, or large scope without operator approval"
+    if recent_6h >= 3:
+        score -= 14
+        thesis = (
+            "Advance the strongest published incubator product toward validation, demo quality, or monetization; "
+            "create a new project only if it is clearly more valuable than compounding the current portfolio."
+        )
+        outcome = (
+            f"A git-backed portfolio milestone under {root} or an existing product folder, with buyer/revenue rationale, "
+            "validation evidence, clean main, and private GitHub publication."
+        )
+        why = (
+            f"Portfolio already has {recent_6h} products shipped in the last 6h; compounding one asset may beat another shallow MVP."
+        )
+        if recent_projects:
+            risk += "; avoid duplicating recent products: " + _studio_one_line("; ".join(recent_projects), max_chars=220)
     return {
         "key": "new-project-incubator",
         "lane": "incubator",
@@ -15796,17 +15897,19 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         "repo_path": "",
         "repo_name": "New product incubator",
         "repo_kind": "Incubator",
-        "score": 96,
+        "score": score,
         "problem": "If existing repos have no critical bug, the factory should create or advance monetizable product surface area instead of doing work-for-work's-sake.",
         "target_user": "Alejandro, a clearly named buyer persona, and future operators/users",
-        "thesis": "Create or advance one small but real sellable, rentable, or automated-revenue product beside PonceBot and ExecutiveDashboard.",
-        "operator_visible_outcome": f"A git-backed project under {root} with README, target buyer, pricing/rental hypothesis, runnable/demoable behavior, validation evidence, and private GitHub publication when safe.",
+        "thesis": thesis,
+        "operator_visible_outcome": outcome,
         "evidence_target": "new folder, clean git history, README, buyer/user hypothesis, monetization hypothesis, validation command/log, GitHub private remote or exact blocker.",
         "business_model": "Direct revenue option: sellable SaaS/tool, rentable automation, lead generator, internal product accelerator, or automated income project.",
-        "monetization_path": "Create a private MVP with target customer, pain, offer, pricing/rental hypothesis, demo, and next validation milestone.",
+        "monetization_path": "Create or advance a private MVP with target customer, pain, offer, pricing/rental hypothesis, demo, and next validation milestone.",
         "commercial_evidence_target": "target buyer, problem severity, offer, price/rental hypothesis, demo/README, validation evidence, and GitHub private remote",
-        "risk_summary": "avoid public launch, billing, credentials, destructive actions, or large scope without operator approval",
-        "why_better_than_alternatives": "It creates visible portfolio growth and revenue optionality when no urgent fix is evidenced.",
+        "risk_summary": risk,
+        "why_better_than_alternatives": why,
+        "portfolio_total": portfolio_total,
+        "portfolio_recent_projects": recent_projects,
     }
 
 
@@ -15862,6 +15965,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     recent = "; ".join(str(x) for x in memory.get("recent_outcomes", [])[:4]) or "none"
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
+    portfolio_projects = "; ".join(str(x) for x in memory.get("studio_portfolio_recent_projects", [])[:6]) or "none"
     return "\n".join(
         [
             "AUTONOMOUS STUDIO CYCLE",
@@ -15872,11 +15976,13 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent outcomes: {recent}",
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
+            f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
             "",
             "Factory objective:",
             f"- Money: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
             f"- Self-improvement: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
             f"- r530 resources: {_STUDIO_R530_RESOURCE_POLICY}",
+            "- Portfolio compounding: compare every new-project bet against advancing an existing published asset toward validation, demo quality, distribution, or revenue. Do not create another shallow MVP if an existing one is the stronger business move.",
             "",
             "Candidate bets:",
             *rows,
@@ -15895,6 +16001,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "- Can it finish in main/published/deployed form with concrete evidence?",
             "- What would make this fail, and what is the smallest safe phase?",
             "- If this is internal improvement, what measurable factory capability changes and why is it not churn?",
+            "- If this is incubator work, is it better to compound a published portfolio asset instead of starting another project?",
             "- If the selected bet is weak after sensing the repo, reject it and choose a stronger candidate from the list.",
         ]
     )
@@ -15993,6 +16100,7 @@ def _studio_complete_cycle_for_order_db(
     try:
         _studio_ensure_schema(db_path)
         with sqlite3.connect(str(db_path), timeout=15.0) as conn:
+            conn.row_factory = sqlite3.Row
             conn.execute(
                 """
                 UPDATE studio_cycles
@@ -16006,6 +16114,13 @@ def _studio_complete_cycle_for_order_db(
                     ts,
                     order_id,
                 ),
+            )
+            _studio_upsert_portfolio_project_for_order_conn(
+                conn=conn,
+                order_id=order_id,
+                outcome_status=outcome_status,
+                outcome_summary=outcome_summary,
+                now=ts,
             )
             conn.commit()
     except Exception:
@@ -16026,6 +16141,176 @@ def _studio_complete_cycle_for_order(
         outcome_status=outcome_status,
         outcome_summary=outcome_summary,
         now=now,
+    )
+
+
+def _studio_project_name_from_signals(*, project_path: str, github_repo: str, summary: str) -> str:
+    path = Path(str(project_path or "")).expanduser() if project_path else None
+    if path and path.exists() and path.is_dir():
+        for readme in sorted(path.glob("README*"))[:3]:
+            if not readme.is_file():
+                continue
+            try:
+                for line in readme.read_text(encoding="utf-8", errors="replace").splitlines()[:40]:
+                    text = line.strip()
+                    if text.startswith("#"):
+                        title = text.lstrip("#").strip()
+                        if title:
+                            return _studio_one_line(title, max_chars=90, default=title)
+            except Exception:
+                continue
+    if github_repo and "/" in github_repo:
+        repo_name = github_repo.rsplit("/", 1)[-1]
+        return " ".join(part.capitalize() for part in re.split(r"[-_]+", repo_name) if part) or repo_name
+    quoted = re.search(r"`([^`]{3,80})`", str(summary or ""))
+    if quoted:
+        return _studio_one_line(quoted.group(1), max_chars=90, default=quoted.group(1))
+    if path:
+        return " ".join(part.capitalize() for part in re.split(r"[-_]+", path.name) if part) or path.name
+    return "Portfolio Project"
+
+
+def _studio_extract_portfolio_project_from_order(
+    *,
+    conn: sqlite3.Connection,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+) -> dict[str, Any] | None:
+    if str(outcome_status or "").strip() != "published_project":
+        return None
+    summary = str(outcome_summary or "")
+    trace: dict[str, Any] = {}
+    try:
+        row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (str(order_id),)).fetchone()
+        if row is not None:
+            raw_trace = row["trace"] if isinstance(row, sqlite3.Row) else row[0]
+            trace = json.loads(raw_trace or "{}")
+    except Exception:
+        trace = {}
+    publication = trace.get("github_publication") if isinstance(trace.get("github_publication"), dict) else {}
+    delivery = trace.get("project_incubator_delivery") if isinstance(trace.get("project_incubator_delivery"), dict) else {}
+
+    project_path = str(publication.get("project_path") or delivery.get("project_path") or "").strip()
+    if not project_path:
+        path_match = re.search(r"(/home/aponce/[A-Za-z0-9._/-]+)", summary)
+        if path_match:
+            project_path = path_match.group(1).rstrip("`.,;:)")
+    github_repo = str(publication.get("github_repo") or "").strip()
+    remote_url = str(publication.get("remote_url") or delivery.get("github_remote_url") or "").strip()
+    if not github_repo and remote_url:
+        github_repo = _github_repo_full_name_from_remote_url(remote_url)
+    if not github_repo:
+        repo_match = re.search(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b", summary)
+        if repo_match:
+            github_repo = repo_match.group(1).rstrip("`.,;:)")
+    if not remote_url and github_repo:
+        remote_url = f"https://github.com/{github_repo}.git"
+    latest_head = str(publication.get("head") or delivery.get("project_head") or "").strip()
+    if not latest_head:
+        head_match = re.search(r"\bhead\s+([0-9a-f]{7,40})\b", summary, flags=re.IGNORECASE)
+        if head_match:
+            latest_head = head_match.group(1)
+    branch = str(publication.get("branch") or "main").strip() or "main"
+    private_raw = publication.get("private")
+    if private_raw is None:
+        private_raw = "private" in summary.lower()
+    private = 1 if bool(private_raw) else 0
+    project_key = (github_repo or project_path).strip().lower()
+    if not project_key:
+        return None
+    project_name = _studio_project_name_from_signals(
+        project_path=project_path,
+        github_repo=github_repo,
+        summary=summary,
+    )
+    validation_summary = ""
+    if re.search(r"\b(test|tests|pytest|demo|validation|verified|passed)\b", summary, flags=re.IGNORECASE):
+        validation_summary = _studio_one_line(summary, max_chars=260, default="")
+    monetization_summary = ""
+    if re.search(r"\b(buyer|pricing|sellable|rentable|revenue|money|offer|customer)\b", summary, flags=re.IGNORECASE):
+        monetization_summary = _studio_one_line(summary, max_chars=260, default="")
+    next_milestone = ""
+    milestone_match = re.search(r"(next [^.;\n]{10,180})", summary, flags=re.IGNORECASE)
+    if milestone_match:
+        next_milestone = _studio_one_line(milestone_match.group(1), max_chars=180, default="")
+    return {
+        "project_key": project_key,
+        "project_name": project_name,
+        "project_path": project_path,
+        "github_repo": github_repo,
+        "github_url": remote_url,
+        "default_branch": branch,
+        "latest_head": latest_head,
+        "private": private,
+        "status": "published_private" if private else "published",
+        "validation_summary": validation_summary,
+        "monetization_summary": monetization_summary,
+        "next_milestone": next_milestone,
+    }
+
+
+def _studio_upsert_portfolio_project_for_order_conn(
+    *,
+    conn: sqlite3.Connection,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float,
+) -> None:
+    project = _studio_extract_portfolio_project_from_order(
+        conn=conn,
+        order_id=order_id,
+        outcome_status=outcome_status,
+        outcome_summary=outcome_summary,
+    )
+    if not project:
+        return
+    conn.execute(
+        """
+        INSERT INTO studio_portfolio_projects(
+            project_key, project_name, project_path, github_repo, github_url, default_branch,
+            latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+            latest_summary, validation_summary, monetization_summary, next_milestone,
+            first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_key) DO UPDATE SET
+            project_name = excluded.project_name,
+            project_path = COALESCE(NULLIF(excluded.project_path, ''), studio_portfolio_projects.project_path),
+            github_repo = COALESCE(NULLIF(excluded.github_repo, ''), studio_portfolio_projects.github_repo),
+            github_url = COALESCE(NULLIF(excluded.github_url, ''), studio_portfolio_projects.github_url),
+            default_branch = COALESCE(NULLIF(excluded.default_branch, ''), studio_portfolio_projects.default_branch),
+            latest_head = COALESCE(NULLIF(excluded.latest_head, ''), studio_portfolio_projects.latest_head),
+            private = excluded.private,
+            status = excluded.status,
+            latest_order_id = excluded.latest_order_id,
+            latest_outcome_status = excluded.latest_outcome_status,
+            latest_summary = excluded.latest_summary,
+            validation_summary = COALESCE(NULLIF(excluded.validation_summary, ''), studio_portfolio_projects.validation_summary),
+            monetization_summary = COALESCE(NULLIF(excluded.monetization_summary, ''), studio_portfolio_projects.monetization_summary),
+            next_milestone = COALESCE(NULLIF(excluded.next_milestone, ''), studio_portfolio_projects.next_milestone),
+            updated_at = excluded.updated_at
+        """,
+        (
+            project["project_key"],
+            project["project_name"],
+            project["project_path"],
+            project["github_repo"],
+            project["github_url"],
+            project["default_branch"],
+            project["latest_head"],
+            int(project["private"]),
+            project["status"],
+            str(order_id),
+            str(order_id),
+            str(outcome_status),
+            _studio_one_line(outcome_summary, max_chars=500, default=str(outcome_status)),
+            project["validation_summary"],
+            project["monetization_summary"],
+            project["next_milestone"],
+            float(now),
+            float(now),
+        ),
     )
 
 

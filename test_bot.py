@@ -1332,6 +1332,99 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
         self.assertIn("Needs operator decision", packet)
 
+    def test_published_project_outcome_records_portfolio_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 225_000.0
+            order_id = "order-portfolio-1"
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace) VALUES (?, ?)",
+                    (
+                        order_id,
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/lead-offer-brief",
+                                    "remote_url": "https://github.com/manolosake/lead-offer-brief.git",
+                                    "branch": "main",
+                                    "head": "2efec0a",
+                                    "private": True,
+                                },
+                                "project_incubator_delivery": {
+                                    "project_path": "/home/aponce/lead-offer-brief",
+                                    "project_head": "2efec0a",
+                                },
+                            }
+                        ),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-portfolio",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "new-project-incubator",
+                        "NEW_PROJECT",
+                        "",
+                        "",
+                        "incubator",
+                        "Create a sellable project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        order_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            bot._studio_complete_cycle_for_order_db(
+                db_path=db,
+                order_id=order_id,
+                outcome_status="published_project",
+                outcome_summary="Published Lead Offer Brief as private GitHub repo manolosake/lead-offer-brief; 3 tests passed.",
+                now=now + 60,
+            )
+            memory = bot._studio_recent_cycle_outcome_memory(db, now=now + 120)
+            packet = bot._studio_cycle_prompt_packet(
+                selected={
+                    "type": "NEW_PROJECT",
+                    "repo_name": "New product incubator",
+                    "score": 96,
+                    "thesis": "Create or advance a monetizable product.",
+                    "operator_visible_outcome": "Published product evidence.",
+                },
+                opportunities=[],
+                memory=memory,
+            )
+
+        self.assertEqual(memory["studio_portfolio_total"], 1)
+        self.assertEqual(memory["studio_portfolio_recent_count_6h"], 1)
+        self.assertIn("Lead Offer Brief", memory["studio_portfolio_recent_projects"][0])
+        self.assertIn("manolosake/lead-offer-brief", memory["studio_portfolio_recent_projects"][0])
+        self.assertIn("Portfolio assets", packet)
+        self.assertIn("Portfolio compounding", packet)
+
     def test_incubator_opportunity_requires_monetization_evidence(self) -> None:
         item = bot._studio_incubator_opportunity(
             cfg=SimpleNamespace(),  # type: ignore[arg-type]
@@ -1348,6 +1441,25 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("Direct revenue", item["business_model"])
         self.assertIn("target customer", item["monetization_path"])
         self.assertIn("target buyer", item["commercial_evidence_target"])
+
+    def test_incubator_opportunity_compounds_when_portfolio_is_fresh(self) -> None:
+        item = bot._studio_incubator_opportunity(
+            cfg=SimpleNamespace(),  # type: ignore[arg-type]
+            now=250_000.0,
+            memory={
+                "studio_portfolio_total": 5,
+                "studio_portfolio_recent_count_6h": 3,
+                "studio_portfolio_recent_projects": [
+                    "WinbackWorkbench · manolosake/winback-workbench · head 973e958",
+                    "Lead Offer Brief · manolosake/lead-offer-brief · head 2efec0a",
+                ],
+            },
+        )
+
+        self.assertLess(item["score"], 96)
+        self.assertIn("Advance the strongest published incubator product", item["thesis"])
+        self.assertIn("compounding one asset", item["why_better_than_alternatives"])
+        self.assertIn("avoid duplicating recent products", item["risk_summary"])
 
     def test_prompt_packet_includes_business_objective_and_self_improvement_guard(self) -> None:
         selected = {
