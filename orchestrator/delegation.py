@@ -7,7 +7,7 @@ import json
 import re
 
 
-_ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "architect_local", "implementer_local", "reviewer_local")
+_ALLOWED_ROLES = ("jarvis", "frontend", "backend", "qa", "sre", "product_ops", "security", "research", "release_mgr", "critic", "architect_local", "implementer_local", "reviewer_local")
 _ALLOWED_MODES = ("ro", "rw", "full")
 _ALLOWED_SLA = ("normal", "high", "urgent")
 
