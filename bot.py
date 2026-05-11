@@ -26885,6 +26885,74 @@ def _cleanup_stale_blocked_jobs(*, orch_q: OrchestratorQueue, now: float) -> int
 
 
 
+def _cleanup_terminal_parent_children_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Cancel active child jobs whose root order is already terminal.
+
+    Grounded issue this prevents: a controller can close an order after validated delivery
+    while previously delegated implementation/QA jobs continue running and spend credits on
+    work that can no longer change the closed outcome.
+    """
+    active_states = ("queued", "waiting_deps", "blocked_approval", "running", "blocked")
+    terminal_parent_states = {"done", "failed", "cancelled", "canceled"}
+    try:
+        max_cancel = max(1, min(50, int(os.environ.get("BOT_TERMINAL_PARENT_CHILD_MAX_CANCEL_PER_TICK", "16").strip() or "16")))
+    except Exception:
+        max_cancel = 16
+
+    cancelled = 0
+    seen: set[str] = set()
+    for state in active_states:
+        if cancelled >= max_cancel:
+            break
+        try:
+            tasks = orch_q.jobs_by_state(state=state, limit=700)
+        except Exception:
+            tasks = []
+        for task in tasks:
+            if cancelled >= max_cancel:
+                break
+            job_id = str(getattr(task, "job_id", "") or "").strip()
+            parent_id = str(getattr(task, "parent_job_id", "") or "").strip()
+            if not job_id or not parent_id or job_id in seen:
+                continue
+            seen.add(job_id)
+            try:
+                parent = orch_q.get_job(parent_id)
+            except Exception:
+                parent = None
+            parent_state = str(getattr(parent, "state", "") or "").strip().lower() if parent is not None else ""
+            if parent_state not in terminal_parent_states:
+                continue
+            try:
+                ok = orch_q.update_state(
+                    job_id,
+                    "cancelled",
+                    blocked_reason="parent_order_terminal",
+                    result_summary=f"Auto-cancelled: parent order {parent_id[:8]} is already {parent_state}.",
+                    result_next_action="Do not continue child work after parent outcome is closed.",
+                    parent_order_terminal_cleanup=True,
+                    parent_order_terminal_cleanup_at=float(now),
+                )
+                if not ok:
+                    continue
+                cancelled += 1
+                orch_q.append_audit_event(
+                    event_type="task.terminal_parent_child_cancelled",
+                    actor="scheduler",
+                    details={
+                        "job_id": job_id,
+                        "parent_job_id": parent_id,
+                        "parent_state": parent_state,
+                        "previous_state": state,
+                        "role": str(getattr(task, "role", "") or ""),
+                    },
+                )
+            except Exception:
+                continue
+    return int(cancelled)
+
+
 def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
@@ -36764,6 +36832,10 @@ def main() -> None:
                     _cleanup_stale_blocked_jobs(orch_q=orchestrator_queue, now=time.time())
                 except Exception:
                     LOG.exception("Hygiene stale cleanup tick failed")
+                try:
+                    _cleanup_terminal_parent_children_tick(orch_q=orchestrator_queue, now=time.time())
+                except Exception:
+                    LOG.exception("Terminal-parent child cleanup tick failed")
                 try:
                     _cleanup_proactive_local_waiting_jobs(
                         orch_q=orchestrator_queue,
