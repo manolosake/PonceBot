@@ -1125,6 +1125,155 @@ class TestStateHandling(unittest.TestCase):
         self.assertNotIn("/tmp/worktrees/skynet/slot1", safe)
 
 
+class TestStudioOutcomeMemory(unittest.TestCase):
+    class _FakeQueue:
+        def list_orders_global(self, status=None, limit: int = 240):
+            return []
+
+    def _insert_cycle_outcome(
+        self,
+        db: Path,
+        *,
+        now: float,
+        key: str,
+        repo_id: str,
+        selected_type: str,
+        outcome_status: str,
+        outcome_summary: str,
+    ) -> None:
+        bot._studio_ensure_schema(db)
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """
+                INSERT INTO studio_cycles(
+                    cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                    selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                    operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                    opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"cycle-{key}-{outcome_status}",
+                    bot._STUDIO_CYCLE_VERSION,
+                    now - 600,
+                    "failed",
+                    key,
+                    selected_type,
+                    repo_id,
+                    "",
+                    "studio",
+                    "Improve selection",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "[]",
+                    outcome_status,
+                    outcome_summary,
+                    None,
+                    now - 600,
+                    now - 600,
+                ),
+            )
+            conn.commit()
+
+    def test_recent_negative_studio_outcome_penalizes_matching_core_opportunity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            now = 100_000.0
+            cfg = SimpleNamespace(orchestrator_db_path=db)
+            repos = [
+                {
+                    "repo_id": "codexbot-core",
+                    "path": "",
+                    "status": "active",
+                    "autonomy_enabled": True,
+                    "priority": 1,
+                    "metadata": {},
+                },
+                {
+                    "repo_id": "executivedashboard",
+                    "path": "",
+                    "status": "active",
+                    "autonomy_enabled": True,
+                    "priority": 1,
+                    "metadata": {},
+                },
+            ]
+
+            without_memory = bot._studio_build_opportunities(
+                cfg=cfg,  # type: ignore[arg-type]
+                orch_q=self._FakeQueue(),  # type: ignore[arg-type]
+                repos=repos,
+                occupied_keys=set(),
+                occupied_repo_ids=set(),
+                now=now,
+            )
+            self.assertEqual(without_memory[0]["repo_id"], "codexbot-core")
+
+            self._insert_cycle_outcome(
+                db,
+                now=now,
+                key="repo-codexbot-core",
+                repo_id="codexbot-core",
+                selected_type="DEEP_IMPROVEMENT",
+                outcome_status="failed_root_caused",
+                outcome_summary="Repeated the same thesis and did not produce a mergeable delta.",
+            )
+
+            with_memory = bot._studio_build_opportunities(
+                cfg=cfg,  # type: ignore[arg-type]
+                orch_q=self._FakeQueue(),  # type: ignore[arg-type]
+                repos=repos,
+                occupied_keys=set(),
+                occupied_repo_ids=set(),
+                now=now,
+            )
+
+        by_repo = {str(item["repo_id"]): item for item in with_memory}
+        self.assertEqual(with_memory[0]["repo_id"], "executivedashboard")
+        self.assertLess(by_repo["codexbot-core"]["score"], by_repo["executivedashboard"]["score"])
+        self.assertTrue(by_repo["codexbot-core"]["recent_studio_outcome_risks"])
+        self.assertIn("recent Studio caution", by_repo["codexbot-core"]["risk_summary"])
+        self.assertIn("lower confidence", by_repo["codexbot-core"]["why_better_than_alternatives"])
+
+    def test_prompt_packet_includes_recent_studio_outcomes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            now = 200_000.0
+            self._insert_cycle_outcome(
+                db,
+                now=now,
+                key="repo-codexbot-core",
+                repo_id="codexbot-core",
+                selected_type="DEEP_IMPROVEMENT",
+                outcome_status="blocked_need_operator",
+                outcome_summary="Needs operator decision before retrying the same repo.",
+            )
+            memory = bot._studio_selection_memory(
+                cfg=SimpleNamespace(orchestrator_db_path=db),  # type: ignore[arg-type]
+                orch_q=self._FakeQueue(),  # type: ignore[arg-type]
+                now=now,
+            )
+            selected = {
+                "type": "DEEP_IMPROVEMENT",
+                "repo_name": "codexbot",
+                "score": 58,
+                "thesis": "Improve Studio selectivity.",
+                "operator_visible_outcome": "A clearer Studio selection loop.",
+            }
+
+            packet = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory=memory)
+
+        self.assertIn("Recent Studio outcomes", packet)
+        self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
+        self.assertIn("Needs operator decision", packet)
+
+
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
         return TestStateHandling()._cfg(state_file)

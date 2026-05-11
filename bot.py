@@ -15075,6 +15075,113 @@ def _studio_recent_order_memory(orch_q: OrchestratorQueue, *, now: float) -> dic
     return memory
 
 
+def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[str, Any]:
+    memory: dict[str, Any] = {
+        "studio_outcomes_72h": 0,
+        "recent_studio_outcomes": [],
+        "recent_studio_negative_outcomes": [],
+        "recent_studio_positive_outcomes": [],
+        "studio_outcomes_by_key": {},
+        "studio_outcomes_by_repo": {},
+        "studio_outcomes_by_type": {},
+    }
+    cutoff = float(now) - 72.0 * 3600.0
+    try:
+        db = Path(db_path).expanduser()
+        if not db.exists():
+            return memory
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT selected_key, selected_repo_id, selected_type, outcome_status, outcome_summary, updated_at
+                FROM studio_cycles
+                WHERE updated_at >= ?
+                  AND outcome_status IN (
+                    'shipped_to_main', 'published_project', 'blocked_need_operator',
+                    'rejected_low_value', 'failed_root_caused'
+                  )
+                ORDER BY updated_at DESC
+                LIMIT 80
+                """,
+                (cutoff,),
+            ).fetchall()
+    except Exception:
+        return memory
+
+    negative = {"failed_root_caused", "blocked_need_operator", "rejected_low_value"}
+    positive = {"shipped_to_main", "published_project"}
+
+    def _append_index(index_key: str, value: str, entry: dict[str, Any]) -> None:
+        if not value:
+            return
+        bucket = memory[index_key].setdefault(value, [])
+        bucket.append(entry)
+
+    for row in rows or []:
+        status = str(row["outcome_status"] or "").strip()
+        if not status:
+            continue
+        key = str(row["selected_key"] or "").strip().lower()
+        repo_id = str(row["selected_repo_id"] or "").strip().lower()
+        selected_type = str(row["selected_type"] or "").strip().upper()
+        summary = _studio_one_line(row["outcome_summary"], max_chars=120, default=status)
+        entry = {
+            "key": key,
+            "repo_id": repo_id,
+            "type": selected_type,
+            "status": status,
+            "summary": summary,
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+        memory["studio_outcomes_72h"] = int(memory["studio_outcomes_72h"]) + 1
+        compact = f"{status}"
+        if repo_id:
+            compact += f" repo={repo_id}"
+        elif key:
+            compact += f" key={key}"
+        if selected_type:
+            compact += f" type={selected_type}"
+        if summary and summary != status:
+            compact += f": {summary}"
+        memory["recent_studio_outcomes"].append(_studio_one_line(compact, max_chars=180))
+        if status in negative:
+            memory["recent_studio_negative_outcomes"].append(entry)
+        elif status in positive:
+            memory["recent_studio_positive_outcomes"].append(entry)
+        _append_index("studio_outcomes_by_key", key, entry)
+        _append_index("studio_outcomes_by_repo", repo_id, entry)
+        _append_index("studio_outcomes_by_type", selected_type, entry)
+
+    memory["recent_studio_outcomes"] = list(dict.fromkeys(memory["recent_studio_outcomes"]))[:8]
+    memory["recent_studio_negative_outcomes"] = memory["recent_studio_negative_outcomes"][:12]
+    memory["recent_studio_positive_outcomes"] = memory["recent_studio_positive_outcomes"][:8]
+    return memory
+
+
+def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
+    memory = _studio_recent_order_memory(orch_q, now=now)
+    cycle_memory = _studio_recent_cycle_outcome_memory(cfg.orchestrator_db_path, now=now)
+    memory.update(cycle_memory)
+    return memory
+
+
+def _studio_outcome_matches(entry: dict[str, Any], *, key: str, repo_id: str, work_type: str) -> str:
+    entry_key = str(entry.get("key") or "").strip().lower()
+    entry_repo_id = str(entry.get("repo_id") or "").strip().lower()
+    entry_type = str(entry.get("type") or "").strip().upper()
+    work_type = str(work_type or "").strip().upper()
+    if entry_key and entry_key == key:
+        return "same key"
+    if entry_repo_id and repo_id and entry_repo_id == repo_id and entry_type and entry_type == work_type:
+        return "same repo/type"
+    if entry_repo_id and repo_id and entry_repo_id == repo_id:
+        return "same repo"
+    if entry_type and work_type and entry_type == work_type:
+        return "same type"
+    return ""
+
+
 def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: dict[str, Any]) -> dict[str, Any]:
     repo_name = _studio_repo_display_name(repo)
     kind = _studio_repo_kind(repo)
@@ -15119,8 +15226,50 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     if last_blocker:
         score -= 20
 
+    key = f"repo-{repo_id or _slug_token(repo_name, max_len=30)}"
+    recent_risks: list[str] = []
+    recent_wins: list[str] = []
+    for entry in memory.get("recent_studio_negative_outcomes", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        match = _studio_outcome_matches(entry, key=key, repo_id=repo_id, work_type=work_type)
+        if not match:
+            continue
+        status_text = str(entry.get("status") or "").strip()
+        summary = _studio_one_line(entry.get("summary"), max_chars=100, default=status_text)
+        recent_risks.append(f"{match} {status_text}: {summary}")
+        if match == "same key":
+            score -= 36
+        elif match == "same repo/type":
+            score -= 30
+        elif match == "same repo":
+            score -= 20
+        else:
+            score -= 6
+    for entry in memory.get("recent_studio_positive_outcomes", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        match = _studio_outcome_matches(entry, key=key, repo_id=repo_id, work_type=work_type)
+        if match not in {"same key", "same repo/type", "same repo"}:
+            continue
+        status_text = str(entry.get("status") or "").strip()
+        summary = _studio_one_line(entry.get("summary"), max_chars=100, default=status_text)
+        recent_wins.append(f"{match} {status_text}: {summary}")
+        score += 6 if match == "same key" else 4
+    if recent_risks:
+        score = max(0, score)
+
+    base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
+    if recent_risks:
+        base_risk = f"{base_risk}; recent Studio caution: {_studio_one_line('; '.join(recent_risks[:2]), max_chars=220)}"
+    why = f"{kind} work maps directly to the highest-value factory surface."
+    if recent_risks:
+        why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
+    elif recent_wins:
+        why += f" Recent Studio success adds modest confidence: {_studio_one_line('; '.join(recent_wins[:2]), max_chars=160)}."
+
     return {
-        "key": f"repo-{repo_id or _slug_token(repo_name, max_len=30)}",
+        "key": key,
         "lane": "core" if kind == "Core" else ("dashboard" if kind == "Dashboard" else "portfolio"),
         "type": work_type,
         "repo_id": repo_id,
@@ -15133,8 +15282,10 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         "thesis": thesis,
         "operator_visible_outcome": outcome,
         "evidence_target": "tests/logs plus merge/push/deploy evidence; UI work also needs screenshot or browser validation.",
-        "risk_summary": last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path",
-        "why_better_than_alternatives": f"{kind} work maps directly to the highest-value factory surface.",
+        "risk_summary": base_risk,
+        "why_better_than_alternatives": why,
+        "recent_studio_outcome_risks": recent_risks[:4],
+        "recent_studio_outcome_wins": recent_wins[:3],
     }
 
 
@@ -15167,8 +15318,10 @@ def _studio_build_opportunities(
     occupied_keys: set[str],
     occupied_repo_ids: set[str],
     now: float,
+    memory: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    memory = _studio_recent_order_memory(orch_q, now=now)
+    if memory is None:
+        memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
     opportunities: list[dict[str, Any]] = []
     for repo in repos:
         status = str(repo.get("status") or "").strip().lower()
@@ -15206,6 +15359,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     rows = [_line(item, idx + 1) for idx, item in enumerate(opportunities)]
     recent = "; ".join(str(x) for x in memory.get("recent_outcomes", [])[:4]) or "none"
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
+    studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
     return "\n".join(
         [
             "AUTONOMOUS STUDIO CYCLE",
@@ -15215,6 +15369,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- proactive orders 72h: {memory.get('orders_72h', 0)}; done: {memory.get('done_72h', 0)}; failed/paused: {memory.get('failed_72h', 0)}; active: {memory.get('active', 0)}",
             f"- recent outcomes: {recent}",
             f"- recent failures: {failures}",
+            f"- Recent Studio outcomes: {studio_outcomes}",
             "",
             "Candidate bets:",
             *rows,
@@ -15383,7 +15538,7 @@ def _studio_next_bet(
 ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
     if not _studio_enabled():
         return None
-    memory = _studio_recent_order_memory(orch_q, now=now)
+    memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
     opportunities = _studio_build_opportunities(
         cfg=cfg,
         orch_q=orch_q,
@@ -15391,6 +15546,7 @@ def _studio_next_bet(
         occupied_keys=occupied_keys,
         occupied_repo_ids=occupied_repo_ids,
         now=now,
+        memory=memory,
     )
     if not opportunities:
         return None
