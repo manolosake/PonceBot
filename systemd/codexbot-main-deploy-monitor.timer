@@ -1,0 +1,11 @@
+[Unit]
+Description=Run PonceBot main branch deploy monitor every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=codexbot-main-deploy-monitor.service
+
+[Install]
+WantedBy=timers.target

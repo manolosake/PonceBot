@@ -1,0 +1,11 @@
+[Unit]
+Description=PonceBot main branch deploy monitor
+After=network-online.target poncebot-static-prod.service
+Wants=network-online.target poncebot-static-prod.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/aponce/codexbot
+EnvironmentFile=-%h/codexbot/codexbot.env
+ExecStart=/home/aponce/codexbot/.venv/bin/python /home/aponce/codexbot/tools/main_deploy_monitor.py
+TimeoutStartSec=3600

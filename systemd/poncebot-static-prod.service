@@ -1,0 +1,14 @@
+[Unit]
+Description=PonceBot static production preview server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aponce/codexbot
+ExecStart=/home/aponce/codexbot/.venv/bin/python /home/aponce/codexbot/tools/static_prod_server.py --root /home/aponce/production-sites/current --host 127.0.0.1 --port 8890
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
