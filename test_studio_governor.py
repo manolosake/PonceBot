@@ -248,6 +248,39 @@ def test_workspace_lease_reaps_terminal_job_holder(tmp_path):
     assert storage.get_workspace_lease(job_id=fresh.job_id) == ("skynet", 1)
 
 
+def test_controller_snapshot_delivery_candidate_requires_validated_release_blocker(tmp_path):
+    snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
+    snapshot.mkdir(parents=True)
+    patch = snapshot.parent / "changes.patch"
+    patch.write_text("diff --git a/static/app.js b/static/app.js\n", encoding="utf-8")
+
+    candidate = bot._controller_snapshot_delivery_candidate(
+        {
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_summary": "PASS implementation/review. Outcome: blocked_need_operator. controller-snapshot has no origin.",
+            "result_next_action": "Apply the validated changes into the real repository checkout, commit, push, and deploy.",
+        }
+    )
+
+    assert candidate["snapshot_dir"] == str(snapshot)
+    assert candidate["patch_path"] == str(patch)
+    assert not bot._controller_snapshot_delivery_candidate(
+        {
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_summary": "Blocked in controller snapshot without validation evidence.",
+        }
+    )
+
+
+def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
+    assert bot._controller_snapshot_safe_untracked_path("test_agents_sprint_brief_shell.py")
+    assert bot._controller_snapshot_safe_untracked_path("static/app.js")
+    assert not bot._controller_snapshot_safe_untracked_path("output/playwright/screenshot.png")
+    assert not bot._controller_snapshot_safe_untracked_path("../outside.py")
+
+
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():
     assert bot._studio_repo_kind({"path": "/home/aponce/codexbot", "repo_id": "codexbot"}) == "Core"
     assert bot._studio_repo_kind({"path": "/home/aponce/poncebot-control-room", "repo_id": "poncebot-control-room"}) == "Portfolio"

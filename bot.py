@@ -14744,6 +14744,290 @@ def _order_operational_maturity_gate(
     return True, "passed", payload
 
 
+def _controller_snapshot_autoship_enabled() -> bool:
+    raw = str(os.environ.get("BOT_CONTROLLER_SNAPSHOT_AUTOSHIP_ENABLED", "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _controller_snapshot_delivery_candidate(trace: dict[str, Any] | None) -> dict[str, Any]:
+    tr = dict(trace or {})
+    if not _controller_snapshot_autoship_enabled():
+        return {}
+    if bool(tr.get("merged_to_main", False)) or bool(tr.get("controller_snapshot_autoship_done", False)):
+        return {}
+
+    snapshot_raw = str(tr.get("controller_snapshot_workdir") or "").strip()
+    if not snapshot_raw:
+        structured = tr.get("structured_digest") if isinstance(tr.get("structured_digest"), dict) else {}
+        snapshot_raw = str(structured.get("workdir") or "").strip()
+    if not snapshot_raw:
+        return {}
+
+    structured = tr.get("structured_digest") if isinstance(tr.get("structured_digest"), dict) else {}
+    summary_blob = " ".join(
+        str(piece or "")
+        for piece in (
+            tr.get("result_summary"),
+            tr.get("result_next_action"),
+            structured.get("summary") if isinstance(structured, dict) else "",
+            structured.get("next_action") if isinstance(structured, dict) else "",
+        )
+    ).lower()
+    if "controller-snapshot" not in summary_blob and "controller snapshot" not in summary_blob:
+        return {}
+    if "blocked_need_operator" not in summary_blob and "apply the validated changes" not in summary_blob:
+        return {}
+    if "pass" not in summary_blob and "validated" not in summary_blob:
+        return {}
+
+    artifacts: list[str] = []
+    for raw in tr.get("result_artifacts") or []:
+        path = str(raw or "").strip()
+        if path:
+            artifacts.append(path)
+    for raw in structured.get("result_artifacts") or structured.get("artifacts") or []:
+        path = str(raw or "").strip()
+        if path and path not in artifacts:
+            artifacts.append(path)
+
+    snapshot = Path(snapshot_raw).expanduser()
+    patch_paths = [Path(path).expanduser() for path in artifacts if Path(str(path)).name == "changes.patch"]
+    fallback_patch = snapshot.parent / "changes.patch"
+    if fallback_patch not in patch_paths:
+        patch_paths.append(fallback_patch)
+
+    patch = next((path for path in patch_paths if path.exists() and path.is_file() and path.stat().st_size > 0), None)
+    if patch is None:
+        return {}
+    return {"snapshot_dir": str(snapshot), "patch_path": str(patch)}
+
+
+def _controller_snapshot_safe_untracked_path(rel_path: str) -> bool:
+    rel = str(rel_path or "").strip()
+    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+        return False
+    parts = {part.lower() for part in Path(rel).parts}
+    blocked_parts = {"output", "node_modules", ".git", ".venv", "__pycache__", ".pytest_cache"}
+    if parts & blocked_parts:
+        return False
+    return Path(rel).suffix.lower() in {
+        ".css",
+        ".html",
+        ".js",
+        ".json",
+        ".md",
+        ".py",
+        ".sh",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".yml",
+        ".yaml",
+    }
+
+
+def _controller_snapshot_copy_safe_untracked_files(*, snapshot_dir: Path, repo_dir: Path) -> list[str]:
+    proc = _run_git(snapshot_dir, ["ls-files", "--others", "--exclude-standard"], check=False)
+    if proc.returncode != 0:
+        return []
+    copied: list[str] = []
+    repo_root = repo_dir.resolve()
+    for raw in str(proc.stdout or "").splitlines():
+        rel = raw.strip()
+        if not _controller_snapshot_safe_untracked_path(rel):
+            continue
+        src = (snapshot_dir / rel).resolve()
+        dst = (repo_dir / rel).resolve()
+        if not _path_is_relative_to(dst, repo_root) or not src.is_file():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        copied.append(rel)
+    return copied
+
+
+def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list[str]) -> list[list[str]]:
+    commands: list[list[str]] = []
+    python_bin = str(repo_dir / ".venv" / "bin" / "python") if (repo_dir / ".venv" / "bin" / "python").exists() else "python3"
+    py_files = [path for path in changed_paths if path.endswith(".py")]
+    js_files = [path for path in changed_paths if path.endswith(".js")]
+    if py_files:
+        commands.append([python_bin, "-m", "py_compile", *py_files[:20]])
+    for path in js_files[:12]:
+        commands.append(["node", "--check", path])
+    return commands
+
+
+def _auto_ship_controller_snapshot_order(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    trace: dict[str, Any],
+    repo_record: dict[str, Any] | None,
+    repo_dir: Path,
+    default_branch: str,
+    now: float,
+) -> dict[str, Any]:
+    candidate = _controller_snapshot_delivery_candidate(trace)
+    if not candidate:
+        return {"status": "skipped", "reason": "not_candidate"}
+    if not (repo_dir / ".git").exists():
+        return {"status": "skipped", "reason": "repo_not_git"}
+
+    snapshot_dir = Path(str(candidate.get("snapshot_dir") or "")).expanduser()
+    patch_path = Path(str(candidate.get("patch_path") or "")).expanduser()
+    if not snapshot_dir.exists() or not patch_path.exists():
+        return {"status": "failed", "reason": "missing_snapshot_artifacts"}
+
+    sync_ok, sync_msg, _deployed_commit, deploy_repo_dir = _sync_repo_checkout_to_default_branch(
+        repo=repo_dir,
+        default_branch=default_branch,
+    )
+    target_repo = deploy_repo_dir or repo_dir
+    if not sync_ok:
+        return {"status": "failed", "reason": "repo_sync_failed", "detail": sync_msg}
+
+    status_before = _git_status_porcelain(target_repo)
+    if status_before.strip():
+        return {"status": "failed", "reason": "repo_dirty_before_snapshot_autoship", "detail": status_before}
+
+    check = _run_git(target_repo, ["apply", "--check", str(patch_path)], check=False)
+    if check.returncode != 0:
+        reverse = _run_git(target_repo, ["apply", "--reverse", "--check", str(patch_path)], check=False)
+        if reverse.returncode == 0:
+            return {"status": "skipped", "reason": "snapshot_patch_already_applied"}
+        return {"status": "failed", "reason": "snapshot_patch_check_failed", "detail": (check.stderr or check.stdout or "").strip()}
+
+    applied = _run_git(target_repo, ["apply", str(patch_path)], check=False)
+    if applied.returncode != 0:
+        return {"status": "failed", "reason": "snapshot_patch_apply_failed", "detail": (applied.stderr or applied.stdout or "").strip()}
+
+    copied_untracked = _controller_snapshot_copy_safe_untracked_files(snapshot_dir=snapshot_dir, repo_dir=target_repo)
+    status_after = _git_status_porcelain(target_repo)
+    changed_paths = _git_changed_paths_from_porcelain(status_after)
+    if not changed_paths:
+        return {"status": "skipped", "reason": "snapshot_no_delta_after_apply"}
+
+    validation_results: list[dict[str, Any]] = []
+    env = _autonomous_commit_identity_env(target_repo)
+    for command in _controller_snapshot_validation_commands(target_repo, changed_paths):
+        run = subprocess.run(
+            command,
+            cwd=str(target_repo),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        validation_results.append(
+            {
+                "command": shlex.join(command),
+                "returncode": int(run.returncode),
+                "stdout": _tail_text(str(run.stdout or ""), max_chars=600),
+                "stderr": _tail_text(str(run.stderr or ""), max_chars=600),
+            }
+        )
+        if run.returncode != 0:
+            return {"status": "failed", "reason": "snapshot_validation_failed", "validation": validation_results}
+
+    add = _run_git(target_repo, ["add", "--", *changed_paths], check=False, env=env)
+    if add.returncode != 0:
+        return {"status": "failed", "reason": "snapshot_git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+
+    commit_msg = f"Ship controller snapshot {str(order_id or '')[:8]}"
+    commit = _run_git(target_repo, ["commit", "-m", commit_msg], check=False, env=env)
+    if commit.returncode != 0:
+        return {"status": "failed", "reason": "snapshot_commit_failed", "detail": (commit.stderr or commit.stdout or "").strip()}
+
+    rev = _run_git(target_repo, ["rev-parse", "--short", "HEAD"], check=False, env=env)
+    commit_sha = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+    push = _run_git(target_repo, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False, env=env)
+    if push.returncode != 0:
+        return {"status": "failed", "reason": "snapshot_push_failed", "detail": (push.stderr or push.stdout or "").strip(), "commit": commit_sha}
+
+    deploy_result = _deploy_after_order_merge(
+        cfg=cfg,
+        repo_record=repo_record,
+        repo_dir=repo_dir,
+        default_branch=default_branch,
+        order_id=order_id,
+        order_branch=str(trace.get("order_branch") or "controller_snapshot"),
+        merge_commit=(commit_sha or None),
+    )
+    deploy_status = str(deploy_result.get("status") or "").strip().lower() or "skipped"
+    deploy_summary = _deploy_result_display(deploy_result)
+    ok = deploy_status != "failed"
+    summary = (
+        f"Auto-shipped validated controller snapshot to {default_branch}"
+        + (f" commit={commit_sha}" if commit_sha else "")
+        + (f". {deploy_summary}" if deploy_summary else ".")
+    )
+    try:
+        orch_q.set_order_status(order_id, chat_id=int(chat_id), status=("done" if ok else "active"))
+        orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase=("done" if ok else "review"))
+        orch_q.update_state(
+            order_id,
+            ("done" if ok else "blocked"),
+            blocked_reason=(None if ok else "deploy_failed"),
+            merge_ready=False,
+            merge_required=False,
+            merged_to_main=bool(ok),
+            merge_commit=(commit_sha or None),
+            deploy_status=deploy_status,
+            deploy_result=str(deploy_result.get("reason") or ""),
+            deploy_summary=deploy_summary,
+            deployed_commit=deploy_result.get("deployed_commit"),
+            deployed_at=(float(now) if ok else None),
+            deploy_error=(deploy_result.get("detail") if not ok else None),
+            controller_snapshot_autoship_done=bool(ok),
+            controller_snapshot_autoship_at=float(now),
+            controller_snapshot_autoship_commit=(commit_sha or None),
+            controller_snapshot_autoship_paths=changed_paths,
+            controller_snapshot_autoship_copied_untracked=copied_untracked,
+            controller_snapshot_autoship_validation=validation_results,
+            result_status=("merged" if ok else "deploy_failed"),
+            result_summary=summary,
+            result_next_action=("Factory ready for next order." if ok else "Inspect deployment failure and complete rollout."),
+        )
+        _studio_complete_cycle_for_order(
+            cfg=cfg,
+            order_id=order_id,
+            outcome_status=("shipped_to_main" if ok else "failed_root_caused"),
+            outcome_summary=summary,
+            now=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.controller_snapshot_autoship",
+            actor="jarvis",
+            details={
+                "order_id": order_id,
+                "repo_path": str(repo_dir),
+                "default_branch": default_branch,
+                "commit": commit_sha,
+                "changed_paths": changed_paths,
+                "copied_untracked": copied_untracked,
+                "deploy": deploy_result,
+            },
+        )
+    except Exception:
+        pass
+
+    return {
+        "status": ("ok" if ok else "failed"),
+        "reason": ("snapshot_autoship_complete" if ok else "snapshot_autoship_deploy_failed"),
+        "summary": summary,
+        "commit": commit_sha,
+        "changed_paths": changed_paths,
+        "copied_untracked": copied_untracked,
+        "deploy": deploy_result,
+    }
+
+
 def _auto_merge_ready_orders_tick(
     *,
     cfg: BotConfig,
@@ -14798,6 +15082,7 @@ def _auto_merge_ready_orders_tick(
         done_orders = []
 
     known_ids = {str(it.get("order_id") or "").strip() for it in orders}
+    snapshot_autoship_count = 0
     for row in done_orders:
             oid = str(row.get("order_id") or "").strip()
             if not oid:
@@ -14822,6 +15107,43 @@ def _auto_merge_ready_orders_tick(
                 continue
             if bool(trace.get("merge_auto_suspended", False)):
                 continue
+            if _controller_snapshot_delivery_candidate(trace):
+                _repo_record, repo_dir, default_branch = _repo_context_for_order(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=chat_for_order,
+                )
+                autoship = _auto_ship_controller_snapshot_order(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=chat_for_order,
+                    trace=trace,
+                    repo_record=_repo_record,
+                    repo_dir=repo_dir,
+                    default_branch=default_branch,
+                    now=float(now),
+                )
+                if str(autoship.get("status") or "").strip().lower() == "ok":
+                    snapshot_autoship_count += 1
+                    continue
+                if str(autoship.get("status") or "").strip().lower() == "failed":
+                    try:
+                        orch_q.update_trace(
+                            oid,
+                            controller_snapshot_autoship_error=autoship,
+                            controller_snapshot_autoship_failed_at=float(now),
+                            live_at=float(now),
+                        )
+                        orch_q.append_audit_event(
+                            event_type="order.controller_snapshot_autoship_failed",
+                            actor="jarvis",
+                            details={"order_id": oid, "result": autoship},
+                        )
+                    except Exception:
+                        pass
+                    continue
             if not heal_done_orders:
                 if not (
                     bool(trace.get("merge_ready", False))
@@ -14864,7 +15186,7 @@ def _auto_merge_ready_orders_tick(
                 orders.append(healed)
                 known_ids.add(oid)
 
-    merged_count = 0
+    merged_count = int(snapshot_autoship_count)
     for it in orders:
         oid = str(it.get("order_id") or "").strip()
         if not oid:
