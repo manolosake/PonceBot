@@ -281,6 +281,23 @@ def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
     assert not bot._controller_snapshot_safe_untracked_path("../outside.py")
 
 
+def test_controller_snapshot_validation_commands_include_android_build(tmp_path):
+    repo = tmp_path / "android"
+    repo.mkdir()
+    (repo / "gradlew").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "validate_unit_tests.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    commands = bot._controller_snapshot_validation_commands(
+        repo,
+        ["app/src/main/java/com/example/MainActivity.kt", "app/src/test/java/com/example/UiLogicTest.kt"],
+    )
+
+    assert ["bash", "scripts/validate_unit_tests.sh"] in commands
+    assert ["bash", "./gradlew", ":app:assembleDebug"] in commands
+
+
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():
     assert bot._studio_repo_kind({"path": "/home/aponce/codexbot", "repo_id": "codexbot"}) == "Core"
     assert bot._studio_repo_kind({"path": "/home/aponce/poncebot-control-room", "repo_id": "poncebot-control-room"}) == "Portfolio"

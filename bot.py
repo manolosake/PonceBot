@@ -14852,10 +14852,20 @@ def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list
     python_bin = str(repo_dir / ".venv" / "bin" / "python") if (repo_dir / ".venv" / "bin" / "python").exists() else "python3"
     py_files = [path for path in changed_paths if path.endswith(".py")]
     js_files = [path for path in changed_paths if path.endswith(".js")]
+    android_files = [
+        path
+        for path in changed_paths
+        if path.endswith((".kt", ".java", ".kts", ".gradle")) or path.startswith(("app/src/", "gradle/"))
+    ]
     if py_files:
         commands.append([python_bin, "-m", "py_compile", *py_files[:20]])
     for path in js_files[:12]:
         commands.append(["node", "--check", path])
+    if android_files:
+        if (repo_dir / "scripts" / "validate_unit_tests.sh").exists():
+            commands.append(["bash", "scripts/validate_unit_tests.sh"])
+        if (repo_dir / "gradlew").exists():
+            commands.append(["bash", "./gradlew", ":app:assembleDebug"])
     return commands
 
 
