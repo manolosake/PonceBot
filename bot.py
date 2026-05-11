@@ -15342,8 +15342,18 @@ def _operational_maturity_sweep_tick(
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 _STUDIO_CYCLE_VERSION = 1
+_STUDIO_GOVERNOR_VERSION = 1
 _STUDIO_OUTCOME_TYPES = ("shipped_to_main", "published_project", "blocked_need_operator", "rejected_low_value", "failed_root_caused")
 _STUDIO_STALE_SELECTED_SECONDS = 30 * 60
+_STUDIO_DELIVERY_FAILURE_PATTERNS = (
+    "no mergeable branch",
+    "validated repo diff",
+    "no validated repo diff",
+    "no material delta",
+    "left no mergeable",
+    "claimed progress",
+    "branch has no diff",
+)
 _STUDIO_OPERATOR_BUSINESS_GOAL = (
     "The software factory should create assets that can make money: sellable products, rentable tools, "
     "automations that can earn or save money, and private projects that can become paid offerings."
@@ -15697,11 +15707,112 @@ def _studio_finalize_stale_selected_cycles(
         return 0
 
 
+def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    ts = float(now if now is not None else time.time())
+    negatives = [entry for entry in memory.get("recent_studio_negative_outcomes", []) or [] if isinstance(entry, dict)]
+    positives = [entry for entry in memory.get("recent_studio_positive_outcomes", []) or [] if isinstance(entry, dict)]
+    recent_projects_6h = int(memory.get("studio_portfolio_recent_count_6h", 0) or 0)
+    recent_projects_24h = int(memory.get("studio_portfolio_recent_count_24h", 0) or 0)
+
+    def _age_hours(entry: dict[str, Any]) -> float:
+        try:
+            updated_at = float(entry.get("updated_at") or 0.0)
+        except Exception:
+            updated_at = 0.0
+        if updated_at <= 0:
+            return 999.0
+        return max(0.0, (ts - updated_at) / 3600.0)
+
+    recent_negative = [entry for entry in negatives if _age_hours(entry) <= 72.0]
+    recent_positive = [entry for entry in positives if _age_hours(entry) <= 72.0]
+    delivery_failures: list[dict[str, Any]] = []
+    write_policy_failures: list[dict[str, Any]] = []
+    new_project_negative_24h = 0
+    new_project_cycles_24h = 0
+    for entry in recent_negative:
+        summary = str(entry.get("summary") or "").lower()
+        key = str(entry.get("key") or "").strip().lower()
+        work_type = str(entry.get("type") or "").strip().upper()
+        if any(pattern in summary for pattern in _STUDIO_DELIVERY_FAILURE_PATTERNS):
+            delivery_failures.append(entry)
+        if "write policy violation" in summary or "modified repository files directly" in summary:
+            write_policy_failures.append(entry)
+        if key == "new-project-incubator" or work_type == "NEW_PROJECT":
+            if _age_hours(entry) <= 24.0:
+                new_project_negative_24h += 1
+                new_project_cycles_24h += 1
+    for entry in recent_positive:
+        key = str(entry.get("key") or "").strip().lower()
+        work_type = str(entry.get("type") or "").strip().upper()
+        if (key == "new-project-incubator" or work_type == "NEW_PROJECT") and _age_hours(entry) <= 24.0:
+            new_project_cycles_24h += 1
+
+    mode = "normal"
+    severity = "green"
+    trigger = "No recent pattern requires overriding the normal Studio ranking."
+    directives: list[str] = []
+    avoid_keys: list[str] = []
+    prefer_lanes: list[str] = []
+    force_next_action = ""
+
+    if delivery_failures:
+        mode = "repair_delivery_contract"
+        severity = "red"
+        trigger = _studio_one_line(delivery_failures[0].get("summary"), max_chars=220, default="Recent delivery failed without mergeable branch or validated diff.")
+        force_next_action = "Select a PonceBot factory-reliability repair before another incubator/new-project cycle."
+        prefer_lanes = ["core"]
+        avoid_keys = ["new-project-incubator"]
+        directives.extend(
+            [
+                "Repair the delivery evidence contract: every claimed implementation needs branch, diff, validation, merge/push/deploy proof, or an explicit root cause.",
+                "Do not start another new-folder project until no-delta/no-branch recovery is addressed or explicitly disproven.",
+            ]
+        )
+    elif new_project_negative_24h >= 2:
+        mode = "incubator_quality_gate"
+        severity = "yellow"
+        trigger = f"{new_project_negative_24h} failed/rejected new-project outcomes in 24h."
+        force_next_action = "Prefer improving the factory or compounding an existing portfolio asset over starting a fresh project."
+        avoid_keys = ["new-project-incubator"]
+        prefer_lanes = ["core", "dashboard", "portfolio"]
+        directives.append("New-project work is cooling down until the next bet has clearer buyer, demo, validation, and publication evidence.")
+    elif recent_projects_6h >= 3:
+        mode = "portfolio_compounding"
+        severity = "yellow"
+        trigger = f"{recent_projects_6h} portfolio projects were published or updated in the last 6h."
+        force_next_action = "Prefer advancing the strongest existing portfolio asset toward demo, distribution, monetization, or validation."
+        prefer_lanes = ["portfolio", "dashboard", "core"]
+        directives.append("Compound an existing asset unless a new project is demonstrably more monetizable than the current portfolio.")
+
+    if write_policy_failures:
+        directives.append("Controller roles must not edit code directly; Skynet/Jarvis should delegate implementation to specialists and only review/decide.")
+    if not directives:
+        directives.append("Use normal ranking, but reject bets that lack visible value, monetization path, validation evidence, or a path to main/deploy.")
+
+    return {
+        "version": _STUDIO_GOVERNOR_VERSION,
+        "mode": mode,
+        "severity": severity,
+        "trigger": trigger,
+        "directives": directives[:5],
+        "avoid_keys": avoid_keys,
+        "prefer_lanes": prefer_lanes,
+        "force_next_action": force_next_action,
+        "delivery_failure_count_72h": len(delivery_failures),
+        "write_policy_failure_count_72h": len(write_policy_failures),
+        "new_project_negative_24h": new_project_negative_24h,
+        "new_project_cycles_24h": new_project_cycles_24h,
+        "portfolio_recent_count_6h": recent_projects_6h,
+        "portfolio_recent_count_24h": recent_projects_24h,
+    }
+
+
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
     _studio_finalize_stale_selected_cycles(cfg.orchestrator_db_path, now=now)
     memory = _studio_recent_order_memory(orch_q, now=now)
     cycle_memory = _studio_recent_cycle_outcome_memory(cfg.orchestrator_db_path, now=now)
     memory.update(cycle_memory)
+    memory["studio_governor"] = _studio_governor_assessment(memory, now=now)
     return memory
 
 
@@ -15778,6 +15889,22 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score -= 20
 
     key = f"repo-{repo_id or _slug_token(repo_name, max_len=30)}"
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    governor_mode = str(governor.get("mode") or "").strip().lower()
+    if governor_mode == "repair_delivery_contract":
+        if kind == "Core":
+            score += 42
+            thesis = "Repair the autonomous factory delivery contract so no job can claim progress without a mergeable branch, validated diff, and ship evidence."
+            outcome = "PonceBot rejects or recovers no-delta/no-branch work automatically and records a root-caused outcome instead of job churn."
+            commercial_evidence = "before/after factory evidence showing ghost deliveries are blocked, recovered, or converted into actionable root causes"
+            monetization_path = "Protect revenue work by ensuring every AI-built product or feature has real branch, validation, merge/push/deploy evidence."
+        else:
+            score -= 24
+    elif governor_mode == "incubator_quality_gate" and kind not in {"Core", "Dashboard"}:
+        score -= 10
+    elif governor_mode == "portfolio_compounding" and kind in {"Core", "Dashboard"}:
+        score -= 6
+
     recent_risks: list[str] = []
     recent_wins: list[str] = []
     recent_saturation: list[str] = []
@@ -15823,11 +15950,15 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score = max(0, score)
 
     base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
+    if governor_mode and governor_mode != "normal":
+        base_risk = f"{base_risk}; Studio Governor {governor_mode}: {_studio_one_line(governor.get('trigger'), max_chars=180)}"
     if recent_risks:
         base_risk = f"{base_risk}; recent Studio caution: {_studio_one_line('; '.join(recent_risks[:2]), max_chars=220)}"
     if recent_saturation:
         base_risk = f"{base_risk}; freshness guard: {_studio_one_line('; '.join(recent_saturation[:2]), max_chars=220)}"
     why = f"{kind} work maps directly to the highest-value factory surface."
+    if governor_mode == "repair_delivery_contract" and kind == "Core":
+        why = "The Studio Governor detected ghost-delivery risk, so repairing PonceBot's delivery contract beats any new feature or incubator bet right now."
     if recent_risks:
         why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
     elif recent_saturation:
@@ -15874,7 +16005,26 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
     outcome = f"A git-backed project under {root} with README, target buyer, pricing/rental hypothesis, runnable/demoable behavior, validation evidence, and private GitHub publication when safe."
     why = "It creates visible portfolio growth and revenue optionality when no urgent fix is evidenced."
     risk = "avoid public launch, billing, credentials, destructive actions, or large scope without operator approval"
-    if recent_6h >= 3:
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    governor_mode = str(governor.get("mode") or "").strip().lower()
+    if governor_mode == "repair_delivery_contract":
+        score -= 70
+        thesis = "Incubator is temporarily gated until PonceBot repairs recent no-delta/no-branch delivery evidence failures."
+        outcome = "No fresh incubator project should be selected unless the next step directly fixes or disproves the delivery-evidence failure."
+        why = "Recent factory evidence says delivery reliability is the bottleneck; starting another project would amplify churn."
+        risk += "; Studio Governor blocks fresh incubator work after ghost-delivery evidence"
+    elif governor_mode == "incubator_quality_gate":
+        score -= 34
+        thesis = "Incubator must compound an existing portfolio asset or present unusually strong buyer/demo evidence before another fresh project."
+        outcome = f"A published portfolio asset under {root} moves toward validation, distribution, monetization, or a clearer demo; avoid shallow new folders."
+        why = "Recent new-project outcomes failed quality gates; compounding has better expected value than another shallow MVP."
+        risk += "; new-project quality gate is active"
+    elif governor_mode == "portfolio_compounding":
+        score -= 18
+        thesis = "Advance the strongest existing portfolio product toward validation, demo quality, distribution, or monetization."
+        outcome = f"A git-backed milestone under {root} or an existing product folder with buyer/revenue rationale, validation evidence, clean main, and private GitHub publication."
+        why = "Recent portfolio activity means compounding one asset likely beats opening another project."
+    if recent_6h >= 3 and governor_mode != "repair_delivery_contract":
         score -= 14
         thesis = (
             "Advance the strongest published incubator product toward validation, demo quality, or monetization; "
@@ -15966,6 +16116,11 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
     portfolio_projects = "; ".join(str(x) for x in memory.get("studio_portfolio_recent_projects", [])[:6]) or "none"
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    governor_mode = str(governor.get("mode") or "normal")
+    governor_trigger = _studio_one_line(governor.get("trigger"), max_chars=220, default="none")
+    governor_directives = "; ".join(str(x) for x in (governor.get("directives") or [])[:4]) or "normal ranking"
+    governor_force = _studio_one_line(governor.get("force_next_action"), max_chars=220, default="none")
     return "\n".join(
         [
             "AUTONOMOUS STUDIO CYCLE",
@@ -15977,6 +16132,11 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
+            "",
+            "Studio governor:",
+            f"- mode: {governor_mode}; severity: {governor.get('severity', 'green')}; trigger: {governor_trigger}",
+            f"- force next action: {governor_force}",
+            f"- directives: {governor_directives}",
             "",
             "Factory objective:",
             f"- Money: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
@@ -16017,6 +16177,13 @@ def _studio_record_cycle(
 ) -> str:
     cycle_id = str(uuid.uuid4())
     prompt_packet = _studio_cycle_prompt_packet(selected=selected, opportunities=opportunities, memory=memory)
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    governor_directives = "; ".join(str(x) for x in (governor.get("directives") or [])[:3])
+    debate_summary = (
+        f"Studio Governor {governor.get('mode', 'normal')}: {_studio_one_line(governor_directives, max_chars=260, default='normal ranking')}"
+        if governor
+        else "Critic gate is embedded in the Skynet prompt; controller must reject or re-scope if value is not visible."
+    )
     _studio_ensure_schema(cfg.orchestrator_db_path)
     with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
         conn.execute(
@@ -16040,7 +16207,7 @@ def _studio_record_cycle(
                 str(selected.get("lane") or ""),
                 str(selected.get("thesis") or ""),
                 str(selected.get("why_better_than_alternatives") or ""),
-                "Critic gate is embedded in the Skynet prompt; controller must reject or re-scope if value is not visible.",
+                debate_summary,
                 str(selected.get("operator_visible_outcome") or ""),
                 str(selected.get("evidence_target") or ""),
                 str(selected.get("risk_summary") or ""),
