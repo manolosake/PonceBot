@@ -14501,6 +14501,16 @@ def _auto_merge_ready_orders_tick(
             try:
                 orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
                 orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
+                orch_q.update_trace(
+                    oid,
+                    merge_ready=False,
+                    merge_ready_at=None,
+                    merge_reopened_for_auto_merge_at=None,
+                    merge_auto_suspended=False,
+                    operational_gate_status="passed",
+                    operational_gate_reason="passed_already_merged",
+                    live_at=float(now),
+                )
             except Exception:
                 pass
             continue
@@ -14748,6 +14758,8 @@ def _auto_merge_ready_orders_tick(
             try:
                 orch_q.update_trace(
                     oid,
+                    merge_ready=False,
+                    merge_ready_at=None,
                     merge_auto_failed_at=None,
                     merge_auto_error=None,
                     merge_auto_attempts=0,
