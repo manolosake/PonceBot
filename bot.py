@@ -14860,6 +14860,439 @@ def _operational_maturity_sweep_tick(
 
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
+_STUDIO_CYCLE_VERSION = 1
+_STUDIO_OUTCOME_TYPES = ("shipped_to_main", "published_project", "blocked_need_operator", "rejected_low_value", "failed_root_caused")
+
+
+def _studio_enabled() -> bool:
+    raw = str(os.environ.get("BOT_AUTONOMOUS_STUDIO_ENABLED", "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _studio_ensure_schema(db_path: Path) -> None:
+    try:
+        db_path = db_path.expanduser().resolve()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    with sqlite3.connect(str(db_path), timeout=15.0) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_cycles (
+                cycle_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL DEFAULT 1,
+                ts REAL NOT NULL,
+                status TEXT NOT NULL,
+                selected_key TEXT NOT NULL,
+                selected_type TEXT NOT NULL,
+                selected_repo_id TEXT,
+                selected_repo_path TEXT,
+                selected_lane TEXT,
+                thesis TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                debate_summary TEXT NOT NULL,
+                operator_visible_outcome TEXT NOT NULL,
+                evidence_target TEXT NOT NULL,
+                risk_summary TEXT NOT NULL,
+                prompt_packet TEXT NOT NULL,
+                opportunities_json TEXT NOT NULL DEFAULT '[]',
+                outcome_status TEXT,
+                outcome_summary TEXT,
+                order_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_memory (
+                memory_key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_ts ON studio_cycles(ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_status ON studio_cycles(status, updated_at DESC)")
+        conn.commit()
+
+
+def _studio_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return "{}"
+
+
+def _studio_one_line(value: Any, *, max_chars: int = 180, default: str = "-") -> str:
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return default
+    if len(text) > max_chars:
+        return text[: max(1, max_chars - 1)].rstrip() + "…"
+    return text
+
+
+def _studio_short_path(path: str) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve())
+    except Exception:
+        return text
+
+
+def _studio_repo_display_name(repo: dict[str, Any]) -> str:
+    path = str(repo.get("path") or "").strip()
+    if path:
+        return Path(path).name or str(repo.get("repo_id") or "repo")
+    return str(repo.get("repo_id") or "repo").strip() or "repo"
+
+
+def _studio_repo_kind(repo: dict[str, Any]) -> str:
+    name = _studio_repo_display_name(repo).strip().lower()
+    path = str(repo.get("path") or "").strip().lower()
+    if "codexbot" in name or "codexbot" in path or "poncebot" in name:
+        return "Core"
+    if "executivedashboard" in name or "executivedashboard" in path:
+        return "Dashboard"
+    if "android" in name or "omnicrew" in name or "omnicrew" in path:
+        return "Product app"
+    return "Portfolio"
+
+
+def _studio_recent_order_memory(orch_q: OrchestratorQueue, *, now: float) -> dict[str, Any]:
+    memory: dict[str, Any] = {
+        "orders_72h": 0,
+        "done_72h": 0,
+        "failed_72h": 0,
+        "active": 0,
+        "recent_titles": [],
+        "recent_failures": [],
+        "recent_outcomes": [],
+    }
+    cutoff = float(now) - 72.0 * 3600.0
+    try:
+        rows = orch_q.list_orders_global(status=None, limit=240)
+    except Exception:
+        rows = []
+    for row in rows or []:
+        if not _is_proactive_order_record(row):
+            continue
+        try:
+            updated = float(row.get("updated_at") or row.get("created_at") or 0.0)
+        except Exception:
+            updated = 0.0
+        if updated and updated < cutoff:
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        title = _studio_one_line(str(row.get("title") or row.get("body") or ""), max_chars=140)
+        memory["orders_72h"] = int(memory["orders_72h"]) + 1
+        if status == "active":
+            memory["active"] = int(memory["active"]) + 1
+        elif status == "done":
+            memory["done_72h"] = int(memory["done_72h"]) + 1
+            if title:
+                memory["recent_outcomes"].append(title)
+        elif status in {"failed", "cancelled", "paused"}:
+            memory["failed_72h"] = int(memory["failed_72h"]) + 1
+            if title:
+                memory["recent_failures"].append(title)
+        if title:
+            memory["recent_titles"].append(title)
+    for key in ("recent_titles", "recent_failures", "recent_outcomes"):
+        memory[key] = list(dict.fromkeys(memory.get(key, [])))[:8]
+    return memory
+
+
+def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: dict[str, Any]) -> dict[str, Any]:
+    repo_name = _studio_repo_display_name(repo)
+    kind = _studio_repo_kind(repo)
+    repo_id = str(repo.get("repo_id") or "").strip().lower()
+    path = _studio_short_path(str(repo.get("path") or ""))
+    priority = int(repo.get("priority") or 3)
+    metadata = dict(repo.get("metadata") or {})
+    last_blocker = str(metadata.get("last_autonomy_blocker") or "").strip()
+    status = str(repo.get("status") or "").strip().lower()
+
+    if kind == "Core":
+        work_type = "DEEP_IMPROVEMENT"
+        thesis = "Make PonceBot more autonomous, selective, and better at shipping real outcomes instead of job churn."
+        outcome = "A PonceBot capability that changes how Skynet chooses, delegates, validates, merges, or learns."
+        target_user = "Alejandro operating PonceBot as a software factory"
+        score = 94
+    elif kind == "Dashboard":
+        work_type = "FEATURE"
+        thesis = "Make ExecutiveDashboard show decisions, outcomes, and product progress more clearly than raw terminal noise."
+        outcome = "A visible dashboard surface that explains current thesis, shipped work, blockers, and portfolio progress."
+        target_user = "Alejandro reviewing the factory from the browser"
+        score = 91
+    elif kind == "Product app":
+        work_type = "FEATURE"
+        thesis = f"Find one visible product milestone in {repo_name} that can be validated with an emulator or runnable proof."
+        outcome = "A user-visible app/product improvement with screenshots or validation logs."
+        target_user = "future product users"
+        score = 76
+    else:
+        work_type = "PRODUCT_WORKFLOW"
+        thesis = f"Advance {repo_name} only if it has a clear user-facing or operator-facing reason to exist now."
+        outcome = "A concrete milestone, README/demo, or feature that makes the repo more useful."
+        target_user = "operator or eventual project user"
+        score = 64
+
+    if priority <= 1:
+        score += 8
+    elif priority >= 3:
+        score -= 4
+    if status != "active":
+        score -= 35
+    if last_blocker:
+        score -= 20
+
+    return {
+        "key": f"repo-{repo_id or _slug_token(repo_name, max_len=30)}",
+        "lane": "core" if kind == "Core" else ("dashboard" if kind == "Dashboard" else "portfolio"),
+        "type": work_type,
+        "repo_id": repo_id,
+        "repo_path": path,
+        "repo_name": repo_name,
+        "repo_kind": kind,
+        "score": int(score),
+        "problem": f"{repo_name} needs progress that is visible, shippable, and not just maintenance.",
+        "target_user": target_user,
+        "thesis": thesis,
+        "operator_visible_outcome": outcome,
+        "evidence_target": "tests/logs plus merge/push/deploy evidence; UI work also needs screenshot or browser validation.",
+        "risk_summary": last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path",
+        "why_better_than_alternatives": f"{kind} work maps directly to the highest-value factory surface.",
+    }
+
+
+def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[str, Any]) -> dict[str, Any]:
+    root = _project_incubator_root_dir()
+    return {
+        "key": "new-project-incubator",
+        "lane": "incubator",
+        "type": "NEW_PROJECT",
+        "repo_id": "",
+        "repo_path": "",
+        "repo_name": "New product incubator",
+        "repo_kind": "Incubator",
+        "score": 86,
+        "problem": "If existing repos have no critical bug, the factory should create new visible product surface area.",
+        "target_user": "Alejandro and future operators/users",
+        "thesis": "Create or advance one small but real product prototype beside PonceBot and ExecutiveDashboard.",
+        "operator_visible_outcome": f"A git-backed project under {root} with README, runnable/demoable behavior, validation evidence, and private GitHub publication when safe.",
+        "evidence_target": "new folder, clean git history, README, validation command/log, GitHub private remote or exact blocker.",
+        "risk_summary": "avoid public launch, billing, credentials, destructive actions, or large scope without operator approval",
+        "why_better_than_alternatives": "It creates visible portfolio growth when no urgent fix is evidenced.",
+    }
+
+
+def _studio_build_opportunities(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    repos: list[dict[str, Any]],
+    occupied_keys: set[str],
+    occupied_repo_ids: set[str],
+    now: float,
+) -> list[dict[str, Any]]:
+    memory = _studio_recent_order_memory(orch_q, now=now)
+    opportunities: list[dict[str, Any]] = []
+    for repo in repos:
+        status = str(repo.get("status") or "").strip().lower()
+        if status != "active" or not bool(repo.get("autonomy_enabled", True)):
+            continue
+        repo_id = str(repo.get("repo_id") or "").strip().lower()
+        if repo_id and repo_id in occupied_repo_ids:
+            continue
+        item = _studio_opportunity_for_repo(repo, now=now, memory=memory)
+        if str(item.get("key") or "").strip().lower() in occupied_keys:
+            continue
+        opportunities.append(item)
+
+    if _project_incubator_enabled() and "project-incubator" not in occupied_keys and "new-project-incubator" not in occupied_keys:
+        incubator = _studio_incubator_opportunity(cfg=cfg, now=now, memory=memory)
+        try:
+            if _project_incubator_due(cfg, occupied_keys=occupied_keys):
+                incubator["score"] = int(incubator.get("score") or 0) + 18
+                incubator["why_better_than_alternatives"] = "Incubator is due by cadence and supports the operator preference for new visible projects."
+        except Exception:
+            pass
+        opportunities.append(incubator)
+
+    opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
+    return opportunities[:5]
+
+
+def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list[dict[str, Any]], memory: dict[str, Any]) -> str:
+    def _line(item: dict[str, Any], idx: int) -> str:
+        return (
+            f"{idx}. {item.get('type')} · {item.get('repo_name')} · score {item.get('score')}: "
+            f"{_studio_one_line(str(item.get('thesis') or ''), max_chars=180)}"
+        )
+
+    rows = [_line(item, idx + 1) for idx, item in enumerate(opportunities)]
+    recent = "; ".join(str(x) for x in memory.get("recent_outcomes", [])[:4]) or "none"
+    failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
+    return "\n".join(
+        [
+            "AUTONOMOUS STUDIO CYCLE",
+            "Sense -> Understand -> Imagine -> Debate -> Choose -> Build -> Judge -> Ship -> Learn.",
+            "",
+            "Workspace memory:",
+            f"- proactive orders 72h: {memory.get('orders_72h', 0)}; done: {memory.get('done_72h', 0)}; failed/paused: {memory.get('failed_72h', 0)}; active: {memory.get('active', 0)}",
+            f"- recent outcomes: {recent}",
+            f"- recent failures: {failures}",
+            "",
+            "Candidate bets:",
+            *rows,
+            "",
+            f"Selected thesis: {_studio_one_line(str(selected.get('thesis') or ''), max_chars=260)}",
+            f"Selected outcome: {_studio_one_line(str(selected.get('operator_visible_outcome') or ''), max_chars=260)}",
+            "",
+            "Mandatory internal debate before delegation:",
+            "- Would Alejandro notice this result without reading raw logs?",
+            "- Does this avoid repeating prior no-delta, write-policy, or low-value work?",
+            "- Can it finish in main/published/deployed form with concrete evidence?",
+            "- What would make this fail, and what is the smallest safe phase?",
+            "- If the selected bet is weak after sensing the repo, reject it and choose a stronger candidate from the list.",
+        ]
+    )
+
+
+def _studio_record_cycle(
+    *,
+    cfg: BotConfig,
+    selected: dict[str, Any],
+    opportunities: list[dict[str, Any]],
+    memory: dict[str, Any],
+    now: float,
+) -> str:
+    cycle_id = str(uuid.uuid4())
+    prompt_packet = _studio_cycle_prompt_packet(selected=selected, opportunities=opportunities, memory=memory)
+    _studio_ensure_schema(cfg.orchestrator_db_path)
+    with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id, selected_repo_path,
+                selected_lane, thesis, rationale, debate_summary, operator_visible_outcome, evidence_target,
+                risk_summary, prompt_packet, opportunities_json, outcome_status, outcome_summary, order_id,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cycle_id,
+                _STUDIO_CYCLE_VERSION,
+                float(now),
+                "selected",
+                str(selected.get("key") or ""),
+                str(selected.get("type") or ""),
+                str(selected.get("repo_id") or "") or None,
+                str(selected.get("repo_path") or "") or None,
+                str(selected.get("lane") or ""),
+                str(selected.get("thesis") or ""),
+                str(selected.get("why_better_than_alternatives") or ""),
+                "Critic gate is embedded in the Skynet prompt; controller must reject or re-scope if value is not visible.",
+                str(selected.get("operator_visible_outcome") or ""),
+                str(selected.get("evidence_target") or ""),
+                str(selected.get("risk_summary") or ""),
+                prompt_packet,
+                _studio_json(opportunities),
+                "",
+                "",
+                None,
+                float(now),
+                float(now),
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO studio_memory(memory_key, value_json, updated_at) VALUES (?, ?, ?)",
+            ("recent_order_memory", _studio_json(memory), float(now)),
+        )
+        conn.commit()
+    return cycle_id
+
+
+def _studio_attach_order(*, cfg: BotConfig, cycle_id: str, order_id: str, now: float) -> None:
+    if not cycle_id or not order_id:
+        return
+    try:
+        _studio_ensure_schema(cfg.orchestrator_db_path)
+        with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+            conn.execute(
+                "UPDATE studio_cycles SET status = ?, order_id = ?, updated_at = ? WHERE cycle_id = ?",
+                ("active", str(order_id), float(now), str(cycle_id)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _studio_next_bet(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    repos: list[dict[str, Any]],
+    occupied_keys: set[str],
+    occupied_repo_ids: set[str],
+    now: float,
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    if not _studio_enabled():
+        return None
+    memory = _studio_recent_order_memory(orch_q, now=now)
+    opportunities = _studio_build_opportunities(
+        cfg=cfg,
+        orch_q=orch_q,
+        repos=repos,
+        occupied_keys=occupied_keys,
+        occupied_repo_ids=occupied_repo_ids,
+        now=now,
+    )
+    if not opportunities:
+        return None
+
+    selected = opportunities[0]
+    cycle_id = _studio_record_cycle(cfg=cfg, selected=selected, opportunities=opportunities, memory=memory, now=now)
+    repo_record = None
+    selected_repo_id = str(selected.get("repo_id") or "").strip().lower()
+    if selected_repo_id:
+        repo_record = next((repo for repo in repos if str(repo.get("repo_id") or "").strip().lower() == selected_repo_id), None)
+
+    lane = str(selected.get("lane") or "studio").strip().lower()
+    key = str(selected.get("key") or cycle_id).strip().lower()
+    if lane == "incubator" or str(selected.get("type") or "").upper() == "NEW_PROJECT":
+        initiative_key = "project-incubator"
+        title = "Studio Cycle: New Product Incubator"
+    else:
+        initiative_key = f"studio-{re.sub(r'[^a-z0-9_-]+', '-', key).strip('-')[:54]}"
+        title = f"Studio Cycle: {_studio_repo_display_name(repo_record or selected)}"
+
+    initiative: dict[str, Any] = {
+        "key": initiative_key,
+        "title": title,
+        "lane": ("incubator" if lane == "incubator" else "studio"),
+        "project_hint": str(selected.get("repo_path") or selected.get("repo_name") or ""),
+        "goal": str(selected.get("thesis") or ""),
+        "success": str(selected.get("operator_visible_outcome") or ""),
+        "expected_measurable_delta": str(selected.get("operator_visible_outcome") or ""),
+        "stop_condition": (
+            "Stop only with one outcome: shipped_to_main, published_project, blocked_need_operator, "
+            "rejected_low_value, or failed_root_caused."
+        ),
+        "studio_cycle": {
+            "cycle_id": cycle_id,
+            "selected": selected,
+            "opportunities": opportunities,
+            "memory": memory,
+            "prompt_packet": _studio_cycle_prompt_packet(selected=selected, opportunities=opportunities, memory=memory),
+        },
+    }
+    return initiative, repo_record
 
 
 def _repo_id_from_blob(blob: str) -> str:
@@ -16080,6 +16513,10 @@ def _spawn_proactive_order(
     repo_path = str(repo.get("path") or "").strip()
     repo_default_branch = str(repo.get("default_branch") or "").strip() or "main"
     repo_name = Path(repo_path).name if repo_path else ""
+    studio_cycle = initiative.get("studio_cycle") if isinstance(initiative.get("studio_cycle"), dict) else {}
+    studio_selected = studio_cycle.get("selected") if isinstance(studio_cycle.get("selected"), dict) else {}
+    studio_opportunities = studio_cycle.get("opportunities") if isinstance(studio_cycle.get("opportunities"), list) else []
+    studio_cycle_id = str(studio_cycle.get("cycle_id") or "").strip()
 
     if repo_id and repo_path:
         project_id = repo_id
@@ -16216,6 +16653,27 @@ def _spawn_proactive_order(
         f"Expected measurable delta: {expected_measurable_delta}",
         f"Stop condition: {stop_condition}",
         "",
+        *(
+            [
+                "Autonomous Studio:",
+                f"- Studio cycle: {studio_cycle_id}",
+                f"- Selected type: {studio_selected.get('type') or '(unknown)'}",
+                f"- Product thesis: {studio_selected.get('thesis') or goal}",
+                f"- Operator-visible outcome: {studio_selected.get('operator_visible_outcome') or success_definition}",
+                f"- Evidence target: {studio_selected.get('evidence_target') or 'tests/logs/artifacts plus merge/push/deploy evidence'}",
+                f"- Risk thesis: {studio_selected.get('risk_summary') or 'Keep the slice bounded and reversible.'}",
+                "- Required thinking loop: Sense -> Understand -> Imagine -> Debate -> Choose -> Build -> Judge -> Ship -> Learn.",
+                "- Before delegating, produce 3-5 possible bets, then explicitly kill weak bets using the critic questions.",
+                "- You may reject the selected bet if repo sensing proves it low-value; if so, choose a stronger candidate from the Studio packet and explain why.",
+                "- Completion outcome must be one of: shipped_to_main, published_project, blocked_need_operator, rejected_low_value, failed_root_caused.",
+                "",
+                "Studio packet:",
+                str(studio_cycle.get("prompt_packet") or "").strip(),
+                "",
+            ]
+            if studio_cycle
+            else []
+        ),
         "Execution policy:",
         scope_policy,
         "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
@@ -16223,6 +16681,7 @@ def _spawn_proactive_order(
         "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",
         "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
         "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
+        "- The classification must map to the Studio selected type when possible; do not downgrade NEW_PROJECT/FEATURE work into generic maintenance without evidence.",
         "- Bugfixes are allowed only with concrete evidence of a P0/P1 operator/customer-impacting failure, security risk, data loss risk, broken deploy, or failing required validation.",
         "- If no P0/P1 bug is evidenced, default to FEATURE, PRODUCT_WORKFLOW, or NEW_PROJECT_PHASE rather than tiny maintenance.",
         "- A valid feature must be notable to an operator or user: new workflow, new dashboard insight, new control surface, new integration, automation, or capability expansion.",
@@ -16264,6 +16723,14 @@ def _spawn_proactive_order(
         "factory_order": bool(repo_id),
         "expected_measurable_delta": expected_measurable_delta,
         "stop_condition": stop_condition,
+        "studio_cycle_id": studio_cycle_id or None,
+        "studio_selected_type": str(studio_selected.get("type") or "").strip() or None,
+        "studio_thesis": str(studio_selected.get("thesis") or "").strip() or None,
+        "studio_operator_visible_outcome": str(studio_selected.get("operator_visible_outcome") or "").strip() or None,
+        "studio_evidence_target": str(studio_selected.get("evidence_target") or "").strip() or None,
+        "studio_risk_summary": str(studio_selected.get("risk_summary") or "").strip() or None,
+        "studio_opportunity_count": len(studio_opportunities),
+        "required_outcome_types": list(_STUDIO_OUTCOME_TYPES),
         "runbook_id": "skynet_proactive_lane",
         "profile_name": str(base_profile.get("name") or controller_role),
         "profile_role": controller_role,
@@ -16329,7 +16796,14 @@ def _spawn_proactive_order(
             repo_id=(repo_id or None),
             repo_path=(repo_path or None),
             live_at=now,
+            studio_cycle_id=(studio_cycle_id or None),
+            studio_selected_type=(str(studio_selected.get("type") or "").strip() or None),
+            studio_thesis=(str(studio_selected.get("thesis") or "").strip() or None),
+            studio_operator_visible_outcome=(str(studio_selected.get("operator_visible_outcome") or "").strip() or None),
+            studio_evidence_target=(str(studio_selected.get("evidence_target") or "").strip() or None),
         )
+        if studio_cycle_id:
+            _studio_attach_order(cfg=cfg, cycle_id=studio_cycle_id, order_id=order_id, now=now)
         orch_q.append_audit_event(
             event_type=("factory.repo_order.created" if repo_id else "order.created"),
             actor=controller_role,
@@ -16456,6 +16930,54 @@ def _proactive_lane_tick(
 
     occupied = _active_proactive_keys(countable_proactive_orders)
     created = 0
+    active_repo_ids = {_repo_id_from_order_record(row) for row in countable_proactive_orders}
+    active_repo_ids.discard("")
+
+    studio_choice = _studio_next_bet(
+        cfg=cfg,
+        orch_q=orch_q,
+        repos=repos,
+        occupied_keys=occupied,
+        occupied_repo_ids=active_repo_ids,
+        now=now,
+    )
+    if studio_choice is not None:
+        initiative, repo_record = studio_choice
+        ok = _spawn_proactive_order(
+            cfg=cfg,
+            orch_q=orch_q,
+            profiles=profiles,
+            chat_id=int(chat_id),
+            now=now,
+            initiative=initiative,
+            repo_record=repo_record,
+        )
+        if ok:
+            created += 1
+            key = str(initiative.get("key") or "").strip().lower()
+            if key == "project-incubator":
+                try:
+                    _mark_project_incubator_spawned(cfg)
+                except Exception:
+                    pass
+            try:
+                orch_q.append_audit_event(
+                    event_type="studio.cycle_order_created",
+                    actor="skynet",
+                    details={
+                        "initiative": key,
+                        "repo_id": (str((repo_record or {}).get("repo_id") or "") or None),
+                        "repo_path": (str((repo_record or {}).get("path") or "") or None),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+            except Exception:
+                pass
+            return created
+
     if _project_incubator_due(cfg, occupied_keys=occupied):
         initiative = _project_incubator_initiative(cfg)
         if initiative is not None:
@@ -16496,8 +17018,6 @@ def _proactive_lane_tick(
         for row in repos
         if str(row.get("status") or "").strip().lower() == "active" and bool(row.get("autonomy_enabled", True))
     ]
-    active_repo_ids = {_repo_id_from_order_record(row) for row in countable_proactive_orders}
-    active_repo_ids.discard("")
     if repo_candidates:
         repo_candidates = sorted(repo_candidates, key=lambda row: (int(row.get("priority") or 2), str(row.get("path") or "")))
         repo_index = 0
@@ -23208,6 +23728,24 @@ def _is_low_value_backlog_job(task: Task) -> bool:
     if _is_controller_role(_coerce_orchestrator_role(task.role)) and req == "maintenance":
         return True
     return False
+
+
+def _runbook_open_job_count(orch_q: OrchestratorQueue, *, runbook_id: str) -> int:
+    wanted = str(runbook_id or "").strip()
+    if not wanted:
+        return 0
+    total = 0
+    for state in ("queued", "waiting_deps", "blocked_approval", "blocked", "running"):
+        try:
+            rows = orch_q.peek(state=state, limit=500)
+        except Exception:
+            rows = []
+        for task in rows or []:
+            labels = dict((getattr(task, "labels", {}) or {}) if isinstance(getattr(task, "labels", {}), dict) else {})
+            trace = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+            if str(labels.get("runbook") or trace.get("runbook_id") or "").strip() == wanted:
+                total += 1
+    return total
 
 
 def _drain_backlog_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
@@ -34580,6 +35118,22 @@ def main() -> None:
                                 LOG.exception("Deterministic idle_no_open_jobs runbook failed")
                             orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
                             continue
+                        if rb.runbook_id == "jarvis_digest":
+                            try:
+                                open_digest_jobs = _runbook_open_job_count(orchestrator_queue, runbook_id=rb.runbook_id)
+                            except Exception:
+                                open_digest_jobs = 0
+                            if open_digest_jobs > 0:
+                                try:
+                                    orchestrator_queue.append_audit_event(
+                                        event_type="runbook.digest_deduped",
+                                        actor="jarvis",
+                                        details={"runbook_id": rb.runbook_id, "open_jobs": int(open_digest_jobs)},
+                                    )
+                                except Exception:
+                                    pass
+                                orchestrator_queue.set_runbook_last_run(runbook_id=rb.runbook_id, ts=now)
+                                continue
                         t = runbook_to_task(rb, chat_id=int(notify_chat_id))
                         # Apply role profile defaults so autonomous tasks behave like the same "agents".
                         try:
