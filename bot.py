@@ -15280,6 +15280,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     key = f"repo-{repo_id or _slug_token(repo_name, max_len=30)}"
     recent_risks: list[str] = []
     recent_wins: list[str] = []
+    recent_saturation: list[str] = []
     for entry in memory.get("recent_studio_negative_outcomes", []) or []:
         if not isinstance(entry, dict):
             continue
@@ -15306,16 +15307,31 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         status_text = str(entry.get("status") or "").strip()
         summary = _studio_one_line(entry.get("summary"), max_chars=100, default=status_text)
         recent_wins.append(f"{match} {status_text}: {summary}")
-        score += 6 if match == "same key" else 4
+        try:
+            outcome_age_s = max(0.0, float(now) - float(entry.get("updated_at") or 0.0))
+        except Exception:
+            outcome_age_s = 0.0
+        if outcome_age_s <= 12.0 * 3600.0 and match in {"same key", "same repo/type"}:
+            recent_saturation.append(f"{match} shipped recently: {summary}")
+            score -= 28 if match == "same key" else 18
+        elif outcome_age_s <= 6.0 * 3600.0 and match == "same repo":
+            recent_saturation.append(f"{match} shipped recently: {summary}")
+            score -= 10
+        else:
+            score += 6 if match == "same key" else 4
     if recent_risks:
         score = max(0, score)
 
     base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
     if recent_risks:
         base_risk = f"{base_risk}; recent Studio caution: {_studio_one_line('; '.join(recent_risks[:2]), max_chars=220)}"
+    if recent_saturation:
+        base_risk = f"{base_risk}; freshness guard: {_studio_one_line('; '.join(recent_saturation[:2]), max_chars=220)}"
     why = f"{kind} work maps directly to the highest-value factory surface."
     if recent_risks:
         why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
+    elif recent_saturation:
+        why += " A recent successful shipment on this same surface lowers priority now; prefer a new project, different repo, or materially fresh angle."
     elif recent_wins:
         why += f" Recent Studio success adds modest confidence: {_studio_one_line('; '.join(recent_wins[:2]), max_chars=160)}."
 
@@ -15337,6 +15353,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         "why_better_than_alternatives": why,
         "recent_studio_outcome_risks": recent_risks[:4],
         "recent_studio_outcome_wins": recent_wins[:3],
+        "recent_studio_saturation": recent_saturation[:3],
     }
 
 
@@ -20709,6 +20726,53 @@ def _task_has_skynet_no_change_evidence(task: Task | None, *, trace: dict[str, A
     return bool(_response_signals_no_code_change(summary))
 
 
+def _trace_branch_sync_no_repo_delta(trace: dict[str, Any] | None) -> bool:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    candidates: list[Any] = [trace_obj.get("branch_sync")]
+    structured = trace_obj.get("structured_digest")
+    if isinstance(structured, dict):
+        candidates.append(structured.get("branch_sync"))
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        status = str(raw.get("status") or "").strip().lower()
+        reason = str(raw.get("reason") or "").strip().lower()
+        if status == "skipped" and reason in {"no_changes", "no_change", "clean"}:
+            return True
+    return False
+
+
+def _task_is_artifact_only_delivery_claim(task: Task | None, *, trace: dict[str, Any] | None = None) -> bool:
+    if task is None:
+        return False
+    role_norm = _coerce_orchestrator_role(str(getattr(task, "role", "") or ""))
+    if role_norm not in {"implementer_local", "backend", "frontend", "sre", "security"}:
+        return False
+    if str(getattr(task, "state", "") or "").strip().lower() != "done":
+        return False
+    trace_obj = trace if isinstance(trace, dict) else {}
+    if _trace_local_no_change(trace_obj) or _trace_has_validated_slice_evidence(trace_obj):
+        return False
+    summary = str(trace_obj.get("result_summary") or "").strip()
+    if not (_summary_has_progress_signal(summary) or _trace_has_nontrivial_artifacts(trace_obj)):
+        return False
+    return bool(_trace_branch_sync_no_repo_delta(trace_obj) or not _trace_patch_info(trace_obj))
+
+
+def _latest_artifact_only_delivery_claim(tasks: list[Task]) -> Task | None:
+    best_task: Task | None = None
+    best_ts = 0.0
+    for task in tasks or []:
+        trace = dict((getattr(task, "trace", {}) or {}) if isinstance(getattr(task, "trace", {}), dict) else {})
+        if not _task_is_artifact_only_delivery_claim(task, trace=trace):
+            continue
+        ts = float(getattr(task, "updated_at", 0.0) or getattr(task, "created_at", 0.0) or 0.0)
+        if ts >= best_ts:
+            best_ts = ts
+            best_task = task
+    return best_task
+
+
 def _task_has_skynet_review_ready_evidence(task: Task | None, *, trace: dict[str, Any] | None = None) -> bool:
     if task is None:
         return False
@@ -23538,6 +23602,65 @@ def _sync_order_phase_from_runtime(
         and (not proactive_improvement_verified)
         and (not _summary_has_blocked_with_root_cause_signal(latest_controller_terminal_summary))
     ):
+        artifact_only_claim = _latest_artifact_only_delivery_claim(phase_children)
+        if artifact_only_claim is not None:
+            claim_trace = dict(
+                (getattr(artifact_only_claim, "trace", {}) or {})
+                if isinstance(getattr(artifact_only_claim, "trace", {}), dict)
+                else {}
+            )
+            claim_role = _coerce_orchestrator_role(str(getattr(artifact_only_claim, "role", "") or ""))
+            claim_job_id = str(getattr(artifact_only_claim, "job_id", "") or "").strip()
+            claim_summary = _studio_one_line(
+                claim_trace.get("result_summary"),
+                max_chars=360,
+                default="Delivery job produced artifacts/progress text without a mergeable repo delta.",
+            )
+            artifact_summary = (
+                "Failed root-caused: a delivery job claimed progress but left no mergeable branch or validated repo diff. "
+                f"job={claim_job_id or 'unknown'} role={claim_role or 'unknown'} summary={claim_summary}"
+            )
+            try:
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    merge_ready_at=None,
+                    proactive_artifact_only_delivery=True,
+                    proactive_artifact_only_delivery_job_id=claim_job_id,
+                    proactive_artifact_only_delivery_role=claim_role,
+                    proactive_improvement_missing=True,
+                    result_status="failed_root_caused",
+                    result_summary=artifact_summary,
+                    result_next_action="Open a fresh Studio bet or re-delegate a bounded write-enabled slice with real branch evidence.",
+                    operational_gate_status="blocked",
+                    operational_gate_reason="artifact_only_delivery_without_repo_delta",
+                    live_at=time.time(),
+                )
+                storage = getattr(orch_q, "_storage", None)
+                db_path = getattr(storage, "path", None)
+                if db_path is not None:
+                    _studio_complete_cycle_for_order_db(
+                        db_path=Path(db_path).expanduser(),
+                        order_id=rid,
+                        outcome_status="failed_root_caused",
+                        outcome_summary=artifact_summary,
+                        now=time.time(),
+                    )
+                orch_q.append_audit_event(
+                    event_type="order.proactive_artifact_only_delivery_failed_root_caused",
+                    actor="skynet",
+                    details={
+                        "order_id": rid,
+                        "job_id": claim_job_id,
+                        "role": claim_role,
+                        "reason": "artifact_only_delivery_without_repo_delta",
+                    },
+                )
+            except Exception:
+                pass
+            return
         try:
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")

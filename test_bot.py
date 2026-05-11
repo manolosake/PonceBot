@@ -1273,6 +1273,79 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
         self.assertIn("Needs operator decision", packet)
 
+    def test_recent_same_surface_shipment_penalizes_repetition(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            now = 400_000.0
+            self._insert_cycle_outcome(
+                db,
+                now=now + 590,
+                key="repo-executivedashboard",
+                repo_id="executivedashboard",
+                selected_type="FEATURE",
+                outcome_status="shipped_to_main",
+                outcome_summary="Merged to main and deployed the dashboard feature.",
+            )
+            memory = bot._studio_selection_memory(
+                cfg=SimpleNamespace(orchestrator_db_path=db),  # type: ignore[arg-type]
+                orch_q=self._FakeQueue(),  # type: ignore[arg-type]
+                now=now,
+            )
+            repo = {
+                "repo_id": "executivedashboard",
+                "path": "/home/aponce/ExecutiveDashboard",
+                "status": "active",
+                "autonomy_enabled": True,
+                "priority": 1,
+                "metadata": {},
+            }
+
+            item = bot._studio_opportunity_for_repo(repo, now=now, memory=memory)
+
+        self.assertLess(item["score"], 86)
+        self.assertTrue(item["recent_studio_saturation"])
+        self.assertIn("fresh angle", item["why_better_than_alternatives"])
+
+    def test_artifact_only_delivery_claim_detects_no_delta_backend(self) -> None:
+        task = SimpleNamespace(
+            job_id="job-ghost",
+            role="backend",
+            state="done",
+            updated_at=123.0,
+            created_at=100.0,
+            trace={
+                "result_summary": "Implemented and validated a dashboard improvement with artifacts.",
+                "result_artifacts": ["/tmp/job/unified_diff.patch"],
+                "structured_digest": {
+                    "branch_sync": {"status": "skipped", "reason": "no_changes"},
+                },
+            },
+        )
+
+        self.assertTrue(bot._task_is_artifact_only_delivery_claim(task, trace=task.trace))
+        self.assertIs(bot._latest_artifact_only_delivery_claim([task]), task)
+
+    def test_artifact_only_delivery_claim_ignores_validated_patch(self) -> None:
+        task = SimpleNamespace(
+            job_id="job-real",
+            role="implementer_local",
+            state="done",
+            updated_at=123.0,
+            created_at=100.0,
+            trace={
+                "result_summary": "Implemented and validated a real patch.",
+                "local_patch_info": {
+                    "changed_files": ["server/app.py"],
+                    "validation_ok": True,
+                },
+                "slice_patch_applied": True,
+                "slice_validation_ok": True,
+            },
+        )
+
+        self.assertFalse(bot._task_is_artifact_only_delivery_claim(task, trace=task.trace))
+
     def test_stale_selected_cycle_without_order_is_closed_with_root_cause(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
