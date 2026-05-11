@@ -863,6 +863,63 @@ class TestStateHandling(unittest.TestCase):
         self.assertEqual(funnel["slices_closed"], 1)
         self.assertTrue(funnel["improvement_verified"])
 
+    def test_collect_order_local_autonomy_funnel_counts_controller_pass_as_closed(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="done",
+            trace={},
+            labels={},
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        impl = SimpleNamespace(
+            job_id="impl",
+            role="backend",
+            state="done",
+            labels={"key": "local_impl_recover_cli_alias"},
+            trace={
+                "result_summary": "Applied bounded CLI improvement with validation evidence.",
+                "slice_patch_applied": True,
+                "slice_validation_ok": True,
+                "patch_info": {"changed_files": ["bot.py", "test_bot.py"], "validation_ok": True},
+            },
+            created_at=110.0,
+            updated_at=120.0,
+        )
+        qa = SimpleNamespace(
+            job_id="qa",
+            role="qa",
+            state="done",
+            labels={"key": "local_review_recover_cli_alias"},
+            trace={"result_summary": "READY: focused and regression validation passed."},
+            created_at=125.0,
+            updated_at=130.0,
+        )
+        controller = SimpleNamespace(
+            job_id="review",
+            role="skynet",
+            state="done",
+            labels={},
+            trace={"result_summary": "PASS for the backend slice."},
+            created_at=135.0,
+            updated_at=140.0,
+        )
+
+        class FakeQueue:
+            def get_job(self, job_id: str):
+                return root if job_id == "root" else None
+
+            def jobs_by_parent(self, parent_job_id: str, limit: int = 800):
+                return [impl, qa, controller] if parent_job_id == "root" else []
+
+        funnel = bot._collect_order_local_autonomy_funnel(orch_q=FakeQueue(), root_ticket="root", now=150.0)
+
+        self.assertEqual(funnel["quality_gate_status"], "closed")
+        self.assertEqual(funnel["slices_closed"], 1)
+        self.assertTrue(funnel["improvement_verified"])
+        self.assertTrue(bot._order_has_meaningful_improvement(orch_q=FakeQueue(), root_ticket="root"))
+
     def test_controller_verified_slice_for_closure_accepts_salvageable_failed_reviewer(self) -> None:
         impl = SimpleNamespace(
             role="implementer_local",

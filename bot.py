@@ -20348,6 +20348,16 @@ def _summary_has_verified_improvement_signal(text: str) -> bool:
     return bool(re.search(r"\bpass\b.{0,80}\bverified[_ ]improvement\b", compact))
 
 
+def _summary_has_controller_pass_signal(text: str) -> bool:
+    blob = str(text or "").strip()
+    if not blob:
+        return False
+    compact = re.sub(r"\s+", " ", blob).lower()
+    if _text_has_no_go_signal(compact):
+        return False
+    return bool(re.search(r"^(pass|approved)\b", compact))
+
+
 def _trace_patch_info(trace: dict[str, Any] | None) -> dict[str, Any]:
     trace_obj = trace if isinstance(trace, dict) else {}
     patch_info = trace_obj.get("local_patch_info")
@@ -20652,7 +20662,11 @@ def _collect_order_local_autonomy_funnel(
             continue
 
         if role_norm in controller_roles and state == "done":
-            if _summary_has_verified_improvement_signal(summary) or bool(trace.get("improvement_verified", False)):
+            if (
+                _summary_has_verified_improvement_signal(summary)
+                or _summary_has_controller_pass_signal(summary)
+                or bool(trace.get("improvement_verified", False))
+            ):
                 if explicit_slice_id and explicit_slice_id in slices:
                     target = slices.get(explicit_slice_id) or bucket
                     target["controller_verified"] = True
