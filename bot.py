@@ -8420,6 +8420,52 @@ def _merge_error_is_no_delta(detail: str) -> bool:
     return "branch_has_no_delta_vs_main" in str(detail or "").strip().lower()
 
 
+def _order_branch_has_merge_delta(
+    *,
+    repo: Path,
+    order_branch: str,
+    default_branch: str = "main",
+) -> tuple[bool, str]:
+    branch = str(order_branch or "").strip()
+    if not branch:
+        return False, "missing_order_branch"
+    repo = Path(repo).expanduser()
+    if not (repo / ".git").exists():
+        return False, "repo_not_git"
+    _run_git(repo, ["fetch", "origin", "--prune"], check=False)
+    base_ref = _git_pick_main_ref(repo, default_branch=default_branch)
+    branch_ref = (
+        _git_remote_branch_ref(repo, branch)
+        or (f"refs/heads/{branch}" if _git_ref_exists(repo, f"refs/heads/{branch}") else "")
+        or (branch if _git_ref_exists(repo, branch) else "")
+    )
+    if not branch_ref:
+        fetched, fetch_error = _git_fetch_remote_branch(repo, branch)
+        if fetched:
+            branch_ref = _git_remote_branch_ref(repo, branch) or f"origin/{branch}"
+        else:
+            return False, fetch_error or "branch_missing_remote"
+
+    diff_check = _run_git(repo, ["diff", "--quiet", f"{base_ref}..{branch_ref}", "--"], check=False)
+    if diff_check.returncode == 0:
+        return False, "branch_has_no_delta_vs_main"
+    if diff_check.returncode != 1:
+        detail = (diff_check.stderr or diff_check.stdout or "").strip()
+        return False, detail or "branch_diff_check_failed"
+
+    material_check = _run_git(
+        repo,
+        ["diff", "--quiet", "--ignore-all-space", "--ignore-blank-lines", f"{base_ref}..{branch_ref}", "--"],
+        check=False,
+    )
+    if material_check.returncode == 0:
+        return False, "branch_has_no_material_delta_vs_main"
+    if material_check.returncode != 1:
+        detail = (material_check.stderr or material_check.stdout or "").strip()
+        return False, detail or "branch_material_diff_check_failed"
+    return True, "has_delta"
+
+
 def _merge_ready_trace_reset_payload(*, now: float | None = None) -> dict[str, Any]:
     ts = float(time.time() if now is None else now)
     return {
@@ -24460,6 +24506,76 @@ def _apply_autonomous_local_first_policy(
         specs=normalized_specs,
         existing_children=existing_children,
     )
+
+
+def _reject_proactive_ready_no_delta_order(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    repo_dir: Path,
+    default_branch: str,
+    root_trace: dict[str, Any],
+    now: float,
+    actor: str = "skynet",
+) -> bool:
+    order_branch = str((root_trace or {}).get("order_branch") or "").strip()
+    delta_ok, delta_reason = _order_branch_has_merge_delta(
+        repo=repo_dir,
+        order_branch=order_branch,
+        default_branch=default_branch,
+    )
+    if delta_ok:
+        return False
+    if delta_reason not in {"branch_has_no_delta_vs_main", "branch_has_no_material_delta_vs_main"}:
+        return False
+
+    summary = (
+        "Rejected low-value no-delta order before merge readiness: branch has no material diff "
+        "against main, so verified improvement cannot be claimed."
+    )
+    try:
+        orch_q.update_state(
+            order_id,
+            "done",
+            blocked_reason="merge_no_delta",
+            merge_ready=False,
+            merge_error=delta_reason,
+            merge_no_delta_active=False,
+            merge_no_delta_detected_at=float(now),
+            merge_no_delta_retired_at=float(now),
+            proactive_improvement_verified=False,
+            proactive_improvement_closed=False,
+            proactive_improvement_missing=True,
+            result_status="rejected_low_value",
+            result_summary=summary,
+            result_next_action="Choose a different bet with measurable branch delta.",
+            live_at=float(now),
+        )
+        orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done")
+        orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done")
+        _studio_complete_cycle_for_order_from_queue(
+            orch_q=orch_q,
+            order_id=order_id,
+            outcome_status="rejected_low_value",
+            outcome_summary=summary,
+            now=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.proactive_verified_no_delta_rejected",
+            actor=str(actor or "skynet"),
+            details={
+                "order_id": str(order_id),
+                "order_branch": order_branch,
+                "reason": delta_reason,
+            },
+        )
+        return True
+    except Exception:
+        LOG.exception("Failed to reject proactive no-delta ready order order_id=%s", order_id)
+        return False
+
+
 def _sync_order_phase_from_runtime(
     *,
     orch_q: OrchestratorQueue,
@@ -25103,6 +25219,18 @@ def _sync_order_phase_from_runtime(
 
     if proactive_order and proactive_improvement_verified and not any_live:
         try:
+            now_ts = time.time()
+            if merge_required and _reject_proactive_ready_no_delta_order(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                root_trace=root_trace,
+                now=now_ts,
+                actor="skynet",
+            ):
+                return
             if merge_required:
                 orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
                 orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
@@ -25113,11 +25241,11 @@ def _sync_order_phase_from_runtime(
                 rid,
                 proactive_improvement_verified=True,
                 proactive_improvement_closed=True,
-                proactive_improvement_closed_at=time.time(),
+                proactive_improvement_closed_at=now_ts,
                 merge_ready=bool(merge_required),
-                merge_ready_at=(time.time() if merge_required else None),
+                merge_ready_at=(now_ts if merge_required else None),
                 **(_merge_ready_trace_reset_payload() if merge_required else {}),
-                live_at=time.time(),
+                live_at=now_ts,
             )
             orch_q.append_audit_event(
                 event_type="order.proactive_verified_improvement_closed",
@@ -25203,6 +25331,17 @@ def _sync_order_phase_from_runtime(
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
         else:
+            if proactive_order and _reject_proactive_ready_no_delta_order(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                root_trace=root_trace,
+                now=time.time(),
+                actor="skynet",
+            ):
+                return
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
             try:
                 orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
@@ -25235,6 +25374,17 @@ def _sync_order_phase_from_runtime(
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
             orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
         else:
+            if proactive_order and _reject_proactive_ready_no_delta_order(
+                orch_q=orch_q,
+                order_id=rid,
+                chat_id=int(chat_id),
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                root_trace=root_trace,
+                now=time.time(),
+                actor="skynet",
+            ):
+                return
             orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
             try:
                 orch_q.update_trace(rid, merge_ready=True, merge_ready_at=time.time())
@@ -26443,6 +26593,17 @@ def _jarvis_final_sweep_tick(
                 merge_required = bool(str(root_trace.get("order_branch") or "").strip()) and not bool(root_trace.get("merged_to_main", False))
 
             if merge_required:
+                if proactive_order and _reject_proactive_ready_no_delta_order(
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=int(chat_id),
+                    repo_dir=repo_dir,
+                    default_branch=default_branch,
+                    root_trace=root_trace,
+                    now=float(now),
+                    actor="skynet",
+                ):
+                    continue
                 ready_succeeded = False
                 try:
                     status_ok = bool(orch_q.set_order_status(oid, chat_id=int(chat_id), status="active"))

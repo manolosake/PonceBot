@@ -1,4 +1,5 @@
 import sqlite3
+import subprocess
 from types import SimpleNamespace
 
 import bot
@@ -183,3 +184,47 @@ def test_final_sweep_no_change_close_waits_for_open_nonblocking_children():
 
     assert bot._final_sweep_blocker_count(children=children, open_states=open_states) == 0
     assert bot._has_open_child_jobs(children=children, open_states=open_states)
+
+
+def test_order_branch_has_merge_delta_rejects_no_delta_branch(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "feature/noop"], cwd=repo, check=True)
+
+    has_delta, reason = bot._order_branch_has_merge_delta(
+        repo=repo,
+        order_branch="feature/noop",
+        default_branch="main",
+    )
+
+    assert not has_delta
+    assert reason == "branch_has_no_delta_vs_main"
+
+
+def test_order_branch_has_merge_delta_accepts_real_branch_delta(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", "-b", "feature/delta"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("base\nchange\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "change"], cwd=repo, check=True, capture_output=True)
+
+    has_delta, reason = bot._order_branch_has_merge_delta(
+        repo=repo,
+        order_branch="feature/delta",
+        default_branch="main",
+    )
+
+    assert has_delta
+    assert reason == "has_delta"
