@@ -52,6 +52,44 @@ def test_studio_governor_makes_core_repair_beat_incubator():
     assert "temporarily gated" in incubator["thesis"].lower()
 
 
+def test_studio_governor_keeps_core_repair_high_despite_prior_core_failures():
+    now = 1_700_000_000.0
+    memory = _delivery_failure_memory(now)
+    memory["recent_studio_negative_outcomes"].extend(
+        [
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "failed_root_caused",
+                "summary": "Prior core repair failed.",
+                "updated_at": now - 120,
+            },
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "rejected_low_value",
+                "summary": "Prior core repair had no delta.",
+                "updated_at": now - 240,
+            },
+        ]
+    )
+    memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
+    core_repo = {
+        "repo_id": "codexbot",
+        "path": "/home/aponce/codexbot",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
+
+    core = bot._studio_opportunity_for_repo(core_repo, now=now, memory=memory)
+
+    assert core["score"] >= 140
+
+
 def test_studio_prompt_includes_governor_directives():
     now = 1_700_000_000.0
     memory = _delivery_failure_memory(now)

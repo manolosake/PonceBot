@@ -15948,6 +15948,8 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             score += 6 if match == "same key" else 4
     if recent_risks:
         score = max(0, score)
+    if governor_mode == "repair_delivery_contract" and kind == "Core":
+        score = max(score, 140)
 
     base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
     if governor_mode and governor_mode != "normal":
