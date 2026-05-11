@@ -14942,6 +14942,7 @@ _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 _STUDIO_CYCLE_VERSION = 1
 _STUDIO_OUTCOME_TYPES = ("shipped_to_main", "published_project", "blocked_need_operator", "rejected_low_value", "failed_root_caused")
+_STUDIO_STALE_SELECTED_SECONDS = 30 * 60
 
 
 def _studio_enabled() -> bool:
@@ -15171,7 +15172,45 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
     return memory
 
 
+def _studio_finalize_stale_selected_cycles(
+    db_path: Path,
+    *,
+    now: float,
+    max_age_seconds: float = _STUDIO_STALE_SELECTED_SECONDS,
+) -> int:
+    cutoff = float(now) - max(60.0, float(max_age_seconds))
+    try:
+        db = Path(db_path).expanduser()
+        if not db.exists():
+            return 0
+        _studio_ensure_schema(db)
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            cur = conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = 'failed',
+                    outcome_status = 'failed_root_caused',
+                    outcome_summary = ?,
+                    updated_at = ?
+                WHERE status = 'selected'
+                  AND (order_id IS NULL OR TRIM(order_id) = '')
+                  AND updated_at <= ?
+                """,
+                (
+                    "Studio cycle was selected but no order was attached; closed as stale before next selection.",
+                    float(now),
+                    cutoff,
+                ),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+    except Exception:
+        LOG.exception("Failed to finalize stale selected Studio cycles")
+        return 0
+
+
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
+    _studio_finalize_stale_selected_cycles(cfg.orchestrator_db_path, now=now)
     memory = _studio_recent_order_memory(orch_q, now=now)
     cycle_memory = _studio_recent_cycle_outcome_memory(cfg.orchestrator_db_path, now=now)
     memory.update(cycle_memory)

@@ -1273,6 +1273,64 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
         self.assertIn("Needs operator decision", packet)
 
+    def test_stale_selected_cycle_without_order_is_closed_with_root_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db = root / "jobs.sqlite"
+            now = 300_000.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                for cycle_id, updated_at in (("old-selected", now - 7200), ("fresh-selected", now - 120)):
+                    conn.execute(
+                        """
+                        INSERT INTO studio_cycles(
+                            cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                            selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                            operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                            opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cycle_id,
+                            bot._STUDIO_CYCLE_VERSION,
+                            updated_at,
+                            "selected",
+                            f"repo-{cycle_id}",
+                            "FEATURE",
+                            "executivedashboard",
+                            "/tmp/repo",
+                            "studio",
+                            "Improve visible outcomes",
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                            "[]",
+                            "",
+                            "",
+                            None,
+                            updated_at,
+                            updated_at,
+                        ),
+                    )
+                conn.commit()
+
+            closed = bot._studio_finalize_stale_selected_cycles(db, now=now, max_age_seconds=1800)
+
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                old = dict(conn.execute("SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE cycle_id = ?", ("old-selected",)).fetchone())
+                fresh = dict(conn.execute("SELECT status, outcome_status FROM studio_cycles WHERE cycle_id = ?", ("fresh-selected",)).fetchone())
+
+        self.assertEqual(closed, 1)
+        self.assertEqual(old["status"], "failed")
+        self.assertEqual(old["outcome_status"], "failed_root_caused")
+        self.assertIn("no order was attached", old["outcome_summary"])
+        self.assertEqual(fresh["status"], "selected")
+        self.assertEqual(fresh["outcome_status"], "")
+
 
 class TestParseJob(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
