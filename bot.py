@@ -16196,8 +16196,20 @@ def _studio_extract_portfolio_project_from_order(
         path_match = re.search(r"(/home/aponce/[A-Za-z0-9._/-]+)", summary)
         if path_match:
             project_path = path_match.group(1).rstrip("`.,;:)")
+    project_git_path: Path | None = None
+    if project_path:
+        try:
+            candidate_path = Path(project_path).expanduser()
+            if candidate_path.exists() and candidate_path.is_dir() and (candidate_path / ".git").exists():
+                project_git_path = candidate_path
+        except Exception:
+            project_git_path = None
     github_repo = str(publication.get("github_repo") or "").strip()
     remote_url = str(publication.get("remote_url") or delivery.get("github_remote_url") or "").strip()
+    if not remote_url and project_git_path is not None:
+        remote = _run_git(project_git_path, ["remote", "get-url", "origin"], check=False)
+        if remote.returncode == 0:
+            remote_url = str(remote.stdout or "").strip()
     if not github_repo and remote_url:
         github_repo = _github_repo_full_name_from_remote_url(remote_url)
     if not github_repo:
@@ -16219,11 +16231,20 @@ def _studio_extract_portfolio_project_from_order(
     if not remote_url and github_repo:
         remote_url = f"https://github.com/{github_repo}.git"
     latest_head = str(publication.get("head") or delivery.get("project_head") or "").strip()
+    if not latest_head and project_git_path is not None:
+        head = _run_git(project_git_path, ["rev-parse", "--short", "HEAD"], check=False)
+        if head.returncode == 0:
+            latest_head = str(head.stdout or "").strip()
     if not latest_head:
         head_match = re.search(r"\bhead\s+([0-9a-f]{7,40})\b", summary, flags=re.IGNORECASE)
         if head_match:
             latest_head = head_match.group(1)
     branch = str(publication.get("branch") or "main").strip() or "main"
+    if project_git_path is not None:
+        branch_proc = _run_git(project_git_path, ["branch", "--show-current"], check=False)
+        branch_text = str(branch_proc.stdout or "").strip() if branch_proc.returncode == 0 else ""
+        if branch_text:
+            branch = branch_text
     private_raw = publication.get("private")
     if private_raw is None:
         private_raw = "private" in summary.lower()
