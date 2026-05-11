@@ -6244,6 +6244,198 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertTrue(root.trace["merge_ready"])
         self.assertFalse(any(event["event_type"] == "order.operational_gate_blocked" for event in q.audit_events))
 
+    def test_sync_order_phase_applies_blocked_studio_terminal_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            bot._studio_ensure_schema(db_path)
+            with sqlite3.connect(str(db_path), timeout=15.0) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id, selected_repo_path,
+                        selected_lane, thesis, rationale, debate_summary, operator_visible_outcome, evidence_target,
+                        risk_summary, prompt_packet, opportunities_json, outcome_status, outcome_summary, order_id,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-1",
+                        1,
+                        1.0,
+                        "blocked",
+                        "studio-repo",
+                        "repo",
+                        "codexbot-6fb8d5b9",
+                        "/tmp/repo",
+                        "studio",
+                        "Ship a tight CLI improvement",
+                        "CLI alias closes a studio-visible gap.",
+                        "Ship the small fix instead of broadening scope.",
+                        "Operator-visible studio outcome",
+                        "tests/logs",
+                        "bounded risk",
+                        "prompt",
+                        "[]",
+                        "blocked_need_operator",
+                        "Need operator decision before continuing.",
+                        "root",
+                        10.0,
+                        10.0,
+                    ),
+                )
+                conn.commit()
+
+            root = SimpleNamespace(
+                job_id="root",
+                role="skynet",
+                state="running",
+                trace={},
+                labels={},
+                parent_job_id="",
+                chat_id=1,
+                created_at=90.0,
+                updated_at=100.0,
+            )
+
+            class FakeQueue:
+                def __init__(self) -> None:
+                    self._storage = SimpleNamespace(path=db_path)
+                    self.phases: list[str] = []
+                    self.statuses: list[str] = []
+                    self.trace_updates: list[dict[str, object]] = []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": chat_id,
+                        "status": "active",
+                        "phase": "review",
+                        "title": "Studio Cycle: codexbot",
+                        "body": "AUTONOMOUS PROACTIVE SPRINT\n[proactive:studio-repo-codexbot-6fb8d5b9]\nLane: studio",
+                    }
+
+                def get_job(self, job_id: str):
+                    return root
+
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600):
+                    return []
+
+                def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                    self.phases.append(phase)
+
+                def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                    self.statuses.append(status)
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    self.trace_updates.append(dict(kwargs))
+
+            q = FakeQueue()
+            with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+                bot, "_order_trace_requires_merge", return_value=(False, "")
+            ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False):
+                bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
+
+            self.assertEqual(q.statuses[-1], "active")
+            self.assertEqual(q.phases[-1], "review")
+            self.assertEqual(q.trace_updates[-1]["studio_terminal_outcome"], "blocked_need_operator")
+            self.assertEqual(q.trace_updates[-1]["operational_gate_status"], "blocked")
+
+    def test_sync_order_phase_applies_done_studio_terminal_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            bot._studio_ensure_schema(db_path)
+            with sqlite3.connect(str(db_path), timeout=15.0) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id, selected_repo_path,
+                        selected_lane, thesis, rationale, debate_summary, operator_visible_outcome, evidence_target,
+                        risk_summary, prompt_packet, opportunities_json, outcome_status, outcome_summary, order_id,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-2",
+                        1,
+                        1.0,
+                        "done",
+                        "studio-repo",
+                        "repo",
+                        "codexbot-6fb8d5b9",
+                        "/tmp/repo",
+                        "studio",
+                        "Ship a tight CLI improvement",
+                        "CLI alias closes a studio-visible gap.",
+                        "Ship the small fix instead of broadening scope.",
+                        "Operator-visible studio outcome",
+                        "tests/logs",
+                        "bounded risk",
+                        "prompt",
+                        "[]",
+                        "published_project",
+                        "Published the project outcome successfully.",
+                        "root",
+                        11.0,
+                        11.0,
+                    ),
+                )
+                conn.commit()
+
+            root = SimpleNamespace(
+                job_id="root",
+                role="skynet",
+                state="running",
+                trace={},
+                labels={},
+                parent_job_id="",
+                chat_id=1,
+                created_at=90.0,
+                updated_at=100.0,
+            )
+
+            class FakeQueue:
+                def __init__(self) -> None:
+                    self._storage = SimpleNamespace(path=db_path)
+                    self.phases: list[str] = []
+                    self.statuses: list[str] = []
+                    self.trace_updates: list[dict[str, object]] = []
+
+                def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                    return {
+                        "order_id": order_id,
+                        "chat_id": chat_id,
+                        "status": "active",
+                        "phase": "review",
+                        "title": "Studio Cycle: codexbot",
+                        "body": "AUTONOMOUS PROACTIVE SPRINT\n[proactive:studio-repo-codexbot-6fb8d5b9]\nLane: studio",
+                    }
+
+                def get_job(self, job_id: str):
+                    return root
+
+                def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600):
+                    return []
+
+                def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                    self.phases.append(phase)
+
+                def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                    self.statuses.append(status)
+
+                def update_trace(self, job_id: str, **kwargs: object) -> None:
+                    self.trace_updates.append(dict(kwargs))
+
+            q = FakeQueue()
+            with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+                bot, "_order_trace_requires_merge", return_value=(False, "")
+            ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False):
+                bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
+
+            self.assertEqual(q.statuses[-1], "done")
+            self.assertEqual(q.phases[-1], "done")
+            self.assertEqual(q.trace_updates[-1]["studio_terminal_outcome"], "published_project")
+            self.assertEqual(q.trace_updates[-1]["operational_gate_status"], "terminal")
+
     def _operational_gate_queue(
         self,
         *,
