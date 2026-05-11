@@ -16246,6 +16246,12 @@ def _studio_extract_portfolio_project_from_order(
         if branch_text:
             branch = branch_text
     private_raw = publication.get("private")
+    if private_raw is None and github_repo:
+        token, _token_source = _github_token_from_env_or_git_credentials()
+        if token:
+            ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{github_repo}")
+            if ok_repo:
+                private_raw = bool(repo_payload.get("private", False))
     if private_raw is None:
         private_raw = "private" in summary.lower()
     private = 1 if bool(private_raw) else 0

@@ -1567,6 +1567,69 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(row["github_repo"], "manolosake/winback-workbench")
         self.assertEqual(row["latest_head"], head)
 
+    def test_portfolio_parser_confirms_private_visibility_from_github_api(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 228_000.0
+            order_id = "order-portfolio-private"
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute("INSERT INTO jobs(job_id, trace) VALUES (?, ?)", (order_id, "{}"))
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-private-parser",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "new-project-incubator",
+                        "NEW_PROJECT",
+                        "",
+                        "",
+                        "incubator",
+                        "Create a sellable project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        order_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_token_from_env_or_git_credentials", return_value=("token", "test")), patch.object(
+                bot, "_github_api_json", return_value=(True, {"private": True})
+            ):
+                bot._studio_complete_cycle_for_order_db(
+                    db_path=db,
+                    order_id=order_id,
+                    outcome_status="published_project",
+                    outcome_summary="Published repo manolosake/winback-workbench with tests passed.",
+                    now=now + 60,
+                )
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT status, private FROM studio_portfolio_projects").fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "published_private")
+        self.assertEqual(row["private"], 1)
+
     def test_incubator_opportunity_requires_monetization_evidence(self) -> None:
         item = bot._studio_incubator_opportunity(
             cfg=SimpleNamespace(),  # type: ignore[arg-type]
