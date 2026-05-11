@@ -3908,12 +3908,12 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             root = q.get_job(order_id)
             assert order is not None and root is not None
             trace = dict(root.trace or {})
-            self.assertEqual(str(order.get("status") or ""), "failed")
-            self.assertEqual(str(order.get("phase") or ""), "failed")
-            self.assertEqual(str(root.state), "failed")
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+            self.assertEqual(str(root.state), "done")
             self.assertFalse(bool(trace.get("merge_ready", False)))
-            self.assertTrue(bool(trace.get("merge_no_delta_active", False)))
-            self.assertEqual(str(trace.get("result_status") or ""), "merge_no_delta")
+            self.assertFalse(bool(trace.get("merge_no_delta_active", False)))
+            self.assertEqual(str(trace.get("result_status") or ""), "rejected_low_value")
 
     def test_merge_conflict_enqueues_skynet_resolution_job(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -13482,33 +13482,32 @@ def _order_command_text(
                         f"Order {root_id[:8]} closed as external project delivery. "
                         f"Project={project_delivery.get('project_path')}."
                     )
+                no_delta_summary = (
+                    "Rejected low-value no-delta order: branch has no diff against main, "
+                    "so nothing should be shipped from this attempt."
+                )
                 orch_q.update_state(
                     root_id,
-                    "failed",
+                    "done",
                     blocked_reason="merge_no_delta",
                     merge_ready=False,
                     merge_error=err_txt,
                     merge_auto_error=err_txt,
                     merge_auto_failed_at=failed_at,
-                    merge_no_delta_active=True,
+                    merge_no_delta_active=False,
                     merge_no_delta_detected_at=failed_at,
-                    result_status="merge_no_delta",
-                    result_summary=(
-                        "Merge refused: order branch has no diff against main; "
-                        "not marking this as delivered."
-                    ),
-                    result_next_action="Replan the order or retire the no-delta branch.",
+                    merge_no_delta_retired_at=failed_at,
+                    result_status="rejected_low_value",
+                    result_summary=no_delta_summary,
+                    result_next_action="Choose a different bet with measurable delta.",
                 )
-                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="failed")
-                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="failed")
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
                 _studio_complete_cycle_for_order(
                     cfg=cfg,
                     order_id=root_id,
-                    outcome_status="failed_root_caused",
-                    outcome_summary=(
-                        "Merge refused: order branch has no diff against main; "
-                        "not marking this as delivered."
-                    ),
+                    outcome_status="rejected_low_value",
+                    outcome_summary=no_delta_summary,
                     now=failed_at,
                 )
         except Exception:
@@ -14684,8 +14683,21 @@ def _auto_merge_ready_orders_tick(
                 deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
                 if terminal_no_delivery:
                     try:
-                        orch_q.set_order_status(oid, chat_id=chat_for_order, status="failed")
-                        orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="failed")
+                        no_delta_summary = (
+                            "Rejected low-value no-delta order: no branch diff existed "
+                            "against main, so nothing was shipped."
+                        )
+                        orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
+                        orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
+                        orch_q.update_state(
+                            oid,
+                            "done",
+                            blocked_reason=None,
+                            merge_ready=False,
+                            result_status="rejected_low_value",
+                            result_summary=no_delta_summary,
+                            result_next_action="Choose a different bet with measurable delta.",
+                        )
                         orch_q.update_trace(
                             oid,
                             merge_ready=False,
@@ -14702,11 +14714,8 @@ def _auto_merge_ready_orders_tick(
                         _studio_complete_cycle_for_order(
                             cfg=cfg,
                             order_id=oid,
-                            outcome_status="failed_root_caused",
-                            outcome_summary=(
-                                "Auto-merge retired a no-delta order; no branch diff existed "
-                                "against main, so nothing was shipped."
-                            ),
+                            outcome_status="rejected_low_value",
+                            outcome_summary=no_delta_summary,
                             now=float(now),
                         )
                     except Exception:
