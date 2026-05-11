@@ -16201,9 +16201,21 @@ def _studio_extract_portfolio_project_from_order(
     if not github_repo and remote_url:
         github_repo = _github_repo_full_name_from_remote_url(remote_url)
     if not github_repo:
-        repo_match = re.search(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b", summary)
+        url_match = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?\b", summary, flags=re.IGNORECASE)
+        if url_match:
+            github_repo = f"{url_match.group(1)}/{url_match.group(2).removesuffix('.git')}"
+    if not github_repo:
+        repo_match = re.search(
+            r"\b(?:repo|repository|github repo)\s*[:=]?\s*`?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)`?",
+            summary,
+            flags=re.IGNORECASE,
+        )
         if repo_match:
             github_repo = repo_match.group(1).rstrip("`.,;:)")
+    if not github_repo:
+        owner_match = re.search(r"\b(manolosake/[A-Za-z0-9_.-]+)\b", summary, flags=re.IGNORECASE)
+        if owner_match:
+            github_repo = owner_match.group(1).rstrip("`.,;:)").lower()
     if not remote_url and github_repo:
         remote_url = f"https://github.com/{github_repo}.git"
     latest_head = str(publication.get("head") or delivery.get("project_head") or "").strip()

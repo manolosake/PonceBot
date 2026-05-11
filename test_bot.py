@@ -1425,6 +1425,68 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("Portfolio assets", packet)
         self.assertIn("Portfolio compounding", packet)
 
+    def test_portfolio_parser_ignores_non_repo_slash_phrases(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 226_000.0
+            order_id = "order-portfolio-summary"
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute("INSERT INTO jobs(job_id, trace) VALUES (?, ?)", (order_id, "{}"))
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-summary-parser",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "new-project-incubator",
+                        "NEW_PROJECT",
+                        "",
+                        "",
+                        "incubator",
+                        "Create a sellable project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        order_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            bot._studio_complete_cycle_for_order_db(
+                db_path=db,
+                order_id=order_id,
+                outcome_status="published_project",
+                outcome_summary=(
+                    "PASS. Avoided repeat/no-delta work. Built `/home/aponce/lead-offer-brief`, "
+                    "repo `manolosake/lead-offer-brief` private on GitHub."
+                ),
+                now=now + 60,
+            )
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT github_repo FROM studio_portfolio_projects").fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["github_repo"], "manolosake/lead-offer-brief")
+
     def test_incubator_opportunity_requires_monetization_evidence(self) -> None:
         item = bot._studio_incubator_opportunity(
             cfg=SimpleNamespace(),  # type: ignore[arg-type]
