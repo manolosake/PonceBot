@@ -8738,22 +8738,24 @@ def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> 
     seen: set[str] = set()
     for path in candidates:
         try:
-            path_key = str(path.resolve())
+            resolved_path = path.resolve()
+            resolved_root = root.resolve()
+            path_key = str(resolved_path)
         except Exception:
+            resolved_path = path
+            resolved_root = root
             path_key = str(path)
         if path_key in seen:
             continue
         seen.add(path_key)
-        if path.name.startswith("."):
-            continue
-        if any(part.startswith(".") for part in path.parts):
-            continue
         if not _path_is_relative_to(path, root):
             continue
         try:
-            relative_parts = path.resolve().relative_to(root.resolve()).parts
+            relative_parts = resolved_path.relative_to(resolved_root).parts
         except Exception:
             relative_parts = ()
+        if any(part.startswith(".") for part in relative_parts):
+            continue
         if len(relative_parts) > 3:
             continue
         if not path.exists() or not path.is_dir():

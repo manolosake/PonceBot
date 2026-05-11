@@ -6709,6 +6709,32 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(evidence["project_path"], str(project.resolve()))
         self.assertFalse(artifact_only)
 
+    def test_project_incubator_hidden_relative_git_project_is_rejected(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+            project = root / ".hidden-incubator" / "scopeguard-mvp"
+            project.mkdir(parents=True)
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Hidden ScopeGuard MVP\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "hidden initial"], cwd=project)
+            trace = {
+                "initiative_key": "project-incubator",
+                "initiative_lane": "incubator",
+                "result_summary": f"Implemented hidden scopeguard MVP at {project} with git-backed validation evidence.",
+            }
+
+            with patch.dict(os.environ, {"BOT_PROJECT_INCUBATOR_ROOT": str(root)}, clear=False):
+                evidence = bot._trace_project_incubator_delivery_evidence(trace)
+
+        self.assertFalse(evidence["ok"], evidence)
+        self.assertEqual(evidence["reason"], "no_git_backed_project_path")
+
     def test_proactive_cli_promotion_disabled_by_default(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("BOT_PROACTIVE_ALLOW_CLI_PROMOTION", None)
