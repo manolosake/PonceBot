@@ -8634,6 +8634,29 @@ def _is_project_incubator_trace(trace: dict[str, Any] | None) -> bool:
     return key == "project-incubator" or lane == "incubator"
 
 
+def _trace_result_artifact_paths(trace: dict[str, Any] | None) -> list[str]:
+    trace_obj = trace if isinstance(trace, dict) else {}
+    raw_items: list[Any] = []
+    for key in ("result_artifacts", "artifacts"):
+        value = trace_obj.get(key)
+        if isinstance(value, list):
+            raw_items.extend(value)
+    digest = trace_obj.get("structured_digest")
+    if isinstance(digest, dict):
+        value = digest.get("artifacts")
+        if isinstance(value, list):
+            raw_items.extend(value)
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
 def _project_incubator_summary_blob(trace: dict[str, Any] | None) -> str:
     tr = dict(trace or {})
     parts = [
@@ -8650,6 +8673,19 @@ def _project_incubator_summary_blob(trace: dict[str, Any] | None) -> str:
                 str(digest.get("classification") or ""),
             ]
         )
+    for artifact in _trace_result_artifact_paths(tr):
+        try:
+            path = Path(str(artifact)).expanduser()
+        except Exception:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".txt", ".log", ".json"}:
+            continue
+        try:
+            parts.append(path.read_text(encoding="utf-8", errors="replace")[:24000])
+        except Exception:
+            continue
     return "\n".join(part for part in parts if part)
 
 
@@ -8684,14 +8720,41 @@ def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> 
         return {"ok": False, "reason": "not_project_incubator"}
     blob = _project_incubator_summary_blob(trace)
     blob_l = blob.lower()
-    if "verified_improvement" not in blob_l or "new_project_phase" not in blob_l:
+    if not (
+        ("verified_improvement" in blob_l and "new_project_phase" in blob_l)
+        or any(tok in blob_l for tok in ("git-backed", "git backed", "runnable", "demo", "mvp", "validated"))
+    ):
         return {"ok": False, "reason": "missing_verified_new_project_signal"}
 
     root = _project_incubator_root_dir()
+    candidates: list[Path] = []
     for path in _project_incubator_candidate_paths_from_trace(trace):
+        candidates.append(path)
+        try:
+            if path.exists() and path.is_dir() and not (path / ".git").exists():
+                candidates.extend(child for child in sorted(path.iterdir()) if child.is_dir())
+        except Exception:
+            pass
+    seen: set[str] = set()
+    for path in candidates:
+        try:
+            path_key = str(path.resolve())
+        except Exception:
+            path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
         if path.name.startswith("."):
             continue
-        if not _path_is_relative_to(path, root) or path.parent.resolve() != root.resolve():
+        if any(part.startswith(".") for part in path.parts):
+            continue
+        if not _path_is_relative_to(path, root):
+            continue
+        try:
+            relative_parts = path.resolve().relative_to(root.resolve()).parts
+        except Exception:
+            relative_parts = ()
+        if len(relative_parts) > 3:
             continue
         if not path.exists() or not path.is_dir():
             continue
@@ -21102,6 +21165,8 @@ def _task_is_artifact_only_delivery_claim(task: Task | None, *, trace: dict[str,
     if str(getattr(task, "state", "") or "").strip().lower() != "done":
         return False
     trace_obj = trace if isinstance(trace, dict) else {}
+    if _trace_has_project_incubator_delivery_evidence(trace_obj):
+        return False
     if _trace_local_no_change(trace_obj) or _trace_has_validated_slice_evidence(trace_obj):
         return False
     summary = str(trace_obj.get("result_summary") or "").strip()
