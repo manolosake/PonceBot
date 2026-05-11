@@ -577,26 +577,39 @@ class TestStateHandling(unittest.TestCase):
 
             self.assertEqual(bot._project_incubator_github_repo_name(project), "bidpulse-local")
 
-    def test_publish_project_incubator_accepts_existing_github_remote_without_api(self) -> None:
-        def run(cmd: list[str], cwd: Path) -> str:
-            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
-
+    def test_publish_project_incubator_pushes_existing_github_remote_without_api(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             project = Path(td) / "bidpulse-local"
             project.mkdir(parents=True, exist_ok=True)
-            run(["git", "init", "-b", "main"], cwd=project)
-            run(["git", "config", "user.email", "test@example.com"], cwd=project)
-            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / ".git").mkdir()
             (project / "README.md").write_text("# BidPulse Local\n", encoding="utf-8")
-            run(["git", "add", "README.md"], cwd=project)
-            run(["git", "commit", "-m", "initial"], cwd=project)
-            run(["git", "remote", "add", "origin", "https://github.com/manolosake/bidpulse-local.git"], cwd=project)
 
-            result = bot._publish_project_incubator_private_github(project, description="BidPulse Local")
+            calls: list[list[str]] = []
+
+            def fake_run_git(_path: Path, args: list[str], *, check: bool = False):
+                calls.append(list(args))
+                if args == ["status", "--short"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+                if args == ["branch", "--show-current"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+                if args == ["rev-parse", "--short", "HEAD"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="abc1234\n", stderr="")
+                if args == ["remote", "get-url", "origin"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="https://github.com/manolosake/bidpulse-local.git\n", stderr="")
+                if args == ["push", "-u", "origin", "main"]:
+                    return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected")
+
+            with patch.object(bot, "_run_git", side_effect=fake_run_git), patch.object(
+                bot, "_github_token_from_env_or_git_credentials", return_value=("", "")
+            ):
+                result = bot._publish_project_incubator_private_github(project, description="BidPulse Local")
 
         self.assertTrue(result["ok"], result)
-        self.assertEqual(result["reason"], "github_remote_already_configured")
+        self.assertEqual(result["reason"], "github_remote_verified_and_pushed")
         self.assertEqual(result["remote_name"], "origin")
+        self.assertEqual(result["github_repo"], "manolosake/bidpulse-local")
+        self.assertIn(["push", "-u", "origin", "main"], calls)
 
     def test_orchestrator_threaded_session_enabled_defaults_true(self) -> None:
         self.assertTrue(bot._orchestrator_threaded_session_enabled({}, role="architect_local"))

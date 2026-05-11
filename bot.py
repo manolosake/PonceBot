@@ -8884,6 +8884,25 @@ def _project_incubator_github_repo_name(project_path: Path) -> str:
     return _slug_token(project_path.name or "poncebot-project", max_len=80)
 
 
+def _github_repo_full_name_from_remote_url(remote_url: str) -> str:
+    text = str(remote_url or "").strip()
+    if not text:
+        return ""
+    patterns = (
+        r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+        r"https?://[^@/\s]+@github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        owner = match.group(1).strip()
+        repo = match.group(2).strip().removesuffix(".git")
+        if owner and repo:
+            return f"{owner}/{repo}"
+    return ""
+
+
 def _publish_project_incubator_private_github(project_path: Path, *, description: str = "") -> dict[str, Any]:
     try:
         path = project_path.expanduser().resolve()
@@ -8894,17 +8913,6 @@ def _publish_project_incubator_private_github(project_path: Path, *, description
     if not (path / ".git").exists():
         return {"ok": False, "reason": "project_not_git_backed", "project_path": str(path)}
 
-    existing_remote = _run_git(path, ["remote", "get-url", "origin"], check=False)
-    existing_url = str(existing_remote.stdout or "").strip() if existing_remote.returncode == 0 else ""
-    if existing_url and "github.com" in existing_url.lower():
-        return {
-            "ok": True,
-            "reason": "github_remote_already_configured",
-            "project_path": str(path),
-            "remote_name": "origin",
-            "remote_url": existing_url,
-        }
-
     status = _run_git(path, ["status", "--short"], check=False)
     status_text = str(status.stdout or "").strip()
     if status.returncode != 0:
@@ -8914,6 +8922,40 @@ def _publish_project_incubator_private_github(project_path: Path, *, description
 
     branch = str(_run_git(path, ["branch", "--show-current"], check=False).stdout or "").strip() or "main"
     head = str(_run_git(path, ["rev-parse", "--short", "HEAD"], check=False).stdout or "").strip()
+    existing_remote = _run_git(path, ["remote", "get-url", "origin"], check=False)
+    existing_url = str(existing_remote.stdout or "").strip() if existing_remote.returncode == 0 else ""
+    if existing_url and "github.com" in existing_url.lower():
+        push = _run_git(path, ["push", "-u", "origin", branch], check=False)
+        if push.returncode != 0:
+            return {
+                "ok": False,
+                "reason": "git_push_failed",
+                "detail": str(push.stderr or push.stdout or "").strip()[:1000],
+                "remote_url": existing_url,
+                "remote_name": "origin",
+                "branch": branch,
+                "head": head,
+            }
+        repo_full_name = _github_repo_full_name_from_remote_url(existing_url)
+        private: bool | None = None
+        token, token_source = _github_token_from_env_or_git_credentials()
+        if token and repo_full_name:
+            ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{repo_full_name}")
+            if ok_repo:
+                private = bool(repo_payload.get("private", False))
+        return {
+            "ok": True,
+            "reason": "github_remote_verified_and_pushed",
+            "project_path": str(path),
+            "github_repo": repo_full_name,
+            "remote_name": "origin",
+            "remote_url": existing_url,
+            "branch": branch,
+            "head": head,
+            "private": private,
+            "token_source": token_source if token else "",
+        }
+
     token, token_source = _github_token_from_env_or_git_credentials()
     if not token:
         return {"ok": False, "reason": "missing_github_token_or_git_credentials"}
@@ -15987,6 +16029,27 @@ def _studio_complete_cycle_for_order(
     )
 
 
+def _studio_complete_cycle_for_order_from_queue(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float | None = None,
+) -> None:
+    storage = getattr(orch_q, "_storage", None)
+    db_path = getattr(storage, "path", None)
+    if db_path is None:
+        return
+    _studio_complete_cycle_for_order_db(
+        db_path=Path(db_path).expanduser(),
+        order_id=order_id,
+        outcome_status=outcome_status,
+        outcome_summary=outcome_summary,
+        now=now,
+    )
+
+
 def _studio_terminal_outcome_for_order(orch_q: OrchestratorQueue, order_id: str) -> dict[str, Any] | None:
     order_id = str(order_id or "").strip()
     if not order_id:
@@ -18645,6 +18708,13 @@ def _close_proactive_terminal_root_failure(
                 result_summary=summary,
                 result_next_action="Factory ready for next order.",
                 project_incubator_external_delivery=True,
+            )
+            _studio_complete_cycle_for_order_from_queue(
+                orch_q=orch_q,
+                order_id=oid,
+                outcome_status="published_project",
+                outcome_summary=summary,
+                now=now,
             )
             orch_q.append_audit_event(
                 event_type="order.project_incubator_external_delivery_closed",
@@ -23679,6 +23749,33 @@ def _sync_order_phase_from_runtime(
 
     status = str(order.get("status") or "").strip().lower()
     if status == "done":
+        if proactive_order and project_incubator_delivery_verified:
+            summary = str(root_trace.get("result_summary") or "").strip() or (
+                "Project incubator external delivery verified; no controller branch merge required."
+            )
+            _studio_complete_cycle_for_order_from_queue(
+                orch_q=orch_q,
+                order_id=rid,
+                outcome_status="published_project",
+                outcome_summary=summary,
+                now=time.time(),
+            )
+            try:
+                orch_q.update_trace(
+                    rid,
+                    merge_ready=False,
+                    merge_required=False,
+                    studio_terminal_outcome="published_project",
+                    studio_terminal_outcome_summary=summary[:1000],
+                    studio_terminal_outcome_enforced_at=time.time(),
+                    operational_gate_status="terminal",
+                    operational_gate_reason="studio_outcome_published_project",
+                    live_at=time.time(),
+                )
+            except Exception:
+                pass
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            return
         if merge_required:
             try:
                 orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
@@ -23765,6 +23862,13 @@ def _sync_order_phase_from_runtime(
                 result_summary=summary,
                 result_next_action="Factory ready for next order.",
                 project_incubator_external_delivery=True,
+            )
+            _studio_complete_cycle_for_order_from_queue(
+                orch_q=orch_q,
+                order_id=rid,
+                outcome_status="published_project",
+                outcome_summary=summary,
+                now=now_ts,
             )
             orch_q.append_audit_event(
                 event_type="order.project_incubator_external_delivery_closed",
