@@ -6197,6 +6197,49 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
             self.assertEqual(manifest["created_at"], "2026-05-11T10:52:07Z")
             self.assertEqual(manifest["notes"], "original")
 
+    def test_project_incubator_workspace_recovers_missing_manifest_from_existing_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+            workspace_dir = root / "20260511-useful-project-abc12345"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            (workspace_dir / "runproof-board").mkdir()
+
+            workspace = bot._ensure_project_workspace(
+                project_id="abc12345-0000-0000-0000-000000000000",
+                title="Useful Project",
+                created_by="jarvis",
+                root_dir=root,
+            )
+
+            path = Path(workspace["path"])
+            self.assertEqual(path, workspace_dir.resolve())
+            manifest = json.loads((path / "PROJECT_MANIFEST.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["project_id"], "abc12345-0000-0000-0000-000000000000")
+            self.assertEqual(manifest["name"], "Useful Project")
+            self.assertEqual(manifest["created_by"], "jarvis")
+            self.assertEqual(len([p for p in root.iterdir() if p.is_dir()]), 1)
+
+    def test_project_incubator_workspace_recovers_corrupt_manifest_from_existing_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+            workspace_dir = root / "20260511-useful-project-abc12345"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            (workspace_dir / "PROJECT_MANIFEST.json").write_text("{broken json\n", encoding="utf-8")
+
+            workspace = bot._ensure_project_workspace(
+                project_id="abc12345-0000-0000-0000-000000000000",
+                title="Useful Project",
+                created_by="jarvis",
+                root_dir=root,
+            )
+
+            path = Path(workspace["path"])
+            self.assertEqual(path, workspace_dir.resolve())
+            manifest = json.loads((path / "PROJECT_MANIFEST.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["project_id"], "abc12345-0000-0000-0000-000000000000")
+            self.assertEqual(manifest["path"], str(workspace_dir.resolve()))
+            self.assertEqual(len([p for p in root.iterdir() if p.is_dir()]), 1)
+
     def test_project_incubator_due_after_repo_sprints(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = SimpleNamespace(state_file=Path(td) / "state.json")

@@ -10010,14 +10010,20 @@ def _ensure_project_workspace(
         return raw if isinstance(raw, dict) else None
 
     def _find_existing_project_workspace(projects_root: Path, pid: str) -> tuple[Path, dict[str, Any]] | None:
+        suffix = f"-{pid[:8]}" if pid else ""
+        fallback_dir: Path | None = None
         for child in sorted(projects_root.iterdir()):
             if not child.is_dir():
                 continue
+            if suffix and child.name.endswith(suffix) and fallback_dir is None:
+                fallback_dir = child.resolve()
             manifest = _read_project_manifest(child / "PROJECT_MANIFEST.json")
             if not manifest:
                 continue
             if str(manifest.get("project_id") or "").strip() == pid:
                 return child.resolve(), manifest
+        if fallback_dir is not None:
+            return fallback_dir, {}
         return None
 
     root = root_dir if root_dir is not None else _projects_root_dir()
