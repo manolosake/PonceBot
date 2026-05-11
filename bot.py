@@ -16403,6 +16403,9 @@ def _studio_governor_preempt_active_orders(
             )
             orch_q.update_trace(
                 oid,
+                merge_ready=False,
+                merge_required=False,
+                merge_cancelled=True,
                 studio_governor_preempted=True,
                 studio_governor_preempted_at=float(now),
                 studio_governor_mode=str(governor.get("mode") or ""),
@@ -27032,6 +27035,75 @@ def _cleanup_terminal_parent_children_tick(*, orch_q: OrchestratorQueue, now: fl
     return int(cancelled)
 
 
+def _cleanup_terminal_root_orders_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
+    """
+    Close ceo_orders rows that still look active after their root job is terminal.
+
+    This prevents rejected/no-delta orders from keeping merge gates alive and blocking the
+    next Studio decision even though the root job already has a terminal outcome.
+    """
+    terminal_states = {"done", "failed", "cancelled", "canceled"}
+    open_child_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    try:
+        rows = orch_q.list_orders_global(status="active", limit=300)
+    except Exception:
+        rows = []
+    closed = 0
+    for row in rows or []:
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        try:
+            root = orch_q.get_job(oid)
+        except Exception:
+            root = None
+        root_state = str(getattr(root, "state", "") or "").strip().lower() if root is not None else ""
+        if root_state not in terminal_states:
+            continue
+        try:
+            children = list(orch_q.jobs_by_parent(parent_job_id=oid, limit=500) or [])
+        except Exception:
+            children = []
+        if any(str(getattr(child, "state", "") or "").strip().lower() in open_child_states for child in children):
+            continue
+        trace = dict((getattr(root, "trace", {}) or {}) if root is not None else {})
+        result_status = str(trace.get("result_status") or "").strip().lower()
+        if root_state == "done" and result_status not in {"rejected_low_value", "done", "merge_no_delta"} and not bool(trace.get("studio_governor_preempted", False)):
+            continue
+        try:
+            orch_q.set_order_status(oid, chat_id=chat_id, status=("done" if root_state == "done" else root_state))
+            orch_q.set_order_phase(oid, chat_id=chat_id, phase=("done" if root_state == "done" else root_state))
+            orch_q.update_trace(
+                oid,
+                merge_ready=False,
+                merge_required=False,
+                merge_cancelled=True,
+                terminal_root_order_closed=True,
+                terminal_root_order_closed_at=float(now),
+                terminal_root_state=root_state,
+                live_at=float(now),
+            )
+            orch_q.append_audit_event(
+                event_type="order.terminal_root_closed",
+                actor="scheduler",
+                details={
+                    "order_id": oid,
+                    "root_state": root_state,
+                    "result_status": result_status,
+                },
+            )
+            closed += 1
+        except Exception:
+            continue
+    return int(closed)
+
+
 def _cleanup_proactive_local_waiting_jobs(*, orch_q: OrchestratorQueue, now: float) -> int:
     try:
         orders = orch_q.list_orders_global(status="active", limit=240)
@@ -36915,6 +36987,10 @@ def main() -> None:
                     _cleanup_terminal_parent_children_tick(orch_q=orchestrator_queue, now=time.time())
                 except Exception:
                     LOG.exception("Terminal-parent child cleanup tick failed")
+                try:
+                    _cleanup_terminal_root_orders_tick(orch_q=orchestrator_queue, now=time.time())
+                except Exception:
+                    LOG.exception("Terminal-root order cleanup tick failed")
                 try:
                     _cleanup_proactive_local_waiting_jobs(
                         orch_q=orchestrator_queue,
