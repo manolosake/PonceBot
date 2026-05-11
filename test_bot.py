@@ -552,6 +552,48 @@ class TestStateHandling(unittest.TestCase):
             self.assertIn("ssh://git@github.com/", rewrite_values)
             self.assertIn("git@github.com:", rewrite_values)
 
+    def test_github_token_can_fallback_to_git_credential_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            cred_path = home / ".config" / "omnicrew" / "git-credentials"
+            cred_path.parent.mkdir(parents=True, exist_ok=True)
+            cred_path.write_text("https://x-access-token:ghp_from_store_123@github.com\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"HOME": str(home), "GITHUB_TOKEN": "", "GH_TOKEN": ""}, clear=False):
+                token, source = bot._github_token_from_env_or_git_credentials()
+
+        self.assertEqual(token, "ghp_from_store_123")
+        self.assertTrue(source.endswith("git-credentials"))
+
+    def test_project_incubator_github_repo_name_prefers_readme_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "20260511-studio-cycle-new-product-incubator-abcd1234"
+            project.mkdir(parents=True, exist_ok=True)
+            (project / "README.md").write_text("# BidPulse Local\n\nDemo project.\n", encoding="utf-8")
+
+            self.assertEqual(bot._project_incubator_github_repo_name(project), "bidpulse-local")
+
+    def test_publish_project_incubator_accepts_existing_github_remote_without_api(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "bidpulse-local"
+            project.mkdir(parents=True, exist_ok=True)
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# BidPulse Local\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "https://github.com/manolosake/bidpulse-local.git"], cwd=project)
+
+            result = bot._publish_project_incubator_private_github(project, description="BidPulse Local")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["reason"], "github_remote_already_configured")
+        self.assertEqual(result["remote_name"], "origin")
+
     def test_orchestrator_threaded_session_enabled_defaults_true(self) -> None:
         self.assertTrue(bot._orchestrator_threaded_session_enabled({}, role="architect_local"))
 

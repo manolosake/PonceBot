@@ -8704,12 +8704,16 @@ def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> 
         if head.returncode != 0 or not str(head.stdout or "").strip():
             continue
         status = _run_git(path, ["status", "--short"], check=False)
+        remote = _run_git(path, ["remote", "get-url", "origin"], check=False)
+        remote_url = str(remote.stdout or "").strip() if remote.returncode == 0 else ""
         return {
             "ok": True,
             "reason": "git_backed_project_verified",
             "project_path": str(path),
             "project_head": str(head.stdout or "").strip(),
             "project_status": str(status.stdout or "").strip(),
+            "github_remote_url": remote_url if "github.com" in remote_url.lower() else "",
+            "github_remote_present": bool(remote_url and "github.com" in remote_url.lower()),
             "readme": str(readmes[0]),
         }
     return {"ok": False, "reason": "no_git_backed_project_path"}
@@ -8717,6 +8721,216 @@ def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> 
 
 def _trace_has_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> bool:
     return bool(_trace_project_incubator_delivery_evidence(trace).get("ok", False))
+
+
+def _github_token_from_env_or_git_credentials() -> tuple[str, str]:
+    token = os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()
+    if token:
+        return token, "env"
+    home = _home_dir_from_env()
+    candidates = [
+        home / ".config" / "omnicrew" / "git-credentials",
+        home / ".git-credentials",
+    ]
+    for cred_path in candidates:
+        try:
+            lines = cred_path.expanduser().read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for raw in lines:
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(line)
+            except Exception:
+                continue
+            if str(parsed.hostname or "").lower() != "github.com":
+                continue
+            password = urllib.parse.unquote(parsed.password or "")
+            if password:
+                return password, str(cred_path.expanduser())
+    return "", ""
+
+
+def _github_api_json(
+    *,
+    token: str,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.github.com{path}",
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "PonceBot-r530",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            body = json.loads(raw) if raw.strip() else {}
+            body["_status"] = int(getattr(resp, "status", 0) or 0)
+            return True, body
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except Exception:
+            body = {"message": raw[:500]}
+        body["_status"] = int(exc.code or 0)
+        return False, body
+    except Exception as exc:
+        return False, {"_status": 0, "message": str(exc), "error": type(exc).__name__}
+
+
+def _project_incubator_github_repo_name(project_path: Path) -> str:
+    candidates: list[str] = []
+    manifest_path = project_path / "PROJECT_MANIFEST.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest, dict):
+            candidates.append(str(manifest.get("name") or ""))
+    except Exception:
+        pass
+    for readme in sorted(project_path.glob("README*")):
+        if not readme.is_file():
+            continue
+        try:
+            for line in readme.read_text(encoding="utf-8", errors="replace").splitlines():
+                text = line.strip()
+                if text.startswith("# "):
+                    candidates.append(text[2:].strip())
+                    break
+        except Exception:
+            continue
+    candidates.append(project_path.name)
+    for candidate in candidates:
+        slug = _slug_token(candidate, max_len=80)
+        if slug:
+            return slug
+    return _slug_token(project_path.name or "poncebot-project", max_len=80)
+
+
+def _publish_project_incubator_private_github(project_path: Path, *, description: str = "") -> dict[str, Any]:
+    try:
+        path = project_path.expanduser().resolve()
+    except Exception:
+        path = project_path.expanduser()
+    if not path.exists() or not path.is_dir():
+        return {"ok": False, "reason": "project_path_missing", "project_path": str(path)}
+    if not (path / ".git").exists():
+        return {"ok": False, "reason": "project_not_git_backed", "project_path": str(path)}
+
+    existing_remote = _run_git(path, ["remote", "get-url", "origin"], check=False)
+    existing_url = str(existing_remote.stdout or "").strip() if existing_remote.returncode == 0 else ""
+    if existing_url and "github.com" in existing_url.lower():
+        return {
+            "ok": True,
+            "reason": "github_remote_already_configured",
+            "project_path": str(path),
+            "remote_name": "origin",
+            "remote_url": existing_url,
+        }
+
+    status = _run_git(path, ["status", "--short"], check=False)
+    status_text = str(status.stdout or "").strip()
+    if status.returncode != 0:
+        return {"ok": False, "reason": "git_status_failed", "detail": str(status.stderr or "").strip()}
+    if status_text:
+        return {"ok": False, "reason": "project_worktree_dirty", "project_status": status_text[:1000]}
+
+    branch = str(_run_git(path, ["branch", "--show-current"], check=False).stdout or "").strip() or "main"
+    head = str(_run_git(path, ["rev-parse", "--short", "HEAD"], check=False).stdout or "").strip()
+    token, token_source = _github_token_from_env_or_git_credentials()
+    if not token:
+        return {"ok": False, "reason": "missing_github_token_or_git_credentials"}
+
+    ok_user, user = _github_api_json(token=token, method="GET", path="/user")
+    login = str(user.get("login") or "").strip()
+    if not ok_user or not login:
+        return {
+            "ok": False,
+            "reason": "github_identity_failed",
+            "status": user.get("_status"),
+            "message": str(user.get("message") or "")[:500],
+        }
+
+    repo_name = _project_incubator_github_repo_name(path)
+    create_payload = {
+        "name": repo_name,
+        "private": True,
+        "auto_init": False,
+        "description": _studio_one_line(description, max_chars=350, default="PonceBot incubated project"),
+    }
+    ok_create, created = _github_api_json(token=token, method="POST", path="/user/repos", payload=create_payload)
+    if not ok_create:
+        status_code = int(created.get("_status") or 0)
+        message = str(created.get("message") or "")
+        if status_code == 422 and "already exists" in message.lower():
+            ok_existing, existing = _github_api_json(token=token, method="GET", path=f"/repos/{login}/{repo_name}")
+            if not ok_existing:
+                return {
+                    "ok": False,
+                    "reason": "github_repo_exists_but_unreadable",
+                    "status": existing.get("_status"),
+                    "message": str(existing.get("message") or "")[:500],
+                    "repo": f"{login}/{repo_name}",
+                }
+            created = existing
+            ok_create = True
+        else:
+            return {
+                "ok": False,
+                "reason": "github_repo_create_failed",
+                "status": status_code,
+                "message": message[:500],
+            }
+
+    remote_url = str(created.get("clone_url") or f"https://github.com/{login}/{repo_name}.git")
+    remote_name = "origin" if not existing_url else "github"
+    if existing_url:
+        add_remote = _run_git(path, ["remote", "add", remote_name, remote_url], check=False)
+        if add_remote.returncode != 0:
+            return {"ok": False, "reason": "git_remote_add_failed", "detail": str(add_remote.stderr or "").strip()[:500]}
+    else:
+        add_remote = _run_git(path, ["remote", "add", "origin", remote_url], check=False)
+        if add_remote.returncode != 0:
+            set_remote = _run_git(path, ["remote", "set-url", "origin", remote_url], check=False)
+            if set_remote.returncode != 0:
+                return {"ok": False, "reason": "git_remote_config_failed", "detail": str(set_remote.stderr or add_remote.stderr or "").strip()[:500]}
+
+    push = _run_git(path, ["push", "-u", remote_name, branch], check=False)
+    if push.returncode != 0:
+        return {
+            "ok": False,
+            "reason": "git_push_failed",
+            "detail": str(push.stderr or push.stdout or "").strip()[:1000],
+            "remote_url": remote_url,
+            "remote_name": remote_name,
+            "branch": branch,
+        }
+    return {
+        "ok": True,
+        "reason": "published_private_github",
+        "project_path": str(path),
+        "github_repo": str(created.get("full_name") or f"{login}/{repo_name}"),
+        "remote_url": remote_url,
+        "remote_name": remote_name,
+        "branch": branch,
+        "head": head,
+        "private": bool(created.get("private", True)),
+        "token_source": token_source,
+    }
 
 
 def _git_common_dir_for_path(path: Path) -> Path | None:
@@ -13451,10 +13665,59 @@ def _order_command_text(
             if no_delta:
                 project_delivery = _trace_project_incubator_delivery_evidence(trace)
                 if bool(project_delivery.get("ok", False)):
-                    cleanup_result = _retire_order_branch_without_merge(repo=repo_dir, order_branch=order_branch)
                     delivery_summary = str(trace.get("result_summary") or "").strip() or (
                         "Project incubator external delivery verified; no controller branch merge required."
                     )
+                    publication = _publish_project_incubator_private_github(
+                        Path(str(project_delivery.get("project_path") or "")),
+                        description=delivery_summary,
+                    )
+                    project_delivery["github_publication"] = publication
+                    if not bool(publication.get("ok", False)):
+                        blocked_summary = (
+                            "Project incubator local delivery verified, but private GitHub publication is blocked: "
+                            f"{publication.get('reason') or 'unknown'}."
+                        )
+                        orch_q.update_trace(
+                            root_id,
+                            merge_ready=False,
+                            merge_required=False,
+                            merge_error=err_txt,
+                            merge_no_delta_active=False,
+                            project_incubator_external_delivery=True,
+                            project_incubator_delivery=project_delivery,
+                            proactive_improvement_verified=True,
+                            proactive_improvement_closed=True,
+                            proactive_improvement_closed_at=failed_at,
+                            result_status="blocked_need_operator",
+                            result_summary=blocked_summary,
+                            result_next_action=str(publication.get("message") or publication.get("detail") or publication.get("reason") or "Configure GitHub publication."),
+                        )
+                        orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
+                        orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+                        orch_q.update_state(
+                            root_id,
+                            "done",
+                            blocked_reason=str(publication.get("reason") or "github_publication_blocked"),
+                            merge_ready=False,
+                            merge_required=False,
+                            result_status="blocked_need_operator",
+                            result_summary=blocked_summary,
+                            result_next_action=str(publication.get("message") or publication.get("detail") or publication.get("reason") or "Configure GitHub publication."),
+                            project_incubator_external_delivery=True,
+                        )
+                        _studio_complete_cycle_for_order(
+                            cfg=cfg,
+                            order_id=root_id,
+                            outcome_status="blocked_need_operator",
+                            outcome_summary=blocked_summary,
+                            now=failed_at,
+                        )
+                        return blocked_summary
+
+                    cleanup_result = _retire_order_branch_without_merge(repo=repo_dir, order_branch=order_branch)
+                    if publication.get("remote_url"):
+                        delivery_summary = f"{delivery_summary} Private GitHub: {publication.get('github_repo') or publication.get('remote_url')}."
                     orch_q.update_trace(
                         root_id,
                         merge_ready=False,
@@ -13470,6 +13733,7 @@ def _order_command_text(
                         proactive_improvement_closed_at=failed_at,
                         post_merge_cleanup_status=str(cleanup_result.get("status") or ""),
                         post_merge_cleanup_result=cleanup_result,
+                        github_publication=publication,
                         result_status="done",
                         result_summary=delivery_summary,
                         result_next_action="Factory ready for next order.",
