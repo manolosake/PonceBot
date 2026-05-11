@@ -15468,9 +15468,9 @@ def _studio_attach_order(*, cfg: BotConfig, cycle_id: str, order_id: str, now: f
         pass
 
 
-def _studio_complete_cycle_for_order(
+def _studio_complete_cycle_for_order_db(
     *,
-    cfg: BotConfig,
+    db_path: Path,
     order_id: str,
     outcome_status: str,
     outcome_summary: str,
@@ -15490,8 +15490,8 @@ def _studio_complete_cycle_for_order(
     else:
         cycle_status = "failed"
     try:
-        _studio_ensure_schema(cfg.orchestrator_db_path)
-        with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+        _studio_ensure_schema(db_path)
+        with sqlite3.connect(str(db_path), timeout=15.0) as conn:
             conn.execute(
                 """
                 UPDATE studio_cycles
@@ -15509,6 +15509,23 @@ def _studio_complete_cycle_for_order(
             conn.commit()
     except Exception:
         LOG.exception("Failed to complete studio cycle for order_id=%s", order_id)
+
+
+def _studio_complete_cycle_for_order(
+    *,
+    cfg: BotConfig,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float | None = None,
+) -> None:
+    _studio_complete_cycle_for_order_db(
+        db_path=cfg.orchestrator_db_path,
+        order_id=order_id,
+        outcome_status=outcome_status,
+        outcome_summary=outcome_summary,
+        now=now,
+    )
 
 
 def _studio_terminal_outcome_for_order(orch_q: OrchestratorQueue, order_id: str) -> dict[str, Any] | None:
@@ -21095,6 +21112,7 @@ def _response_signals_no_code_change(text: str) -> bool:
     signals = (
         "no code changes required",
         "no code changes are required",
+        "no_code_change",
         "no code change required",
         "no code change is required",
         "no code change to apply",
@@ -23553,25 +23571,38 @@ def _sync_order_phase_from_runtime(
         return
 
     if proactive_order and proactive_verified_no_change and not any_live:
+        no_change_summary = (
+            "Rejected low-value no-code-change order: the selected bet was already implemented "
+            "or produced no new validated delta, so nothing new was shipped."
+        )
         try:
-            if merge_required:
-                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="ready_for_merge")
-                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
-            else:
-                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
-                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
             orch_q.update_trace(
                 rid,
                 proactive_no_change_validated=True,
                 proactive_no_change_validated_at=time.time(),
                 proactive_no_change_resolution="reviewer_validated_existing_implementation",
-                merge_ready=bool(merge_required),
-                merge_ready_at=(time.time() if merge_required else None),
-                **(_merge_ready_trace_reset_payload() if merge_required else {}),
+                proactive_improvement_missing=True,
+                result_status="rejected_low_value",
+                result_summary=no_change_summary,
+                result_next_action="Choose a different bet with measurable delta.",
+                merge_ready=False,
+                merge_ready_at=None,
                 live_at=time.time(),
             )
+            storage = getattr(orch_q, "_storage", None)
+            db_path = getattr(storage, "path", None)
+            if db_path is not None:
+                _studio_complete_cycle_for_order_db(
+                    db_path=Path(db_path).expanduser(),
+                    order_id=rid,
+                    outcome_status="rejected_low_value",
+                    outcome_summary=no_change_summary,
+                    now=time.time(),
+                )
             orch_q.append_audit_event(
-                event_type="order.proactive_no_change_closed",
+                event_type="order.proactive_no_change_rejected_low_value",
                 actor="skynet",
                 details={
                     "order_id": rid,
@@ -24792,6 +24823,10 @@ def _jarvis_final_sweep_tick(
                 for c in children
             )
             if not active_local:
+                no_change_summary = (
+                    "Rejected low-value no-code-change order: the selected bet was already implemented "
+                    "or produced no new validated delta, so nothing new was shipped."
+                )
                 try:
                     orch_q.set_order_status(oid, chat_id=int(chat_id), status="done")
                     orch_q.set_order_phase(oid, chat_id=int(chat_id), phase="done")
@@ -24800,10 +24835,23 @@ def _jarvis_final_sweep_tick(
                         proactive_no_change_validated=True,
                         proactive_no_change_validated_at=float(now),
                         proactive_no_change_resolution="reviewer_validated_existing_implementation",
+                        proactive_improvement_missing=True,
+                        result_status="rejected_low_value",
+                        result_summary=no_change_summary,
+                        result_next_action="Choose a different bet with measurable delta.",
+                        merge_ready=False,
+                        merge_ready_at=None,
                         live_at=float(now),
                     )
+                    _studio_complete_cycle_for_order(
+                        cfg=cfg,
+                        order_id=oid,
+                        outcome_status="rejected_low_value",
+                        outcome_summary=no_change_summary,
+                        now=float(now),
+                    )
                     orch_q.append_audit_event(
-                        event_type="order.proactive_no_change_closed",
+                        event_type="order.proactive_no_change_rejected_low_value",
                         actor="skynet",
                         details={
                             "order_id": oid,
