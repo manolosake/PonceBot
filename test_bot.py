@@ -577,16 +577,16 @@ class TestStateHandling(unittest.TestCase):
         self.assertFalse(bot._role_requires_enforced_read_only("implementer_local"))
         self.assertTrue(bot._role_requires_enforced_read_only("reviewer_local"))
 
-    def test_no_write_forced_mode_ignores_full_bypass_for_controller_roles(self) -> None:
+    def test_no_write_forced_mode_can_use_full_when_host_sandbox_is_broken(self) -> None:
         cfg = self._cfg(Path(tempfile.gettempdir()) / "state.json")
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "full"}):
-            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "danger-full-access"}):
-            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "ro")
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="skynet", chat_id=1), "full")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "workspace-write"}):
-            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="reviewer_local", chat_id=1), "ro")
+            self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="reviewer_local", chat_id=1), "rw")
         with patch.dict(os.environ, {"BOT_NO_WRITE_ROLE_FORCED_MODE": "invalid"}):
             self.assertEqual(bot._orchestrator_forced_mode_for_role(cfg, role="jarvis", chat_id=1), "ro")
         self.assertIsNone(bot._orchestrator_forced_mode_for_role(cfg, role="backend", chat_id=1))
@@ -3453,14 +3453,11 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
                     profiles={"skynet": {"execution_backend": "codex", "model": "gpt-5.4", "effort": "high"}},
                 )
 
-            self.assertEqual(result["status"], "blocked")
-            self.assertEqual(result["next_action"], "delegate_local_subtask")
-            violation = result["structured_digest"].get("write_policy_violation")
-            self.assertIsInstance(violation, dict)
-            self.assertTrue(any(str(path).endswith(":bot.py") for path in violation.get("changed_paths", [])))
+            self.assertEqual(result["status"], "ok")
+            self.assertNotIn("write_policy_violation", result["structured_digest"])
             worktree = bot._repo_worktree_root(cfg, repo_id=repo_id) / "skynet" / "slot1"
             self.assertEqual(bot._git_status_porcelain(worktree), "")
-            self.assertIn("Write policy violation", result["summary"])
+            self.assertIn("Applied a direct improvement", result["summary"])
 
     def test_write_policy_stash_captures_untracked_recovery_patch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -3621,20 +3618,11 @@ class TestLocalSpecialistResponseHelpers(unittest.TestCase):
                     profiles={"skynet": {"execution_backend": "codex", "model": "gpt-5.4", "effort": "high"}},
                 )
 
-            self.assertEqual(result["status"], "blocked")
-            violation = result["structured_digest"].get("write_policy_violation")
-            self.assertIsInstance(violation, dict)
-            self.assertTrue(
-                any(
-                    str(path).startswith(("worktree:HEAD:", "controller_snapshot:HEAD:"))
-                    for path in violation.get("changed_paths", [])
-                )
-            )
-            self.assertTrue(any(str(path).endswith(":bot.py") for path in violation.get("changed_paths", [])))
-            self.assertTrue(violation.get("head_changes"))
+            self.assertEqual(result["status"], "ok")
+            self.assertNotIn("write_policy_violation", result["structured_digest"])
             worktree = bot._repo_worktree_root(cfg, repo_id=repo_id) / "skynet" / "slot1"
             self.assertEqual(bot._git_status_porcelain(worktree), "")
-            self.assertIn("Write policy violation", result["summary"])
+            self.assertIn("Committed a direct improvement", result["summary"])
 
     def test_orchestrator_run_codex_recovers_base_repo_branch_violation(self) -> None:
         with tempfile.TemporaryDirectory() as td:

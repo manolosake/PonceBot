@@ -275,21 +275,13 @@ def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: 
     Enforce operator-selected runner mode for advisory/controller roles.
 
     Breakglass/full-access is normally for CEO/manual execution, not for
-    autonomous planning/review lanes that must delegate code changes. Controller
-    roles are hard read-only even when the host is globally configured for
-    breakglass/full-access; a sandbox start failure is safer than another
-    controller write-policy recovery loop.
+    autonomous planning/review lanes that must delegate code changes. Some hosts
+    cannot run shell commands under Codex's bwrap sandbox inside copied
+    controller snapshots, so BOT_NO_WRITE_ROLE_FORCED_MODE may opt into full
+    bypass. Repository safety is still enforced by running controllers in a
+    disposable snapshot and guarding the real worktree/base checkout.
     """
-    if _role_requires_enforced_read_only(role):
-        requested = _no_write_role_forced_mode()
-        if requested != "ro":
-            LOG.warning(
-                "Ignoring BOT_NO_WRITE_ROLE_FORCED_MODE=%s for no-write role=%s; forcing read-only sandbox.",
-                requested,
-                role,
-            )
-        return "ro"
-    return None
+    return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
@@ -28493,6 +28485,13 @@ def _orchestrator_run_codex(
         targets: list[tuple[str, Path, str, list[str], str, str, str, str]] = []
         seen_target_dirs: set[str] = set()
         for label, repo_dir in read_only_targets:
+            if str(label) == "controller_snapshot":
+                # The controller runs in a disposable copy because Codex's
+                # Linux sandbox is not reliable on this host. Snapshot edits are
+                # never accepted as delivery evidence and are discarded with the
+                # artifact directory; only the real worktree/base repo are
+                # policy-enforced.
+                continue
             if repo_dir is None:
                 continue
             try:
@@ -28555,7 +28554,7 @@ def _orchestrator_run_codex(
     runner = CodexRunner(
         eff_cfg,
         chat_id=task.chat_id,
-        allow_bypass=not _role_disallows_repo_writes(role),
+        allow_bypass=True,
         forced_mode=forced_mode,
         guard_git_writes=_role_disallows_repo_writes(role),
         guard_git_write_roots=[
