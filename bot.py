@@ -22885,24 +22885,39 @@ def _sync_order_phase_from_runtime(
     if studio_terminal:
         outcome = str(studio_terminal.get("outcome_status") or "").strip().lower()
         summary = str(studio_terminal.get("outcome_summary") or outcome).strip()
+        if outcome == "failed_root_caused":
+            desired_status = "failed"
+            desired_phase = "failed"
+        elif outcome == "blocked_need_operator":
+            desired_status = "active"
+            desired_phase = "review"
+        else:
+            desired_status = "done"
+            desired_phase = "done"
+        terminal_gate_status = "blocked" if outcome == "blocked_need_operator" else "terminal"
+        terminal_gate_reason = f"studio_outcome_{outcome}"
+        existing_trace = _trace_payload(root_trace)
+        existing_status = str(order.get("status") or "").strip().lower()
+        existing_phase = str(order.get("phase") or "").strip().lower()
+        already_enforced = (
+            existing_status == desired_status
+            and existing_phase == desired_phase
+            and str(existing_trace.get("studio_terminal_outcome") or "").strip().lower() == outcome
+            and str(existing_trace.get("operational_gate_reason") or "").strip() == terminal_gate_reason
+        )
+        if already_enforced:
+            return
         try:
-            if outcome == "failed_root_caused":
-                orch_q.set_order_status(rid, chat_id=int(chat_id), status="failed")
-                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="failed")
-            elif outcome == "blocked_need_operator":
-                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
-                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
-            else:
-                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
-                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status=desired_status)
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase=desired_phase)
             orch_q.update_trace(
                 rid,
                 merge_ready=False,
                 studio_terminal_outcome=outcome,
                 studio_terminal_outcome_summary=summary[:1000],
                 studio_terminal_outcome_enforced_at=time.time(),
-                operational_gate_status=("blocked" if outcome == "blocked_need_operator" else "terminal"),
-                operational_gate_reason=f"studio_outcome_{outcome}",
+                operational_gate_status=terminal_gate_status,
+                operational_gate_reason=terminal_gate_reason,
                 live_at=time.time(),
             )
         except Exception:
