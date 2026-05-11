@@ -10002,24 +10002,50 @@ def _ensure_project_workspace(
     runtime_mode: str = "venv",
     root_dir: Path | None = None,
 ) -> dict[str, str]:
+    def _read_project_manifest(manifest_path: Path) -> dict[str, Any] | None:
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def _find_existing_project_workspace(projects_root: Path, pid: str) -> tuple[Path, dict[str, Any]] | None:
+        for child in sorted(projects_root.iterdir()):
+            if not child.is_dir():
+                continue
+            manifest = _read_project_manifest(child / "PROJECT_MANIFEST.json")
+            if not manifest:
+                continue
+            if str(manifest.get("project_id") or "").strip() == pid:
+                return child.resolve(), manifest
+        return None
+
     root = root_dir if root_dir is not None else _projects_root_dir()
     root.mkdir(parents=True, exist_ok=True)
 
     pid = (project_id or "").strip() or str(uuid.uuid4())
-    slug = _slug_token(title or pid)
-    dirname = f"{time.strftime('%Y%m%d')}-{slug}-{pid[:8]}"
-    path = (root / dirname).resolve()
-    path.mkdir(parents=True, exist_ok=True)
+    existing = _find_existing_project_workspace(root, pid)
+    if existing is not None:
+        path, existing_manifest = existing
+    else:
+        slug = _slug_token(title or pid)
+        dirname = f"{time.strftime('%Y%m%d')}-{slug}-{pid[:8]}"
+        path = (root / dirname).resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        existing_manifest = {}
 
     manifest = {
         "project_id": pid,
-        "name": title or pid,
+        "name": str(existing_manifest.get("name") or title or pid),
         "path": str(path),
-        "runtime_mode": runtime_mode,
-        "ports": [],
-        "created_by": created_by or "jarvis",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "notes": "Isolated workspace scaffold created by PonceBot orchestration.",
+        "runtime_mode": str(existing_manifest.get("runtime_mode") or runtime_mode or "venv"),
+        "ports": list(existing_manifest.get("ports") or []),
+        "created_by": str(existing_manifest.get("created_by") or created_by or "jarvis"),
+        "created_at": str(existing_manifest.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+        "notes": str(
+            existing_manifest.get("notes")
+            or "Isolated workspace scaffold created by PonceBot orchestration."
+        ),
     }
     try:
         (path / "PROJECT_MANIFEST.json").write_text(

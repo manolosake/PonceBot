@@ -6075,6 +6075,69 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
             self.assertEqual(path.parent, root.resolve())
             self.assertTrue((path / "PROJECT_MANIFEST.json").exists())
 
+    def test_project_incubator_workspace_reuses_existing_project_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+
+            first = bot._ensure_project_workspace(
+                project_id="abc12345",
+                title="First Title",
+                created_by="skynet",
+                root_dir=root,
+            )
+            second = bot._ensure_project_workspace(
+                project_id="abc12345",
+                title="Second Title",
+                created_by="jarvis",
+                root_dir=root,
+            )
+
+            first_path = Path(first["path"])
+            second_path = Path(second["path"])
+            self.assertEqual(first_path, second_path)
+            manifest = json.loads((second_path / "PROJECT_MANIFEST.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["project_id"], "abc12345")
+            self.assertEqual(manifest["name"], "First Title")
+            self.assertEqual(manifest["created_by"], "skynet")
+            self.assertEqual(len([p for p in root.iterdir() if p.is_dir()]), 1)
+
+    def test_project_incubator_workspace_repairs_manifest_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "home"
+            workspace_dir = root / "20260511-sample-abcd1234"
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            (workspace_dir / "PROJECT_MANIFEST.json").write_text(
+                json.dumps(
+                    {
+                        "project_id": "abc12345",
+                        "name": "Useful Project",
+                        "path": "/tmp/stale-path",
+                        "runtime_mode": "venv",
+                        "ports": [],
+                        "created_by": "skynet",
+                        "created_at": "2026-05-11T10:52:07Z",
+                        "notes": "original",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            workspace = bot._ensure_project_workspace(
+                project_id="abc12345",
+                title="Useful Project",
+                created_by="jarvis",
+                root_dir=root,
+            )
+
+            path = Path(workspace["path"])
+            self.assertEqual(path, workspace_dir.resolve())
+            manifest = json.loads((path / "PROJECT_MANIFEST.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["path"], str(workspace_dir.resolve()))
+            self.assertEqual(manifest["created_at"], "2026-05-11T10:52:07Z")
+            self.assertEqual(manifest["notes"], "original")
+
     def test_project_incubator_due_after_repo_sprints(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cfg = SimpleNamespace(state_file=Path(td) / "state.json")
