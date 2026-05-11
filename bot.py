@@ -18381,26 +18381,6 @@ def _proactive_lane_tick(
 
     runbook_id = "skynet_proactive_lane"
     try:
-        last = float(orch_q.get_runbook_last_run(runbook_id=runbook_id) or 0.0)
-    except Exception:
-        last = 0.0
-    if last > 0 and (now - last) < float(cfg.proactive_lane_interval_seconds):
-        return 0
-
-    try:
-        hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
-        if hard_pressured:
-            return 0
-    except Exception:
-        pass
-
-    try:
-        if int(orch_q.get_queued_count()) >= int(cfg.proactive_lane_max_global_queued):
-            return 0
-    except Exception:
-        pass
-
-    try:
         active_orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
     except Exception:
         active_orders = []
@@ -18443,6 +18423,26 @@ def _proactive_lane_tick(
                 now=float(now),
             )
         ]
+
+    try:
+        last = float(orch_q.get_runbook_last_run(runbook_id=runbook_id) or 0.0)
+    except Exception:
+        last = 0.0
+    if (not preempted) and last > 0 and (now - last) < float(cfg.proactive_lane_interval_seconds):
+        return 0
+
+    try:
+        hard_pressured, _, _ = _queue_is_hard_pressured(orch_q=orch_q)
+        if hard_pressured:
+            return 0
+    except Exception:
+        pass
+
+    try:
+        if int(orch_q.get_queued_count()) >= int(cfg.proactive_lane_max_global_queued):
+            return 0
+    except Exception:
+        pass
     if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
         return 0
 
