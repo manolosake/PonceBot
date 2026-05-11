@@ -18424,11 +18424,20 @@ def _proactive_lane_tick(
             )
         ]
 
+    urgent_studio_repair = False
+    if not preempted:
+        try:
+            memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+            governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+            urgent_studio_repair = str(governor.get("mode") or "").strip().lower() == "repair_delivery_contract"
+        except Exception:
+            urgent_studio_repair = False
+
     try:
         last = float(orch_q.get_runbook_last_run(runbook_id=runbook_id) or 0.0)
     except Exception:
         last = 0.0
-    if (not preempted) and last > 0 and (now - last) < float(cfg.proactive_lane_interval_seconds):
+    if (not preempted) and (not urgent_studio_repair) and last > 0 and (now - last) < float(cfg.proactive_lane_interval_seconds):
         return 0
 
     try:
