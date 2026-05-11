@@ -186,12 +186,19 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
         "selected_type": "DEEP_IMPROVEMENT",
         "selected_lane": "core",
     }
+    dashboard_cycle = {
+        "selected_key": "repo-executivedashboard",
+        "selected_repo_id": "executivedashboard",
+        "selected_type": "FEATURE",
+        "selected_lane": "dashboard",
+    }
 
     assert not bot._studio_governor_should_preempt_active_cycle(normal_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(loop_governor, loop_cycle)
     assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, dashboard_cycle)
 
 
 def test_workspace_lease_reaps_terminal_job_holder(tmp_path):

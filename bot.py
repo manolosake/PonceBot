@@ -16509,6 +16509,8 @@ def _studio_governor_should_preempt_active_cycle(
     }
     if mode == "repair_delivery_contract":
         return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+    if mode == "repair_loop_cooldown":
+        return bool(key or lane or selected_type)
     repo_tokens = {key}
     if repo_id:
         repo_tokens.add(repo_id)
@@ -18691,6 +18693,21 @@ def _proactive_lane_tick(
         now=now,
     )
     if preempted:
+        try:
+            memory_after_preempt = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+            governor_after_preempt = (
+                memory_after_preempt.get("studio_governor")
+                if isinstance(memory_after_preempt.get("studio_governor"), dict)
+                else {}
+            )
+            if str(governor_after_preempt.get("mode") or "").strip().lower() == "repair_loop_cooldown":
+                try:
+                    orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+                except Exception:
+                    pass
+                return 0
+        except Exception:
+            pass
         try:
             active_orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
         except Exception:
