@@ -19246,7 +19246,21 @@ def _controller_local_recovery_specs(structured_digest: Any) -> list[TaskSpec]:
     order_branch = str(structured_digest.get("order_branch") or "").strip()
     recovery_artifacts = _controller_recovery_artifact_paths(structured_digest)
     if not summary:
-        cli_recovery = bool(_proactive_cli_promotion_enabled() and not _skynet_factory_local_only_enabled())
+        def _cli_recovery_safe_path(path: str) -> bool:
+            norm = str(path or "").strip().lower()
+            if not norm:
+                return False
+            if norm.startswith(("app/", "android/", "ios/", "mobile/")):
+                return False
+            if norm.endswith((".kt", ".java", ".swift", ".m", ".mm")):
+                return False
+            return True
+
+        cli_recovery = bool(
+            _proactive_cli_promotion_enabled()
+            and not _skynet_factory_local_only_enabled()
+            and all(_cli_recovery_safe_path(path) for path in changed_paths)
+        )
         digest = hashlib.sha1("\\n".join(changed_paths).encode("utf-8", errors="ignore")).hexdigest()[:10]
         recovery_key = f"{'local_impl_recover' if cli_recovery else 'local_arch_recover'}_{digest}"
         file_list = "\\n".join(f"- `{path}`" for path in changed_paths[:8])
