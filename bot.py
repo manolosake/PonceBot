@@ -26153,6 +26153,10 @@ def _parse_job(cfg: BotConfig, msg: IncomingMessage) -> tuple[str, Job | None]:
     if text == "/orders":
         return _orch_marker("orders"), None
 
+    if text.startswith("/action_plan"):
+        tail = (text[len("/action_plan") :] or "").strip()
+        return _parse_plan_command_tail(tail)
+
     if text.startswith("/plan"):
         tail = (text[len("/plan") :] or "").strip()
         return _parse_plan_command_tail(tail)

@@ -7342,3 +7342,85 @@ class TestFocusReceiptHelpers(unittest.TestCase):
         )
         self.assertTrue(api.messages)
         self.assertIn("Jarvis: focus receipt (global rank=3)", api.messages[-1])
+
+
+class TestPlanCommandHelpers(unittest.TestCase):
+    def test_parse_job_routes_action_plan_alias_to_plan_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = TestStateHandling()._cfg(Path(td) / "state.json")
+            msg = bot.IncomingMessage(
+                update_id=1,
+                chat_id=7,
+                user_id=2,
+                message_id=10,
+                username="u",
+                text="/action_plan all 7",
+            )
+
+            resp, job = bot._parse_job(cfg, msg)
+
+        self.assertIsNone(job)
+        self.assertEqual(
+            resp,
+            bot._plan_payload_marker(
+                {
+                    "scope": "all",
+                    "limit": 7,
+                }
+            ),
+        )
+
+    def test_send_orchestrator_marker_response_plan_uses_global_scope(self) -> None:
+        api = _FakeAPI()
+        cfg = TestStateHandling()._cfg(Path(tempfile.mkdtemp()) / "state.json")
+        orch_q = object()
+        plan_payload = {
+            "summary": {
+                "active_proactive_orders": 3,
+                "returned": 2,
+                "top_lane": "studio",
+                "top_action": "Ship the top studio slice.",
+                "lanes": {"studio": 2, "incubator": 1},
+            },
+            "lanes": [
+                {
+                    "lane": "studio",
+                    "label": "Studio",
+                    "count": 2,
+                    "recommended_next_action": "Ship the top studio slice.",
+                    "orders": [
+                        {
+                            "rank": 1,
+                            "order_id": "11111111-2222-3333-4444-555555555555",
+                            "order_id_short": "11111111",
+                            "current_stage": "delivery",
+                            "readiness_verdict": "go",
+                            "next_action": "Land the user-visible CLI improvement.",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch.object(bot, "StatusService") as status_service_cls:
+            svc = status_service_cls.return_value
+            svc.proactive_action_plan.return_value = plan_payload
+
+            handled = bot._send_orchestrator_marker_response(
+                "plan",
+                json.dumps({"scope": "all", "limit": 7}, sort_keys=True, separators=(",", ":")),
+                cfg,
+                api,
+                chat_id=7,
+                user_id=2,
+                reply_to_message_id=10,
+                orch_q=orch_q,  # type: ignore[arg-type]
+                profiles=None,
+            )
+
+        self.assertTrue(handled)
+        svc.proactive_action_plan.assert_called_once_with(chat_id=None, limit=7)
+        self.assertTrue(api.messages)
+        self.assertIn("Jarvis: proactive action plan (global limit=7)", api.messages[-1])
+        self.assertIn("top_lane=studio", api.messages[-1])
+        self.assertIn("order=11111111", api.messages[-1])
