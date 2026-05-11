@@ -14898,7 +14898,77 @@ def _auto_ship_controller_snapshot_order(
     if check.returncode != 0:
         reverse = _run_git(target_repo, ["apply", "--reverse", "--check", str(patch_path)], check=False)
         if reverse.returncode == 0:
-            return {"status": "skipped", "reason": "snapshot_patch_already_applied"}
+            rev = _run_git(target_repo, ["rev-parse", "--short", "HEAD"], check=False)
+            commit_sha = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
+            deploy_result = _deploy_after_order_merge(
+                cfg=cfg,
+                repo_record=repo_record,
+                repo_dir=repo_dir,
+                default_branch=default_branch,
+                order_id=order_id,
+                order_branch=str(trace.get("order_branch") or "controller_snapshot"),
+                merge_commit=(commit_sha or None),
+            )
+            deploy_status = str(deploy_result.get("status") or "").strip().lower() or "skipped"
+            deploy_summary = _deploy_result_display(deploy_result)
+            ok = deploy_status != "failed"
+            summary = (
+                f"Controller snapshot patch is already present on {default_branch}"
+                + (f" commit={commit_sha}" if commit_sha else "")
+                + (f". {deploy_summary}" if deploy_summary else ".")
+            )
+            try:
+                orch_q.set_order_status(order_id, chat_id=int(chat_id), status=("done" if ok else "active"))
+                orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase=("done" if ok else "review"))
+                orch_q.update_state(
+                    order_id,
+                    ("done" if ok else "blocked"),
+                    blocked_reason=(None if ok else "deploy_failed"),
+                    merge_ready=False,
+                    merge_required=False,
+                    merged_to_main=bool(ok),
+                    merge_commit=(commit_sha or None),
+                    deploy_status=deploy_status,
+                    deploy_result=str(deploy_result.get("reason") or ""),
+                    deploy_summary=deploy_summary,
+                    deployed_commit=deploy_result.get("deployed_commit"),
+                    deployed_at=(float(now) if ok else None),
+                    deploy_error=(deploy_result.get("detail") if not ok else None),
+                    controller_snapshot_autoship_done=bool(ok),
+                    controller_snapshot_autoship_already_applied=True,
+                    controller_snapshot_autoship_at=float(now),
+                    controller_snapshot_autoship_commit=(commit_sha or None),
+                    result_status=("merged" if ok else "deploy_failed"),
+                    result_summary=summary,
+                    result_next_action=("Factory ready for next order." if ok else "Inspect deployment failure and complete rollout."),
+                )
+                _studio_complete_cycle_for_order(
+                    cfg=cfg,
+                    order_id=order_id,
+                    outcome_status=("shipped_to_main" if ok else "failed_root_caused"),
+                    outcome_summary=summary,
+                    now=float(now),
+                )
+                orch_q.append_audit_event(
+                    event_type="order.controller_snapshot_autoship_already_applied",
+                    actor="jarvis",
+                    details={
+                        "order_id": order_id,
+                        "repo_path": str(repo_dir),
+                        "default_branch": default_branch,
+                        "commit": commit_sha,
+                        "deploy": deploy_result,
+                    },
+                )
+            except Exception:
+                pass
+            return {
+                "status": ("ok" if ok else "failed"),
+                "reason": ("snapshot_patch_already_applied" if ok else "snapshot_already_applied_deploy_failed"),
+                "summary": summary,
+                "commit": commit_sha,
+                "deploy": deploy_result,
+            }
         return {"status": "failed", "reason": "snapshot_patch_check_failed", "detail": (check.stderr or check.stdout or "").strip()}
 
     applied = _run_git(target_repo, ["apply", str(patch_path)], check=False)
