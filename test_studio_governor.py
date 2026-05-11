@@ -85,3 +85,8 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
 
     assert not bot._studio_governor_should_preempt_active_cycle(normal_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
+
+
+def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():
+    assert bot._studio_repo_kind({"path": "/home/aponce/codexbot", "repo_id": "codexbot"}) == "Core"
+    assert bot._studio_repo_kind({"path": "/home/aponce/poncebot-control-room", "repo_id": "poncebot-control-room"}) == "Portfolio"

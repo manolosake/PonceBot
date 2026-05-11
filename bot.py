@@ -15485,7 +15485,7 @@ def _studio_repo_display_name(repo: dict[str, Any]) -> str:
 def _studio_repo_kind(repo: dict[str, Any]) -> str:
     name = _studio_repo_display_name(repo).strip().lower()
     path = str(repo.get("path") or "").strip().lower()
-    if "codexbot" in name or "codexbot" in path or "poncebot" in name:
+    if "codexbot" in name or "codexbot" in path or name == "poncebot" or path.endswith("/poncebot"):
         return "Core"
     if "executivedashboard" in name or "executivedashboard" in path:
         return "Dashboard"
@@ -16243,6 +16243,37 @@ def _studio_attach_order(*, cfg: BotConfig, cycle_id: str, order_id: str, now: f
         pass
 
 
+def _studio_fail_cycle_without_order(
+    *,
+    cfg: BotConfig,
+    cycle_id: str,
+    summary: str,
+    now: float,
+) -> None:
+    cid = str(cycle_id or "").strip()
+    if not cid:
+        return
+    try:
+        _studio_ensure_schema(cfg.orchestrator_db_path)
+        with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+            conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = 'failed',
+                    outcome_status = 'failed_root_caused',
+                    outcome_summary = ?,
+                    updated_at = ?
+                WHERE cycle_id = ?
+                  AND status = 'selected'
+                  AND (order_id IS NULL OR TRIM(order_id) = '')
+                """,
+                (_studio_one_line(summary, max_chars=500, default="Studio cycle failed before order creation."), float(now), cid),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _studio_governor_should_preempt_active_cycle(
     governor: dict[str, Any],
     cycle: dict[str, Any],
@@ -16319,7 +16350,18 @@ def _studio_governor_preempt_active_orders(
         if phase in {"ready_for_merge", "merged", "done", "failed", "cancelled"}:
             continue
         cycle = _studio_active_cycle_for_order(cfg.orchestrator_db_path, order_id=oid)
-        if not cycle or not _studio_governor_should_preempt_active_cycle(governor, cycle):
+        should_preempt = bool(cycle and _studio_governor_should_preempt_active_cycle(governor, cycle))
+        if not should_preempt:
+            try:
+                root = orch_q.get_job(oid)
+                root_trace = dict((root.trace or {}) if root else {})
+            except Exception:
+                root_trace = {}
+            if not str(root_trace.get("studio_cycle_id") or "").strip():
+                should_preempt = True
+            elif str(root_trace.get("studio_selected_type") or "").strip().upper() != "DEEP_IMPROVEMENT":
+                should_preempt = True
+        if not should_preempt:
             continue
         cancelled_children = 0
         try:
@@ -16380,7 +16422,7 @@ def _studio_governor_preempt_active_orders(
                 actor="skynet",
                 details={
                     "order_id": oid,
-                    "cycle_id": str(cycle.get("cycle_id") or ""),
+                    "cycle_id": str((cycle or {}).get("cycle_id") or ""),
                     "mode": str(governor.get("mode") or ""),
                     "cancelled_children": int(cancelled_children),
                     "trigger": str(governor.get("trigger") or ""),
@@ -18504,6 +18546,32 @@ def _proactive_lane_tick(
             except Exception:
                 pass
             return created
+        studio_cycle = initiative.get("studio_cycle") if isinstance(initiative.get("studio_cycle"), dict) else {}
+        cycle_id = str(studio_cycle.get("cycle_id") or "").strip()
+        _studio_fail_cycle_without_order(
+            cfg=cfg,
+            cycle_id=cycle_id,
+            summary=(
+                "Studio selected a bet but order spawn failed before a root job was created; "
+                "legacy fallback was suppressed so the factory does not work on an unchosen repo."
+            ),
+            now=float(now),
+        )
+        try:
+            orch_q.append_audit_event(
+                event_type="studio.cycle_order_spawn_failed",
+                actor="skynet",
+                details={
+                    "cycle_id": cycle_id,
+                    "initiative": str(initiative.get("key") or ""),
+                    "repo_id": (str((repo_record or {}).get("repo_id") or "") or None),
+                    "repo_path": (str((repo_record or {}).get("path") or "") or None),
+                    "fallback_suppressed": True,
+                },
+            )
+        except Exception:
+            pass
+        return 0
 
     if _project_incubator_due(cfg, occupied_keys=occupied):
         initiative = _project_incubator_initiative(cfg)
