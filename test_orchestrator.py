@@ -3908,8 +3908,8 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             root = q.get_job(order_id)
             assert order is not None and root is not None
             trace = dict(root.trace or {})
-            self.assertEqual(str(order.get("status") or ""), "done")
-            self.assertEqual(str(order.get("phase") or ""), "done")
+            self.assertEqual(str(order.get("status") or ""), "failed")
+            self.assertEqual(str(order.get("phase") or ""), "failed")
             self.assertEqual(str(root.state), "failed")
             self.assertFalse(bool(trace.get("merge_ready", False)))
             self.assertTrue(bool(trace.get("merge_no_delta_active", False)))

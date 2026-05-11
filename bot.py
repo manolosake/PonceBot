@@ -275,12 +275,21 @@ def _orchestrator_forced_mode_for_role(cfg: "BotConfig", *, role: str, chat_id: 
     Enforce operator-selected runner mode for advisory/controller roles.
 
     Breakglass/full-access is normally for CEO/manual execution, not for
-    autonomous planning/review lanes that must delegate code changes. Some hosts
-    cannot start Codex's bwrap sandbox; BOT_NO_WRITE_ROLE_FORCED_MODE may opt
-    into workspace-write or full bypass, while controller prompts plus post-run
-    base-repo/worktree guards still enforce no-write policy.
+    autonomous planning/review lanes that must delegate code changes. Controller
+    roles are hard read-only even when the host is globally configured for
+    breakglass/full-access; a sandbox start failure is safer than another
+    controller write-policy recovery loop.
     """
-    return _no_write_role_forced_mode() if _role_requires_enforced_read_only(role) else None
+    if _role_requires_enforced_read_only(role):
+        requested = _no_write_role_forced_mode()
+        if requested != "ro":
+            LOG.warning(
+                "Ignoring BOT_NO_WRITE_ROLE_FORCED_MODE=%s for no-write role=%s; forcing read-only sandbox.",
+                requested,
+                role,
+            )
+        return "ro"
+    return None
 
 
 def _role_disallows_repo_writes(role: str) -> bool:
@@ -13335,6 +13344,16 @@ def _order_command_text(
                         ),
                         result_next_action="Inspect deployment failure and complete rollout.",
                     )
+                    _studio_complete_cycle_for_order(
+                        cfg=cfg,
+                        order_id=root_id,
+                        outcome_status="failed_root_caused",
+                        outcome_summary=(
+                            f"Merged to {default_branch}"
+                            + (f" commit={merge_commit}" if merge_commit else "")
+                            + f"; deploy failed: {deploy_summary or deploy_result.get('detail') or 'unknown'}"
+                        ),
+                    )
                 else:
                     orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
                     orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
@@ -13349,6 +13368,16 @@ def _order_command_text(
                             + (f" {cleanup_summary}" if cleanup_summary else "")
                         ),
                         result_next_action="Factory ready for next order.",
+                    )
+                    _studio_complete_cycle_for_order(
+                        cfg=cfg,
+                        order_id=root_id,
+                        outcome_status="shipped_to_main",
+                        outcome_summary=(
+                            f"Merged to {default_branch}"
+                            + (f" commit={merge_commit}" if merge_commit else "")
+                            + (f". {deploy_summary}" if deploy_summary else ".")
+                        ),
                     )
             except Exception:
                 pass
@@ -13434,6 +13463,13 @@ def _order_command_text(
                         result_next_action="Factory ready for next order.",
                         project_incubator_external_delivery=True,
                     )
+                    _studio_complete_cycle_for_order(
+                        cfg=cfg,
+                        order_id=root_id,
+                        outcome_status="published_project",
+                        outcome_summary=delivery_summary,
+                        now=failed_at,
+                    )
                     orch_q.append_audit_event(
                         event_type="order.project_incubator_external_delivery_closed",
                         actor=actor_norm,
@@ -13471,8 +13507,18 @@ def _order_command_text(
                     ),
                     result_next_action="Replan the order or retire the no-delta branch.",
                 )
-                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="done")
-                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="done")
+                orch_q.set_order_status(root_id, chat_id=int(chat_id), status="failed")
+                orch_q.set_order_phase(root_id, chat_id=int(chat_id), phase="failed")
+                _studio_complete_cycle_for_order(
+                    cfg=cfg,
+                    order_id=root_id,
+                    outcome_status="failed_root_caused",
+                    outcome_summary=(
+                        "Merge refused: order branch has no diff against main; "
+                        "not marking this as delivered."
+                    ),
+                    now=failed_at,
+                )
         except Exception:
             pass
         try:
@@ -14661,6 +14707,16 @@ def _auto_merge_ready_orders_tick(
                             actor="jarvis",
                             details={"order_id": oid, "reason": "merge_no_delta"},
                         )
+                        _studio_complete_cycle_for_order(
+                            cfg=cfg,
+                            order_id=oid,
+                            outcome_status="failed_root_caused",
+                            outcome_summary=(
+                                "Auto-merge retired a no-delta order; no branch diff existed "
+                                "against main, so nothing was shipped."
+                            ),
+                            now=float(now),
+                        )
                     except Exception:
                         pass
                     continue
@@ -15231,6 +15287,49 @@ def _studio_attach_order(*, cfg: BotConfig, cycle_id: str, order_id: str, now: f
             conn.commit()
     except Exception:
         pass
+
+
+def _studio_complete_cycle_for_order(
+    *,
+    cfg: BotConfig,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float | None = None,
+) -> None:
+    order_id = str(order_id or "").strip()
+    outcome_status = str(outcome_status or "").strip()
+    if not order_id or outcome_status not in _STUDIO_OUTCOME_TYPES:
+        return
+    ts = float(now if now is not None else time.time())
+    if outcome_status in {"shipped_to_main", "published_project"}:
+        cycle_status = "done"
+    elif outcome_status == "rejected_low_value":
+        cycle_status = "rejected"
+    elif outcome_status == "blocked_need_operator":
+        cycle_status = "blocked"
+    else:
+        cycle_status = "failed"
+    try:
+        _studio_ensure_schema(cfg.orchestrator_db_path)
+        with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+            conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = ?, outcome_status = ?, outcome_summary = ?, updated_at = ?
+                WHERE order_id = ?
+                """,
+                (
+                    cycle_status,
+                    outcome_status,
+                    _studio_one_line(outcome_summary, max_chars=500, default=outcome_status),
+                    ts,
+                    order_id,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        LOG.exception("Failed to complete studio cycle for order_id=%s", order_id)
 
 
 def _studio_next_bet(
@@ -28456,7 +28555,7 @@ def _orchestrator_run_codex(
     runner = CodexRunner(
         eff_cfg,
         chat_id=task.chat_id,
-        allow_bypass=True,
+        allow_bypass=not _role_disallows_repo_writes(role),
         forced_mode=forced_mode,
         guard_git_writes=_role_disallows_repo_writes(role),
         guard_git_write_roots=[
