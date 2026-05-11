@@ -372,16 +372,18 @@ def deploy_command_policy(target: RepoTarget, policy: dict[str, Any], head: str)
         }
     verify_command = command_list(policy.get("verify_command"))
     if verify_command:
-        verify = run(verify_command, cwd=cwd, env=env, timeout=min(timeout, 120))
-        if verify.returncode != 0:
+        verify = run_verify_with_retries(verify_command, cwd=cwd, env=env, window_seconds=min(timeout, 180))
+        if not verify["ok"]:
             return {
                 "ok": False,
                 "status": "failed",
                 "reason": "verify_failed",
                 "command": " ".join(command),
                 "verify_command": " ".join(verify_command),
-                "stdout": tail(verify.stdout),
-                "stderr": tail(verify.stderr),
+                "stdout": verify.get("stdout", ""),
+                "stderr": verify.get("stderr", ""),
+                "detail": verify.get("detail", ""),
+                "verify_attempts": verify.get("attempts", 0),
             }
     return {
         "ok": True,
@@ -390,6 +392,36 @@ def deploy_command_policy(target: RepoTarget, policy: dict[str, Any], head: str)
         "command": " ".join(command),
         "stdout": tail(result.stdout),
     }
+
+
+def run_verify_with_retries(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    window_seconds: int = 120,
+    interval_seconds: float = 3.0,
+) -> dict[str, Any]:
+    deadline = time.time() + max(5, int(window_seconds))
+    attempts = 0
+    last_stdout = ""
+    last_stderr = ""
+    while True:
+        attempts += 1
+        result = run(command, cwd=cwd, env=env, timeout=min(30, max(5, int(window_seconds))))
+        last_stdout = tail(result.stdout)
+        last_stderr = tail(result.stderr)
+        if result.returncode == 0:
+            return {"ok": True, "attempts": attempts, "stdout": last_stdout, "stderr": last_stderr}
+        if time.time() >= deadline:
+            return {
+                "ok": False,
+                "attempts": attempts,
+                "stdout": last_stdout,
+                "stderr": last_stderr,
+                "detail": last_stderr or last_stdout or f"verify failed after {attempts} attempts",
+            }
+        time.sleep(interval_seconds)
 
 
 def validate_checkout(target: RepoTarget) -> dict[str, Any]:
