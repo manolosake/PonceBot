@@ -54,7 +54,7 @@ def test_studio_governor_makes_core_repair_beat_incubator():
     assert "temporarily gated" in incubator["thesis"].lower()
 
 
-def test_studio_governor_keeps_core_repair_high_despite_prior_core_failures():
+def test_studio_governor_breaks_repeated_core_repair_loop():
     now = 1_700_000_000.0
     memory = _delivery_failure_memory(now)
     memory["recent_studio_negative_outcomes"].extend(
@@ -78,6 +78,9 @@ def test_studio_governor_keeps_core_repair_high_despite_prior_core_failures():
         ]
     )
     memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
+    assert memory["studio_governor"]["mode"] == "repair_loop_breaker"
+    assert "repo-codexbot" in memory["studio_governor"]["avoid_keys"]
+
     core_repo = {
         "repo_id": "codexbot",
         "path": "/home/aponce/codexbot",
@@ -86,10 +89,20 @@ def test_studio_governor_keeps_core_repair_high_despite_prior_core_failures():
         "autonomy_enabled": True,
         "metadata": {},
     }
+    dashboard_repo = {
+        "repo_id": "executivedashboard",
+        "path": "/home/aponce/ExecutiveDashboard",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
 
     core = bot._studio_opportunity_for_repo(core_repo, now=now, memory=memory)
+    dashboard = bot._studio_opportunity_for_repo(dashboard_repo, now=now, memory=memory)
 
-    assert core["score"] >= 140
+    assert core["score"] < dashboard["score"]
+    assert "Hold this repeated PonceBot core repair" in core["thesis"]
 
 
 def test_studio_prompt_includes_governor_directives():
@@ -122,9 +135,18 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     }
     normal_governor = {"mode": "normal", "avoid_keys": []}
     repair_governor = {"mode": "repair_delivery_contract", "avoid_keys": ["new-project-incubator"]}
+    loop_governor = {"mode": "repair_loop_breaker", "avoid_keys": ["repo-codexbot"]}
+    loop_cycle = {
+        "selected_key": "repo-codexbot",
+        "selected_repo_id": "codexbot",
+        "selected_type": "DEEP_IMPROVEMENT",
+        "selected_lane": "core",
+    }
 
     assert not bot._studio_governor_should_preempt_active_cycle(normal_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(loop_governor, loop_cycle)
+    assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
 
 
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():

@@ -15834,16 +15834,31 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     recent_positive = [entry for entry in positives if _age_hours(entry) <= 72.0]
     delivery_failures: list[dict[str, Any]] = []
     write_policy_failures: list[dict[str, Any]] = []
+    core_repair_loop_failures: list[dict[str, Any]] = []
+    core_repair_loop_keys: list[str] = []
     new_project_negative_24h = 0
     new_project_cycles_24h = 0
     for entry in recent_negative:
         summary = str(entry.get("summary") or "").lower()
         key = str(entry.get("key") or "").strip().lower()
+        repo_id = str(entry.get("repo_id") or "").strip().lower()
         work_type = str(entry.get("type") or "").strip().upper()
         if any(pattern in summary for pattern in _STUDIO_DELIVERY_FAILURE_PATTERNS):
             delivery_failures.append(entry)
         if "write policy violation" in summary or "modified repository files directly" in summary:
             write_policy_failures.append(entry)
+        is_core_repair = (
+            _age_hours(entry) <= 6.0
+            and ("codexbot" in key or "codexbot" in repo_id or key == "repo-poncebot" or repo_id == "poncebot")
+            and work_type in {"DEEP_IMPROVEMENT", "FEATURE", "PRODUCT_WORKFLOW", ""}
+        )
+        if is_core_repair:
+            core_repair_loop_failures.append(entry)
+            if key:
+                core_repair_loop_keys.append(key)
+            if repo_id:
+                core_repair_loop_keys.append(repo_id)
+                core_repair_loop_keys.append(f"repo-{repo_id}")
         if key == "new-project-incubator" or work_type == "NEW_PROJECT":
             if _age_hours(entry) <= 24.0:
                 new_project_negative_24h += 1
@@ -15862,7 +15877,29 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     prefer_lanes: list[str] = []
     force_next_action = ""
 
-    if delivery_failures:
+    core_repair_loop_keys = list(dict.fromkeys(core_repair_loop_keys))[:8]
+
+    if delivery_failures and len(core_repair_loop_failures) >= 2:
+        mode = "repair_loop_breaker"
+        severity = "red"
+        trigger = (
+            f"{len(core_repair_loop_failures)} recent PonceBot repair attempts failed/rejected after the delivery "
+            "failure trigger; repeating the same core repair is now classified as churn."
+        )
+        force_next_action = (
+            "Do not open another codexbot/PonceBot core repair unless fresh evidence identifies a different concrete "
+            "failure mode; choose dashboard/portfolio value or observe until evidence changes."
+        )
+        prefer_lanes = ["dashboard", "portfolio", "incubator"]
+        avoid_keys = core_repair_loop_keys or ["repo-codexbot", "codexbot"]
+        directives.extend(
+            [
+                "Break the repair loop: stop rewarding the same codexbot delivery-contract bet after repeated no-delta/failed outcomes.",
+                "A new codexbot core repair needs fresh root-cause evidence, not just the historical delivery-failure trigger.",
+                "Prefer a different repo/lane with visible value, deploy evidence, and a path to main while the loop cools down.",
+            ]
+        )
+    elif delivery_failures:
         mode = "repair_delivery_contract"
         severity = "red"
         trigger = _studio_one_line(delivery_failures[0].get("summary"), max_chars=220, default="Recent delivery failed without mergeable branch or validated diff.")
@@ -15907,6 +15944,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "force_next_action": force_next_action,
         "delivery_failure_count_72h": len(delivery_failures),
         "write_policy_failure_count_72h": len(write_policy_failures),
+        "core_repair_loop_failure_count_6h": len(core_repair_loop_failures),
         "new_project_negative_24h": new_project_negative_24h,
         "new_project_cycles_24h": new_project_cycles_24h,
         "portfolio_recent_count_6h": recent_projects_6h,
@@ -15999,6 +16037,22 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     key = f"repo-{repo_id or _slug_token(repo_name, max_len=30)}"
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_mode = str(governor.get("mode") or "").strip().lower()
+    governor_avoid_keys = {
+        str(item or "").strip().lower()
+        for item in (governor.get("avoid_keys") or [])
+        if str(item or "").strip()
+    }
+    repo_avoid_tokens = {key.lower()}
+    if repo_id:
+        repo_avoid_tokens.add(repo_id)
+        repo_avoid_tokens.add(f"repo-{repo_id}")
+    governor_avoids_this_repo = bool(repo_avoid_tokens & governor_avoid_keys)
+    governor_avoid_reason = ""
+    if governor_avoids_this_repo:
+        score -= 90
+        governor_avoid_reason = (
+            f"Studio Governor {governor_mode} explicitly avoids this repo/key after repeated low-value or failed outcomes."
+        )
     if governor_mode == "repair_delivery_contract":
         if kind == "Core":
             score += 42
@@ -16008,6 +16062,23 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             monetization_path = "Protect revenue work by ensuring every AI-built product or feature has real branch, validation, merge/push/deploy evidence."
         else:
             score -= 24
+    elif governor_mode == "repair_loop_breaker":
+        if governor_avoids_this_repo:
+            thesis = (
+                "Hold this repeated PonceBot core repair until fresh evidence identifies a new concrete failure mode."
+            )
+            outcome = (
+                "No additional codexbot repair loop is opened from stale failure evidence; the factory picks a different "
+                "valuable lane or waits for new proof."
+            )
+            commercial_evidence = "audit evidence that repeated no-delta/failed repair bets are cooled down instead of re-selected"
+            monetization_path = "Protect paid-product velocity by avoiding credit waste on repeated non-delta repairs."
+        elif kind == "Dashboard":
+            score += 24
+            thesis = "Improve the operator surface so the factory's current thesis, value, blockers, and shipped outcomes are easier to verify."
+            outcome = "A visible ExecutiveDashboard improvement that makes progress, blockers, or outcomes clearer with deploy proof."
+        elif kind in {"Product app", "Portfolio"}:
+            score += 10
     elif governor_mode == "incubator_quality_gate" and kind not in {"Core", "Dashboard"}:
         score -= 10
     elif governor_mode == "portfolio_compounding" and kind in {"Core", "Dashboard"}:
@@ -16060,6 +16131,8 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score = max(score, 140)
 
     base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
+    if governor_avoid_reason:
+        base_risk = f"{base_risk}; {governor_avoid_reason}"
     if governor_mode and governor_mode != "normal":
         base_risk = f"{base_risk}; Studio Governor {governor_mode}: {_studio_one_line(governor.get('trigger'), max_chars=180)}"
     if recent_risks:
@@ -16388,9 +16461,11 @@ def _studio_governor_should_preempt_active_cycle(
     governor: dict[str, Any],
     cycle: dict[str, Any],
 ) -> bool:
-    if str((governor or {}).get("mode") or "").strip().lower() != "repair_delivery_contract":
+    mode = str((governor or {}).get("mode") or "").strip().lower()
+    if mode not in {"repair_delivery_contract", "repair_loop_breaker"}:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
+    repo_id = str((cycle or {}).get("selected_repo_id") or "").strip().lower()
     lane = str((cycle or {}).get("selected_lane") or "").strip().lower()
     selected_type = str((cycle or {}).get("selected_type") or "").strip().upper()
     avoid_keys = {
@@ -16398,7 +16473,13 @@ def _studio_governor_should_preempt_active_cycle(
         for item in ((governor or {}).get("avoid_keys") or [])
         if str(item or "").strip()
     }
-    return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+    if mode == "repair_delivery_contract":
+        return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+    repo_tokens = {key}
+    if repo_id:
+        repo_tokens.add(repo_id)
+        repo_tokens.add(f"repo-{repo_id}")
+    return bool(repo_tokens & avoid_keys)
 
 
 def _studio_active_cycle_for_order(db_path: Path, *, order_id: str) -> dict[str, Any] | None:
@@ -16413,7 +16494,7 @@ def _studio_active_cycle_for_order(db_path: Path, *, order_id: str) -> dict[str,
             conn.row_factory = sqlite3.Row
             row = conn.execute(
                 """
-                SELECT cycle_id, status, selected_key, selected_type, selected_lane, outcome_status, order_id
+                SELECT cycle_id, status, selected_key, selected_type, selected_repo_id, selected_lane, outcome_status, order_id
                 FROM studio_cycles
                 WHERE order_id = ?
                   AND status = 'active'
@@ -16441,13 +16522,20 @@ def _studio_governor_preempt_active_orders(
     except Exception:
         return 0
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
-    if str(governor.get("mode") or "").strip().lower() != "repair_delivery_contract":
+    governor_mode = str(governor.get("mode") or "").strip().lower()
+    if governor_mode not in {"repair_delivery_contract", "repair_loop_breaker"}:
         return 0
 
-    summary = (
-        "Rejected low-value by Studio Governor: recent no-delta/no-branch delivery failures require "
-        "a PonceBot delivery-contract repair before more incubator/new-project work."
-    )
+    if governor_mode == "repair_loop_breaker":
+        summary = (
+            "Rejected low-value by Studio Governor: repeated codexbot/PonceBot repair attempts recently failed "
+            "or produced no material delta, so repeating the same core repair is now classified as churn."
+        )
+    else:
+        summary = (
+            "Rejected low-value by Studio Governor: recent no-delta/no-branch delivery failures require "
+            "a PonceBot delivery-contract repair before more incubator/new-project work."
+        )
     active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked", "ready"}
     preempted = 0
     for row in active_orders:
@@ -16461,7 +16549,7 @@ def _studio_governor_preempt_active_orders(
             continue
         cycle = _studio_active_cycle_for_order(cfg.orchestrator_db_path, order_id=oid)
         should_preempt = bool(cycle and _studio_governor_should_preempt_active_cycle(governor, cycle))
-        if not should_preempt:
+        if not should_preempt and governor_mode == "repair_delivery_contract":
             try:
                 root = orch_q.get_job(oid)
                 root_trace = dict((root.trace or {}) if root else {})
