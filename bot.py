@@ -13911,6 +13911,15 @@ def _order_command_text(
                     outcome_summary=no_delta_summary,
                     now=failed_at,
                 )
+                try:
+                    orch_q.append_audit_event(
+                        event_type="order.merge_no_delta_rejected",
+                        actor=actor_norm,
+                        details={"order_id": root_id, "order_branch": order_branch},
+                    )
+                except Exception:
+                    pass
+                return no_delta_summary
         except Exception:
             pass
         try:
