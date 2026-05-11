@@ -16243,6 +16243,155 @@ def _studio_attach_order(*, cfg: BotConfig, cycle_id: str, order_id: str, now: f
         pass
 
 
+def _studio_governor_should_preempt_active_cycle(
+    governor: dict[str, Any],
+    cycle: dict[str, Any],
+) -> bool:
+    if str((governor or {}).get("mode") or "").strip().lower() != "repair_delivery_contract":
+        return False
+    key = str((cycle or {}).get("selected_key") or "").strip().lower()
+    lane = str((cycle or {}).get("selected_lane") or "").strip().lower()
+    selected_type = str((cycle or {}).get("selected_type") or "").strip().upper()
+    avoid_keys = {
+        str(item or "").strip().lower()
+        for item in ((governor or {}).get("avoid_keys") or [])
+        if str(item or "").strip()
+    }
+    return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+
+
+def _studio_active_cycle_for_order(db_path: Path, *, order_id: str) -> dict[str, Any] | None:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return None
+    try:
+        db = Path(db_path).expanduser()
+        if not db.exists():
+            return None
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT cycle_id, status, selected_key, selected_type, selected_lane, outcome_status, order_id
+                FROM studio_cycles
+                WHERE order_id = ?
+                  AND status = 'active'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (oid,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
+def _studio_governor_preempt_active_orders(
+    *,
+    cfg: BotConfig,
+    orch_q: OrchestratorQueue,
+    active_orders: list[dict[str, Any]],
+    now: float,
+) -> int:
+    if not active_orders:
+        return 0
+    try:
+        memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+    except Exception:
+        return 0
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    if str(governor.get("mode") or "").strip().lower() != "repair_delivery_contract":
+        return 0
+
+    summary = (
+        "Rejected low-value by Studio Governor: recent no-delta/no-branch delivery failures require "
+        "a PonceBot delivery-contract repair before more incubator/new-project work."
+    )
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked", "ready"}
+    preempted = 0
+    for row in active_orders:
+        if not _is_proactive_order_record(row):
+            continue
+        oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        phase = str(row.get("phase") or "").strip().lower()
+        if phase in {"ready_for_merge", "merged", "done", "failed", "cancelled"}:
+            continue
+        cycle = _studio_active_cycle_for_order(cfg.orchestrator_db_path, order_id=oid)
+        if not cycle or not _studio_governor_should_preempt_active_cycle(governor, cycle):
+            continue
+        cancelled_children = 0
+        try:
+            children = list(orch_q.jobs_by_parent(parent_job_id=oid, limit=800) or [])
+        except Exception:
+            children = []
+        for child in children:
+            state = str(getattr(child, "state", "") or "").strip().lower()
+            job_id = str(getattr(child, "job_id", "") or "").strip()
+            if job_id and state in active_states:
+                try:
+                    if orch_q.cancel(job_id):
+                        cancelled_children += 1
+                except Exception:
+                    pass
+        try:
+            orch_q.cancel(oid)
+        except Exception:
+            pass
+        try:
+            chat_id = int(row.get("chat_id") or 0)
+        except Exception:
+            chat_id = 0
+        if chat_id <= 0:
+            continue
+        try:
+            orch_q.set_order_status(oid, chat_id=chat_id, status="done")
+            orch_q.set_order_phase(oid, chat_id=chat_id, phase="done")
+            orch_q.update_state(
+                oid,
+                "done",
+                blocked_reason=None,
+                merge_ready=False,
+                result_status="rejected_low_value",
+                result_summary=summary,
+                result_next_action=str(governor.get("force_next_action") or "Repair PonceBot delivery contract."),
+            )
+            orch_q.update_trace(
+                oid,
+                studio_governor_preempted=True,
+                studio_governor_preempted_at=float(now),
+                studio_governor_mode=str(governor.get("mode") or ""),
+                studio_governor_trigger=str(governor.get("trigger") or ""),
+                studio_governor_cancelled_children=int(cancelled_children),
+                proactive_improvement_closed=True,
+                proactive_improvement_closed_at=float(now),
+                live_at=float(now),
+            )
+            _studio_complete_cycle_for_order(
+                cfg=cfg,
+                order_id=oid,
+                outcome_status="rejected_low_value",
+                outcome_summary=summary,
+                now=float(now),
+            )
+            orch_q.append_audit_event(
+                event_type="studio.governor_preempted_order",
+                actor="skynet",
+                details={
+                    "order_id": oid,
+                    "cycle_id": str(cycle.get("cycle_id") or ""),
+                    "mode": str(governor.get("mode") or ""),
+                    "cancelled_children": int(cancelled_children),
+                    "trigger": str(governor.get("trigger") or ""),
+                },
+            )
+            preempted += 1
+        except Exception:
+            continue
+    return int(preempted)
+
+
 def _studio_complete_cycle_for_order_db(
     *,
     db_path: Path,
@@ -18273,6 +18422,27 @@ def _proactive_lane_tick(
             now=float(now),
         )
     ]
+    preempted = _studio_governor_preempt_active_orders(
+        cfg=cfg,
+        orch_q=orch_q,
+        active_orders=countable_proactive_orders,
+        now=now,
+    )
+    if preempted:
+        try:
+            active_orders = orch_q.list_orders(chat_id=int(chat_id), status="active", limit=200)
+        except Exception:
+            active_orders = []
+        active_proactive_orders = [o for o in active_orders if _is_proactive_order_record(o)]
+        countable_proactive_orders = [
+            row
+            for row in active_proactive_orders
+            if not _order_has_pending_factory_ceo_strategy_proposal(
+                cfg,
+                order_id=str(row.get("order_id") or ""),
+                now=float(now),
+            )
+        ]
     if len(countable_proactive_orders) >= int(cfg.proactive_lane_max_active_orders):
         return 0
 

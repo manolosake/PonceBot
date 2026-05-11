@@ -72,3 +72,16 @@ def test_studio_prompt_includes_governor_directives():
     assert "Studio governor:" in prompt
     assert "repair_delivery_contract" in prompt
     assert "Do not start another new-folder project" in prompt
+
+
+def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
+    cycle = {
+        "selected_key": "new-project-incubator",
+        "selected_type": "NEW_PROJECT",
+        "selected_lane": "incubator",
+    }
+    normal_governor = {"mode": "normal", "avoid_keys": []}
+    repair_governor = {"mode": "repair_delivery_contract", "avoid_keys": ["new-project-incubator"]}
+
+    assert not bot._studio_governor_should_preempt_active_cycle(normal_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
