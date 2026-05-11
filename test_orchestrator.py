@@ -4925,6 +4925,143 @@ class TestMergeAndDeployFlow(unittest.TestCase):
             self.assertIsNone(trace.get("merge_auto_error"))
             self.assertFalse(bool(trace.get("merge_conflict_active", False)))
 
+    def test_auto_merge_tick_treats_rejected_no_delta_as_terminal_no_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            repo_path = td_path / "repo"
+            repo_path.mkdir(parents=True, exist_ok=True)
+            (repo_path / ".git").mkdir(parents=True, exist_ok=True)
+
+            cfg = _cfg(td_path / "state.json", workdir=repo_path)
+            storage = SQLiteTaskStorage(td_path / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            q.upsert_repo(
+                repo_id="repo-secondary",
+                path=str(repo_path),
+                default_branch="main",
+                autonomy_enabled=True,
+                priority=1,
+                runtime_mode="ceo-bounded",
+                daily_budget=0.0,
+                status="active",
+                metadata={},
+            )
+
+            order_id = "ord-merge-no-delta-auto"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=1,
+                title="Retire no-delta auto-merge",
+                body="[repo:repo-secondary]",
+                status="active",
+                priority=1,
+                intent_type="order_project_new",
+                project_id="proj-1",
+                phase="ready_for_merge",
+            )
+            q.set_order_phase(order_id, chat_id=1, phase="ready_for_merge")
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="root",
+                    request_type="maintenance",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="ro",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    state="done",
+                    trace={
+                        "order_branch": "feature/repo-secondary",
+                        "repo_id": "repo-secondary",
+                        "repo_path": str(repo_path),
+                        "merge_ready": True,
+                        "merge_ready_at": 1000.0,
+                        "proactive_improvement_closed_at": 1000.0,
+                    },
+                    job_id=order_id,
+                )
+            )
+
+            class _API:
+                def __init__(self) -> None:
+                    self.msgs: list[str] = []
+
+                def send_message(self, _chat_id: int, text: str, reply_to_message_id=None) -> None:
+                    self.msgs.append(text)
+
+            def _mark_no_delta(*_args, **_kwargs) -> str:
+                q.update_state(
+                    order_id,
+                    "done",
+                    blocked_reason="merge_no_delta",
+                    merge_ready=False,
+                    result_status="rejected_low_value",
+                    result_summary="Rejected low-value no-delta order.",
+                )
+                q.update_trace(
+                    order_id,
+                    merge_no_delta_detected_at=1200.0,
+                    merge_auto_error="merge_no_delta",
+                )
+                q.set_order_status(order_id, chat_id=1, status="done")
+                q.set_order_phase(order_id, chat_id=1, phase="done")
+                return "Order ord-merg merged to main. commit=abc123"
+
+            api = _API()
+            with patch.object(bot, "_jarvis_auto_approve_merge_enabled", return_value=True), patch.object(
+                bot,
+                "_sync_order_phase_from_runtime",
+                return_value=None,
+            ), patch.object(
+                bot,
+                "_order_trace_requires_merge",
+                return_value=(True, "feature/repo-secondary"),
+            ), patch.object(
+                bot,
+                "_repo_context_for_order",
+                return_value=({"repo_id": "repo-secondary", "path": str(repo_path)}, repo_path, "main"),
+            ), patch.object(
+                bot,
+                "_git_pick_main_ref",
+                return_value="origin/main",
+            ), patch.object(
+                bot,
+                "_git_remote_branch_ref",
+                return_value="origin/feature/repo-secondary",
+            ), patch.object(
+                bot,
+                "_git_is_ancestor",
+                return_value=True,
+            ), patch.object(
+                bot,
+                "_git_dirty_status_lines",
+                return_value=[],
+            ), patch.object(
+                bot,
+                "_order_command_text",
+                side_effect=_mark_no_delta,
+            ) as merge_cmd:
+                merged = bot._auto_merge_ready_orders_tick(
+                    cfg=cfg,
+                    api=api,
+                    orch_q=q,
+                    now=1200.0,
+                )
+
+            self.assertEqual(merged, 0)
+            self.assertEqual(merge_cmd.call_count, 1)
+            self.assertEqual(api.msgs, [])
+            root = q.get_job(order_id)
+            assert root is not None
+            trace = dict(root.trace or {})
+            self.assertEqual(str(trace.get("result_status") or ""), "rejected_low_value")
+            self.assertEqual(str(trace.get("merge_auto_error") or ""), "merge_no_delta")
+            self.assertTrue(bool(trace.get("merge_no_delta_detected_at")))
+
 class TestFactoryRepoOrderGuardrail(unittest.TestCase):
     def test_duplicate_active_proactive_orders_for_same_repo_pause_newer_order(self) -> None:
         with tempfile.TemporaryDirectory() as td:
