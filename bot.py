@@ -32729,8 +32729,15 @@ def orchestrator_worker_loop(
             # Keep retries alive in that case when max_retries still allows another attempt.
             if orch_state == "failed" and (not isinstance(structured_digest, (dict, list))):
                 retry_allowed = True
+            workspace_slot_unavailable = bool(
+                isinstance(structured_digest, dict)
+                and str(structured_digest.get("workspace") or "").strip().lower() == "unavailable"
+            )
             failure_class = str(result_meta.get("failure_class") or "").strip().lower()
             retry_cap = int(task.max_retries or 0)
+            if workspace_slot_unavailable:
+                retry_allowed = True
+                retry_cap = max(retry_cap, 4)
             if role_norm_task == "implementer_local":
                 retry_cap = min(retry_cap, 1)
                 if failure_class in ("terminal", "blocked"):

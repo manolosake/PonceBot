@@ -3,6 +3,8 @@ import subprocess
 from types import SimpleNamespace
 
 import bot
+from orchestrator.schemas.task import Task
+from orchestrator.storage import SQLiteTaskStorage
 
 
 def _delivery_failure_memory(now: float) -> dict:
@@ -147,6 +149,51 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(loop_governor, loop_cycle)
     assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
+
+
+def test_workspace_lease_reaps_terminal_job_holder(tmp_path):
+    storage = SQLiteTaskStorage(tmp_path / "jobs.sqlite")
+    stale = Task.new(
+        job_id="stale-job",
+        source="test",
+        role="skynet",
+        input_text="old",
+        request_type="exec",
+        priority=1,
+        model="gpt-5.5",
+        effort="high",
+        mode_hint="full",
+        requires_approval=False,
+        max_cost_window_usd=0,
+        chat_id=1,
+        state="done",
+    )
+    fresh = Task.new(
+        job_id="fresh-job",
+        source="test",
+        role="skynet",
+        input_text="new",
+        request_type="exec",
+        priority=1,
+        model="gpt-5.5",
+        effort="high",
+        mode_hint="full",
+        requires_approval=False,
+        max_cost_window_usd=0,
+        chat_id=1,
+        state="queued",
+    )
+    storage.submit_task(stale)
+    storage.submit_task(fresh)
+    with storage._conn() as conn:
+        conn.execute(
+            "INSERT INTO workspace_leases(role, slot, job_id, leased_at) VALUES (?, ?, ?, ?)",
+            ("skynet", 1, stale.job_id, 1.0),
+        )
+        conn.commit()
+
+    assert storage.lease_workspace(role="skynet", job_id=fresh.job_id, slots=1) == 1
+    assert storage.get_workspace_lease(job_id=fresh.job_id) == ("skynet", 1)
 
 
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():

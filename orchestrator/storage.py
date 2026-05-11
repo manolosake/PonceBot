@@ -3136,6 +3136,18 @@ class SQLiteTaskStorage:
         slots = max(1, int(slots))
         with self._lock:
             with self._conn() as conn:
+                # A terminal or deleted job must never hold a workspace slot forever.
+                # Leases are best-effort runtime locks, not durable ownership records.
+                conn.execute(
+                    """
+                    DELETE FROM workspace_leases
+                    WHERE job_id NOT IN (
+                        SELECT job_id
+                        FROM jobs
+                        WHERE state IN ('queued', 'waiting_deps', 'running', 'blocked_approval', 'blocked')
+                    )
+                    """
+                )
                 # Already leased by this job?
                 row = conn.execute("SELECT slot FROM workspace_leases WHERE job_id = ?", (job_id,)).fetchone()
                 if row is not None:
