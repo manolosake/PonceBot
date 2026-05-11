@@ -107,6 +107,47 @@ def test_studio_governor_breaks_repeated_core_repair_loop():
     assert "Hold this repeated PonceBot core repair" in core["thesis"]
 
 
+def test_studio_governor_cools_down_after_non_core_ship():
+    now = 1_700_000_000.0
+    memory = _delivery_failure_memory(now)
+    memory["recent_studio_negative_outcomes"].extend(
+        [
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "failed_root_caused",
+                "summary": "Prior core repair failed.",
+                "updated_at": now - 120,
+            },
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "rejected_low_value",
+                "summary": "Prior core repair had no delta.",
+                "updated_at": now - 240,
+            },
+        ]
+    )
+    memory["recent_studio_positive_outcomes"] = [
+        {
+            "key": "new-project-incubator",
+            "repo_id": "",
+            "type": "NEW_PROJECT",
+            "status": "published_project",
+            "summary": "Published a private project with README and validation.",
+            "updated_at": now - 60,
+        }
+    ]
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "repair_loop_cooldown"
+    assert governor["severity"] == "yellow"
+    assert "new-project-incubator" in governor["avoid_keys"]
+
+
 def test_studio_prompt_includes_governor_directives():
     now = 1_700_000_000.0
     memory = _delivery_failure_memory(now)
@@ -138,6 +179,7 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     normal_governor = {"mode": "normal", "avoid_keys": []}
     repair_governor = {"mode": "repair_delivery_contract", "avoid_keys": ["new-project-incubator"]}
     loop_governor = {"mode": "repair_loop_breaker", "avoid_keys": ["repo-codexbot"]}
+    cooldown_governor = {"mode": "repair_loop_cooldown", "avoid_keys": ["new-project-incubator"]}
     loop_cycle = {
         "selected_key": "repo-codexbot",
         "selected_repo_id": "codexbot",
@@ -149,6 +191,7 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(loop_governor, loop_cycle)
     assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, cycle)
 
 
 def test_workspace_lease_reaps_terminal_job_holder(tmp_path):

@@ -15836,6 +15836,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     write_policy_failures: list[dict[str, Any]] = []
     core_repair_loop_failures: list[dict[str, Any]] = []
     core_repair_loop_keys: list[str] = []
+    non_core_positive_30m: list[dict[str, Any]] = []
     new_project_negative_24h = 0
     new_project_cycles_24h = 0
     for entry in recent_negative:
@@ -15865,7 +15866,10 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
                 new_project_cycles_24h += 1
     for entry in recent_positive:
         key = str(entry.get("key") or "").strip().lower()
+        repo_id = str(entry.get("repo_id") or "").strip().lower()
         work_type = str(entry.get("type") or "").strip().upper()
+        if _age_hours(entry) <= 0.5 and "codexbot" not in key and "codexbot" not in repo_id:
+            non_core_positive_30m.append(entry)
         if (key == "new-project-incubator" or work_type == "NEW_PROJECT") and _age_hours(entry) <= 24.0:
             new_project_cycles_24h += 1
 
@@ -15879,7 +15883,27 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
 
     core_repair_loop_keys = list(dict.fromkeys(core_repair_loop_keys))[:8]
 
-    if delivery_failures and len(core_repair_loop_failures) >= 2:
+    if delivery_failures and len(core_repair_loop_failures) >= 2 and non_core_positive_30m:
+        mode = "repair_loop_cooldown"
+        severity = "yellow"
+        trigger = (
+            "A non-core Studio bet already shipped after the PonceBot repair loop was detected; "
+            "opening another immediate sprint would be task-chaining, not quality-focused proactivity."
+        )
+        force_next_action = (
+            "Respect the normal proactive interval, keep codexbot core repairs cooled down, and use the next cycle "
+            "for dashboard/portfolio value only if it remains the strongest bet."
+        )
+        prefer_lanes = ["dashboard", "portfolio"]
+        avoid_keys = (core_repair_loop_keys or ["repo-codexbot", "codexbot"]) + ["new-project-incubator"]
+        directives.extend(
+            [
+                "Cooldown after a successful alternative shipment: do not open another immediate incubator sprint.",
+                "Keep repeated codexbot repairs gated until fresh root-cause evidence appears.",
+                "Prefer observation or compounding existing portfolio/dashboard value on the next normal interval.",
+            ]
+        )
+    elif delivery_failures and len(core_repair_loop_failures) >= 2:
         mode = "repair_loop_breaker"
         severity = "red"
         trigger = (
@@ -16079,6 +16103,10 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             outcome = "A visible ExecutiveDashboard improvement that makes progress, blockers, or outcomes clearer with deploy proof."
         elif kind in {"Product app", "Portfolio"}:
             score += 10
+    elif governor_mode == "repair_loop_cooldown" and kind == "Core":
+        score -= 28
+    elif governor_mode == "repair_loop_cooldown" and kind == "Dashboard":
+        score += 8
     elif governor_mode == "incubator_quality_gate" and kind not in {"Core", "Dashboard"}:
         score -= 10
     elif governor_mode == "portfolio_compounding" and kind in {"Core", "Dashboard"}:
@@ -16196,6 +16224,12 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         outcome = "No fresh incubator project should be selected unless the next step directly fixes or disproves the delivery-evidence failure."
         why = "Recent factory evidence says delivery reliability is the bottleneck; starting another project would amplify churn."
         risk += "; Studio Governor blocks fresh incubator work after ghost-delivery evidence"
+    elif governor_mode == "repair_loop_cooldown":
+        score -= 45
+        thesis = "Incubator is cooling down because the factory already shipped a non-core bet after breaking a PonceBot repair loop."
+        outcome = "No immediate second new project; wait for the normal proactive interval or compound an existing asset with stronger evidence."
+        why = "A fresh shipment just happened; another immediate incubator sprint would optimize quantity over quality."
+        risk += "; post-shipment cooldown prevents task-chaining"
     elif governor_mode == "incubator_quality_gate":
         score -= 34
         thesis = "Incubator must compound an existing portfolio asset or present unusually strong buyer/demo evidence before another fresh project."
@@ -16462,7 +16496,7 @@ def _studio_governor_should_preempt_active_cycle(
     cycle: dict[str, Any],
 ) -> bool:
     mode = str((governor or {}).get("mode") or "").strip().lower()
-    if mode not in {"repair_delivery_contract", "repair_loop_breaker"}:
+    if mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown"}:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
     repo_id = str((cycle or {}).get("selected_repo_id") or "").strip().lower()
@@ -16523,10 +16557,15 @@ def _studio_governor_preempt_active_orders(
         return 0
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_mode = str(governor.get("mode") or "").strip().lower()
-    if governor_mode not in {"repair_delivery_contract", "repair_loop_breaker"}:
+    if governor_mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown"}:
         return 0
 
-    if governor_mode == "repair_loop_breaker":
+    if governor_mode == "repair_loop_cooldown":
+        summary = (
+            "Rejected low-value by Studio Governor: a non-core Studio bet already shipped after the repair-loop break, "
+            "so opening another immediate sprint would be task-chaining instead of quality-focused proactivity."
+        )
+    elif governor_mode == "repair_loop_breaker":
         summary = (
             "Rejected low-value by Studio Governor: repeated codexbot/PonceBot repair attempts recently failed "
             "or produced no material delta, so repeating the same core repair is now classified as churn."
