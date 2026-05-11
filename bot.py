@@ -14672,55 +14672,66 @@ def _auto_merge_ready_orders_tick(
             or ("auto-merged by jarvis to " in result_norm)
         ):
             merged_ok = True
-        if not merged_ok:
-            try:
-                after_order = orch_q.get_order(oid, chat_id=chat_for_order) or {}
-                after_root = orch_q.get_job(oid)
-                after_trace = dict((after_root.trace or {}) if after_root else {})
-                terminal_no_delivery = str(after_trace.get("result_status") or "").strip().lower() in {
-                    "merge_no_delta",
-                }
-                deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
-                if terminal_no_delivery:
-                    try:
-                        no_delta_summary = (
-                            "Rejected low-value no-delta order: no branch diff existed "
-                            "against main, so nothing was shipped."
-                        )
-                        orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
-                        orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
-                        orch_q.update_state(
-                            oid,
-                            "done",
-                            blocked_reason=None,
-                            merge_ready=False,
-                            result_status="rejected_low_value",
-                            result_summary=no_delta_summary,
-                            result_next_action="Choose a different bet with measurable delta.",
-                        )
-                        orch_q.update_trace(
-                            oid,
-                            merge_ready=False,
-                            merge_no_delta_active=False,
-                            merge_no_delta_retired_at=float(now),
-                            merge_auto_error="merge_no_delta",
-                            live_at=float(now),
-                        )
-                        orch_q.append_audit_event(
-                            event_type="order.auto_merge_no_delta_retired",
-                            actor="jarvis",
-                            details={"order_id": oid, "reason": "merge_no_delta"},
-                        )
-                        _studio_complete_cycle_for_order(
-                            cfg=cfg,
-                            order_id=oid,
-                            outcome_status="rejected_low_value",
-                            outcome_summary=no_delta_summary,
-                            now=float(now),
-                        )
-                    except Exception:
-                        pass
-                    continue
+        try:
+            after_order = orch_q.get_order(oid, chat_id=chat_for_order) or {}
+            after_root = orch_q.get_job(oid)
+            after_trace = dict((after_root.trace or {}) if after_root else {})
+            result_status = str(after_trace.get("result_status") or "").strip().lower()
+            merge_error_blob = " ".join(
+                str(after_trace.get(key) or "").strip().lower()
+                for key in ("blocked_reason", "merge_error", "merge_auto_error", "result_summary")
+            )
+            terminal_no_delivery = result_status in {"merge_no_delta"} or (
+                result_status == "rejected_low_value"
+                and (
+                    bool(after_trace.get("merge_no_delta_detected_at"))
+                    or "merge_no_delta" in merge_error_blob
+                    or "no-delta" in merge_error_blob
+                    or "no delta" in merge_error_blob
+                )
+            )
+            deploy_failed_after_merge = str(after_trace.get("deploy_status") or "").strip().lower() == "failed"
+            if terminal_no_delivery:
+                try:
+                    no_delta_summary = (
+                        "Rejected low-value no-delta order: no branch diff existed "
+                        "against main, so nothing was shipped."
+                    )
+                    orch_q.set_order_status(oid, chat_id=chat_for_order, status="done")
+                    orch_q.set_order_phase(oid, chat_id=chat_for_order, phase="done")
+                    orch_q.update_state(
+                        oid,
+                        "done",
+                        blocked_reason=None,
+                        merge_ready=False,
+                        result_status="rejected_low_value",
+                        result_summary=no_delta_summary,
+                        result_next_action="Choose a different bet with measurable delta.",
+                    )
+                    orch_q.update_trace(
+                        oid,
+                        merge_ready=False,
+                        merge_no_delta_active=False,
+                        merge_no_delta_retired_at=float(now),
+                        merge_auto_error="merge_no_delta",
+                        live_at=float(now),
+                    )
+                    orch_q.append_audit_event(
+                        event_type="order.auto_merge_no_delta_retired",
+                        actor="jarvis",
+                        details={"order_id": oid, "reason": "merge_no_delta"},
+                    )
+                    _studio_complete_cycle_for_order(
+                        cfg=cfg,
+                        order_id=oid,
+                        outcome_status="rejected_low_value",
+                        outcome_summary=no_delta_summary,
+                        now=float(now),
+                    )
+                except Exception:
+                    pass
+                continue
+            if not merged_ok:
                 merged_ok = (
                     not terminal_no_delivery
                     and not deploy_failed_after_merge
@@ -14729,8 +14740,8 @@ def _auto_merge_ready_orders_tick(
                         or str(after_order.get("status") or "").strip().lower() == "done"
                     )
                 )
-            except Exception:
-                merged_ok = False
+        except Exception:
+            merged_ok = False
 
         if merged_ok:
             merged_count += 1
