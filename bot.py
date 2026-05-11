@@ -15324,6 +15324,34 @@ def _studio_complete_cycle_for_order(
         LOG.exception("Failed to complete studio cycle for order_id=%s", order_id)
 
 
+def _studio_terminal_outcome_for_order(orch_q: OrchestratorQueue, order_id: str) -> dict[str, Any] | None:
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return None
+    try:
+        storage = getattr(orch_q, "_storage", None)
+        db_path = getattr(storage, "path", None)
+        if db_path is None:
+            db_path = Path(__file__).resolve().parent / "data" / "jobs.sqlite"
+        db_path = Path(db_path).expanduser()
+        with sqlite3.connect(str(db_path), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT cycle_id, status, outcome_status, outcome_summary, updated_at
+                FROM studio_cycles
+                WHERE order_id = ?
+                  AND outcome_status IN ('shipped_to_main', 'published_project', 'blocked_need_operator', 'rejected_low_value', 'failed_root_caused')
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (order_id,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+
 def _studio_next_bet(
     *,
     cfg: BotConfig,
@@ -22852,6 +22880,34 @@ def _sync_order_phase_from_runtime(
             orch_q=orch_q,
             root_ticket=rid,
         )
+    studio_terminal = _studio_terminal_outcome_for_order(orch_q, rid) if proactive_order else None
+    if studio_terminal:
+        outcome = str(studio_terminal.get("outcome_status") or "").strip().lower()
+        summary = str(studio_terminal.get("outcome_summary") or outcome).strip()
+        now_ts = time.time()
+        try:
+            if outcome == "failed_root_caused":
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="failed")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="failed")
+            elif outcome == "blocked_need_operator":
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="active")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="review")
+            else:
+                orch_q.set_order_status(rid, chat_id=int(chat_id), status="done")
+                orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="done")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                studio_terminal_outcome=outcome,
+                studio_terminal_outcome_summary=summary[:1000],
+                studio_terminal_outcome_enforced_at=now_ts,
+                operational_gate_status=("blocked" if outcome == "blocked_need_operator" else "terminal"),
+                operational_gate_reason=f"studio_outcome_{outcome}",
+                live_at=now_ts,
+            )
+        except Exception:
+            pass
+        return
 
     status = str(order.get("status") or "").strip().lower()
     if status == "done":
