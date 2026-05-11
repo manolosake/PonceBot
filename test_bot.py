@@ -1273,6 +1273,45 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
         self.assertIn("Needs operator decision", packet)
 
+    def test_incubator_opportunity_requires_monetization_evidence(self) -> None:
+        item = bot._studio_incubator_opportunity(
+            cfg=SimpleNamespace(),  # type: ignore[arg-type]
+            now=250_000.0,
+            memory={},
+        )
+
+        self.assertEqual(item["type"], "NEW_PROJECT")
+        self.assertGreaterEqual(item["score"], 96)
+        self.assertIn("sellable", item["thesis"])
+        self.assertIn("rentable", item["thesis"])
+        self.assertIn("pricing", item["operator_visible_outcome"].lower())
+        self.assertIn("monetization", item["evidence_target"].lower())
+        self.assertIn("Direct revenue", item["business_model"])
+        self.assertIn("target customer", item["monetization_path"])
+        self.assertIn("target buyer", item["commercial_evidence_target"])
+
+    def test_prompt_packet_includes_business_objective_and_self_improvement_guard(self) -> None:
+        selected = {
+            "type": "NEW_PROJECT",
+            "repo_name": "New product incubator",
+            "score": 99,
+            "thesis": "Create a rentable automation product.",
+            "operator_visible_outcome": "A private MVP with buyer and pricing hypothesis.",
+            "business_model": "Direct revenue option.",
+            "monetization_path": "Sellable tool for a named buyer.",
+            "commercial_evidence_target": "buyer, price, demo, validation.",
+        }
+
+        packet = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory={})
+
+        self.assertIn("Factory objective", packet)
+        self.assertIn("make money", packet)
+        self.assertIn("sellable products", packet)
+        self.assertIn("rentable tools", packet)
+        self.assertIn("never as work-for-work's-sake", packet)
+        self.assertIn("Selected monetization path", packet)
+        self.assertIn("Can this make money", packet)
+
     def test_recent_same_surface_shipment_penalizes_repetition(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
