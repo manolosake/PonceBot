@@ -180,6 +180,7 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     repair_governor = {"mode": "repair_delivery_contract", "avoid_keys": ["new-project-incubator"]}
     loop_governor = {"mode": "repair_loop_breaker", "avoid_keys": ["repo-codexbot"]}
     cooldown_governor = {"mode": "repair_loop_cooldown", "avoid_keys": ["new-project-incubator"]}
+    quality_governor = {"mode": "incubator_quality_gate", "avoid_keys": ["new-project-incubator"]}
     loop_cycle = {
         "selected_key": "repo-codexbot",
         "selected_repo_id": "codexbot",
@@ -199,6 +200,7 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, dashboard_cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(quality_governor, cycle)
 
 
 def test_workspace_lease_reaps_terminal_job_holder(tmp_path):

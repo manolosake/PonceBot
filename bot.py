@@ -16108,7 +16108,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     elif governor_mode == "repair_loop_cooldown" and kind == "Dashboard":
         score += 8
     elif governor_mode == "incubator_quality_gate" and kind not in {"Core", "Dashboard"}:
-        score -= 10
+        score -= 24
     elif governor_mode == "portfolio_compounding" and kind in {"Core", "Dashboard"}:
         score -= 6
 
@@ -16231,7 +16231,7 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         why = "A fresh shipment just happened; another immediate incubator sprint would optimize quantity over quality."
         risk += "; post-shipment cooldown prevents task-chaining"
     elif governor_mode == "incubator_quality_gate":
-        score -= 34
+        score -= 70
         thesis = "Incubator must compound an existing portfolio asset or present unusually strong buyer/demo evidence before another fresh project."
         outcome = f"A published portfolio asset under {root} moves toward validation, distribution, monetization, or a clearer demo; avoid shallow new folders."
         why = "Recent new-project outcomes failed quality gates; compounding has better expected value than another shallow MVP."
@@ -16496,7 +16496,7 @@ def _studio_governor_should_preempt_active_cycle(
     cycle: dict[str, Any],
 ) -> bool:
     mode = str((governor or {}).get("mode") or "").strip().lower()
-    if mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown"}:
+    if mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown", "incubator_quality_gate"}:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
     repo_id = str((cycle or {}).get("selected_repo_id") or "").strip().lower()
@@ -16511,6 +16511,8 @@ def _studio_governor_should_preempt_active_cycle(
         return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
     if mode == "repair_loop_cooldown":
         return bool(key or lane or selected_type)
+    if mode == "incubator_quality_gate":
+        return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
     repo_tokens = {key}
     if repo_id:
         repo_tokens.add(repo_id)
@@ -16559,10 +16561,20 @@ def _studio_governor_preempt_active_orders(
         return 0
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_mode = str(governor.get("mode") or "").strip().lower()
-    if governor_mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown"}:
+    if governor_mode not in {
+        "repair_delivery_contract",
+        "repair_loop_breaker",
+        "repair_loop_cooldown",
+        "incubator_quality_gate",
+    }:
         return 0
 
-    if governor_mode == "repair_loop_cooldown":
+    if governor_mode == "incubator_quality_gate":
+        summary = (
+            "Rejected low-value by Studio Governor: recent new-project outcomes failed quality gates, "
+            "so another immediate incubator sprint is paused until the next bet has stronger buyer, demo, and validation evidence."
+        )
+    elif governor_mode == "repair_loop_cooldown":
         summary = (
             "Rejected low-value by Studio Governor: a non-core Studio bet already shipped after the repair-loop break, "
             "so opening another immediate sprint would be task-chaining instead of quality-focused proactivity."
@@ -18686,6 +18698,17 @@ def _proactive_lane_tick(
             now=float(now),
         )
     ]
+    preempt_governor_mode = ""
+    try:
+        memory_before_preempt = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+        governor_before_preempt = (
+            memory_before_preempt.get("studio_governor")
+            if isinstance(memory_before_preempt.get("studio_governor"), dict)
+            else {}
+        )
+        preempt_governor_mode = str(governor_before_preempt.get("mode") or "").strip().lower()
+    except Exception:
+        preempt_governor_mode = ""
     preempted = _studio_governor_preempt_active_orders(
         cfg=cfg,
         orch_q=orch_q,
@@ -18693,6 +18716,12 @@ def _proactive_lane_tick(
         now=now,
     )
     if preempted:
+        if preempt_governor_mode in {"repair_loop_cooldown", "incubator_quality_gate"}:
+            try:
+                orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
+            except Exception:
+                pass
+            return 0
         try:
             memory_after_preempt = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
             governor_after_preempt = (
