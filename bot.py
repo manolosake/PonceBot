@@ -29747,6 +29747,37 @@ def _maybe_enqueue_post_delivery_review(
     model = _orchestrator_model_for_profile(cfg, base_profile)
     effort = _orchestrator_effort_for_profile(base_profile, cfg)
     order_branch = _resolve_order_branch_from_task(task, orch_q)
+    target_trace = dict((task.trace or {}) if isinstance(task.trace, dict) else {})
+    target_digest = target_trace.get("structured_digest")
+    if not isinstance(target_digest, dict):
+        target_digest = {}
+    target_artifacts_dir = str(
+        getattr(task, "artifacts_dir", "") or target_digest.get("artifacts_dir") or ""
+    ).strip()
+    target_summary = str(
+        target_trace.get("result_summary") or target_digest.get("summary") or ""
+    ).strip()
+    target_artifacts_raw = target_trace.get("result_artifacts") or target_digest.get("artifacts") or []
+    target_artifacts = [str(item) for item in target_artifacts_raw if str(item or "").strip()][:12] if isinstance(target_artifacts_raw, list) else []
+    target_summary_one_line = re.sub(r"\s+", " ", target_summary)[:900] if target_summary else "(none recorded)"
+    target_evidence_lines = [
+        "Target evidence context:",
+        f"- Target artifacts dir: {target_artifacts_dir or '(none recorded)'}",
+        f"- Target result status: {str(target_trace.get('result_status') or task.state or '').strip()}",
+        f"- Target summary: {target_summary_one_line}",
+    ]
+    if target_artifacts:
+        target_evidence_lines.append("- Target artifact files:")
+        target_evidence_lines.extend(f"  - {item}" for item in target_artifacts)
+    target_evidence_lines.extend(
+        [
+            "",
+            "Important evidence rule:",
+            "- You are running in a disposable controller_snapshot; do not reject solely because the snapshot CWD lacks target artifacts.",
+            "- Inspect the absolute Target artifacts dir/files above when present, and treat a PASS QA summary plus command logs as valid evidence unless the evidence itself is inconsistent.",
+        ]
+    )
+    target_evidence_block = "\n".join(target_evidence_lines)
 
     review_text = (
         "POST-DELIVERY QUALITY REVIEW\n"
@@ -29754,6 +29785,7 @@ def _maybe_enqueue_post_delivery_review(
         f"Target job: {task.job_id}\n"
         f"Target role: {role}\n"
         f"Round: {review_round}/{int(review_cap)}\n\n"
+        f"{target_evidence_block}\n\n"
         "Review protocol:\n"
         "- Inspect latest artifacts, logs, and implementation evidence from the target job.\n"
         "- Validate acceptance criteria and user-facing quality.\n"
