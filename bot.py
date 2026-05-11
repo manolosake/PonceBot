@@ -26238,6 +26238,11 @@ def _final_sweep_blocker_count(*, children: Sequence[Task], open_states: set[str
     return blockers
 
 
+def _has_open_child_jobs(*, children: Sequence[Task], open_states: set[str] | None = None) -> bool:
+    states = open_states or {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    return any(str(c.state or "").strip().lower() in states for c in children)
+
+
 def _jarvis_final_sweep_tick(
     *,
     cfg: BotConfig,
@@ -26309,7 +26314,7 @@ def _jarvis_final_sweep_tick(
                 and str(c.state or "").strip().lower() in open_states
                 for c in children
             )
-            if not active_local:
+            if not active_local and not _has_open_child_jobs(children=children, open_states=open_states):
                 no_change_summary = (
                     "Rejected low-value no-code-change order: the selected bet was already implemented "
                     "or produced no new validated delta, so nothing new was shipped."

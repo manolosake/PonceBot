@@ -172,3 +172,14 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
     assert rows["orphan-cycle"] == ("failed", "failed_root_caused")
     assert rows["live-order-cycle"] == ("active", None)
     assert rows["live-job-cycle"] == ("active", None)
+
+
+def test_final_sweep_no_change_close_waits_for_open_nonblocking_children():
+    children = [
+        SimpleNamespace(role="qa", state="running"),
+        SimpleNamespace(role="skynet", state="running"),
+    ]
+    open_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+
+    assert bot._final_sweep_blocker_count(children=children, open_states=open_states) == 0
+    assert bot._has_open_child_jobs(children=children, open_states=open_states)
