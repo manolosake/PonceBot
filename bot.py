@@ -8695,7 +8695,7 @@ def _project_incubator_candidate_paths_from_trace(trace: dict[str, Any] | None) 
         return []
     root = _project_incubator_root_dir()
     root_s = str(root)
-    pattern = re.compile(re.escape(root_s.rstrip("/")) + r"/[A-Za-z0-9][A-Za-z0-9._/-]*")
+    pattern = re.compile(re.escape(root_s.rstrip("/")) + r"/[^\s`'\"),;:]+")
     out: list[Path] = []
     seen: set[str] = set()
     for match in pattern.finditer(blob):
@@ -8744,16 +8744,14 @@ def _trace_project_incubator_delivery_evidence(trace: dict[str, Any] | None) -> 
         if path_key in seen:
             continue
         seen.add(path_key)
-        if path.name.startswith("."):
-            continue
-        if any(part.startswith(".") for part in path.parts):
-            continue
         if not _path_is_relative_to(path, root):
             continue
         try:
             relative_parts = path.resolve().relative_to(root.resolve()).parts
         except Exception:
             relative_parts = ()
+        if any(part.startswith(".") for part in relative_parts):
+            continue
         if len(relative_parts) > 3:
             continue
         if not path.exists() or not path.is_dir():
