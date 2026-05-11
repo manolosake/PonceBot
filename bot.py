@@ -14943,6 +14943,14 @@ _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 _STUDIO_CYCLE_VERSION = 1
 _STUDIO_OUTCOME_TYPES = ("shipped_to_main", "published_project", "blocked_need_operator", "rejected_low_value", "failed_root_caused")
 _STUDIO_STALE_SELECTED_SECONDS = 30 * 60
+_STUDIO_OPERATOR_BUSINESS_GOAL = (
+    "The software factory should create assets that can make money: sellable products, rentable tools, "
+    "automations that can earn or save money, and private projects that can become paid offerings."
+)
+_STUDIO_SELF_IMPROVEMENT_GOAL = (
+    "Continuous improvement counts only when it measurably improves selection quality, delivery reliability, "
+    "speed, deployability, learning, or revenue potential; never as work-for-work's-sake."
+)
 
 
 def _studio_enabled() -> bool:
@@ -15248,24 +15256,36 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         thesis = "Make PonceBot more autonomous, selective, and better at shipping real outcomes instead of job churn."
         outcome = "A PonceBot capability that changes how Skynet chooses, delegates, validates, merges, or learns."
         target_user = "Alejandro operating PonceBot as a software factory"
+        business_model = "Factory leverage: make the autonomous studio ship more monetizable bets with less waste."
+        monetization_path = "Indirect revenue through better project selection, faster shipping, fewer ghost deliveries, and more reliable deploys."
+        commercial_evidence = "factory metric or outcome evidence showing improved delivery, selection quality, deployability, learning, or revenue potential"
         score = 94
     elif kind == "Dashboard":
         work_type = "FEATURE"
         thesis = "Make ExecutiveDashboard show decisions, outcomes, and product progress more clearly than raw terminal noise."
         outcome = "A visible dashboard surface that explains current thesis, shipped work, blockers, and portfolio progress."
         target_user = "Alejandro reviewing the factory from the browser"
+        business_model = "Operator intelligence: reduce oversight friction so revenue-producing work is easier to direct and verify."
+        monetization_path = "Indirect revenue by making profitable work visible, auditable, and easier to steer toward shipped outcomes."
+        commercial_evidence = "operator-visible proof that current work, shipped value, blockers, or monetization path became clearer"
         score = 91
     elif kind == "Product app":
         work_type = "FEATURE"
         thesis = f"Find one visible product milestone in {repo_name} that can be validated with an emulator or runnable proof."
         outcome = "A user-visible app/product improvement with screenshots or validation logs."
         target_user = "future product users"
+        business_model = "Product value: advance a feature or workflow that could support a paid, rented, or lead-generating offering."
+        monetization_path = "Direct or near-direct revenue through a more useful product surface, demo, or customer-facing capability."
+        commercial_evidence = "target user, pain, value proposition, demo/proof, and why this increases sellability or retention"
         score = 76
     else:
         work_type = "PRODUCT_WORKFLOW"
         thesis = f"Advance {repo_name} only if it has a clear user-facing or operator-facing reason to exist now."
         outcome = "A concrete milestone, README/demo, or feature that makes the repo more useful."
         target_user = "operator or eventual project user"
+        business_model = "Portfolio option: preserve or grow a project only when it has a credible user, buyer, or operational payoff."
+        monetization_path = "Revenue optionality through a clearer product milestone, reusable asset, or automation that saves time/money."
+        commercial_evidence = "buyer/user hypothesis, useful milestone, README/demo evidence, or rationale for archiving/pausing low-value work"
         score = 64
 
     if priority <= 1:
@@ -15349,6 +15369,9 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         "thesis": thesis,
         "operator_visible_outcome": outcome,
         "evidence_target": "tests/logs plus merge/push/deploy evidence; UI work also needs screenshot or browser validation.",
+        "business_model": business_model,
+        "monetization_path": monetization_path,
+        "commercial_evidence_target": commercial_evidence,
         "risk_summary": base_risk,
         "why_better_than_alternatives": why,
         "recent_studio_outcome_risks": recent_risks[:4],
@@ -15367,14 +15390,17 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         "repo_path": "",
         "repo_name": "New product incubator",
         "repo_kind": "Incubator",
-        "score": 86,
-        "problem": "If existing repos have no critical bug, the factory should create new visible product surface area.",
-        "target_user": "Alejandro and future operators/users",
-        "thesis": "Create or advance one small but real product prototype beside PonceBot and ExecutiveDashboard.",
-        "operator_visible_outcome": f"A git-backed project under {root} with README, runnable/demoable behavior, validation evidence, and private GitHub publication when safe.",
-        "evidence_target": "new folder, clean git history, README, validation command/log, GitHub private remote or exact blocker.",
+        "score": 96,
+        "problem": "If existing repos have no critical bug, the factory should create or advance monetizable product surface area instead of doing work-for-work's-sake.",
+        "target_user": "Alejandro, a clearly named buyer persona, and future operators/users",
+        "thesis": "Create or advance one small but real sellable, rentable, or automated-revenue product beside PonceBot and ExecutiveDashboard.",
+        "operator_visible_outcome": f"A git-backed project under {root} with README, target buyer, pricing/rental hypothesis, runnable/demoable behavior, validation evidence, and private GitHub publication when safe.",
+        "evidence_target": "new folder, clean git history, README, buyer/user hypothesis, monetization hypothesis, validation command/log, GitHub private remote or exact blocker.",
+        "business_model": "Direct revenue option: sellable SaaS/tool, rentable automation, lead generator, internal product accelerator, or automated income project.",
+        "monetization_path": "Create a private MVP with target customer, pain, offer, pricing/rental hypothesis, demo, and next validation milestone.",
+        "commercial_evidence_target": "target buyer, problem severity, offer, price/rental hypothesis, demo/README, validation evidence, and GitHub private remote",
         "risk_summary": "avoid public launch, billing, credentials, destructive actions, or large scope without operator approval",
-        "why_better_than_alternatives": "It creates visible portfolio growth when no urgent fix is evidenced.",
+        "why_better_than_alternatives": "It creates visible portfolio growth and revenue optionality when no urgent fix is evidenced.",
     }
 
 
@@ -15419,9 +15445,11 @@ def _studio_build_opportunities(
 
 def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list[dict[str, Any]], memory: dict[str, Any]) -> str:
     def _line(item: dict[str, Any], idx: int) -> str:
+        money = _studio_one_line(str(item.get("monetization_path") or item.get("business_model") or ""), max_chars=130, default="")
+        money_suffix = f" | money: {money}" if money else ""
         return (
             f"{idx}. {item.get('type')} · {item.get('repo_name')} · score {item.get('score')}: "
-            f"{_studio_one_line(str(item.get('thesis') or ''), max_chars=180)}"
+            f"{_studio_one_line(str(item.get('thesis') or ''), max_chars=180)}{money_suffix}"
         )
 
     rows = [_line(item, idx + 1) for idx, item in enumerate(opportunities)]
@@ -15439,17 +15467,26 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             "",
+            "Factory objective:",
+            f"- Money: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
+            f"- Self-improvement: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
+            "",
             "Candidate bets:",
             *rows,
             "",
             f"Selected thesis: {_studio_one_line(str(selected.get('thesis') or ''), max_chars=260)}",
             f"Selected outcome: {_studio_one_line(str(selected.get('operator_visible_outcome') or ''), max_chars=260)}",
+            f"Selected business model: {_studio_one_line(str(selected.get('business_model') or ''), max_chars=260)}",
+            f"Selected monetization path: {_studio_one_line(str(selected.get('monetization_path') or ''), max_chars=260)}",
+            f"Selected commercial evidence: {_studio_one_line(str(selected.get('commercial_evidence_target') or ''), max_chars=260)}",
             "",
             "Mandatory internal debate before delegation:",
             "- Would Alejandro notice this result without reading raw logs?",
+            "- Can this make money, save money, increase sellability/rentability, or improve the factory's ability to create monetizable assets?",
             "- Does this avoid repeating prior no-delta, write-policy, or low-value work?",
             "- Can it finish in main/published/deployed form with concrete evidence?",
             "- What would make this fail, and what is the smallest safe phase?",
+            "- If this is internal improvement, what measurable factory capability changes and why is it not churn?",
             "- If the selected bet is weak after sensing the repo, reject it and choose a stronger candidate from the list.",
         ]
     )
@@ -17041,6 +17078,9 @@ def _spawn_proactive_order(
                 f"- Product thesis: {studio_selected.get('thesis') or goal}",
                 f"- Operator-visible outcome: {studio_selected.get('operator_visible_outcome') or success_definition}",
                 f"- Evidence target: {studio_selected.get('evidence_target') or 'tests/logs/artifacts plus merge/push/deploy evidence'}",
+                f"- Business model: {studio_selected.get('business_model') or 'Explain how this can create, save, or unlock money.'}",
+                f"- Monetization path: {studio_selected.get('monetization_path') or 'Explain the direct or indirect path to sellability, rentability, savings, or automated revenue.'}",
+                f"- Commercial evidence target: {studio_selected.get('commercial_evidence_target') or 'target user/buyer, value hypothesis, and evidence that the result is more sellable or operationally valuable'}",
                 f"- Risk thesis: {studio_selected.get('risk_summary') or 'Keep the slice bounded and reversible.'}",
                 "- Required thinking loop: Sense -> Understand -> Imagine -> Debate -> Choose -> Build -> Judge -> Ship -> Learn.",
                 "- Before delegating, produce 3-5 possible bets, then explicitly kill weak bets using the critic questions.",
@@ -17058,6 +17098,11 @@ def _spawn_proactive_order(
         scope_policy,
         "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
         *incubator_policy_lines,
+        f"- Factory business objective: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
+        f"- Self-improvement bar: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
+        "- Every proactive bet must state a credible path to make money, save money, increase sellability/rentability, or improve the factory's ability to create monetizable assets.",
+        "- New project work must include a target buyer/user, problem, offer, pricing or rental hypothesis, MVP/demo, README, validation evidence, and private GitHub publication or exact blocker.",
+        "- Internal platform work is valid only when it changes a measurable factory capability: better selection quality, fewer ghost deliveries, faster safe shipping, stronger deploy/release confidence, or clearer learning.",
         "- VERIFIED_IMPROVEMENT requires prior delegated implementer evidence plus reviewer/QA evidence; controller-only analysis or direct diffs do not qualify.",
         "- Avoid work-for-work's-sake: choose the highest-impact bugfix, issue resolution, feature, product improvement, new-project phase, or refactor slice that can be validated today.",
         "- Required work classification: choose exactly one of BUGFIX, FEATURE, PRODUCT_WORKFLOW, DEEP_REFACTOR, or NEW_PROJECT_PHASE, and state why that class is justified.",
