@@ -1,3 +1,4 @@
+import sqlite3
 from types import SimpleNamespace
 
 import bot
@@ -128,3 +129,46 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():
     assert bot._studio_repo_kind({"path": "/home/aponce/codexbot", "repo_id": "codexbot"}) == "Core"
     assert bot._studio_repo_kind({"path": "/home/aponce/poncebot-control-room", "repo_id": "poncebot-control-room"}) == "Portfolio"
+
+
+def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
+    now = 1_700_000_000.0
+    db = tmp_path / "jobs.sqlite"
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, parent_job_id TEXT, state TEXT)")
+        conn.execute("CREATE TABLE ceo_orders(order_id TEXT PRIMARY KEY, status TEXT)")
+        conn.executemany(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', ?, 'DEEP_IMPROVEMENT', ?, '/home/aponce/codexbot',
+                'core', 'Repair delivery.', 'Because ghost delivery.', 'Critic agrees.',
+                'No ghost deliveries.', 'Tests.', 'Low.', 'packet', '[]', ?, ?, ?)
+            """,
+            [
+                ("orphan-cycle", now - 900, "repo-codexbot", "codexbot", "orphan-order", now - 900, now - 900),
+                ("live-order-cycle", now - 900, "repo-codexbot", "codexbot", "live-order", now - 900, now - 900),
+                ("live-job-cycle", now - 900, "repo-codexbot", "codexbot", "live-job", now - 900, now - 900),
+            ],
+        )
+        conn.execute("INSERT INTO ceo_orders(order_id, status) VALUES (?, ?)", ("live-order", "active"))
+        conn.execute("INSERT INTO jobs(job_id, parent_job_id, state) VALUES (?, ?, ?)", ("live-job", "", "running"))
+        conn.commit()
+
+    closed = bot._studio_finalize_orphaned_active_cycles(db, now=now, max_age_seconds=300)
+
+    assert closed == 1
+    with sqlite3.connect(db) as conn:
+        rows = {
+            row[0]: row[1:]
+            for row in conn.execute(
+                "SELECT cycle_id, status, outcome_status FROM studio_cycles ORDER BY cycle_id"
+            )
+        }
+    assert rows["orphan-cycle"] == ("failed", "failed_root_caused")
+    assert rows["live-order-cycle"] == ("active", None)
+    assert rows["live-job-cycle"] == ("active", None)

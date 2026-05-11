@@ -15707,6 +15707,58 @@ def _studio_finalize_stale_selected_cycles(
         return 0
 
 
+def _studio_finalize_orphaned_active_cycles(
+    db_path: Path,
+    *,
+    now: float,
+    max_age_seconds: float = 300.0,
+) -> int:
+    cutoff = float(now) - max(60.0, float(max_age_seconds))
+    active_job_states = ("queued", "running", "ready", "blocked", "blocked_approval", "waiting_deps")
+    try:
+        db = Path(db_path).expanduser()
+        if not db.exists():
+            return 0
+        _studio_ensure_schema(db)
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            cur = conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = 'failed',
+                    outcome_status = 'failed_root_caused',
+                    outcome_summary = ?,
+                    updated_at = ?
+                WHERE status = 'active'
+                  AND order_id IS NOT NULL
+                  AND TRIM(order_id) <> ''
+                  AND updated_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM ceo_orders
+                      WHERE ceo_orders.order_id = studio_cycles.order_id
+                        AND ceo_orders.status = 'active'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE (jobs.job_id = studio_cycles.order_id OR jobs.parent_job_id = studio_cycles.order_id)
+                        AND jobs.state IN (?, ?, ?, ?, ?, ?)
+                  )
+                """,
+                (
+                    "Studio cycle had an attached order but no active order or open jobs; closed as orphaned before next selection.",
+                    float(now),
+                    cutoff,
+                    *active_job_states,
+                ),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+    except Exception:
+        LOG.exception("Failed to finalize orphaned active Studio cycles")
+        return 0
+
+
 def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
     ts = float(now if now is not None else time.time())
     negatives = [entry for entry in memory.get("recent_studio_negative_outcomes", []) or [] if isinstance(entry, dict)]
@@ -15809,6 +15861,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
 
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
     _studio_finalize_stale_selected_cycles(cfg.orchestrator_db_path, now=now)
+    _studio_finalize_orphaned_active_cycles(cfg.orchestrator_db_path, now=now)
     memory = _studio_recent_order_memory(orch_q, now=now)
     cycle_memory = _studio_recent_cycle_outcome_memory(cfg.orchestrator_db_path, now=now)
     memory.update(cycle_memory)
@@ -36991,6 +37044,10 @@ def main() -> None:
                     _cleanup_terminal_root_orders_tick(orch_q=orchestrator_queue, now=time.time())
                 except Exception:
                     LOG.exception("Terminal-root order cleanup tick failed")
+                try:
+                    _studio_finalize_orphaned_active_cycles(cfg.orchestrator_db_path, now=time.time())
+                except Exception:
+                    LOG.exception("Orphaned Studio cycle cleanup tick failed")
                 try:
                     _cleanup_proactive_local_waiting_jobs(
                         orch_q=orchestrator_queue,
