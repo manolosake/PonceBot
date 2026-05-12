@@ -298,6 +298,25 @@ def test_controller_snapshot_validation_commands_include_android_build(tmp_path)
     assert ["bash", "./gradlew", ":app:assembleDebug"] in commands
 
 
+def test_controller_snapshot_validation_commands_include_node_workflow(tmp_path):
+    repo = tmp_path / "node"
+    repo.mkdir()
+    (repo / "package.json").write_text('{"scripts":{"test":"node --test"}}\n', encoding="utf-8")
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "demo.mjs").write_text("console.log('demo')\n", encoding="utf-8")
+
+    commands = bot._controller_snapshot_validation_commands(
+        repo,
+        ["src/app.js", "scripts/demo.mjs", "src/styles.css"],
+    )
+
+    assert ["node", "--check", "src/app.js"] in commands
+    assert ["node", "--check", "scripts/demo.mjs"] in commands
+    assert ["npm", "test"] in commands
+    assert ["node", "scripts/demo.mjs"] in commands
+
+
 def test_controller_snapshot_revert_applied_delta_restores_only_snapshot_delta(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

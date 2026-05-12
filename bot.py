@@ -14851,7 +14851,8 @@ def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list
     commands: list[list[str]] = []
     python_bin = str(repo_dir / ".venv" / "bin" / "python") if (repo_dir / ".venv" / "bin" / "python").exists() else "python3"
     py_files = [path for path in changed_paths if path.endswith(".py")]
-    js_files = [path for path in changed_paths if path.endswith(".js")]
+    js_files = [path for path in changed_paths if path.endswith((".js", ".mjs", ".cjs"))]
+    web_files = [path for path in changed_paths if path.endswith((".js", ".mjs", ".cjs", ".html", ".css"))]
     android_files = [
         path
         for path in changed_paths
@@ -14866,7 +14867,53 @@ def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list
             commands.append(["bash", "scripts/validate_unit_tests.sh"])
         if (repo_dir / "gradlew").exists():
             commands.append(["bash", "./gradlew", ":app:assembleDebug"])
+    if web_files and (repo_dir / "package.json").exists():
+        try:
+            package = json.loads((repo_dir / "package.json").read_text(encoding="utf-8"))
+        except Exception:
+            package = {}
+        scripts = package.get("scripts") if isinstance(package, dict) and isinstance(package.get("scripts"), dict) else {}
+        test_script = str(scripts.get("test") or "").strip()
+        if test_script and "no test specified" not in test_script.lower():
+            commands.append(["npm", "test"])
+    if web_files and (repo_dir / "scripts" / "demo.mjs").exists():
+        commands.append(["node", "scripts/demo.mjs"])
     return commands
+
+
+def _recent_controller_snapshot_studio_order_rows(
+    *,
+    orch_q: OrchestratorQueue,
+    now: float,
+    max_age_seconds: float,
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    storage = getattr(orch_q, "_storage", None)
+    db_path = getattr(storage, "path", None)
+    if db_path is None:
+        return []
+    cutoff = float(now) - max(300.0, float(max_age_seconds))
+    try:
+        with sqlite3.connect(str(Path(db_path).expanduser()), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT o.order_id, o.chat_id, o.status, o.phase, o.title, o.updated_at
+                FROM studio_cycles sc
+                JOIN ceo_orders o ON o.order_id = sc.order_id
+                JOIN jobs j ON j.job_id = sc.order_id
+                WHERE sc.updated_at >= ?
+                  AND sc.order_id IS NOT NULL
+                  AND sc.outcome_status IN ('failed_root_caused', 'blocked_need_operator')
+                  AND j.trace LIKE '%controller_snapshot_workdir%'
+                ORDER BY sc.updated_at DESC
+                LIMIT ?
+                """,
+                (cutoff, int(limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except Exception:
+        return []
 
 
 def _controller_snapshot_revert_applied_delta(
@@ -15209,6 +15256,16 @@ def _auto_merge_ready_orders_tick(
         done_orders = list(orch_q.list_orders_global(status="done", limit=240) or [])
     except Exception:
         done_orders = []
+    seen_done_order_ids = {str(row.get("order_id") or "").strip() for row in done_orders}
+    for row in _recent_controller_snapshot_studio_order_rows(
+        orch_q=orch_q,
+        now=float(now),
+        max_age_seconds=heal_done_max_age_s,
+    ):
+        oid = str(row.get("order_id") or "").strip()
+        if oid and oid not in seen_done_order_ids:
+            done_orders.append(row)
+            seen_done_order_ids.add(oid)
 
     known_ids = {str(it.get("order_id") or "").strip() for it in orders}
     snapshot_autoship_count = 0
