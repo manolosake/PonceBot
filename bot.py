@@ -14869,6 +14869,34 @@ def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list
     return commands
 
 
+def _controller_snapshot_revert_applied_delta(
+    *,
+    repo_dir: Path,
+    patch_path: Path,
+    copied_untracked: list[str],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"reverse_patch_returncode": None, "removed_untracked": [], "errors": []}
+    reverse = _run_git(repo_dir, ["apply", "--reverse", str(patch_path)], check=False)
+    result["reverse_patch_returncode"] = int(reverse.returncode)
+    if reverse.returncode != 0:
+        result["errors"].append((reverse.stderr or reverse.stdout or "").strip() or "reverse_patch_failed")
+
+    repo_root = repo_dir.resolve()
+    for rel in copied_untracked:
+        if not _controller_snapshot_safe_untracked_path(rel):
+            continue
+        path = (repo_dir / rel).resolve()
+        if not _path_is_relative_to(path, repo_root) or not path.exists():
+            continue
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                result["removed_untracked"].append(rel)
+        except Exception as exc:
+            result["errors"].append(f"{rel}: {exc}")
+    return result
+
+
 def _auto_ship_controller_snapshot_order(
     *,
     cfg: BotConfig,
@@ -14998,6 +15026,7 @@ def _auto_ship_controller_snapshot_order(
             command,
             cwd=str(target_repo),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -15013,11 +15042,31 @@ def _auto_ship_controller_snapshot_order(
             }
         )
         if run.returncode != 0:
-            return {"status": "failed", "reason": "snapshot_validation_failed", "validation": validation_results}
+            rollback = _controller_snapshot_revert_applied_delta(
+                repo_dir=target_repo,
+                patch_path=patch_path,
+                copied_untracked=copied_untracked,
+            )
+            return {
+                "status": "failed",
+                "reason": "snapshot_validation_failed",
+                "validation": validation_results,
+                "rollback": rollback,
+            }
 
     add = _run_git(target_repo, ["add", "--", *changed_paths], check=False, env=env)
     if add.returncode != 0:
-        return {"status": "failed", "reason": "snapshot_git_add_failed", "detail": (add.stderr or add.stdout or "").strip()}
+        rollback = _controller_snapshot_revert_applied_delta(
+            repo_dir=target_repo,
+            patch_path=patch_path,
+            copied_untracked=copied_untracked,
+        )
+        return {
+            "status": "failed",
+            "reason": "snapshot_git_add_failed",
+            "detail": (add.stderr or add.stdout or "").strip(),
+            "rollback": rollback,
+        }
 
     commit_msg = f"Ship controller snapshot {str(order_id or '')[:8]}"
     commit = _run_git(target_repo, ["commit", "-m", commit_msg], check=False, env=env)

@@ -298,6 +298,34 @@ def test_controller_snapshot_validation_commands_include_android_build(tmp_path)
     assert ["bash", "./gradlew", ":app:assembleDebug"] in commands
 
 
+def test_controller_snapshot_revert_applied_delta_restores_only_snapshot_delta(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    (repo / "app.js").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.js"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+    (repo / "app.js").write_text("base\nchange\n", encoding="utf-8")
+    patch = tmp_path / "changes.patch"
+    patch.write_text(subprocess.run(["git", "diff", "HEAD", "--", "."], cwd=repo, check=True, text=True, capture_output=True).stdout, encoding="utf-8")
+    subprocess.run(["git", "checkout", "--", "app.js"], cwd=repo, check=True)
+    subprocess.run(["git", "apply", str(patch)], cwd=repo, check=True)
+    (repo / "test_snapshot.py").write_text("print('ok')\n", encoding="utf-8")
+
+    result = bot._controller_snapshot_revert_applied_delta(
+        repo_dir=repo,
+        patch_path=patch,
+        copied_untracked=["test_snapshot.py"],
+    )
+
+    assert result["reverse_patch_returncode"] == 0
+    assert not result["errors"]
+    assert (repo / "app.js").read_text(encoding="utf-8") == "base\n"
+    assert not (repo / "test_snapshot.py").exists()
+
+
 def test_studio_repo_kind_does_not_treat_poncebot_named_portfolio_as_core():
     assert bot._studio_repo_kind({"path": "/home/aponce/codexbot", "repo_id": "codexbot"}) == "Core"
     assert bot._studio_repo_kind({"path": "/home/aponce/poncebot-control-room", "repo_id": "poncebot-control-room"}) == "Portfolio"
