@@ -16287,7 +16287,49 @@ def _studio_finalize_orphaned_active_cycles(
             return 0
         _studio_ensure_schema(db)
         with sqlite3.connect(str(db), timeout=8.0) as conn:
-            cur = conn.execute(
+            snapshot_cur = conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = 'active',
+                    outcome_status = 'blocked_need_operator',
+                    outcome_summary = ?,
+                    updated_at = ?
+                WHERE status = 'active'
+                  AND order_id IS NOT NULL
+                  AND TRIM(order_id) <> ''
+                  AND updated_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM ceo_orders
+                      WHERE ceo_orders.order_id = studio_cycles.order_id
+                        AND ceo_orders.status = 'active'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE (jobs.job_id = studio_cycles.order_id OR jobs.parent_job_id = studio_cycles.order_id)
+                        AND jobs.state IN (?, ?, ?, ?, ?, ?)
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE jobs.job_id = studio_cycles.order_id
+                        AND COALESCE(jobs.trace, '') LIKE '%controller_snapshot_workdir%'
+                        AND (
+                            COALESCE(jobs.trace, '') LIKE '%blocked_need_operator%'
+                            OR COALESCE(jobs.trace, '') LIKE '%Run the validated patch%'
+                            OR COALESCE(jobs.trace, '') LIKE '%controller snapshot%'
+                        )
+                  )
+                """,
+                (
+                    "Studio cycle has a validated controller snapshot waiting for autoship; keep it recoverable instead of marking it failed.",
+                    float(now),
+                    cutoff,
+                    *active_job_states,
+                ),
+            )
+            failed_cur = conn.execute(
                 """
                 UPDATE studio_cycles
                 SET status = 'failed',
@@ -16310,6 +16352,17 @@ def _studio_finalize_orphaned_active_cycles(
                       WHERE (jobs.job_id = studio_cycles.order_id OR jobs.parent_job_id = studio_cycles.order_id)
                         AND jobs.state IN (?, ?, ?, ?, ?, ?)
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE jobs.job_id = studio_cycles.order_id
+                        AND COALESCE(jobs.trace, '') LIKE '%controller_snapshot_workdir%'
+                        AND (
+                            COALESCE(jobs.trace, '') LIKE '%blocked_need_operator%'
+                            OR COALESCE(jobs.trace, '') LIKE '%Run the validated patch%'
+                            OR COALESCE(jobs.trace, '') LIKE '%controller snapshot%'
+                        )
+                  )
                 """,
                 (
                     "Studio cycle had an attached order but no active order or open jobs; closed as orphaned before next selection.",
@@ -16319,7 +16372,7 @@ def _studio_finalize_orphaned_active_cycles(
                 ),
             )
             conn.commit()
-            return int(cur.rowcount or 0)
+            return int(snapshot_cur.rowcount or 0) + int(failed_cur.rowcount or 0)
     except Exception:
         LOG.exception("Failed to finalize orphaned active Studio cycles")
         return 0

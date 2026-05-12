@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 from types import SimpleNamespace
@@ -357,7 +358,7 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
     db = tmp_path / "jobs.sqlite"
     bot._studio_ensure_schema(db)
     with sqlite3.connect(db) as conn:
-        conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, parent_job_id TEXT, state TEXT)")
+        conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, parent_job_id TEXT, state TEXT, trace TEXT)")
         conn.execute("CREATE TABLE ceo_orders(order_id TEXT PRIMARY KEY, status TEXT)")
         conn.executemany(
             """
@@ -374,15 +375,39 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
                 ("orphan-cycle", now - 900, "repo-codexbot", "codexbot", "orphan-order", now - 900, now - 900),
                 ("live-order-cycle", now - 900, "repo-codexbot", "codexbot", "live-order", now - 900, now - 900),
                 ("live-job-cycle", now - 900, "repo-codexbot", "codexbot", "live-job", now - 900, now - 900),
+                (
+                    "snapshot-cycle",
+                    now - 900,
+                    "repo-codexbot",
+                    "codexbot",
+                    "snapshot-order",
+                    now - 900,
+                    now - 900,
+                ),
             ],
         )
         conn.execute("INSERT INTO ceo_orders(order_id, status) VALUES (?, ?)", ("live-order", "active"))
-        conn.execute("INSERT INTO jobs(job_id, parent_job_id, state) VALUES (?, ?, ?)", ("live-job", "", "running"))
+        conn.execute("INSERT INTO jobs(job_id, parent_job_id, state, trace) VALUES (?, ?, ?, ?)", ("live-job", "", "running", "{}"))
+        conn.execute(
+            "INSERT INTO jobs(job_id, parent_job_id, state, trace) VALUES (?, ?, ?, ?)",
+            (
+                "snapshot-order",
+                "",
+                "done",
+                json.dumps(
+                    {
+                        "controller_snapshot_workdir": "/tmp/controller_snapshot",
+                        "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot.",
+                        "result_next_action": "Run the validated patch in a write-enabled source checkout.",
+                    }
+                ),
+            ),
+        )
         conn.commit()
 
     closed = bot._studio_finalize_orphaned_active_cycles(db, now=now, max_age_seconds=300)
 
-    assert closed == 1
+    assert closed == 2
     with sqlite3.connect(db) as conn:
         rows = {
             row[0]: row[1:]
@@ -393,6 +418,7 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
     assert rows["orphan-cycle"] == ("failed", "failed_root_caused")
     assert rows["live-order-cycle"] == ("active", None)
     assert rows["live-job-cycle"] == ("active", None)
+    assert rows["snapshot-cycle"] == ("active", "blocked_need_operator")
 
 
 def test_final_sweep_no_change_close_waits_for_open_nonblocking_children():
