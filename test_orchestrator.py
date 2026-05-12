@@ -3903,7 +3903,7 @@ class TestMergeAndDeployFlow(unittest.TestCase):
                     actor="jarvis",
                 )
 
-            self.assertIn("branch_has_no_delta_vs_main", msg)
+            self.assertIn("Rejected low-value no-delta order", msg)
             order = q.get_order(order_id, chat_id=1)
             root = q.get_job(order_id)
             assert order is not None and root is not None
