@@ -14807,7 +14807,7 @@ def _controller_snapshot_safe_untracked_path(rel_path: str) -> bool:
     if not rel or rel.startswith("/") or ".." in Path(rel).parts:
         return False
     parts = {part.lower() for part in Path(rel).parts}
-    blocked_parts = {"output", "node_modules", ".git", ".venv", "__pycache__", ".pytest_cache"}
+    blocked_parts = {"output", "node_modules", ".git", ".venv", "__pycache__", ".pytest_cache", ".codexbot_tmp"}
     if parts & blocked_parts:
         return False
     return Path(rel).suffix.lower() in {

@@ -278,6 +278,7 @@ def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
     assert bot._controller_snapshot_safe_untracked_path("test_agents_sprint_brief_shell.py")
     assert bot._controller_snapshot_safe_untracked_path("static/app.js")
     assert not bot._controller_snapshot_safe_untracked_path("output/playwright/screenshot.png")
+    assert not bot._controller_snapshot_safe_untracked_path(".codexbot_tmp/playwright/prefs.js")
     assert not bot._controller_snapshot_safe_untracked_path("../outside.py")
 
 
