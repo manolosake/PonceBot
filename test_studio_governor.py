@@ -301,7 +301,7 @@ def test_controller_snapshot_validation_commands_include_android_build(tmp_path)
 def test_controller_snapshot_validation_commands_include_node_workflow(tmp_path):
     repo = tmp_path / "node"
     repo.mkdir()
-    (repo / "package.json").write_text('{"scripts":{"test":"node --test"}}\n', encoding="utf-8")
+    (repo / "package.json").write_text('{"scripts":{"test":"node --test","validate":"node scripts/demo.mjs"}}\n', encoding="utf-8")
     scripts = repo / "scripts"
     scripts.mkdir()
     (scripts / "demo.mjs").write_text("console.log('demo')\n", encoding="utf-8")
@@ -314,6 +314,7 @@ def test_controller_snapshot_validation_commands_include_node_workflow(tmp_path)
     assert ["node", "--check", "src/app.js"] in commands
     assert ["node", "--check", "scripts/demo.mjs"] in commands
     assert ["npm", "test"] in commands
+    assert ["npm", "run", "validate"] in commands
     assert ["node", "scripts/demo.mjs"] in commands
 
 

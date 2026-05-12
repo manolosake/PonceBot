@@ -14876,6 +14876,9 @@ def _controller_snapshot_validation_commands(repo_dir: Path, changed_paths: list
         test_script = str(scripts.get("test") or "").strip()
         if test_script and "no test specified" not in test_script.lower():
             commands.append(["npm", "test"])
+        validate_script = str(scripts.get("validate") or "").strip()
+        if validate_script:
+            commands.append(["npm", "run", "validate"])
     if web_files and (repo_dir / "scripts" / "demo.mjs").exists():
         commands.append(["node", "scripts/demo.mjs"])
     return commands
