@@ -16898,6 +16898,96 @@ def _studio_build_opportunities(
     return opportunities[:5]
 
 
+def _studio_selection_kill_sheet(
+    selected: dict[str, Any],
+    opportunities: list[dict[str, Any]],
+    memory: dict[str, Any],
+) -> list[str]:
+    selected_key = str(selected.get("key") or "").strip().lower()
+    try:
+        selected_score = int(selected.get("score") or 0)
+    except Exception:
+        selected_score = 0
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
+    governor_mode = str(governor.get("mode") or "").strip().lower()
+    governor_avoid_keys = {
+        str(item or "").strip().lower()
+        for item in (governor.get("avoid_keys") or [])
+        if str(item or "").strip()
+    }
+
+    def _candidate_tokens(item: dict[str, Any]) -> set[str]:
+        tokens = {str(item.get("key") or "").strip().lower()}
+        repo_id = str(item.get("repo_id") or "").strip().lower()
+        if repo_id:
+            tokens.add(repo_id)
+            tokens.add(f"repo-{repo_id}")
+        return {token for token in tokens if token}
+
+    def _risk_reasons(item: dict[str, Any]) -> list[str]:
+        risk = str(item.get("risk_summary") or "")
+        reasons: list[str] = []
+        for clause in risk.split(";"):
+            clause_text = _studio_one_line(clause, max_chars=120, default="")
+            clause_l = clause_text.lower()
+            if not clause_text:
+                continue
+            if "studio governor" in clause_l and governor_mode and governor_mode != "normal":
+                reasons.append(governor_mode)
+            elif any(
+                marker in clause_l
+                for marker in (
+                    "quality gate",
+                    "recent studio caution",
+                    "freshness guard",
+                    "cooldown",
+                    "avoid duplicating",
+                    "blocks fresh incubator",
+                    "post-shipment",
+                )
+            ):
+                reasons.append(clause_text)
+        return reasons
+
+    lines: list[str] = []
+    for item in opportunities:
+        item_key = str(item.get("key") or "").strip().lower()
+        if selected_key and item_key == selected_key:
+            continue
+        if not selected_key and item is selected:
+            continue
+        try:
+            item_score = int(item.get("score") or 0)
+        except Exception:
+            item_score = 0
+        reasons: list[str] = []
+        if governor_mode and governor_mode != "normal" and (_candidate_tokens(item) & governor_avoid_keys):
+            reasons.append(governor_mode)
+        reasons.extend(_risk_reasons(item))
+        for risk in (item.get("recent_studio_outcome_risks") or [])[:2]:
+            risk_text = _studio_one_line(risk, max_chars=120, default="")
+            if risk_text:
+                reasons.append(risk_text)
+        for saturation in (item.get("recent_studio_saturation") or [])[:2]:
+            saturation_text = _studio_one_line(saturation, max_chars=120, default="")
+            if saturation_text:
+                reasons.append(saturation_text)
+        if item_score < selected_score:
+            reasons.append(f"weaker than selected score {selected_score}")
+        elif item_score == selected_score:
+            reasons.append(f"lost deterministic tie-break against selected score {selected_score}")
+        else:
+            reasons.append(f"rejected by governor/risk evidence despite score {item_score} vs selected {selected_score}")
+        reasons = list(dict.fromkeys(reason for reason in reasons if reason))[:4]
+        lines.append(
+            f"Killed {item.get('type')} · {item.get('repo_name')} · score {item_score}: "
+            f"{'; '.join(reasons)}"
+        )
+        if len(lines) >= 4:
+            break
+    return lines
+
+
 def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list[dict[str, Any]], memory: dict[str, Any]) -> str:
     def _line(item: dict[str, Any], idx: int) -> str:
         money = _studio_one_line(str(item.get("monetization_path") or item.get("business_model") or ""), max_chars=130, default="")
@@ -16908,6 +16998,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
         )
 
     rows = [_line(item, idx + 1) for idx, item in enumerate(opportunities)]
+    kill_sheet = _studio_selection_kill_sheet(selected, opportunities, memory)
     recent = "; ".join(str(x) for x in memory.get("recent_outcomes", [])[:4]) or "none"
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
@@ -16943,6 +17034,9 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "Candidate bets:",
             *rows,
             "",
+            "Selection kill-sheet:",
+            *(kill_sheet or ["- none; only one viable candidate was available"]),
+            "",
             f"Selected thesis: {_studio_one_line(str(selected.get('thesis') or ''), max_chars=260)}",
             f"Selected outcome: {_studio_one_line(str(selected.get('operator_visible_outcome') or ''), max_chars=260)}",
             f"Selected business model: {_studio_one_line(str(selected.get('business_model') or ''), max_chars=260)}",
@@ -16975,10 +17069,21 @@ def _studio_record_cycle(
     prompt_packet = _studio_cycle_prompt_packet(selected=selected, opportunities=opportunities, memory=memory)
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_directives = "; ".join(str(x) for x in (governor.get("directives") or [])[:3])
+    kill_sheet = _studio_selection_kill_sheet(selected, opportunities, memory)
+    kill_summary = _studio_one_line(
+        " | ".join(kill_sheet),
+        max_chars=420,
+        default="none; only one viable candidate was available",
+    )
     debate_summary = (
-        f"Studio Governor {governor.get('mode', 'normal')}: {_studio_one_line(governor_directives, max_chars=260, default='normal ranking')}"
+        f"Studio Governor {governor.get('mode', 'normal')}: "
+        f"{_studio_one_line(governor_directives, max_chars=260, default='normal ranking')} | "
+        f"Selection kill-sheet: {kill_summary}"
         if governor
-        else "Critic gate is embedded in the Skynet prompt; controller must reject or re-scope if value is not visible."
+        else (
+            "Critic gate is embedded in the Skynet prompt; controller must reject or re-scope if value is not visible. "
+            f"Selection kill-sheet: {kill_summary}"
+        )
     )
     _studio_ensure_schema(cfg.orchestrator_db_path)
     with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:

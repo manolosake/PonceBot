@@ -1332,6 +1332,95 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("blocked_need_operator repo=codexbot-core type=DEEP_IMPROVEMENT", packet)
         self.assertIn("Needs operator decision", packet)
 
+    def test_prompt_packet_includes_selection_kill_sheet(self) -> None:
+        selected = {
+            "key": "repo-codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "repo_name": "codexbot",
+            "score": 120,
+            "thesis": "Repair Studio selection.",
+            "operator_visible_outcome": "A clearer selection loop.",
+        }
+        rejected = {
+            "key": "new-project-incubator",
+            "type": "NEW_PROJECT",
+            "repo_name": "New product incubator",
+            "score": 26,
+            "thesis": "Create another product.",
+            "operator_visible_outcome": "A project folder.",
+            "risk_summary": (
+                "avoid public launch; "
+                "Studio Governor incubator_quality_gate: 2 failed/rejected new-project outcomes in 24h.; "
+                "new-project quality gate is active"
+            ),
+            "recent_studio_outcome_risks": [],
+            "recent_studio_saturation": [],
+        }
+        memory = {
+            "studio_governor": {
+                "mode": "incubator_quality_gate",
+                "avoid_keys": ["new-project-incubator"],
+                "directives": ["New-project work is cooling down."],
+            }
+        }
+
+        packet = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected, rejected], memory=memory)
+
+        self.assertIn("Selection kill-sheet:", packet)
+        self.assertIn("Killed NEW_PROJECT · New product incubator · score 26", packet)
+        self.assertIn("incubator_quality_gate", packet)
+        self.assertIn("new-project quality gate is active", packet)
+        self.assertIn("weaker than selected score 120", packet)
+
+    def test_record_cycle_persists_selection_kill_sheet_in_debate_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            selected = {
+                "key": "repo-codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "repo_name": "codexbot",
+                "score": 120,
+                "thesis": "Repair Studio selection.",
+                "operator_visible_outcome": "A clearer selection loop.",
+            }
+            rejected = {
+                "key": "new-project-incubator",
+                "type": "NEW_PROJECT",
+                "repo_name": "New product incubator",
+                "score": 26,
+                "thesis": "Create another product.",
+                "operator_visible_outcome": "A project folder.",
+                "risk_summary": (
+                    "Studio Governor incubator_quality_gate: 2 failed/rejected new-project outcomes in 24h.; "
+                    "new-project quality gate is active"
+                ),
+            }
+            memory = {
+                "studio_governor": {
+                    "mode": "incubator_quality_gate",
+                    "avoid_keys": ["new-project-incubator"],
+                    "directives": ["New-project work is cooling down."],
+                }
+            }
+
+            cycle_id = bot._studio_record_cycle(
+                cfg=SimpleNamespace(orchestrator_db_path=db),  # type: ignore[arg-type]
+                selected=selected,
+                opportunities=[selected, rejected],
+                memory=memory,
+                now=201_000.0,
+            )
+            with sqlite3.connect(db) as conn:
+                debate_summary = conn.execute(
+                    "SELECT debate_summary FROM studio_cycles WHERE cycle_id = ?",
+                    (cycle_id,),
+                ).fetchone()[0]
+
+        self.assertIn("Selection kill-sheet", debate_summary)
+        self.assertIn("Killed NEW_PROJECT · New product incubator · score 26", debate_summary)
+        self.assertIn("incubator_quality_gate", debate_summary)
+        self.assertIn("weaker than selected score 120", debate_summary)
+
     def test_published_project_outcome_records_portfolio_asset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
