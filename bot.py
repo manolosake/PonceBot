@@ -16680,6 +16680,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     recent_risks: list[str] = []
     recent_wins: list[str] = []
     recent_saturation: list[str] = []
+    recent_core_freshness_wins = 0
     for entry in memory.get("recent_studio_negative_outcomes", []) or []:
         if not isinstance(entry, dict):
             continue
@@ -16712,12 +16713,25 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             outcome_age_s = 0.0
         if outcome_age_s <= 12.0 * 3600.0 and match in {"same key", "same repo/type"}:
             recent_saturation.append(f"{match} shipped recently: {summary}")
+            if kind == "Core":
+                recent_core_freshness_wins += 1
             score -= 28 if match == "same key" else 18
         elif outcome_age_s <= 6.0 * 3600.0 and match == "same repo":
             recent_saturation.append(f"{match} shipped recently: {summary}")
             score -= 10
         else:
             score += 6 if match == "same key" else 4
+    if (
+        kind == "Core"
+        and governor_mode != "repair_delivery_contract"
+        and recent_core_freshness_wins
+    ):
+        core_cooldown = (
+            "codexbot core cooldown: same key/repo-type shipped recently; avoid another "
+            "core DEEP_IMPROVEMENT unless there is fresh repair evidence"
+        )
+        recent_saturation.append(core_cooldown)
+        score -= 100 if recent_core_freshness_wins >= 2 else 70
     if recent_risks:
         score = max(0, score)
     if governor_mode == "repair_delivery_contract" and kind == "Core":

@@ -39,6 +39,24 @@ def test_studio_governor_forces_delivery_repair_after_ghost_delivery():
 def test_studio_governor_makes_core_repair_beat_incubator():
     now = 1_700_000_000.0
     memory = _delivery_failure_memory(now)
+    memory["recent_studio_positive_outcomes"] = [
+        {
+            "key": "repo-codexbot",
+            "repo_id": "codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "status": "merged",
+            "summary": "Prior core reliability improvement shipped.",
+            "updated_at": now - 900,
+        },
+        {
+            "key": "repo-codexbot",
+            "repo_id": "codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "status": "merged",
+            "summary": "Another core reliability improvement shipped.",
+            "updated_at": now - 1800,
+        },
+    ]
     memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
     core_repo = {
         "repo_id": "codexbot",
@@ -48,13 +66,82 @@ def test_studio_governor_makes_core_repair_beat_incubator():
         "autonomy_enabled": True,
         "metadata": {},
     }
+    dashboard_repo = {
+        "repo_id": "executivedashboard",
+        "path": "/home/aponce/ExecutiveDashboard",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
 
     core = bot._studio_opportunity_for_repo(core_repo, now=now, memory=memory)
+    dashboard = bot._studio_opportunity_for_repo(dashboard_repo, now=now, memory=memory)
     incubator = bot._studio_incubator_opportunity(cfg=SimpleNamespace(), now=now, memory=memory)
 
+    assert core["score"] >= 140
+    assert core["score"] > dashboard["score"]
     assert core["score"] > incubator["score"]
     assert "delivery contract" in core["thesis"].lower()
     assert "temporarily gated" in incubator["thesis"].lower()
+
+
+def test_studio_core_recent_win_cooldown_prefers_dashboard_without_delivery_failure():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [],
+        "recent_studio_positive_outcomes": [
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "merged",
+                "summary": "Core selection controls shipped.",
+                "updated_at": now - 900,
+            },
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "merged",
+                "summary": "Core validation checks shipped.",
+                "updated_at": now - 1800,
+            },
+        ],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+    memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
+    core_repo = {
+        "repo_id": "codexbot",
+        "path": "/home/aponce/codexbot",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
+    dashboard_repo = {
+        "repo_id": "executivedashboard",
+        "path": "/home/aponce/ExecutiveDashboard",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
+
+    core = bot._studio_opportunity_for_repo(core_repo, now=now, memory=memory)
+    dashboard = bot._studio_opportunity_for_repo(dashboard_repo, now=now, memory=memory)
+    core_text = " ".join(
+        [
+            core["risk_summary"],
+            core["why_better_than_alternatives"],
+            " ".join(core["recent_studio_saturation"]),
+        ]
+    ).lower()
+
+    assert dashboard["score"] > core["score"]
+    assert "codexbot core cooldown" in core_text
+    assert "avoid another core deep_improvement" in core_text
 
 
 def test_studio_governor_breaks_repeated_core_repair_loop():
