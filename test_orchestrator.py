@@ -5913,6 +5913,86 @@ class TestSkynetLocalRecovery(unittest.TestCase):
             self.assertEqual(str(order.get("status") or ""), "active")
             self.assertEqual(str(order.get("phase") or ""), "ready_for_merge")
 
+    def test_sync_order_phase_root_causes_proactive_artifact_only_delivery_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _cfg_obj, q, order_id, _repo_dir = self._seed_factory_order(td)
+            now = _time.time()
+            storage_path = q._storage.path
+            bot._studio_ensure_schema(storage_path)
+            with sqlite3.connect(storage_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, order_id, created_at, updated_at
+                    ) VALUES (?, 1, ?, 'active', 'repo-codexbot', 'DEEP_IMPROVEMENT', 'codexbot-6fb8d5b9',
+                        '', 'core', 'Repair artifact-only delivery closure.', 'Because ghost deliveries waste cycles.',
+                        'Critic requires branch evidence.', 'No ghost deliveries.', 'Regression test.',
+                        'Bounded test-only coverage.', 'packet', '[]', ?, ?, ?)
+                    """,
+                    ("cycle-artifact-only", now, order_id, now, now),
+                )
+                conn.commit()
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="backend",
+                    input_text="implement bounded delivery claim",
+                    request_type="task",
+                    priority=1,
+                    model="",
+                    effort="",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=1,
+                    parent_job_id=order_id,
+                    state="done",
+                    trace={
+                        "result_status": "done",
+                        "result_summary": (
+                            "Implemented the reliability repair and validated the delivery artifact, "
+                            "but branch sync skipped because no repository changes were detected."
+                        ),
+                        "result_artifacts": ["artifacts/reliability-delivery-report.md"],
+                        "branch_sync": {"status": "skipped", "reason": "no_changes"},
+                    },
+                    job_id="job-backend-artifact-only",
+                )
+            )
+
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket=order_id, chat_id=1)
+
+            order = q.get_order(order_id, chat_id=1)
+            self.assertIsNotNone(order)
+            assert order is not None
+            self.assertEqual(str(order.get("status") or ""), "done")
+            self.assertEqual(str(order.get("phase") or ""), "done")
+
+            root = q.get_job(order_id)
+            self.assertIsNotNone(root)
+            assert root is not None
+            trace = dict((root.trace or {}) if isinstance(root.trace, dict) else {})
+            self.assertEqual(str(trace.get("result_status") or ""), "failed_root_caused")
+            self.assertEqual(
+                str(trace.get("operational_gate_reason") or ""),
+                "artifact_only_delivery_without_repo_delta",
+            )
+            self.assertTrue(bool(trace.get("proactive_artifact_only_delivery", False)))
+
+            with sqlite3.connect(storage_path) as conn:
+                row = conn.execute(
+                    "SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE order_id = ?",
+                    (order_id,),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row[0], "failed")
+            self.assertEqual(row[1], "failed_root_caused")
+            self.assertIn("no mergeable branch or validated repo diff", str(row[2]))
+
     def test_blocked_controller_write_policy_violation_requests_local_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             _cfg_obj, _q, order_id, repo_dir = self._seed_factory_order(td)
