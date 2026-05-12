@@ -14811,6 +14811,7 @@ def _controller_snapshot_safe_untracked_path(rel_path: str) -> bool:
     if parts & blocked_parts:
         return False
     return Path(rel).suffix.lower() in {
+        ".csv",
         ".css",
         ".html",
         ".js",
@@ -15292,10 +15293,6 @@ def _auto_merge_ready_orders_tick(
 
             root = orch_q.get_job(oid)
             trace = dict((root.trace or {}) if root else {})
-            if bool(trace.get("merge_cancelled", False)):
-                continue
-            if bool(trace.get("merge_auto_suspended", False)):
-                continue
             if _controller_snapshot_delivery_candidate(trace):
                 _repo_record, repo_dir, default_branch = _repo_context_for_order(
                     cfg=cfg,
@@ -15333,6 +15330,10 @@ def _auto_merge_ready_orders_tick(
                     except Exception:
                         pass
                     continue
+            if bool(trace.get("merge_cancelled", False)):
+                continue
+            if bool(trace.get("merge_auto_suspended", False)):
+                continue
             if not heal_done_orders:
                 if not (
                     bool(trace.get("merge_ready", False))

@@ -259,6 +259,7 @@ def test_controller_snapshot_delivery_candidate_requires_validated_release_block
         {
             "controller_snapshot_workdir": str(snapshot),
             "result_artifacts": [str(patch)],
+            "merge_cancelled": True,
             "result_summary": "PASS implementation/review. Outcome: blocked_need_operator. controller-snapshot has no origin.",
             "result_next_action": "Apply the validated changes into the real repository checkout, commit, push, and deploy.",
         }
@@ -278,6 +279,7 @@ def test_controller_snapshot_delivery_candidate_requires_validated_release_block
 def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
     assert bot._controller_snapshot_safe_untracked_path("test_agents_sprint_brief_shell.py")
     assert bot._controller_snapshot_safe_untracked_path("static/app.js")
+    assert bot._controller_snapshot_safe_untracked_path("samples/sample_requests.csv")
     assert not bot._controller_snapshot_safe_untracked_path("output/playwright/screenshot.png")
     assert not bot._controller_snapshot_safe_untracked_path(".codexbot_tmp/playwright/prefs.js")
     assert not bot._controller_snapshot_safe_untracked_path("../outside.py")
