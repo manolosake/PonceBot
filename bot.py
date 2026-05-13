@@ -8319,12 +8319,10 @@ def _autonomous_commit_identity_env(worktree_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     name = (
         str(os.environ.get("BOT_AUTONOMOUS_GIT_AUTHOR_NAME") or "").strip()
-        or _git_config_get(worktree_dir, "user.name")
         or "manolosake"
     )
     email = (
         str(os.environ.get("BOT_AUTONOMOUS_GIT_AUTHOR_EMAIL") or "").strip()
-        or _git_config_get(worktree_dir, "user.email")
         or "manolosake@gmail.com"
     )
     # These are assigned, not setdefault: the autonomous worker may inherit stale

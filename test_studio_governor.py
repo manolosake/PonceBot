@@ -418,6 +418,23 @@ def test_recent_controller_snapshot_rows_use_studio_updated_at_for_recovery(tmp_
     assert rows[0]["updated_at"] == 2_000.0
 
 
+def test_autonomous_commit_identity_ignores_stale_repo_config(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    monkeypatch.delenv("BOT_AUTONOMOUS_GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("BOT_AUTONOMOUS_GIT_AUTHOR_EMAIL", raising=False)
+
+    env = bot._autonomous_commit_identity_env(repo)
+
+    assert env["GIT_AUTHOR_NAME"] == "manolosake"
+    assert env["GIT_AUTHOR_EMAIL"] == "manolosake@gmail.com"
+    assert env["GIT_COMMITTER_NAME"] == "manolosake"
+    assert env["GIT_COMMITTER_EMAIL"] == "manolosake@gmail.com"
+
+
 def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
     assert bot._controller_snapshot_safe_untracked_path("test_agents_sprint_brief_shell.py")
     assert bot._controller_snapshot_safe_untracked_path("static/app.js")
