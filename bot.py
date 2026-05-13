@@ -10305,6 +10305,42 @@ def _tail_text(blob: str, *, max_chars: int = 1200) -> str:
     return "..." + text[-max_chars:]
 
 
+def _repo_has_unwritable_build_outputs(repo: Path) -> bool:
+    try:
+        repo = repo.expanduser().resolve()
+    except Exception:
+        repo = repo.expanduser()
+    if not (repo / "gradlew").exists():
+        return False
+    for rel in ("app/build", "build"):
+        path = repo / rel
+        try:
+            if path.exists() and not os.access(str(path), os.W_OK | os.X_OK):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _fresh_autoship_worktree_dir(repo: Path, branch: str) -> tuple[Path, str]:
+    branch_slug = _slug_token(branch) or "main"
+    repo_slug = _slug_token(repo.name, max_len=48) or "repo"
+    suffix = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    raw_root = str(
+        os.environ.get("BOT_AUTOSHIP_WORKTREE_ROOT")
+        or os.environ.get("BOT_ARTIFACTS_ROOT")
+        or ""
+    ).strip()
+    if raw_root:
+        root = Path(raw_root).expanduser() / "autoship_worktrees"
+    else:
+        root = Path.home() / "codexbot" / "data" / "autoship_worktrees"
+    return (
+        (root / f"{repo_slug}-{branch_slug}-{suffix}").resolve(),
+        f"poncebot/autoship/{repo_slug}-{branch_slug}-{suffix}",
+    )
+
+
 def _sync_repo_checkout_to_default_branch(
     *,
     repo: Path,
@@ -10348,6 +10384,17 @@ def _sync_repo_checkout_to_default_branch(
     head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     current_branch = str(head.stdout or "").strip() if head.returncode == 0 else ""
     if current_branch in ("", branch):
+        if _repo_has_unwritable_build_outputs(repo):
+            fresh_dir, fresh_branch = _fresh_autoship_worktree_dir(repo, branch)
+            try:
+                fresh_dir.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                return False, f"fresh_autoship_worktree_prepare_failed:{exc}", None, None
+            add = _run_git(repo, ["worktree", "add", "-B", fresh_branch, str(fresh_dir), f"origin/{branch}"], check=False)
+            if add.returncode != 0:
+                detail = (add.stderr or add.stdout or "").strip()
+                return False, detail or "fresh_autoship_worktree_add_failed", None, None
+            return _finalize_synced_checkout(fresh_dir)
         return _finalize_synced_checkout(repo)
 
     worktree_dir = _runtime_worktree_dir()

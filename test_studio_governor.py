@@ -492,6 +492,24 @@ def test_studio_readiness_uses_user_jdk_for_android_repo(tmp_path, monkeypatch):
     assert readiness["repo_checks"][0]["missing_tools"] == []
 
 
+def test_unwritable_android_build_outputs_trigger_fresh_autoship_worktree(tmp_path, monkeypatch):
+    repo = tmp_path / "android"
+    repo.mkdir()
+    (repo / "gradlew").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    app_build = repo / "app" / "build"
+    app_build.mkdir(parents=True)
+    app_build.chmod(0o555)
+    monkeypatch.setenv("BOT_ARTIFACTS_ROOT", str(tmp_path / "artifacts"))
+
+    try:
+        assert bot._repo_has_unwritable_build_outputs(repo)
+        fresh_dir, fresh_branch = bot._fresh_autoship_worktree_dir(repo, "main")
+        assert str(fresh_dir).startswith(str(tmp_path / "artifacts" / "autoship_worktrees"))
+        assert "poncebot/autoship/android-main-" in fresh_branch
+    finally:
+        app_build.chmod(0o755)
+
+
 def test_studio_governor_blocks_missing_validation_toolchain():
     now = 1_700_000_000.0
     memory = {
