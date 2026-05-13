@@ -11,6 +11,53 @@ from orchestrator.storage import SQLiteTaskStorage
 
 
 class TestStatusWorkflowSummary(unittest.TestCase):
+    def _make_ready_proactive_order(
+        self,
+        q: OrchestratorQueue,
+        *,
+        order_id: str,
+        trace_extra: dict[str, object] | None = None,
+    ) -> None:
+        trace = {
+            "proactive_lane": True,
+            "proactive_slices_applied": 1,
+            "proactive_slices_validated": 1,
+            "proactive_slices_closed": 1,
+            "proactive_quality_gate_status": "validated",
+            "proactive_improvement_closed": True,
+            "merge_ready": True,
+        }
+        trace.update(trace_extra or {})
+        q.upsert_order(
+            order_id=order_id,
+            chat_id=1,
+            title="Proactive Sprint: release target gate",
+            body="Ship one bounded improvement.",
+            status="active",
+            priority=1,
+            phase="review",
+            project_id="codexbot",
+        )
+        q.submit_task(
+            Task.new(
+                source="scheduler",
+                role="skynet",
+                input_text="AUTONOMOUS PROACTIVE SPRINT",
+                request_type="maintenance",
+                priority=1,
+                model="gpt-5.3-codex",
+                effort="medium",
+                mode_hint="ro",
+                requires_approval=False,
+                max_cost_window_usd=1.0,
+                chat_id=1,
+                state="done",
+                is_autonomous=True,
+                trace=trace,
+                job_id=order_id,
+            )
+        )
+
     def test_order_evidence_packet_includes_workflow_logs_and_artifact_refs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -245,6 +292,59 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertEqual(blockers[0]["stage"], "skynet_review")
             self.assertIn("unsupported", str(blockers[0]["summary"]).lower())
             self.assertEqual(snap["order_workflows"][0]["order_id"], order_id)
+
+    def test_release_readiness_requires_concrete_release_target_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "22222222-3333-4444-5555-666666666666"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertIn("Missing concrete release target evidence", checks["release_target_evidence"]["summary"])
+            self.assertIn("release_target_evidence", readiness["summary"])
+            self.assertIn("Missing concrete release target evidence", readiness["next_action"])
+
+            plan = svc.proactive_action_plan(chat_id=1, limit=10)
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["release"]["count"], 0)
+            self.assertEqual(lanes["advance"]["count"], 1)
+            self.assertEqual(lanes["advance"]["orders"][0]["order_id"], order_id)
+
+    def test_release_readiness_allows_merge_ready_order_with_order_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "33333333-4444-5555-6666-777777777777"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={"order_branch": "feature/release-target-gate"},
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "ready")
+            self.assertEqual(readiness["verdict"], "go")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pass")
+            self.assertEqual(checks["release_target_evidence"]["evidence"][0]["key"], "order_branch")
+
+            plan = svc.proactive_action_plan(chat_id=1, limit=10)
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["release"]["count"], 1)
+            self.assertEqual(lanes["release"]["orders"][0]["order_id"], order_id)
 
 
 if __name__ == "__main__":

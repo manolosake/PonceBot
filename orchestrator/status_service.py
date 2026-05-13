@@ -978,6 +978,67 @@ def _readiness_trace_event_evidence(traces: list[dict[str, Any]], *, event_types
     return out
 
 
+def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]:
+    trace = dict(root_trace or {})
+    evidence: list[dict[str, Any]] = []
+
+    order_branch = str(trace.get("order_branch") or "").strip()
+    if order_branch:
+        evidence.append(_readiness_trace_evidence("order_branch", order_branch))
+
+    merged_to_main = bool(trace.get("merged_to_main", False))
+    deploy_status = str(trace.get("deploy_status") or "").strip().lower()
+    if merged_to_main:
+        evidence.append(_readiness_trace_evidence("merged_to_main", merged_to_main))
+    if deploy_status in {"ok", "scheduled"}:
+        evidence.append(_readiness_trace_evidence("deploy_status", deploy_status))
+        deployed_commit = str(trace.get("deployed_commit") or "").strip()
+        if deployed_commit:
+            evidence.append(_readiness_trace_evidence("deployed_commit", deployed_commit))
+
+    publication = trace.get("github_publication") if isinstance(trace.get("github_publication"), dict) else {}
+    publication_ok = bool(publication.get("ok", False))
+    publication_target = (
+        str(publication.get("github_repo") or "").strip()
+        or str(publication.get("remote_url") or "").strip()
+        or str(publication.get("project_path") or "").strip()
+    )
+    if publication_ok and publication_target:
+        evidence.append({"kind": "trace", "key": "github_publication", "value": publication_target})
+
+    delivery = trace.get("project_incubator_delivery") if isinstance(trace.get("project_incubator_delivery"), dict) else {}
+    delivery_ok = bool(delivery.get("ok", False))
+    delivery_target = (
+        str(delivery.get("github_remote_url") or "").strip()
+        or str(delivery.get("project_path") or "").strip()
+        or str(delivery.get("project_head") or "").strip()
+    )
+    if delivery_ok and delivery_target and bool(trace.get("project_incubator_external_delivery", False)):
+        evidence.append({"kind": "trace", "key": "project_incubator_delivery", "value": delivery_target})
+
+    studio_outcome = str(trace.get("studio_terminal_outcome") or "").strip().lower()
+    studio_summary = str(trace.get("studio_terminal_outcome_summary") or trace.get("result_summary") or "").strip()
+    studio_summary_l = studio_summary.lower()
+    if studio_outcome == "published_project" and studio_summary and any(
+        marker in studio_summary_l for marker in ("github.com", "/home/", "project=")
+    ):
+        evidence.append({"kind": "trace", "key": "studio_terminal_outcome", "value": studio_summary[:280]})
+
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        key = str(item.get("key") or "")
+        value = str(item.get("value") or "")
+        marker = (key, value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(item)
+        if len(out) >= 5:
+            break
+    return out
+
+
 def _task_summary(task: Task | None, fallback: str) -> str:
     if task is None:
         return fallback
@@ -1031,7 +1092,14 @@ def _build_release_readiness(
     applies = bool(root_trace.get("proactive_lane", False) or proactive_keys_present)
     phase = str(order_row.get("phase") or "planning")
     current_stage = str(workflow.get("current_stage") or "skynet_plan")
-    check_keys = ["delivery_applied", "validation_passed", "controller_signoff", "release_evidence", "merge_ready"]
+    check_keys = [
+        "delivery_applied",
+        "validation_passed",
+        "controller_signoff",
+        "release_evidence",
+        "release_target_evidence",
+        "merge_ready",
+    ]
 
     if not applies:
         return {
@@ -1069,6 +1137,8 @@ def _build_release_readiness(
     merged_to_main = bool(root_trace.get("merged_to_main", False))
     deploy_status = str(root_trace.get("deploy_status") or "").strip().lower()
     already_released = bool(merged_to_main or deploy_status in {"ok", "scheduled"})
+    release_target_evidence = _release_target_evidence(root_trace)
+    has_release_target_evidence = bool(release_target_evidence)
 
     delivery_blocked = [t for t in delivery_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
     validation_blocked = [t for t in validation_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
@@ -1170,6 +1240,16 @@ def _build_release_readiness(
             ),
         },
         {
+            "key": "release_target_evidence",
+            "status": "pass" if has_release_target_evidence else "pending",
+            "summary": (
+                "Release target evidence is present."
+                if has_release_target_evidence
+                else "Missing concrete release target evidence: add order_branch, merged/deployed status, or published project/repo evidence."
+            ),
+            "evidence": release_target_evidence,
+        },
+        {
             "key": "merge_ready",
             "status": "pass" if merge_ready_pass else "pending",
             "summary": (
@@ -1197,7 +1277,7 @@ def _build_release_readiness(
     elif all(str(check.get("status") or "") == "pass" for check in checks):
         state = "ready"
         verdict = "go"
-        summary = "Proactive order has delivery, validation, controller, release, and merge-ready evidence."
+        summary = "Proactive order has delivery, validation, controller, release, target, and merge-ready evidence."
         next_action = "Release or merge the order branch."
     else:
         state = "not_ready"
@@ -1308,7 +1388,7 @@ def _priority_decision(order: dict[str, Any]) -> tuple[str, str, dict[str, Any] 
 
     if merged_to_main or readiness_state == "released":
         return "monitor", "Already merged or released; keep it behind unreleased proactive orders.", blocker
-    if merge_ready or readiness_state == "ready" or readiness_verdict == "go":
+    if readiness_state == "ready" or readiness_verdict == "go":
         return "release", "Ready/go order should be released before spending attention on blocked or not-ready work.", blocker
     if blocker is not None or readiness_state == "blocked" or readiness_verdict == "no_go":
         blocker_summary = str((blocker or {}).get("summary") or "").strip()
@@ -1317,6 +1397,8 @@ def _priority_decision(order: dict[str, Any]) -> tuple[str, str, dict[str, Any] 
         if blocker_summary:
             why = f"{why} Primary blocker: {blocker_summary}"
         return "unblock", why, blocker
+    if merge_ready:
+        return "advance", f"Merge-ready signal exists, but readiness is waiting on {stage} evidence before release.", blocker
     return "advance", f"Not ready yet; advance {stage} evidence before it can be released.", blocker
 
 
