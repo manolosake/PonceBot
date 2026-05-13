@@ -8315,8 +8315,33 @@ def _git_config_get(repo: Path, key: str) -> str:
     return str(proc.stdout or "").strip()
 
 
+def _factory_validation_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(base_env or os.environ)
+    path = str(env.get("PATH") or os.defpath)
+
+    if not shutil.which("java", path=path):
+        candidates: list[Path] = []
+        raw_java_home = str(env.get("JAVA_HOME") or "").strip()
+        if raw_java_home:
+            candidates.append(Path(raw_java_home).expanduser())
+        try:
+            candidates.append(Path.home() / ".local" / "jdks" / "jdk-17")
+        except Exception:
+            pass
+        candidates.append(Path("/home/aponce/.local/jdks/jdk-17"))
+
+        for candidate in candidates:
+            java_bin = candidate / "bin" / "java"
+            if java_bin.exists() and os.access(str(java_bin), os.X_OK):
+                env["JAVA_HOME"] = str(candidate)
+                env["PATH"] = str(candidate / "bin") + os.pathsep + path
+                break
+
+    return env
+
+
 def _autonomous_commit_identity_env(worktree_dir: Path) -> dict[str, str]:
-    env = dict(os.environ)
+    env = _factory_validation_env(dict(os.environ))
     name = (
         str(os.environ.get("BOT_AUTONOMOUS_GIT_AUTHOR_NAME") or "").strip()
         or "manolosake"
@@ -16049,10 +16074,24 @@ def _studio_ensure_schema(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_maturity_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                status TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                checks_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_ts ON studio_cycles(ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_status ON studio_cycles(status, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_updated ON studio_portfolio_projects(updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_github ON studio_portfolio_projects(github_repo)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_maturity_ts ON studio_maturity_snapshots(ts DESC)")
         conn.commit()
 
 
@@ -16425,6 +16464,13 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     positives = [entry for entry in memory.get("recent_studio_positive_outcomes", []) or [] if isinstance(entry, dict)]
     recent_projects_6h = int(memory.get("studio_portfolio_recent_count_6h", 0) or 0)
     recent_projects_24h = int(memory.get("studio_portfolio_recent_count_24h", 0) or 0)
+    readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
+    readiness_status = str(readiness.get("status") or "green").strip().lower()
+    readiness_gaps = [
+        item
+        for item in (readiness.get("repo_gaps") or [])
+        if isinstance(item, dict) and item.get("missing_tools")
+    ]
 
     def _age_hours(entry: dict[str, Any]) -> float:
         try:
@@ -16549,6 +16595,24 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         avoid_keys = ["new-project-incubator"]
         prefer_lanes = ["core", "dashboard", "portfolio"]
         directives.append("New-project work is cooling down until the next bet has clearer buyer, demo, validation, and publication evidence.")
+    elif readiness_status in {"red", "yellow"} and readiness_gaps:
+        mode = "toolchain_readiness_gate"
+        severity = "red" if readiness_status == "red" else "yellow"
+        first_gap = readiness_gaps[0]
+        repo_name = str(first_gap.get("repo_name") or first_gap.get("repo_id") or "repo").strip()
+        missing = ", ".join(str(x) for x in (first_gap.get("missing_tools") or [])[:4])
+        trigger = f"Operational readiness gap: {repo_name} cannot run required validation tools ({missing})."
+        force_next_action = (
+            "Prefer a readiness repair or a different repo that can be fully validated; do not ship work on a repo "
+            "whose required validator is missing unless the outcome is blocked_need_operator with exact install steps."
+        )
+        prefer_lanes = ["core", "dashboard", "portfolio"]
+        for gap in readiness_gaps[:6]:
+            rid = str(gap.get("repo_id") or "").strip().lower()
+            if rid:
+                avoid_keys.extend([rid, f"repo-{rid}"])
+        directives.append("Treat missing validators as release blockers, not as warnings hidden in terminal logs.")
+        directives.append("Use r530-local toolchains when available; otherwise close with blocked_need_operator and exact remediation.")
     elif recent_projects_6h >= 3:
         mode = "portfolio_compounding"
         severity = "yellow"
@@ -16559,6 +16623,8 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
 
     if write_policy_failures:
         directives.append("Controller roles must not edit code directly; Skynet/Jarvis should delegate implementation to specialists and only review/decide.")
+    if readiness_gaps:
+        directives.append("Every selected bet must name the validation toolchain it will use before implementation starts.")
     if not directives:
         directives.append("Use normal ranking, but reject bets that lack visible value, monetization path, validation evidence, or a path to main/deploy.")
 
@@ -16578,7 +16644,175 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "new_project_cycles_24h": new_project_cycles_24h,
         "portfolio_recent_count_6h": recent_projects_6h,
         "portfolio_recent_count_24h": recent_projects_24h,
+        "readiness_status": readiness_status,
+        "readiness_gap_count": len(readiness_gaps),
     }
+
+
+def _studio_repo_required_validation_tools(repo_dir: Path) -> tuple[list[str], list[str]]:
+    stacks: list[str] = []
+    tools: list[str] = []
+
+    def add_stack(name: str, required: list[str]) -> None:
+        if name not in stacks:
+            stacks.append(name)
+        for tool in required:
+            if tool not in tools:
+                tools.append(tool)
+
+    try:
+        repo_name = repo_dir.name.lower()
+    except Exception:
+        repo_name = ""
+    try:
+        has_android = (
+            (repo_dir / "gradlew").exists()
+            or (repo_dir / "build.gradle").exists()
+            or (repo_dir / "build.gradle.kts").exists()
+            or (repo_dir / "settings.gradle").exists()
+            or (repo_dir / "settings.gradle.kts").exists()
+            or "android" in repo_name
+        )
+    except Exception:
+        has_android = False
+    if has_android:
+        add_stack("android", ["java"])
+
+    try:
+        if (repo_dir / "package.json").exists():
+            add_stack("node", ["node", "npm"])
+    except Exception:
+        pass
+
+    try:
+        has_python = (
+            (repo_dir / "pyproject.toml").exists()
+            or (repo_dir / "requirements.txt").exists()
+            or any(repo_dir.glob("test_*.py"))
+        )
+        tests_dir = repo_dir / "tests"
+        if not has_python and tests_dir.is_dir():
+            has_python = any(tests_dir.glob("test_*.py"))
+    except Exception:
+        has_python = False
+    if has_python:
+        add_stack("python", ["python3"])
+
+    return stacks, tools
+
+
+def _studio_tool_available(tool: str, env: dict[str, str]) -> bool:
+    return bool(shutil.which(str(tool), path=str(env.get("PATH") or os.defpath)))
+
+
+def _studio_operational_readiness(
+    *,
+    cfg: BotConfig,
+    repos: list[dict[str, Any]],
+    now: float,
+) -> dict[str, Any]:
+    env = _factory_validation_env(dict(os.environ))
+    repo_checks: list[dict[str, Any]] = []
+    repo_gaps: list[dict[str, Any]] = []
+    all_missing: list[str] = []
+    for repo in repos:
+        if str(repo.get("status") or "").strip().lower() != "active":
+            continue
+        if not bool(repo.get("autonomy_enabled", True)):
+            continue
+        raw_path = str(repo.get("path") or "").strip()
+        if not raw_path:
+            continue
+        try:
+            repo_dir = Path(raw_path).expanduser().resolve()
+        except Exception:
+            repo_dir = Path(raw_path).expanduser()
+        if not repo_dir.exists() or not repo_dir.is_dir():
+            continue
+        stacks, required_tools = _studio_repo_required_validation_tools(repo_dir)
+        missing_tools = [tool for tool in required_tools if not _studio_tool_available(tool, env)]
+        check = {
+            "repo_id": str(repo.get("repo_id") or "").strip().lower(),
+            "repo_name": _studio_repo_display_name(repo),
+            "repo_path": str(repo_dir),
+            "repo_kind": _studio_repo_kind(repo),
+            "stacks": stacks,
+            "required_tools": required_tools,
+            "missing_tools": missing_tools,
+            "status": "blocked" if missing_tools else "ready",
+        }
+        repo_checks.append(check)
+        if missing_tools:
+            repo_gaps.append(check)
+            all_missing.extend(missing_tools)
+
+    unique_missing = list(dict.fromkeys(all_missing))
+    if repo_gaps:
+        status = "red" if any("android" in (gap.get("stacks") or []) for gap in repo_gaps) else "yellow"
+    else:
+        status = "green"
+    score = max(0, 100 - (25 * len(repo_gaps)) - (8 * len(unique_missing)))
+    if status == "green":
+        summary = "All active repos with detected stacks have the required local validation tools."
+    else:
+        details = [
+            f"{gap.get('repo_name')}: missing {', '.join(str(x) for x in (gap.get('missing_tools') or []))}"
+            for gap in repo_gaps[:4]
+        ]
+        summary = "Validation toolchain gaps: " + "; ".join(details)
+    return {
+        "version": 1,
+        "ts": float(now),
+        "status": status,
+        "score": int(score),
+        "summary": _studio_one_line(summary, max_chars=320),
+        "repo_checks": repo_checks[:25],
+        "repo_gaps": repo_gaps[:12],
+        "missing_tools": unique_missing,
+    }
+
+
+def _studio_readiness_for_repo(memory: dict[str, Any], *, repo_id: str, repo_path: str) -> dict[str, Any] | None:
+    readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
+    checks = readiness.get("repo_checks") if isinstance(readiness.get("repo_checks"), list) else []
+    rid = str(repo_id or "").strip().lower()
+    try:
+        path = str(Path(repo_path).expanduser().resolve()) if repo_path else ""
+    except Exception:
+        path = str(repo_path or "").strip()
+    for item in checks:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("repo_id") or "").strip().lower()
+        item_path = str(item.get("repo_path") or "").strip()
+        if (rid and item_id == rid) or (path and item_path == path):
+            return item
+    return None
+
+
+def _studio_record_maturity_snapshot(*, cfg: BotConfig, readiness: dict[str, Any], now: float) -> None:
+    try:
+        _studio_ensure_schema(cfg.orchestrator_db_path)
+        with sqlite3.connect(str(cfg.orchestrator_db_path), timeout=15.0) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO studio_maturity_snapshots(
+                    snapshot_id, ts, status, score, summary, checks_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"readiness-{int(float(now) // 300)}",
+                    float(now),
+                    str(readiness.get("status") or "green"),
+                    int(readiness.get("score") or 0),
+                    _studio_one_line(readiness.get("summary"), max_chars=500, default=""),
+                    _studio_json(readiness),
+                    float(now),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        LOG.exception("Failed to record Studio maturity snapshot")
 
 
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
@@ -16786,6 +17020,16 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         base_risk = f"{base_risk}; recent Studio caution: {_studio_one_line('; '.join(recent_risks[:2]), max_chars=220)}"
     if recent_saturation:
         base_risk = f"{base_risk}; freshness guard: {_studio_one_line('; '.join(recent_saturation[:2]), max_chars=220)}"
+    repo_readiness = _studio_readiness_for_repo(memory, repo_id=repo_id, repo_path=path)
+    readiness_status = str((repo_readiness or {}).get("status") or "ready").strip().lower()
+    missing_tools = [str(x) for x in ((repo_readiness or {}).get("missing_tools") or []) if str(x).strip()]
+    stacks = [str(x) for x in ((repo_readiness or {}).get("stacks") or []) if str(x).strip()]
+    if missing_tools:
+        score -= 60
+        base_risk = (
+            f"{base_risk}; validation toolchain blocker: missing {', '.join(missing_tools)} "
+            f"for {', '.join(stacks) or 'detected'} stack"
+        )
     why = f"{kind} work maps directly to the highest-value factory surface."
     if governor_mode == "repair_delivery_contract" and kind == "Core":
         why = "The Studio Governor detected ghost-delivery risk, so repairing PonceBot's delivery contract beats any new feature or incubator bet right now."
@@ -16815,6 +17059,11 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         "commercial_evidence_target": commercial_evidence,
         "risk_summary": base_risk,
         "why_better_than_alternatives": why,
+        "toolchain_readiness": {
+            "status": readiness_status,
+            "stacks": stacks,
+            "missing_tools": missing_tools,
+        },
         "recent_studio_outcome_risks": recent_risks[:4],
         "recent_studio_outcome_wins": recent_wins[:3],
         "recent_studio_saturation": recent_saturation[:3],
@@ -16911,6 +17160,10 @@ def _studio_build_opportunities(
 ) -> list[dict[str, Any]]:
     if memory is None:
         memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+    readiness = _studio_operational_readiness(cfg=cfg, repos=repos, now=now)
+    memory["studio_readiness"] = readiness
+    memory["studio_governor"] = _studio_governor_assessment(memory, now=now)
+    _studio_record_maturity_snapshot(cfg=cfg, readiness=readiness, now=now)
     opportunities: list[dict[str, Any]] = []
     for repo in repos:
         status = str(repo.get("status") or "").strip().lower()
@@ -17048,6 +17301,9 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     governor_trigger = _studio_one_line(governor.get("trigger"), max_chars=220, default="none")
     governor_directives = "; ".join(str(x) for x in (governor.get("directives") or [])[:4]) or "normal ranking"
     governor_force = _studio_one_line(governor.get("force_next_action"), max_chars=220, default="none")
+    readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
+    readiness_summary = _studio_one_line(readiness.get("summary"), max_chars=260, default="not collected")
+    readiness_missing = ", ".join(str(x) for x in (readiness.get("missing_tools") or [])[:6]) or "none"
     return "\n".join(
         [
             "AUTONOMOUS STUDIO CYCLE",
@@ -17059,6 +17315,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
+            f"- Operational readiness: status={readiness.get('status', 'unknown')} score={readiness.get('score', 'n/a')}; missing={readiness_missing}; {readiness_summary}",
             "",
             "Studio governor:",
             f"- mode: {governor_mode}; severity: {governor.get('severity', 'green')}; trigger: {governor_trigger}",

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import subprocess
 from types import SimpleNamespace
@@ -433,6 +434,90 @@ def test_autonomous_commit_identity_ignores_stale_repo_config(tmp_path, monkeypa
     assert env["GIT_AUTHOR_EMAIL"] == "manolosake@gmail.com"
     assert env["GIT_COMMITTER_NAME"] == "manolosake"
     assert env["GIT_COMMITTER_EMAIL"] == "manolosake@gmail.com"
+
+
+def test_autonomous_validation_env_finds_user_jdk(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home = tmp_path / "home"
+    java_bin = home / ".local" / "jdks" / "jdk-17" / "bin" / "java"
+    java_bin.parent.mkdir(parents=True)
+    java_bin.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    java_bin.chmod(0o755)
+    empty_path = tmp_path / "empty-bin"
+    empty_path.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(empty_path))
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+    monkeypatch.delenv("BOT_AUTONOMOUS_GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("BOT_AUTONOMOUS_GIT_AUTHOR_EMAIL", raising=False)
+
+    env = bot._autonomous_commit_identity_env(repo)
+
+    assert env["JAVA_HOME"] == str(home / ".local" / "jdks" / "jdk-17")
+    assert env["PATH"].split(os.pathsep)[0] == str(java_bin.parent)
+    assert env["GIT_AUTHOR_NAME"] == "manolosake"
+
+
+def test_studio_readiness_uses_user_jdk_for_android_repo(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    java_bin = home / ".local" / "jdks" / "jdk-17" / "bin" / "java"
+    java_bin.parent.mkdir(parents=True)
+    java_bin.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    java_bin.chmod(0o755)
+    android = tmp_path / "OmniCrewApp.android"
+    android.mkdir()
+    (android / "gradlew").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(tmp_path / "missing-bin"))
+    monkeypatch.delenv("JAVA_HOME", raising=False)
+
+    readiness = bot._studio_operational_readiness(
+        cfg=SimpleNamespace(),
+        repos=[
+            {
+                "repo_id": "omnicrewapp.android",
+                "path": str(android),
+                "priority": 1,
+                "status": "active",
+                "autonomy_enabled": True,
+                "metadata": {},
+            }
+        ],
+        now=1_700_000_000.0,
+    )
+
+    assert readiness["status"] == "green"
+    assert readiness["repo_checks"][0]["stacks"] == ["android"]
+    assert readiness["repo_checks"][0]["missing_tools"] == []
+
+
+def test_studio_governor_blocks_missing_validation_toolchain():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+        "studio_readiness": {
+            "status": "red",
+            "repo_gaps": [
+                {
+                    "repo_id": "omnicrewapp.android",
+                    "repo_name": "OmniCrewApp.android",
+                    "stacks": ["android"],
+                    "missing_tools": ["java"],
+                }
+            ],
+        },
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "toolchain_readiness_gate"
+    assert governor["severity"] == "red"
+    assert "repo-omnicrewapp.android" in governor["avoid_keys"]
+    assert governor["readiness_gap_count"] == 1
 
 
 def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
