@@ -15291,15 +15291,24 @@ def _auto_merge_ready_orders_tick(
         done_orders = list(orch_q.list_orders_global(status="done", limit=240) or [])
     except Exception:
         done_orders = []
-    seen_done_order_ids = {str(row.get("order_id") or "").strip() for row in done_orders}
+    done_order_by_id = {str(row.get("order_id") or "").strip(): row for row in done_orders}
+    seen_done_order_ids = set(done_order_by_id)
     for row in _recent_controller_snapshot_studio_order_rows(
         orch_q=orch_q,
         now=float(now),
         max_age_seconds=heal_done_max_age_s,
     ):
         oid = str(row.get("order_id") or "").strip()
+        if not oid:
+            continue
+        if oid in done_order_by_id:
+            # Prefer the Studio recovery row because its updated_at reflects the
+            # fresh recoverable autoship marker, while the CEO order may be old.
+            done_order_by_id[oid].update(row)
+            continue
         if oid and oid not in seen_done_order_ids:
             done_orders.append(row)
+            done_order_by_id[oid] = row
             seen_done_order_ids.add(oid)
 
     known_ids = {str(it.get("order_id") or "").strip() for it in orders}
