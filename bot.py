@@ -14767,17 +14767,45 @@ def _controller_snapshot_delivery_candidate(trace: dict[str, Any] | None) -> dic
     summary_blob = " ".join(
         str(piece or "")
         for piece in (
+            tr.get("result_status"),
             tr.get("result_summary"),
             tr.get("result_next_action"),
             structured.get("summary") if isinstance(structured, dict) else "",
             structured.get("next_action") if isinstance(structured, dict) else "",
         )
     ).lower()
-    if "controller-snapshot" not in summary_blob and "controller snapshot" not in summary_blob:
+
+    has_release_blocker = any(
+        marker in summary_blob
+        for marker in (
+            "blocked_need_operator",
+            "apply the validated changes",
+            "write-enabled autoship",
+            "autoship/merge/deploy",
+            "ship to main",
+            "commit, push",
+            "merge/push/deploy",
+            "published_project",
+            "private github",
+        )
+    )
+    if not has_release_blocker:
         return {}
-    if "blocked_need_operator" not in summary_blob and "apply the validated changes" not in summary_blob:
-        return {}
-    if "pass" not in summary_blob and "validated" not in summary_blob:
+
+    has_validation_evidence = any(
+        marker in summary_blob
+        for marker in (
+            "pass",
+            "validated",
+            "reviewer",
+            "qa:",
+            "tests",
+            "evidence",
+            "published_project",
+            "private github",
+        )
+    )
+    if not has_validation_evidence:
         return {}
 
     artifacts: list[str] = []
@@ -14902,7 +14930,12 @@ def _recent_controller_snapshot_studio_order_rows(
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT o.order_id, o.chat_id, o.status, o.phase, o.title, o.updated_at
+                SELECT o.order_id,
+                       o.chat_id,
+                       o.status,
+                       o.phase,
+                       o.title,
+                       MAX(COALESCE(o.updated_at, 0), COALESCE(sc.updated_at, 0)) AS updated_at
                 FROM studio_cycles sc
                 JOIN ceo_orders o ON o.order_id = sc.order_id
                 JOIN jobs j ON j.job_id = sc.order_id

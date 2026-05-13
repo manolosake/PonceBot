@@ -363,6 +363,61 @@ def test_controller_snapshot_delivery_candidate_requires_validated_release_block
     )
 
 
+def test_controller_snapshot_delivery_candidate_accepts_published_project_summary(tmp_path):
+    snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
+    snapshot.mkdir(parents=True)
+    patch = snapshot.parent / "changes.patch"
+    patch.write_text("diff --git a/README.md b/README.md\n", encoding="utf-8")
+
+    candidate = bot._controller_snapshot_delivery_candidate(
+        {
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "merge_cancelled": True,
+            "result_status": "done",
+            "result_summary": "PASS. Outcome: `published_project`. Private GitHub repo exists on main with validation evidence.",
+            "result_next_action": None,
+        }
+    )
+
+    assert candidate["snapshot_dir"] == str(snapshot)
+    assert candidate["patch_path"] == str(patch)
+
+
+def test_recent_controller_snapshot_rows_use_studio_updated_at_for_recovery(tmp_path):
+    db = tmp_path / "jobs.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE studio_cycles (order_id TEXT, status TEXT, outcome_status TEXT, updated_at REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE ceo_orders (order_id TEXT, chat_id INTEGER, status TEXT, phase TEXT, title TEXT, updated_at REAL)"
+        )
+        conn.execute("CREATE TABLE jobs (job_id TEXT, trace TEXT)")
+        conn.execute(
+            "INSERT INTO studio_cycles VALUES (?, ?, ?, ?)",
+            ("order-1", "active", "blocked_need_operator", 2_000.0),
+        )
+        conn.execute(
+            "INSERT INTO ceo_orders VALUES (?, ?, ?, ?, ?, ?)",
+            ("order-1", 123, "done", "done", "Snapshot order", 100.0),
+        )
+        conn.execute(
+            "INSERT INTO jobs VALUES (?, ?)",
+            ("order-1", json.dumps({"controller_snapshot_workdir": "/tmp/snapshot"})),
+        )
+
+    orch_q = SimpleNamespace(_storage=SimpleNamespace(path=db))
+    rows = bot._recent_controller_snapshot_studio_order_rows(
+        orch_q=orch_q,
+        now=2_100.0,
+        max_age_seconds=300.0,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["updated_at"] == 2_000.0
+
+
 def test_controller_snapshot_untracked_filter_keeps_source_not_evidence():
     assert bot._controller_snapshot_safe_untracked_path("test_agents_sprint_brief_shell.py")
     assert bot._controller_snapshot_safe_untracked_path("static/app.js")
