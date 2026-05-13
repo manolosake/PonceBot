@@ -3172,12 +3172,32 @@ class StatusService:
         for lane, label in lane_defs:
             orders = lanes_by_key[lane]
             recommended = str((orders[0].get("next_action") if orders else "") or "")
+            lane_top_order: dict[str, Any] | None = None
+            lane_top_rank: int | None = None
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                try:
+                    rank = int(order.get("rank") or 0)
+                except Exception:
+                    continue
+                if rank <= 0:
+                    continue
+                if lane_top_rank is None or rank < lane_top_rank:
+                    lane_top_order = order
+                    lane_top_rank = rank
+            execution_packet = (
+                _proactive_lane_execution_packet(lane_top_order, lane, label)
+                if isinstance(lane_top_order, dict)
+                else None
+            )
             lanes.append(
                 {
                     "lane": lane,
                     "label": label,
                     "count": len(orders),
                     "recommended_next_action": recommended,
+                    "execution_packet": execution_packet,
                     "orders": orders,
                 }
             )
@@ -3200,6 +3220,24 @@ class StatusService:
                     top_order = order
                     top_lane = str(lane.get("lane") or "")
 
+        top_execution_packet = None
+        if isinstance(top_order, dict) and top_lane:
+            for lane in lanes:
+                if str(lane.get("lane") or "") == top_lane:
+                    packet = lane.get("execution_packet")
+                    top_execution_packet = packet if isinstance(packet, dict) else None
+                    break
+        next_delegate = None
+        if isinstance(top_execution_packet, dict):
+            next_delegate = {
+                "owner_role": top_execution_packet.get("owner_role"),
+                "order_id": top_execution_packet.get("order_id"),
+                "lane": top_execution_packet.get("lane"),
+                "action": top_execution_packet.get("action"),
+                "inspect_endpoint": top_execution_packet.get("inspect_endpoint"),
+                "handoff_endpoint": top_execution_packet.get("handoff_endpoint"),
+            }
+
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())
         return {
@@ -3214,8 +3252,10 @@ class StatusService:
                 "lanes": lane_counts,
                 "top_lane": top_lane,
                 "top_action": (str(top_order.get("next_action") or "") if isinstance(top_order, dict) else None),
+                "next_delegate": next_delegate,
             },
             "lanes": lanes,
+            "top_execution_packet": top_execution_packet,
         }
 
     def order_evidence_packet(

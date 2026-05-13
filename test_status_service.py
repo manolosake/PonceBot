@@ -12,6 +12,162 @@ from orchestrator.storage import SQLiteTaskStorage
 
 
 class TestStatusService(unittest.TestCase):
+    def test_proactive_action_plan_adds_execution_packets_and_next_delegate(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            orders = [
+                {
+                    "rank": 2,
+                    "order_id": "release-order",
+                    "order_id_short": "release",
+                    "title": "Release order",
+                    "priority": 1,
+                    "phase": "review",
+                    "current_stage": "deploy",
+                    "readiness_state": "ready",
+                    "readiness_verdict": "go",
+                    "decision": "release",
+                    "why": "Ready to release.",
+                    "next_action": "Release the branch.",
+                    "handoff": {
+                        "suggested_role": "release_mgr",
+                        "suggested_endpoint": "/handoff/release-order",
+                        "inspect_path": "/inspect/release-order",
+                        "checklist": ["Confirm release target."],
+                        "definition_of_done": ["Release evidence recorded."],
+                        "evidence_expectations": ["merge result"],
+                        "suggested_validation": ["Check deploy status."],
+                    },
+                    "updated_at": 20.0,
+                    "merge_ready": True,
+                    "merged_to_main": False,
+                },
+                {
+                    "rank": 1,
+                    "order_id": "advance-order",
+                    "order_id_short": "advance",
+                    "title": "Advance order",
+                    "priority": 1,
+                    "phase": "executing",
+                    "current_stage": "delivery",
+                    "readiness_state": "not_ready",
+                    "readiness_verdict": "wait",
+                    "decision": "advance",
+                    "why": "Needs delivery evidence.",
+                    "next_action": "Implement the bounded slice.",
+                    "handoff": {
+                        "suggested_role": "implementer_local",
+                        "suggested_endpoint": "/handoff/advance-order",
+                        "inspect_path": "/inspect/advance-order",
+                        "checklist": ["Open the order."],
+                        "definition_of_done": ["Tests pass."],
+                        "evidence_expectations": ["pytest output"],
+                        "suggested_validation": ["Run focused tests."],
+                        "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
+                    },
+                    "updated_at": 10.0,
+                    "merge_ready": False,
+                    "merged_to_main": False,
+                },
+                {
+                    "rank": 3,
+                    "order_id": "unblock-order",
+                    "order_id_short": "unblock",
+                    "title": "Unblock order",
+                    "priority": 2,
+                    "phase": "review",
+                    "current_stage": "skynet_review",
+                    "readiness_state": "blocked",
+                    "readiness_verdict": "no_go",
+                    "decision": "unblock",
+                    "why": "Reviewer blocker.",
+                    "primary_blocker": {"stage": "skynet_review", "job": {"role": "reviewer_local"}},
+                    "next_action": "Clear the review blocker.",
+                    "handoff": {
+                        "suggested_role": "reviewer_local",
+                        "suggested_endpoint": "/handoff/unblock-order",
+                        "inspect_path": "/inspect/unblock-order",
+                        "checklist": ["Review blocker."],
+                        "definition_of_done": ["Blocker cleared."],
+                        "evidence_expectations": ["review note"],
+                        "suggested_validation": ["Recheck readiness."],
+                    },
+                    "updated_at": 30.0,
+                    "merge_ready": False,
+                    "merged_to_main": False,
+                },
+            ]
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 3},
+                "orders": orders,
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["release"]["execution_packet"]["order_id"], "release-order")
+            self.assertEqual(lanes["release"]["execution_packet"]["owner_role"], "release_mgr")
+            self.assertEqual(lanes["unblock"]["execution_packet"]["owner_role"], "reviewer_local")
+            self.assertIsNone(lanes["monitor"]["execution_packet"])
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(top_packet, lanes["advance"]["execution_packet"])
+            self.assertEqual(top_packet["order_id"], "advance-order")
+            self.assertEqual(top_packet["owner_role"], "implementer_local")
+            self.assertEqual(top_packet["lane"], "advance")
+            self.assertEqual(top_packet["action"], "Implement the bounded slice.")
+            self.assertEqual(top_packet["inspect_endpoint"], "/inspect/advance-order")
+            self.assertEqual(top_packet["handoff_endpoint"], "/handoff/advance-order")
+            self.assertEqual(top_packet["acceptance_criteria"], ["Open the order."])
+            self.assertEqual(top_packet["definition_of_done"], ["Tests pass."])
+            self.assertEqual(top_packet["evidence_required"], ["pytest output"])
+            self.assertEqual(top_packet["suggested_validation"], ["Run focused tests."])
+            self.assertIn("ROLE: implementer_local.", top_packet["assignment_prompt"])
+
+            self.assertEqual(
+                plan["summary"]["next_delegate"],
+                {
+                    "owner_role": "implementer_local",
+                    "order_id": "advance-order",
+                    "lane": "advance",
+                    "action": "Implement the bounded slice.",
+                    "inspect_endpoint": "/inspect/advance-order",
+                    "handoff_endpoint": "/handoff/advance-order",
+                },
+            )
+
+    def test_proactive_action_plan_empty_packets_are_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 0},
+                "orders": [],
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            self.assertIsNone(plan["top_execution_packet"])
+            self.assertIsNone(plan["summary"]["next_delegate"])
+            self.assertTrue(all(lane["execution_packet"] is None for lane in plan["lanes"]))
+
     def test_operator_focus_delegate_contract_is_populated(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

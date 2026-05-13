@@ -318,6 +318,32 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertEqual(lanes["release"]["count"], 0)
             self.assertEqual(lanes["advance"]["count"], 1)
             self.assertEqual(lanes["advance"]["orders"][0]["order_id"], order_id)
+            self.assertIsNone(lanes["release"]["execution_packet"])
+
+            advance_packet = lanes["advance"]["execution_packet"]
+            self.assertIsInstance(advance_packet, dict)
+            self.assertEqual(advance_packet["order_id"], order_id)
+            self.assertEqual(advance_packet["lane"], "advance")
+            self.assertIn(advance_packet["owner_role"], {"implementer_local", "reviewer_local", "release_mgr", "architect_local"})
+            self.assertIn(order_id, advance_packet["inspect_endpoint"])
+            self.assertIn(order_id, advance_packet["handoff_endpoint"])
+            self.assertTrue(advance_packet["acceptance_criteria"])
+            self.assertTrue(advance_packet["definition_of_done"])
+            self.assertTrue(advance_packet["evidence_required"])
+            self.assertTrue(advance_packet["suggested_validation"])
+            self.assertIn("ROLE:", advance_packet["assignment_prompt"])
+            self.assertEqual(plan["top_execution_packet"], advance_packet)
+            self.assertEqual(
+                plan["summary"]["next_delegate"],
+                {
+                    "owner_role": advance_packet["owner_role"],
+                    "order_id": order_id,
+                    "lane": "advance",
+                    "action": advance_packet["action"],
+                    "inspect_endpoint": advance_packet["inspect_endpoint"],
+                    "handoff_endpoint": advance_packet["handoff_endpoint"],
+                },
+            )
 
     def test_release_readiness_allows_merge_ready_order_with_order_branch(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -345,6 +371,22 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             lanes = {lane["lane"]: lane for lane in plan["lanes"]}
             self.assertEqual(lanes["release"]["count"], 1)
             self.assertEqual(lanes["release"]["orders"][0]["order_id"], order_id)
+            release_packet = lanes["release"]["execution_packet"]
+            self.assertIsInstance(release_packet, dict)
+            self.assertEqual(release_packet["order_id"], order_id)
+            self.assertEqual(release_packet["lane"], "release")
+            self.assertEqual(release_packet["owner_role"], "release_mgr")
+            self.assertIn(order_id, release_packet["inspect_endpoint"])
+            self.assertIn(order_id, release_packet["handoff_endpoint"])
+            self.assertIn("Release or merge", " ".join(release_packet["definition_of_done"]))
+            self.assertTrue(release_packet["acceptance_criteria"])
+            self.assertTrue(release_packet["evidence_required"])
+            self.assertTrue(release_packet["suggested_validation"])
+            self.assertIn("ROLE: release_mgr.", release_packet["assignment_prompt"])
+            self.assertEqual(plan["top_execution_packet"], release_packet)
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
+            self.assertEqual(plan["summary"]["next_delegate"]["order_id"], order_id)
+            self.assertEqual(plan["summary"]["next_delegate"]["lane"], "release")
 
 
 if __name__ == "__main__":
