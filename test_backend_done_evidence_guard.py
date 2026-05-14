@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
-from tools.backend_done_evidence_guard import validate_evidence
+from tools.backend_done_evidence_guard import main, validate_evidence
 
 
 class TestBackendDoneEvidenceGuard(unittest.TestCase):
@@ -49,6 +51,16 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
         payload.update(overrides)
         return payload
 
+    def _commercial_evidence(self, **overrides: object) -> dict:
+        commercial_evidence = {
+            "monetization_or_savings_path": (
+                "fewer ghost closes improve selection quality and delivery reliability"
+            ),
+            "evidence": "guard evidence saves review time by blocking low-value proactive work",
+        }
+        commercial_evidence.update(overrides)
+        return commercial_evidence
+
     def test_validate_evidence_passes_with_existing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
@@ -72,6 +84,230 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_default_allows_missing_commercial_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_requires_commercial_evidence_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_commercial_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "commercial_evidence_missing")
+
+    def test_main_require_commercial_evidence_flag_rejects_missing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                        "--require-commercial-evidence",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["reason"], "commercial_evidence_missing")
+
+    def test_main_require_commercial_evidence_false_allows_missing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                        "--require-commercial-evidence=false",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_requires_commercial_evidence_fields_when_enabled(self) -> None:
+        cases = [
+            (
+                "monetization_or_savings_path",
+                {
+                    "evidence": (
+                        "guard evidence saves review time by blocking low-value proactive work"
+                    )
+                },
+                "commercial_evidence_monetization_path_missing",
+            ),
+            (
+                "evidence",
+                {
+                    "monetization_or_savings_path": (
+                        "fewer ghost closes improve selection quality and delivery reliability"
+                    )
+                },
+                "commercial_evidence_evidence_missing",
+            ),
+        ]
+        for name, commercial_evidence, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(commercial_evidence=commercial_evidence),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_commercial_evidence=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_validate_evidence_rejects_generic_commercial_evidence_fields(self) -> None:
+        cases = [
+            (
+                "monetization_or_savings_path",
+                {
+                    "monetization_or_savings_path": "done",
+                    "evidence": (
+                        "guard evidence saves review time by blocking low-value proactive work"
+                    ),
+                },
+                "commercial_evidence_monetization_path_too_generic",
+            ),
+            (
+                "evidence",
+                {
+                    "monetization_or_savings_path": (
+                        "fewer ghost closes improve selection quality and delivery reliability"
+                    ),
+                    "evidence": "proof.log",
+                },
+                "commercial_evidence_evidence_too_generic",
+            ),
+        ]
+        for name, commercial_evidence, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(commercial_evidence=commercial_evidence),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_commercial_evidence=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_validate_evidence_rejects_non_commercial_commercial_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    commercial_evidence={
+                        "monetization_or_savings_path": (
+                            "updated backend docs for internal maintainers"
+                        ),
+                        "evidence": "documented backend cleanup notes in the project summary",
+                    },
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_commercial_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "commercial_evidence_not_commercially_relevant")
+
+    def test_validate_evidence_rejects_current_as_rent_false_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    commercial_evidence={
+                        "monetization_or_savings_path": (
+                            "updated current backend docs for maintainers"
+                        ),
+                        "evidence": "documented current backend cleanup notes",
+                    },
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_commercial_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "commercial_evidence_not_commercially_relevant")
+
+    def test_validate_evidence_accepts_substantive_commercial_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(commercial_evidence=self._commercial_evidence()),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_commercial_evidence=True,
+            )
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_commercial_gate_applies_to_root_caused_terminal_outcome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_artifact(artifacts_dir, "proof.log")
+            self._write_evidence(artifacts_dir, self._root_caused_payload())
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_commercial_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "commercial_evidence_missing")
 
     def test_validate_evidence_requires_factory_delta_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as td:

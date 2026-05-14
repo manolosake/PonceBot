@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import ntpath
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,56 @@ FACTORY_DELTA_PLACEHOLDERS = {
     "autonomy",
     "revenue",
 }
+COMMERCIAL_EVIDENCE_PLACEHOLDERS = FACTORY_DELTA_PLACEHOLDERS | {
+    "backend",
+    "backend docs",
+    "docs",
+    "documentation",
+    "file",
+    "log",
+    "proof artifact",
+    "updated",
+    "updated docs",
+}
+COMMERCIAL_RELEVANCE_TERMS = {
+    "money",
+    "revenue",
+    "sell",
+    "rent",
+    "pricing",
+    "buyer",
+    "customer",
+    "save",
+    "savings",
+    "less waste",
+    "fewer ghost",
+    "profitable",
+    "retention",
+    "lead",
+    "factory leverage",
+    "selection quality",
+    "delivery reliability",
+    "deployability",
+    "learning",
+    "speed",
+}
+COMMERCIAL_RELEVANCE_TOKEN_VARIANTS = {
+    "money": {"money"},
+    "revenue": {"revenue", "revenues"},
+    "sell": {"sell", "sells", "selling", "sold"},
+    "rent": {"rent", "rents", "rental", "rented", "renting"},
+    "pricing": {"price", "prices", "priced", "pricing"},
+    "buyer": {"buyer", "buyers"},
+    "customer": {"customer", "customers"},
+    "save": {"save", "saves", "saved", "saving"},
+    "savings": {"savings"},
+    "profitable": {"profit", "profits", "profitable", "profitability"},
+    "retention": {"retention"},
+    "lead": {"lead", "leads"},
+    "deployability": {"deployability", "deployable"},
+    "learning": {"learn", "learns", "learned", "learning"},
+    "speed": {"speed", "speeds"},
+}
 
 
 def _is_absolute_artifact_path(raw_path: str) -> bool:
@@ -94,6 +145,31 @@ def _is_substantive_factory_delta_text(value: Any) -> bool:
     words = text.split()
     non_space_chars = sum(1 for char in text if not char.isspace())
     return len(words) >= 2 or non_space_chars >= 16
+
+
+def _is_substantive_commercial_evidence_text(value: Any) -> bool:
+    if not _has_text(value):
+        return False
+    text = str(value).strip()
+    if text.lower() in COMMERCIAL_EVIDENCE_PLACEHOLDERS:
+        return False
+    words = text.split()
+    non_space_chars = sum(1 for char in text if not char.isspace())
+    return len(words) >= 2 or non_space_chars >= 16
+
+
+def _is_commercially_relevant_text(*values: Any) -> bool:
+    normalized = " ".join(str(value or "").strip().lower() for value in values)
+    for phrase in (term for term in COMMERCIAL_RELEVANCE_TERMS if " " in term):
+        pattern = r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b"
+        if re.search(pattern, normalized):
+            return True
+
+    tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    for term in (term for term in COMMERCIAL_RELEVANCE_TERMS if " " not in term):
+        if tokens & COMMERCIAL_RELEVANCE_TOKEN_VARIANTS.get(term, {term}):
+            return True
+    return False
 
 
 def _parse_bool_flag(value: str | bool | None) -> bool:
@@ -190,6 +266,57 @@ def _factory_delta_error(
             "reason": "factory_delta_capability_not_factory_relevant",
             "summary_path": str(summary_path),
             "capability_changed": str(capability_changed).strip(),
+        }
+
+    return None
+
+
+def _commercial_evidence_error(
+    *,
+    payload: dict[str, Any],
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    commercial_evidence = payload.get("commercial_evidence")
+    if not isinstance(commercial_evidence, dict):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_missing",
+            "summary_path": str(summary_path),
+        }
+
+    monetization_path = commercial_evidence.get("monetization_or_savings_path")
+    if not _has_text(monetization_path):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_monetization_path_missing",
+            "summary_path": str(summary_path),
+        }
+    evidence = commercial_evidence.get("evidence")
+    if not _has_text(evidence):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_evidence_missing",
+            "summary_path": str(summary_path),
+        }
+    if not _is_substantive_commercial_evidence_text(monetization_path):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_monetization_path_too_generic",
+            "summary_path": str(summary_path),
+            "monetization_or_savings_path": str(monetization_path).strip(),
+        }
+    if not _is_substantive_commercial_evidence_text(evidence):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_evidence_too_generic",
+            "summary_path": str(summary_path),
+            "evidence": str(evidence).strip(),
+        }
+    if not _is_commercially_relevant_text(monetization_path, evidence):
+        return {
+            "ok": False,
+            "reason": "commercial_evidence_not_commercially_relevant",
+            "summary_path": str(summary_path),
         }
 
     return None
@@ -298,6 +425,7 @@ def validate_evidence(
     allow_empty_artifacts: bool = False,
     allow_missing_files: bool = False,
     require_factory_delta: bool = False,
+    require_commercial_evidence: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     artifacts_root = artifacts_dir.expanduser().resolve()
     summary_path = (artifacts_root / summary_name).resolve()
@@ -484,6 +612,14 @@ def validate_evidence(
         if factory_delta_error is not None:
             return False, factory_delta_error
 
+    if require_commercial_evidence:
+        commercial_evidence_error = _commercial_evidence_error(
+            payload=payload,
+            summary_path=summary_path,
+        )
+        if commercial_evidence_error is not None:
+            return False, commercial_evidence_error
+
     return True, {
         "ok": True,
         "summary_path": str(summary_path),
@@ -507,6 +643,14 @@ def main(argv: list[str] | None = None) -> int:
         type=_parse_bool_flag,
         help="require final_evidence.json to state an explicit factory capability delta",
     )
+    parser.add_argument(
+        "--require-commercial-evidence",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_parse_bool_flag,
+        help="require final_evidence.json to state explicit commercial or factory-value evidence",
+    )
     args = parser.parse_args(argv)
 
     ok, payload = validate_evidence(
@@ -515,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_empty_artifacts=bool(args.allow_empty_artifacts),
         allow_missing_files=bool(args.allow_missing_files),
         require_factory_delta=bool(args.require_factory_delta),
+        require_commercial_evidence=bool(args.require_commercial_evidence),
     )
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return 0 if ok else 2
