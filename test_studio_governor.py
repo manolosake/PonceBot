@@ -1,7 +1,9 @@
 import json
+import inspect
 import os
 import sqlite3
 import subprocess
+import unittest
 from types import SimpleNamespace
 
 import bot
@@ -257,6 +259,66 @@ def test_studio_prompt_includes_governor_directives():
     assert "Studio governor:" in prompt
     assert "repair_delivery_contract" in prompt
     assert "Do not start another new-folder project" in prompt
+
+
+def test_studio_governor_exposes_incubator_quality_debt_and_prompt_line():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": "new-project-incubator",
+                "repo_id": "",
+                "type": "NEW_PROJECT",
+                "status": "rejected_low_value",
+                "summary": f"New project failed buyer/demo quality gate {idx}.",
+                "updated_at": now - (idx * 60),
+            }
+            for idx in range(1, 12)
+        ],
+        "recent_studio_positive_outcomes": [
+            {
+                "key": "new-project-incubator",
+                "repo_id": "",
+                "type": "NEW_PROJECT",
+                "status": "published_project",
+                "summary": "One project published with validation evidence.",
+                "updated_at": now - 120,
+            }
+        ],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "incubator_quality_gate"
+    assert governor["new_project_negative_24h"] == 11
+    assert governor["new_project_positive_24h"] == 1
+    assert governor["new_project_cycles_24h"] == 12
+    assert governor["new_project_quality_debt_24h"] == 10
+    assert governor["new_project_failure_ratio_24h"] == 0.917
+    assert "quality debt 10" in governor["trigger"]
+    assert "failure ratio 92%" in governor["trigger"]
+    assert "factory improvement" in governor["force_next_action"]
+    assert "buyer/demo/validation/publication evidence" in governor["force_next_action"]
+    assert any("quality debt" in directive for directive in governor["directives"])
+    assert any("fresh projects need stronger proof" in directive for directive in governor["directives"])
+
+    memory["studio_governor"] = governor
+    selected = {
+        "type": "DASHBOARD",
+        "repo_name": "ExecutiveDashboard",
+        "score": 101,
+        "thesis": "Improve selection visibility.",
+        "operator_visible_outcome": "Governor debt is visible to delegated specialists.",
+        "business_model": "Factory leverage.",
+        "monetization_path": "Reduce churn.",
+        "commercial_evidence_target": "Prompt packet includes quality debt.",
+    }
+
+    prompt = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory=memory)
+
+    assert "new-project quality: debt=10; failure_ratio=92%; negatives=11; positives=1; cycles=12" in prompt
 
 
 def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
@@ -738,3 +800,18 @@ def test_order_branch_has_merge_delta_accepts_real_branch_delta(tmp_path):
 
     assert has_delta
     assert reason == "has_delta"
+
+
+def load_tests(loader, tests, pattern):
+    suite = unittest.TestSuite()
+    current_module = globals()
+    for name in sorted(current_module):
+        if not name.startswith("test_"):
+            continue
+        candidate = current_module[name]
+        if not callable(candidate):
+            continue
+        if inspect.signature(candidate).parameters:
+            continue
+        suite.addTest(unittest.FunctionTestCase(candidate))
+    return suite

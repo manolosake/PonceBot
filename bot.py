@@ -16536,6 +16536,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     core_repair_loop_keys: list[str] = []
     non_core_positive_30m: list[dict[str, Any]] = []
     new_project_negative_24h = 0
+    new_project_positive_24h = 0
     new_project_cycles_24h = 0
     for entry in recent_negative:
         summary = str(entry.get("summary") or "").lower()
@@ -16569,7 +16570,21 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         if _age_hours(entry) <= 0.5 and "codexbot" not in key and "codexbot" not in repo_id:
             non_core_positive_30m.append(entry)
         if (key == "new-project-incubator" or work_type == "NEW_PROJECT") and _age_hours(entry) <= 24.0:
+            new_project_positive_24h += 1
             new_project_cycles_24h += 1
+
+    new_project_quality_debt_24h = max(0, new_project_negative_24h - new_project_positive_24h)
+    new_project_failure_ratio_24h = (
+        round(new_project_negative_24h / new_project_cycles_24h, 3)
+        if new_project_cycles_24h
+        else None
+    )
+    new_project_quality_summary = (
+        f"quality debt {new_project_quality_debt_24h}; "
+        f"failure ratio {new_project_failure_ratio_24h:.0%} across {new_project_cycles_24h} new-project cycles"
+        if new_project_failure_ratio_24h is not None
+        else f"quality debt {new_project_quality_debt_24h}; no new-project cycles in 24h"
+    )
 
     mode = "normal"
     severity = "green"
@@ -16637,11 +16652,20 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     elif new_project_negative_24h >= 2:
         mode = "incubator_quality_gate"
         severity = "yellow"
-        trigger = f"{new_project_negative_24h} failed/rejected new-project outcomes in 24h."
-        force_next_action = "Prefer improving the factory or compounding an existing portfolio asset over starting a fresh project."
+        trigger = f"{new_project_negative_24h} failed/rejected new-project outcomes in 24h ({new_project_quality_summary})."
+        force_next_action = (
+            "Do not start fresh incubator work until the next bet is either a compounding portfolio move or a factory "
+            f"improvement with buyer/demo/validation/publication evidence ({new_project_quality_summary})."
+        )
         avoid_keys = ["new-project-incubator"]
         prefer_lanes = ["core", "dashboard", "portfolio"]
-        directives.append("New-project work is cooling down until the next bet has clearer buyer, demo, validation, and publication evidence.")
+        directives.append(
+            "New-project work is cooling down until a compounding or factory-improvement bet has explicit buyer, demo, "
+            "validation, and publication evidence."
+        )
+        directives.append(
+            f"Treat the incubator quality debt as selection evidence: {new_project_quality_summary}; fresh projects need stronger proof than portfolio compounding."
+        )
     elif readiness_status in {"red", "yellow"} and readiness_gaps:
         mode = "toolchain_readiness_gate"
         severity = "red" if readiness_status == "red" else "yellow"
@@ -16688,7 +16712,10 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "write_policy_failure_count_72h": len(write_policy_failures),
         "core_repair_loop_failure_count_6h": len(core_repair_loop_failures),
         "new_project_negative_24h": new_project_negative_24h,
+        "new_project_positive_24h": new_project_positive_24h,
         "new_project_cycles_24h": new_project_cycles_24h,
+        "new_project_quality_debt_24h": new_project_quality_debt_24h,
+        "new_project_failure_ratio_24h": new_project_failure_ratio_24h,
         "portfolio_recent_count_6h": recent_projects_6h,
         "portfolio_recent_count_24h": recent_projects_24h,
         "readiness_status": readiness_status,
@@ -17348,6 +17375,20 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     governor_trigger = _studio_one_line(governor.get("trigger"), max_chars=220, default="none")
     governor_directives = "; ".join(str(x) for x in (governor.get("directives") or [])[:4]) or "normal ranking"
     governor_force = _studio_one_line(governor.get("force_next_action"), max_chars=220, default="none")
+    try:
+        governor_failure_ratio = float(governor.get("new_project_failure_ratio_24h"))
+    except Exception:
+        governor_failure_ratio = -1.0
+    governor_quality_line = (
+        "new-project quality: "
+        f"debt={governor.get('new_project_quality_debt_24h', 0)}; "
+        f"failure_ratio={governor_failure_ratio:.0%}; "
+        f"negatives={governor.get('new_project_negative_24h', 0)}; "
+        f"positives={governor.get('new_project_positive_24h', 0)}; "
+        f"cycles={governor.get('new_project_cycles_24h', 0)}"
+        if governor_failure_ratio >= 0.0
+        else "new-project quality: no new-project cycles in 24h"
+    )
     readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
     readiness_summary = _studio_one_line(readiness.get("summary"), max_chars=260, default="not collected")
     readiness_missing = ", ".join(str(x) for x in (readiness.get("missing_tools") or [])[:6]) or "none"
@@ -17366,6 +17407,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "",
             "Studio governor:",
             f"- mode: {governor_mode}; severity: {governor.get('severity', 'green')}; trigger: {governor_trigger}",
+            f"- {governor_quality_line}",
             f"- force next action: {governor_force}",
             f"- directives: {governor_directives}",
             "",
