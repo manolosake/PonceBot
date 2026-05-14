@@ -321,6 +321,62 @@ def test_studio_governor_exposes_incubator_quality_debt_and_prompt_line():
     assert "new-project quality: debt=10; failure_ratio=92%; negatives=11; positives=1; cycles=12" in prompt
 
 
+def test_studio_governor_counts_incubator_like_product_workflow_debt():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": f"20260511-studio-cycle-new-product-incubator-{idx}",
+                "repo_id": "",
+                "type": "PRODUCT_WORKFLOW",
+                "status": "rejected_low_value",
+                "summary": f"Rejected product workflow incubator quality gate {idx}.",
+                "updated_at": now - (idx * 60),
+            }
+            for idx in range(1, 3)
+        ],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "incubator_quality_gate"
+    assert governor["new_project_negative_24h"] == 2
+    assert governor["new_project_cycles_24h"] == 2
+    assert governor["new_project_quality_debt_24h"] == 2
+    assert governor["new_project_failure_ratio_24h"] == 1.0
+
+
+def test_studio_governor_ignores_ordinary_product_workflow_debt():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": f"20260511-studio-cycle-product-workflow-{idx}",
+                "repo_id": "executivedashboard",
+                "type": "PRODUCT_WORKFLOW",
+                "status": "rejected_low_value",
+                "summary": f"Rejected ordinary workflow quality gate {idx}.",
+                "updated_at": now - (idx * 60),
+            }
+            for idx in range(1, 3)
+        ],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "normal"
+    assert governor["new_project_negative_24h"] == 0
+    assert governor["new_project_cycles_24h"] == 0
+    assert governor["new_project_quality_debt_24h"] == 0
+    assert governor["new_project_failure_ratio_24h"] is None
+
+
 def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     cycle = {
         "selected_key": "new-project-incubator",
@@ -352,6 +408,83 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, dashboard_cycle)
     assert bot._studio_governor_should_preempt_active_cycle(quality_governor, cycle)
+
+
+def test_studio_governor_preempts_incubator_like_product_workflow_cycle():
+    quality_governor = {"mode": "incubator_quality_gate", "avoid_keys": ["new-project-incubator"]}
+    incubator_like_cycle = {
+        "selected_key": "20260511-studio-cycle-new-product-incubator-1",
+        "selected_repo_id": "",
+        "selected_type": "PRODUCT_WORKFLOW",
+        "selected_lane": "studio",
+    }
+    ordinary_cycle = {
+        "selected_key": "20260511-studio-cycle-product-workflow-1",
+        "selected_repo_id": "executivedashboard",
+        "selected_type": "PRODUCT_WORKFLOW",
+        "selected_lane": "portfolio",
+    }
+
+    assert bot._studio_governor_should_preempt_active_cycle(quality_governor, incubator_like_cycle)
+    assert not bot._studio_governor_should_preempt_active_cycle(quality_governor, ordinary_cycle)
+
+
+def test_studio_recent_cycle_outcome_memory_preserves_selected_lane(tmp_path):
+    now = 1_700_000_000.0
+    db_path = tmp_path / "studio.sqlite"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE studio_cycles (
+                cycle_id TEXT PRIMARY KEY,
+                selected_key TEXT,
+                selected_repo_id TEXT,
+                selected_type TEXT,
+                selected_lane TEXT,
+                outcome_status TEXT,
+                outcome_summary TEXT,
+                updated_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_cycles (
+                cycle_id, selected_key, selected_repo_id, selected_type, selected_lane,
+                outcome_status, outcome_summary, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "cycle-1",
+                "20260511-studio-cycle-product-workflow-1",
+                "",
+                "PRODUCT_WORKFLOW",
+                "incubator",
+                "rejected_low_value",
+                "Incubator lane workflow was rejected.",
+                now - 60,
+            ),
+        )
+        conn.execute(
+            """
+            CREATE TABLE studio_portfolio_projects (
+                project_key TEXT PRIMARY KEY,
+                project_name TEXT,
+                project_path TEXT,
+                github_repo TEXT,
+                latest_head TEXT,
+                latest_summary TEXT,
+                status TEXT,
+                updated_at REAL
+            )
+            """
+        )
+        conn.commit()
+
+    memory = bot._studio_recent_cycle_outcome_memory(db_path, now=now)
+
+    assert memory["recent_studio_negative_outcomes"][0]["lane"] == "incubator"
 
 
 def test_workspace_lease_reaps_terminal_job_holder(tmp_path):

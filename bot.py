@@ -16252,9 +16252,14 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
             return memory
         with sqlite3.connect(str(db), timeout=8.0) as conn:
             conn.row_factory = sqlite3.Row
+            columns = {
+                str(row["name"] or "").strip().lower()
+                for row in conn.execute("PRAGMA table_info(studio_cycles)").fetchall()
+            }
+            selected_lane_expr = "selected_lane" if "selected_lane" in columns else "NULL AS selected_lane"
             rows = conn.execute(
-                """
-                SELECT selected_key, selected_repo_id, selected_type, outcome_status, outcome_summary, updated_at
+                f"""
+                SELECT selected_key, selected_repo_id, selected_type, {selected_lane_expr}, outcome_status, outcome_summary, updated_at
                 FROM studio_cycles
                 WHERE updated_at >= ?
                   AND outcome_status IN (
@@ -16285,11 +16290,13 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         key = str(row["selected_key"] or "").strip().lower()
         repo_id = str(row["selected_repo_id"] or "").strip().lower()
         selected_type = str(row["selected_type"] or "").strip().upper()
+        selected_lane = str(row["selected_lane"] or "").strip().lower()
         summary = _studio_one_line(row["outcome_summary"], max_chars=120, default=status)
         entry = {
             "key": key,
             "repo_id": repo_id,
             "type": selected_type,
+            "lane": selected_lane,
             "status": status,
             "summary": summary,
             "updated_at": float(row["updated_at"] or 0.0),
@@ -16361,6 +16368,28 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         recent_projects.append(_studio_one_line(" · ".join(bits), max_chars=180))
     memory["studio_portfolio_recent_projects"] = list(dict.fromkeys(recent_projects))[:8]
     return memory
+
+
+_STUDIO_INCUBATOR_NEW_PROJECT_KEY_MARKERS = (
+    "new-product-incubator",
+    "new-project-incubator",
+    "project-incubator",
+)
+
+
+def _studio_is_incubator_new_project_work(item: dict[str, Any] | None) -> bool:
+    if not isinstance(item, dict):
+        return False
+    key = str(item.get("key") or item.get("selected_key") or "").strip().lower()
+    lane = str(item.get("lane") or item.get("selected_lane") or "").strip().lower()
+    work_type = str(item.get("type") or item.get("selected_type") or "").strip().upper()
+    if work_type in {"NEW_PROJECT", "NEW_PROJECT_PHASE"}:
+        return True
+    if lane == "incubator":
+        return True
+    if key in {"new-project-incubator", "project-incubator"}:
+        return True
+    return any(marker in key for marker in _STUDIO_INCUBATOR_NEW_PROJECT_KEY_MARKERS)
 
 
 def _studio_finalize_stale_selected_cycles(
@@ -16559,17 +16588,16 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
             if repo_id:
                 core_repair_loop_keys.append(repo_id)
                 core_repair_loop_keys.append(f"repo-{repo_id}")
-        if key == "new-project-incubator" or work_type == "NEW_PROJECT":
+        if _studio_is_incubator_new_project_work(entry):
             if _age_hours(entry) <= 24.0:
                 new_project_negative_24h += 1
                 new_project_cycles_24h += 1
     for entry in recent_positive:
         key = str(entry.get("key") or "").strip().lower()
         repo_id = str(entry.get("repo_id") or "").strip().lower()
-        work_type = str(entry.get("type") or "").strip().upper()
         if _age_hours(entry) <= 0.5 and "codexbot" not in key and "codexbot" not in repo_id:
             non_core_positive_30m.append(entry)
-        if (key == "new-project-incubator" or work_type == "NEW_PROJECT") and _age_hours(entry) <= 24.0:
+        if _studio_is_incubator_new_project_work(entry) and _age_hours(entry) <= 24.0:
             new_project_positive_24h += 1
             new_project_cycles_24h += 1
 
@@ -17782,11 +17810,11 @@ def _studio_governor_should_preempt_active_cycle(
         if str(item or "").strip()
     }
     if mode == "repair_delivery_contract":
-        return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+        return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     if mode == "repair_loop_cooldown":
         return bool(key or lane or selected_type)
     if mode == "incubator_quality_gate":
-        return bool(key in avoid_keys or lane == "incubator" or selected_type == "NEW_PROJECT")
+        return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     repo_tokens = {key}
     if repo_id:
         repo_tokens.add(repo_id)
