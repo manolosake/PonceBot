@@ -16915,6 +16915,199 @@ def _studio_outcome_matches(entry: dict[str, Any], *, key: str, repo_id: str, wo
     return ""
 
 
+_STUDIO_FACTORY_VALUE_DIMENSIONS: dict[str, str] = {
+    "measurable_factory_or_user_delta": "measurable factory/user delta",
+    "monetization_or_savings_path": "monetization or savings path",
+    "validation_toolchain_readiness": "validation/toolchain readiness",
+    "ship_recovery_path": "ship/recovery path",
+}
+
+
+def _studio_factory_value_assessment(opportunity: dict[str, Any]) -> dict[str, Any]:
+    def _field(name: str) -> str:
+        return str(opportunity.get(name) or "").strip()
+
+    def _has_any(text: str, markers: tuple[str, ...]) -> bool:
+        haystack = text.lower()
+        return any(marker in haystack for marker in markers)
+
+    thesis = _field("thesis")
+    outcome = _field("operator_visible_outcome")
+    evidence = _field("evidence_target")
+    business_model = _field("business_model")
+    money = _field("monetization_path")
+    commercial = _field("commercial_evidence_target")
+    risk = _field("risk_summary")
+    why = _field("why_better_than_alternatives")
+    text = " ".join([thesis, outcome, evidence, business_model, money, commercial, risk, why])
+
+    readiness = opportunity.get("toolchain_readiness") if isinstance(opportunity.get("toolchain_readiness"), dict) else {}
+    missing_tools = [str(x) for x in (readiness.get("missing_tools") or []) if str(x).strip()]
+    readiness_status = str(readiness.get("status") or "").strip().lower()
+
+    measurable = _has_any(
+        text,
+        (
+            "metric",
+            "measurable",
+            "before/after",
+            "outcome evidence",
+            "operator-visible",
+            "user-visible",
+            "visible",
+            "capability",
+            "delivery",
+            "selection",
+            "validation",
+            "demo",
+            "clearer",
+            "fewer",
+            "faster",
+            "reduce",
+            "improve",
+        ),
+    )
+    monetization = _has_any(
+        " ".join([business_model, money, commercial, why]),
+        (
+            "revenue",
+            "money",
+            "monetiz",
+            "sell",
+            "sellable",
+            "paid",
+            "rent",
+            "pricing",
+            "buyer",
+            "customer",
+            "save",
+            "saves",
+            "save money",
+            "less waste",
+            "fewer ghost",
+            "profitable",
+            "retention",
+            "lead",
+        ),
+    )
+    validation = (
+        not missing_tools
+        and readiness_status not in {"blocked", "red", "missing"}
+        and _has_any(
+            " ".join([evidence, outcome, commercial, risk]),
+            (
+                "test",
+                "tests",
+                "validation",
+                "validated",
+                "logs",
+                "command",
+                "emulator",
+                "browser",
+                "screenshot",
+                "demo",
+                "runnable",
+                "toolchain",
+                "readiness",
+            ),
+        )
+    )
+    ship_recovery = _has_any(
+        " ".join([outcome, evidence, risk, money, thesis]),
+        (
+            "ship",
+            "shippable",
+            "merge",
+            "push",
+            "deploy",
+            "published",
+            "publication",
+            "github",
+            "remote",
+            "clean git",
+            "recover",
+            "recovery",
+            "blocker",
+            "root cause",
+            "rollback",
+            "private mvp",
+        ),
+    )
+
+    dimensions = {
+        "measurable_factory_or_user_delta": {
+            "ok": bool(measurable),
+            "evidence": _studio_one_line(outcome or thesis, max_chars=180, default="missing measurable outcome"),
+        },
+        "monetization_or_savings_path": {
+            "ok": bool(monetization),
+            "evidence": _studio_one_line(money or business_model or commercial, max_chars=180, default="missing money/savings path"),
+        },
+        "validation_toolchain_readiness": {
+            "ok": bool(validation),
+            "evidence": (
+                f"missing tools: {', '.join(missing_tools)}"
+                if missing_tools
+                else _studio_one_line(evidence or commercial, max_chars=180, default="missing validation/toolchain proof")
+            ),
+        },
+        "ship_recovery_path": {
+            "ok": bool(ship_recovery),
+            "evidence": _studio_one_line(
+                outcome or evidence or risk,
+                max_chars=180,
+                default="missing ship/recovery path",
+            ),
+        },
+    }
+    missing = [
+        label
+        for key, label in _STUDIO_FACTORY_VALUE_DIMENSIONS.items()
+        if not bool(dimensions[key]["ok"])
+    ]
+    ok_count = 4 - len(missing)
+    value_score = int(round((ok_count / 4.0) * 100.0))
+    shipability_score = int(round(((1 if validation else 0) + (1 if ship_recovery else 0)) * 50.0))
+    if missing:
+        score_adjustment = -min(36, 12 * len(missing))
+        summary = f"{ok_count}/4 factory-value dimensions evidenced; missing {', '.join(missing)}."
+    else:
+        score_adjustment = 4
+        summary = "4/4 factory-value dimensions evidenced; value, validation, and shipping path are explicit."
+    return {
+        "version": 1,
+        "dimensions": dimensions,
+        "score": value_score,
+        "shipability_score": shipability_score,
+        "missing_dimensions": missing,
+        "score_adjustment": score_adjustment,
+        "summary": summary,
+    }
+
+
+def _studio_apply_factory_value_assessment(opportunity: dict[str, Any]) -> dict[str, Any]:
+    assessment = _studio_factory_value_assessment(opportunity)
+    opportunity["factory_value"] = assessment
+    try:
+        opportunity["score"] = int(opportunity.get("score") or 0) + int(assessment.get("score_adjustment") or 0)
+    except Exception:
+        opportunity["score"] = int(assessment.get("score_adjustment") or 0)
+    return opportunity
+
+
+def _studio_factory_value_line(assessment: dict[str, Any] | None, *, max_chars: int = 260) -> str:
+    if not isinstance(assessment, dict):
+        return "not assessed"
+    missing = [str(x) for x in (assessment.get("missing_dimensions") or []) if str(x).strip()]
+    missing_text = ", ".join(missing) if missing else "none"
+    return _studio_one_line(
+        f"score={assessment.get('score', 'n/a')}; shipability={assessment.get('shipability_score', 'n/a')}; "
+        f"missing={missing_text}; {assessment.get('summary') or ''}",
+        max_chars=max_chars,
+        default="not assessed",
+    )
+
+
 def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: dict[str, Any]) -> dict[str, Any]:
     repo_name = _studio_repo_display_name(repo)
     kind = _studio_repo_kind(repo)
@@ -17114,7 +17307,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     elif recent_wins:
         why += f" Recent Studio success adds modest confidence: {_studio_one_line('; '.join(recent_wins[:2]), max_chars=160)}."
 
-    return {
+    opportunity = {
         "key": key,
         "lane": "core" if kind == "Core" else ("dashboard" if kind == "Dashboard" else "portfolio"),
         "type": work_type,
@@ -17142,6 +17335,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         "recent_studio_outcome_wins": recent_wins[:3],
         "recent_studio_saturation": recent_saturation[:3],
     }
+    return _studio_apply_factory_value_assessment(opportunity)
 
 
 def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[str, Any]) -> dict[str, Any]:
@@ -17198,7 +17392,7 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         )
         if recent_projects:
             risk += "; avoid duplicating recent products: " + _studio_one_line("; ".join(recent_projects), max_chars=220)
-    return {
+    opportunity = {
         "key": "new-project-incubator",
         "lane": "incubator",
         "type": "NEW_PROJECT",
@@ -17220,6 +17414,7 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         "portfolio_total": portfolio_total,
         "portfolio_recent_projects": recent_projects,
     }
+    return _studio_apply_factory_value_assessment(opportunity)
 
 
 def _studio_build_opportunities(
@@ -17330,6 +17525,11 @@ def _studio_selection_kill_sheet(
         reasons: list[str] = []
         if governor_mode and governor_mode != "normal" and (_candidate_tokens(item) & governor_avoid_keys):
             reasons.append(governor_mode)
+        factory_value = item.get("factory_value") if isinstance(item.get("factory_value"), dict) else {}
+        for missing in (factory_value.get("missing_dimensions") or [])[:3]:
+            missing_text = str(missing or "").strip()
+            if missing_text:
+                reasons.append(f"missing {missing_text}")
         reasons.extend(_risk_reasons(item))
         for risk in (item.get("recent_studio_outcome_risks") or [])[:2]:
             risk_text = _studio_one_line(risk, max_chars=120, default="")
@@ -17366,6 +17566,9 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
 
     rows = [_line(item, idx + 1) for idx, item in enumerate(opportunities)]
     kill_sheet = _studio_selection_kill_sheet(selected, opportunities, memory)
+    selected_factory_value = (
+        selected.get("factory_value") if isinstance(selected.get("factory_value"), dict) else {}
+    )
     recent = "; ".join(str(x) for x in memory.get("recent_outcomes", [])[:4]) or "none"
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
@@ -17428,6 +17631,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"Selected business model: {_studio_one_line(str(selected.get('business_model') or ''), max_chars=260)}",
             f"Selected monetization path: {_studio_one_line(str(selected.get('monetization_path') or ''), max_chars=260)}",
             f"Selected commercial evidence: {_studio_one_line(str(selected.get('commercial_evidence_target') or ''), max_chars=260)}",
+            f"Selected factory value: {_studio_factory_value_line(selected_factory_value, max_chars=300)}",
             "",
             "Mandatory internal debate before delegation:",
             "- Would Alejandro notice this result without reading raw logs?",

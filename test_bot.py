@@ -1735,6 +1735,62 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("Direct revenue", item["business_model"])
         self.assertIn("target customer", item["monetization_path"])
         self.assertIn("target buyer", item["commercial_evidence_target"])
+        self.assertIn("factory_value", item)
+        self.assertEqual(item["factory_value"]["missing_dimensions"], [])
+        self.assertGreaterEqual(item["factory_value"]["score"], 100)
+        self.assertGreaterEqual(item["factory_value"]["shipability_score"], 100)
+
+    def test_factory_value_penalizes_missing_validation_and_ship_path(self) -> None:
+        item = {
+            "key": "weak-bet",
+            "type": "FEATURE",
+            "repo_name": "Weak Bet",
+            "score": 80,
+            "thesis": "Improve a vague internal surface.",
+            "operator_visible_outcome": "A nicer implementation.",
+            "business_model": "Operator savings through less waste.",
+            "monetization_path": "Save money by reducing manual review time.",
+            "commercial_evidence_target": "operator savings",
+            "evidence_target": "brief notes only",
+            "risk_summary": "small bounded change",
+        }
+
+        assessed = bot._studio_apply_factory_value_assessment(item)
+
+        self.assertLess(assessed["score"], 80)
+        self.assertIn("validation/toolchain readiness", assessed["factory_value"]["missing_dimensions"])
+        self.assertIn("ship/recovery path", assessed["factory_value"]["missing_dimensions"])
+        self.assertLess(assessed["factory_value"]["shipability_score"], 100)
+
+    def test_repo_opportunity_factory_value_tracks_toolchain_gap(self) -> None:
+        now = 250_000.0
+        memory = {
+            "studio_readiness": {
+                "repo_checks": [
+                    {
+                        "repo_id": "sampleapp",
+                        "repo_path": "/home/aponce/sampleapp",
+                        "status": "red",
+                        "stacks": ["python"],
+                        "missing_tools": ["pytest"],
+                    }
+                ]
+            }
+        }
+        repo = {
+            "repo_id": "sampleapp",
+            "path": "/home/aponce/sampleapp",
+            "status": "active",
+            "autonomy_enabled": True,
+            "priority": 1,
+            "metadata": {},
+        }
+
+        item = bot._studio_opportunity_for_repo(repo, now=now, memory=memory)
+
+        self.assertIn("factory_value", item)
+        self.assertIn("validation/toolchain readiness", item["factory_value"]["missing_dimensions"])
+        self.assertIn("missing tools: pytest", item["factory_value"]["dimensions"]["validation_toolchain_readiness"]["evidence"])
 
     def test_incubator_opportunity_compounds_when_portfolio_is_fresh(self) -> None:
         item = bot._studio_incubator_opportunity(
@@ -1776,6 +1832,59 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("never as work-for-work's-sake", packet)
         self.assertIn("Selected monetization path", packet)
         self.assertIn("Can this make money", packet)
+
+    def test_prompt_packet_includes_selected_factory_value(self) -> None:
+        selected = {
+            "type": "NEW_PROJECT",
+            "repo_name": "New product incubator",
+            "score": 100,
+            "thesis": "Create a rentable automation product.",
+            "operator_visible_outcome": "A private MVP with validation logs and GitHub publication.",
+            "business_model": "Direct revenue option.",
+            "monetization_path": "Sellable tool for a named buyer.",
+            "commercial_evidence_target": "buyer, price, demo, validation.",
+            "evidence_target": "validation command/log and private GitHub remote.",
+        }
+        selected = bot._studio_apply_factory_value_assessment(selected)
+
+        packet = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory={})
+
+        self.assertIn("Selected factory value:", packet)
+        self.assertIn("shipability=100", packet)
+        self.assertIn("missing=none", packet)
+
+    def test_kill_sheet_names_missing_factory_value_dimensions(self) -> None:
+        selected = {
+            "key": "repo-codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "repo_name": "codexbot",
+            "score": 100,
+            "thesis": "Repair Studio selection.",
+            "operator_visible_outcome": "A clearer selection loop.",
+        }
+        rejected = {
+            "key": "weak-bet",
+            "type": "FEATURE",
+            "repo_name": "Weak Bet",
+            "score": 80,
+            "thesis": "Improve a vague internal surface.",
+            "operator_visible_outcome": "A nicer implementation.",
+            "business_model": "Operator savings.",
+            "monetization_path": "Save review time.",
+            "commercial_evidence_target": "operator savings",
+            "evidence_target": "brief notes only",
+            "risk_summary": "small bounded change",
+            "recent_studio_outcome_risks": [],
+            "recent_studio_saturation": [],
+        }
+        rejected = bot._studio_apply_factory_value_assessment(rejected)
+
+        lines = bot._studio_selection_kill_sheet(selected, [selected, rejected], {})
+
+        self.assertTrue(lines)
+        self.assertIn("missing validation/toolchain readiness", lines[0])
+        self.assertIn("missing ship/recovery path", lines[0])
+        self.assertIn("weaker than selected score 100", lines[0])
 
     def test_prompt_packet_includes_r530_resource_policy(self) -> None:
         selected = {
