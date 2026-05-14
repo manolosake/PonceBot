@@ -18,6 +18,10 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def _write_shipped_artifacts(self, artifacts_dir: Path) -> None:
+        for artifact_name in ["proof.log", "changes.patch", "tests.log", "release.txt"]:
+            self._write_artifact(artifacts_dir, artifact_name)
+
     def _shipped_payload(self, **overrides: object) -> dict:
         payload = {
             "summary": "verified improvement",
@@ -48,8 +52,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
     def test_validate_evidence_passes_with_existing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
-            for artifact_name in ["proof.log", "changes.patch", "tests.log", "release.txt"]:
-                self._write_artifact(artifacts_dir, artifact_name)
+            self._write_shipped_artifacts(artifacts_dir)
             self._write_evidence(artifacts_dir, self._shipped_payload())
 
             ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
@@ -58,6 +61,188 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["artifact_count"], 4)
             self.assertEqual(payload["outcome"], "shipped_to_main")
+
+    def test_validate_evidence_default_allows_missing_factory_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_requires_factory_delta_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_factory_delta=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "factory_delta_missing")
+
+    def test_validate_evidence_requires_factory_delta_fields_when_enabled(self) -> None:
+        cases = [
+            (
+                "capability_changed",
+                {"measurable_delta": "blocked generic terminal bundles", "evidence": "guard test"},
+                "factory_delta_capability_changed_missing",
+            ),
+            (
+                "measurable_delta",
+                {
+                    "capability_changed": "validation requires internal capability delta",
+                    "evidence": "guard test",
+                },
+                "factory_delta_measurable_delta_missing",
+            ),
+            (
+                "evidence",
+                {
+                    "capability_changed": "validation requires internal capability delta",
+                    "measurable_delta": "blocked generic terminal bundles",
+                },
+                "factory_delta_evidence_missing",
+            ),
+        ]
+        for name, factory_delta, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(factory_delta=factory_delta),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_factory_delta=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_validate_evidence_rejects_generic_factory_delta_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    factory_delta={
+                        "capability_changed": "updated backend docs",
+                        "measurable_delta": "blocked generic terminal bundles",
+                        "evidence": "guard test",
+                    },
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_factory_delta=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "factory_delta_capability_not_factory_relevant")
+
+    def test_validate_evidence_rejects_reviewer_probe_generic_factory_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    factory_delta={
+                        "capability_changed": "validation",
+                        "measurable_delta": "done",
+                        "evidence": "proof.log",
+                    },
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_factory_delta=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "factory_delta_capability_changed_too_generic")
+
+    def test_validate_evidence_rejects_generic_factory_delta_fields(self) -> None:
+        cases = [
+            (
+                "capability_changed",
+                {
+                    "capability_changed": "validation",
+                    "measurable_delta": "blocked generic terminal bundles",
+                    "evidence": "test_backend_done_evidence_guard.py",
+                },
+                "factory_delta_capability_changed_too_generic",
+            ),
+            (
+                "measurable_delta",
+                {
+                    "capability_changed": "validation evidence now gates delivery",
+                    "measurable_delta": "done",
+                    "evidence": "test_backend_done_evidence_guard.py",
+                },
+                "factory_delta_measurable_delta_too_generic",
+            ),
+            (
+                "evidence",
+                {
+                    "capability_changed": "validation evidence now gates delivery",
+                    "measurable_delta": "blocked generic terminal bundles",
+                    "evidence": "proof.log",
+                },
+                "factory_delta_evidence_too_generic",
+            ),
+        ]
+        for name, factory_delta, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(factory_delta=factory_delta),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_factory_delta=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_validate_evidence_accepts_relevant_factory_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    factory_delta={
+                        "capability_changed": "validation and learning evidence now gates delivery",
+                        "measurable_delta": "generic terminal bundles fail without explicit delta",
+                        "evidence": "test_backend_done_evidence_guard.py",
+                    },
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_factory_delta=True,
+            )
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
 
     def test_validate_evidence_fails_when_shipped_outcome_missing_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:

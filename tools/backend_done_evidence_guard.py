@@ -15,6 +15,49 @@ ROOT_CAUSED_TERMINAL_OUTCOMES = {
     "failed_root_caused",
 }
 VALID_OUTCOMES = DELIVERED_OUTCOMES | ROOT_CAUSED_TERMINAL_OUTCOMES
+FACTORY_CAPABILITY_FAMILIES = {
+    "choose",
+    "selection",
+    "delegate",
+    "validation",
+    "merge",
+    "ship",
+    "deploy",
+    "learn",
+    "governor",
+    "studio",
+    "autonomy",
+    "outcome",
+    "delivery",
+    "quality",
+    "revenue",
+}
+FACTORY_DELTA_PLACEHOLDERS = {
+    "done",
+    "n/a",
+    "na",
+    "none",
+    "todo",
+    "tbd",
+    "proof",
+    "proof.log",
+    "test",
+    "tests",
+    "validation",
+    "quality",
+    "delivery",
+    "ship",
+    "learn",
+    "merge",
+    "deploy",
+    "selection",
+    "delegate",
+    "outcome",
+    "studio",
+    "governor",
+    "autonomy",
+    "revenue",
+}
 
 
 def _is_absolute_artifact_path(raw_path: str) -> bool:
@@ -42,6 +85,28 @@ def _has_non_empty_text_list(value: Any) -> bool:
     return isinstance(value, list) and any(_has_text(item) for item in value)
 
 
+def _is_substantive_factory_delta_text(value: Any) -> bool:
+    if not _has_text(value):
+        return False
+    text = str(value).strip()
+    if text.lower() in FACTORY_DELTA_PLACEHOLDERS:
+        return False
+    words = text.split()
+    non_space_chars = sum(1 for char in text if not char.isspace())
+    return len(words) >= 2 or non_space_chars >= 16
+
+
+def _parse_bool_flag(value: str | bool | None) -> bool:
+    if value is True or value is None:
+        return True
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected one of on/off, true/false, yes/no, or 1/0; got {value!r}")
+
+
 def _has_diff_evidence(delivery_contract: dict[str, Any]) -> bool:
     return (
         _has_text(delivery_contract.get("diff_artifact"))
@@ -60,6 +125,74 @@ def _has_ship_evidence(delivery_contract: dict[str, Any]) -> bool:
     return _has_text(delivery_contract.get("ship_evidence")) or _has_non_empty_text_list(
         delivery_contract.get("ship_artifacts")
     )
+
+
+def _factory_delta_error(
+    *,
+    payload: dict[str, Any],
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    factory_delta = payload.get("factory_delta")
+    if not isinstance(factory_delta, dict):
+        return {
+            "ok": False,
+            "reason": "factory_delta_missing",
+            "summary_path": str(summary_path),
+        }
+
+    capability_changed = factory_delta.get("capability_changed")
+    if not _has_text(capability_changed):
+        return {
+            "ok": False,
+            "reason": "factory_delta_capability_changed_missing",
+            "summary_path": str(summary_path),
+        }
+    if not _has_text(factory_delta.get("measurable_delta")):
+        return {
+            "ok": False,
+            "reason": "factory_delta_measurable_delta_missing",
+            "summary_path": str(summary_path),
+        }
+    if not _has_text(factory_delta.get("evidence")):
+        return {
+            "ok": False,
+            "reason": "factory_delta_evidence_missing",
+            "summary_path": str(summary_path),
+        }
+    if not _is_substantive_factory_delta_text(capability_changed):
+        return {
+            "ok": False,
+            "reason": "factory_delta_capability_changed_too_generic",
+            "summary_path": str(summary_path),
+            "capability_changed": str(capability_changed).strip(),
+        }
+    measurable_delta = factory_delta.get("measurable_delta")
+    if not _is_substantive_factory_delta_text(measurable_delta):
+        return {
+            "ok": False,
+            "reason": "factory_delta_measurable_delta_too_generic",
+            "summary_path": str(summary_path),
+            "measurable_delta": str(measurable_delta).strip(),
+        }
+    evidence = factory_delta.get("evidence")
+    if not _is_substantive_factory_delta_text(evidence):
+        return {
+            "ok": False,
+            "reason": "factory_delta_evidence_too_generic",
+            "summary_path": str(summary_path),
+            "evidence": str(evidence).strip(),
+        }
+
+    normalized_capability = str(capability_changed).strip().lower()
+    if not any(family in normalized_capability for family in FACTORY_CAPABILITY_FAMILIES):
+        return {
+            "ok": False,
+            "reason": "factory_delta_capability_not_factory_relevant",
+            "summary_path": str(summary_path),
+            "capability_changed": str(capability_changed).strip(),
+        }
+
+    return None
 
 
 def _check_artifact_references(
@@ -164,6 +297,7 @@ def validate_evidence(
     summary_name: str = "final_evidence.json",
     allow_empty_artifacts: bool = False,
     allow_missing_files: bool = False,
+    require_factory_delta: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     artifacts_root = artifacts_dir.expanduser().resolve()
     summary_path = (artifacts_root / summary_name).resolve()
@@ -345,6 +479,11 @@ def validate_evidence(
             "outcome": outcome,
         }
 
+    if require_factory_delta:
+        factory_delta_error = _factory_delta_error(payload=payload, summary_path=summary_path)
+        if factory_delta_error is not None:
+            return False, factory_delta_error
+
     return True, {
         "ok": True,
         "summary_path": str(summary_path),
@@ -360,6 +499,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--summary-name", default="final_evidence.json", help="summary filename inside artifacts dir")
     parser.add_argument("--allow-empty-artifacts", action="store_true", help="accept empty artifacts list")
     parser.add_argument("--allow-missing-files", action="store_true", help="skip existence checks for listed artifacts")
+    parser.add_argument(
+        "--require-factory-delta",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_parse_bool_flag,
+        help="require final_evidence.json to state an explicit factory capability delta",
+    )
     args = parser.parse_args(argv)
 
     ok, payload = validate_evidence(
@@ -367,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_name=str(args.summary_name or "final_evidence.json").strip() or "final_evidence.json",
         allow_empty_artifacts=bool(args.allow_empty_artifacts),
         allow_missing_files=bool(args.allow_missing_files),
+        require_factory_delta=bool(args.require_factory_delta),
     )
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return 0 if ok else 2
