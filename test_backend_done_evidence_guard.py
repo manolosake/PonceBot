@@ -61,6 +61,55 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
         commercial_evidence.update(overrides)
         return commercial_evidence
 
+    def _studio_decision_evidence(self, **overrides: object) -> dict:
+        studio_decision_evidence = {
+            "candidate_bets": [
+                {
+                    "id": "tighten-final-guard",
+                    "summary": "add validation gate that blocks weak backend completion evidence",
+                },
+                {
+                    "id": "expand-routing-signal",
+                    "thesis": "improve factory selection by making routing intent explicit",
+                },
+                {
+                    "id": "summarize-ci-failures",
+                    "expected_delta": "reduce job churn by surfacing actionable failure causes",
+                },
+            ],
+            "killed_bets": [
+                {
+                    "id": "expand-routing-signal",
+                    "reason": "lower leverage because it does not validate final decision quality",
+                },
+                {
+                    "id": "summarize-ci-failures",
+                    "reason": "deferred because current churn is from weak completion evidence",
+                },
+            ],
+            "selected_bet": {
+                "id": "tighten-final-guard",
+                "reason": "highest leverage because it stops unsupported backend completions",
+            },
+            "critic_answers": [
+                {
+                    "question": "Does this reduce churn?",
+                    "answer": "yes, it rejects summaries without explicit studio decision evidence",
+                },
+                {
+                    "question": "Is the schema auditable?",
+                    "answer": "yes, stable reason codes identify each missing decision field",
+                },
+                {
+                    "question": "Can terminal outcomes still pass?",
+                    "answer": "yes, rejected or root-caused outcomes pass with the same evidence",
+                },
+            ],
+            "debate_summary": "selected the guard because evidence validation directly reduces churn",
+        }
+        studio_decision_evidence.update(overrides)
+        return studio_decision_evidence
+
     def test_validate_evidence_passes_with_existing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
@@ -94,6 +143,291 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
 
             self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_default_allows_missing_studio_decision_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_requires_studio_decision_evidence_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_studio_decision_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "studio_decision_evidence_missing")
+
+    def test_validate_evidence_accepts_valid_studio_decision_evidence_for_shipped_outcome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    studio_decision_evidence=self._studio_decision_evidence()
+                ),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_studio_decision_evidence=True,
+            )
+
+            self.assertTrue(ok)
+            self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_accepts_valid_studio_decision_evidence_for_terminal_outcomes(
+        self,
+    ) -> None:
+        for outcome in ("failed_root_caused", "rejected_low_value"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_artifact(artifacts_dir, "proof.log")
+                self._write_evidence(
+                    artifacts_dir,
+                    self._root_caused_payload(
+                        outcome=outcome,
+                        studio_decision_evidence=self._studio_decision_evidence(
+                            critic_answers={
+                                "risk": "the selected guard has limited blast radius",
+                                "value": "the selected guard reduces repeated low-value completions",
+                                "fallback": "the gate remains optional for existing workflows",
+                            }
+                        ),
+                    ),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_studio_decision_evidence=True,
+                )
+
+                self.assertTrue(ok)
+                self.assertTrue(payload["ok"])
+
+    def test_validate_evidence_rejects_too_few_studio_candidate_bets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            evidence = self._studio_decision_evidence()
+            evidence["candidate_bets"] = evidence["candidate_bets"][:2]
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(studio_decision_evidence=evidence),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_studio_decision_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "studio_decision_candidate_bets_too_few")
+
+    def test_validate_evidence_rejects_unknown_or_killed_selected_studio_bet(self) -> None:
+        cases = [
+            (
+                "unknown",
+                {"id": "missing-bet", "reason": "stronger because it reduces churn fastest"},
+                "studio_decision_selected_bet_unknown",
+            ),
+            (
+                "killed",
+                {
+                    "id": "expand-routing-signal",
+                    "reason": "stronger because it reduces churn fastest",
+                },
+                "studio_decision_selected_bet_killed",
+            ),
+        ]
+        for name, selected_bet, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(
+                        studio_decision_evidence=self._studio_decision_evidence(
+                            selected_bet=selected_bet
+                        )
+                    ),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_studio_decision_evidence=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_validate_evidence_rejects_unknown_killed_studio_bet(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            evidence = self._studio_decision_evidence()
+            evidence["killed_bets"].append(
+                {
+                    "id": "unlisted-bet",
+                    "reason": "rejected because it was not part of the candidate set",
+                }
+            )
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(studio_decision_evidence=evidence),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_studio_decision_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "studio_decision_killed_bet_unknown")
+
+    def test_validate_evidence_rejects_unresolved_non_selected_studio_bet(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            evidence = self._studio_decision_evidence()
+            evidence["killed_bets"] = evidence["killed_bets"][:1]
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(studio_decision_evidence=evidence),
+            )
+
+            ok, payload = validate_evidence(
+                artifacts_dir=artifacts_dir,
+                require_studio_decision_evidence=True,
+            )
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "studio_decision_candidate_bet_unresolved")
+            self.assertEqual(payload["candidate_bet_ids"], ["summarize-ci-failures"])
+
+    def test_validate_evidence_rejects_weak_studio_decision_evidence_fields(self) -> None:
+        cases = [
+            (
+                "killed_reason",
+                {"killed_bets": [{"id": "expand-routing-signal", "reason": "done"}]},
+                "studio_decision_killed_bet_reason_missing",
+            ),
+            (
+                "critic_answers",
+                {
+                    "critic_answers": [
+                        {"answer": "yes"},
+                        {"answer": "done"},
+                        {"answer": "proof.log"},
+                    ]
+                },
+                "studio_decision_critic_answers_missing",
+            ),
+            (
+                "debate_summary",
+                {"debate_summary": "done"},
+                "studio_decision_debate_summary_missing",
+            ),
+        ]
+        for name, overrides, reason in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                artifacts_dir = Path(td)
+                self._write_shipped_artifacts(artifacts_dir)
+                self._write_evidence(
+                    artifacts_dir,
+                    self._shipped_payload(
+                        studio_decision_evidence=self._studio_decision_evidence(**overrides)
+                    ),
+                )
+
+                ok, payload = validate_evidence(
+                    artifacts_dir=artifacts_dir,
+                    require_studio_decision_evidence=True,
+                )
+
+                self.assertFalse(ok)
+                self.assertEqual(payload["reason"], reason)
+
+    def test_main_require_studio_decision_evidence_false_allows_missing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                        "--require-studio-decision-evidence=false",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertTrue(payload["ok"])
+
+    def test_main_require_studio_decision_evidence_bare_flag_rejects_missing_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(artifacts_dir, self._shipped_payload())
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                        "--require-studio-decision-evidence",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["reason"], "studio_decision_evidence_missing")
+
+    def test_main_require_studio_decision_evidence_true_accepts_valid_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            self._write_evidence(
+                artifacts_dir,
+                self._shipped_payload(
+                    studio_decision_evidence=self._studio_decision_evidence()
+                ),
+            )
+            stdout = StringIO()
+
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "--artifacts-dir",
+                        str(artifacts_dir),
+                        "--require-studio-decision-evidence=true",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(stdout.getvalue())
             self.assertTrue(payload["ok"])
 
     def test_validate_evidence_requires_commercial_evidence_when_enabled(self) -> None:

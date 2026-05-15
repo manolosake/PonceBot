@@ -109,6 +109,17 @@ COMMERCIAL_RELEVANCE_TOKEN_VARIANTS = {
     "learning": {"learn", "learns", "learned", "learning"},
     "speed": {"speed", "speeds"},
 }
+STUDIO_CANDIDATE_TEXT_KEYS = (
+    "summary",
+    "thesis",
+    "expected_delta",
+    "reason",
+    "rationale",
+    "why",
+    "value",
+    "impact",
+)
+STUDIO_REASON_KEYS = ("reason", "rationale", "why", "explanation")
 
 
 def _is_absolute_artifact_path(raw_path: str) -> bool:
@@ -322,6 +333,192 @@ def _commercial_evidence_error(
     return None
 
 
+def _substantive_studio_text(value: Any) -> bool:
+    return _is_substantive_factory_delta_text(value)
+
+
+def _entry_id(entry: dict[str, Any]) -> str:
+    return str(entry.get("id") or "").strip()
+
+
+def _has_substantive_value_for_any_key(entry: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    return any(_substantive_studio_text(entry.get(key)) for key in keys)
+
+
+def _has_substantive_critic_answers(critic_answers: Any) -> bool:
+    if isinstance(critic_answers, list):
+        substantive_count = 0
+        for item in critic_answers:
+            if isinstance(item, dict) and _substantive_studio_text(item.get("answer")):
+                substantive_count += 1
+        return substantive_count >= 3
+
+    if isinstance(critic_answers, dict):
+        substantive_count = sum(
+            1 for value in critic_answers.values() if _substantive_studio_text(value)
+        )
+        return substantive_count >= 3
+
+    return False
+
+
+def _studio_decision_evidence_error(
+    *,
+    payload: dict[str, Any],
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    studio_decision_evidence = payload.get("studio_decision_evidence")
+    if not isinstance(studio_decision_evidence, dict):
+        return {
+            "ok": False,
+            "reason": "studio_decision_evidence_missing",
+            "summary_path": str(summary_path),
+        }
+
+    candidate_bets = studio_decision_evidence.get("candidate_bets")
+    if not isinstance(candidate_bets, list):
+        return {
+            "ok": False,
+            "reason": "studio_decision_candidate_bets_missing",
+            "summary_path": str(summary_path),
+        }
+    if len(candidate_bets) < 3:
+        return {
+            "ok": False,
+            "reason": "studio_decision_candidate_bets_too_few",
+            "summary_path": str(summary_path),
+            "candidate_bet_count": len(candidate_bets),
+        }
+
+    candidate_ids: set[str] = set()
+    for index, candidate in enumerate(candidate_bets):
+        if not isinstance(candidate, dict):
+            return {
+                "ok": False,
+                "reason": "studio_decision_candidate_bet_not_object",
+                "summary_path": str(summary_path),
+                "candidate_index": index,
+            }
+        candidate_id = _entry_id(candidate)
+        if not candidate_id:
+            return {
+                "ok": False,
+                "reason": "studio_decision_candidate_bet_id_missing",
+                "summary_path": str(summary_path),
+                "candidate_index": index,
+            }
+        if candidate_id in candidate_ids:
+            return {
+                "ok": False,
+                "reason": "studio_decision_candidate_bet_id_duplicate",
+                "summary_path": str(summary_path),
+                "candidate_id": candidate_id,
+            }
+        if not _has_substantive_value_for_any_key(candidate, STUDIO_CANDIDATE_TEXT_KEYS):
+            return {
+                "ok": False,
+                "reason": "studio_decision_candidate_bet_text_missing",
+                "summary_path": str(summary_path),
+                "candidate_id": candidate_id,
+            }
+        candidate_ids.add(candidate_id)
+
+    killed_bets = studio_decision_evidence.get("killed_bets")
+    if not isinstance(killed_bets, list) or not killed_bets:
+        return {
+            "ok": False,
+            "reason": "studio_decision_killed_bets_missing",
+            "summary_path": str(summary_path),
+        }
+
+    killed_ids: set[str] = set()
+    for index, killed_bet in enumerate(killed_bets):
+        if not isinstance(killed_bet, dict):
+            return {
+                "ok": False,
+                "reason": "studio_decision_killed_bet_not_object",
+                "summary_path": str(summary_path),
+                "killed_bet_index": index,
+            }
+        killed_id = _entry_id(killed_bet)
+        if not killed_id:
+            return {
+                "ok": False,
+                "reason": "studio_decision_killed_bet_id_missing",
+                "summary_path": str(summary_path),
+                "killed_bet_index": index,
+            }
+        if killed_id not in candidate_ids:
+            return {
+                "ok": False,
+                "reason": "studio_decision_killed_bet_unknown",
+                "summary_path": str(summary_path),
+                "killed_bet_id": killed_id,
+            }
+        if not _has_substantive_value_for_any_key(killed_bet, STUDIO_REASON_KEYS):
+            return {
+                "ok": False,
+                "reason": "studio_decision_killed_bet_reason_missing",
+                "summary_path": str(summary_path),
+                "killed_bet_id": killed_id,
+            }
+        killed_ids.add(killed_id)
+
+    selected_bet = studio_decision_evidence.get("selected_bet")
+    if not isinstance(selected_bet, dict):
+        return {
+            "ok": False,
+            "reason": "studio_decision_selected_bet_missing",
+            "summary_path": str(summary_path),
+        }
+    selected_id = _entry_id(selected_bet)
+    if not selected_id or not _has_substantive_value_for_any_key(selected_bet, STUDIO_REASON_KEYS):
+        return {
+            "ok": False,
+            "reason": "studio_decision_selected_bet_missing",
+            "summary_path": str(summary_path),
+        }
+    if selected_id not in candidate_ids:
+        return {
+            "ok": False,
+            "reason": "studio_decision_selected_bet_unknown",
+            "summary_path": str(summary_path),
+            "selected_bet_id": selected_id,
+        }
+    if selected_id in killed_ids:
+        return {
+            "ok": False,
+            "reason": "studio_decision_selected_bet_killed",
+            "summary_path": str(summary_path),
+            "selected_bet_id": selected_id,
+        }
+    unresolved_candidate_ids = candidate_ids - killed_ids - {selected_id}
+    if unresolved_candidate_ids:
+        return {
+            "ok": False,
+            "reason": "studio_decision_candidate_bet_unresolved",
+            "summary_path": str(summary_path),
+            "candidate_bet_ids": sorted(unresolved_candidate_ids),
+        }
+
+    if not _has_substantive_critic_answers(studio_decision_evidence.get("critic_answers")):
+        return {
+            "ok": False,
+            "reason": "studio_decision_critic_answers_missing",
+            "summary_path": str(summary_path),
+        }
+
+    debate_summary = studio_decision_evidence.get("debate_summary")
+    if not _substantive_studio_text(debate_summary):
+        return {
+            "ok": False,
+            "reason": "studio_decision_debate_summary_missing",
+            "summary_path": str(summary_path),
+        }
+
+    return None
+
+
 def _check_artifact_references(
     *,
     artifacts_root: Path,
@@ -426,6 +623,7 @@ def validate_evidence(
     allow_missing_files: bool = False,
     require_factory_delta: bool = False,
     require_commercial_evidence: bool = False,
+    require_studio_decision_evidence: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     artifacts_root = artifacts_dir.expanduser().resolve()
     summary_path = (artifacts_root / summary_name).resolve()
@@ -620,6 +818,14 @@ def validate_evidence(
         if commercial_evidence_error is not None:
             return False, commercial_evidence_error
 
+    if require_studio_decision_evidence:
+        studio_decision_evidence_error = _studio_decision_evidence_error(
+            payload=payload,
+            summary_path=summary_path,
+        )
+        if studio_decision_evidence_error is not None:
+            return False, studio_decision_evidence_error
+
     return True, {
         "ok": True,
         "summary_path": str(summary_path),
@@ -651,6 +857,14 @@ def main(argv: list[str] | None = None) -> int:
         type=_parse_bool_flag,
         help="require final_evidence.json to state explicit commercial or factory-value evidence",
     )
+    parser.add_argument(
+        "--require-studio-decision-evidence",
+        nargs="?",
+        const=True,
+        default=False,
+        type=_parse_bool_flag,
+        help="require final_evidence.json to include studio decision evidence",
+    )
     args = parser.parse_args(argv)
 
     ok, payload = validate_evidence(
@@ -660,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_missing_files=bool(args.allow_missing_files),
         require_factory_delta=bool(args.require_factory_delta),
         require_commercial_evidence=bool(args.require_commercial_evidence),
+        require_studio_decision_evidence=bool(args.require_studio_decision_evidence),
     )
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return 0 if ok else 2
