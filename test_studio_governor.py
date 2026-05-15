@@ -746,6 +746,24 @@ def test_controller_snapshot_delivery_candidate_accepts_published_project_summar
     assert candidate["patch_path"] == str(patch)
 
 
+def test_controller_snapshot_delivery_candidate_reports_expected_missing_patch(tmp_path):
+    snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
+    snapshot.mkdir(parents=True)
+    patch = snapshot.parent / "changes.patch"
+
+    candidate = bot._controller_snapshot_delivery_candidate(
+        {
+            "controller_snapshot_workdir": str(snapshot),
+            "merge_cancelled": True,
+            "result_summary": "PASS implementation/review. Outcome: blocked_need_operator.",
+            "result_next_action": "Apply the validated changes into the real repository checkout, commit, push, and deploy.",
+        }
+    )
+
+    assert candidate["snapshot_dir"] == str(snapshot)
+    assert candidate["patch_path"] == str(patch)
+
+
 def test_controller_snapshot_delivery_candidate_accepts_nested_structured_digest_metadata(tmp_path):
     snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
     snapshot.mkdir(parents=True)
@@ -980,6 +998,53 @@ def test_auto_merge_tick_root_causes_pre_deploy_controller_snapshot_autoship_fai
         "failed",
         "failed_root_caused",
         "Controller snapshot autoship failed_root_caused: snapshot patch check failed (reason=snapshot_patch_check_failed). Detail: error: patch failed: app.py:12",
+    )
+
+
+def test_auto_merge_tick_root_causes_missing_controller_snapshot_patch(tmp_path, monkeypatch):
+    now = 2_000.0
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+    missing_patch = tmp_path / "changes.patch"
+    missing_patch.unlink()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    trace = dict(orch_q.get_job(order_id).trace or {})
+    candidate = bot._controller_snapshot_delivery_candidate(trace)
+    assert candidate["patch_path"] == str(missing_patch)
+
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, repo, "main"))
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    assert merged == 0
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "failed"
+    assert order["phase"] == "failed"
+    assert job.state == "failed"
+    assert job.trace["result_status"] == "failed_root_caused"
+    assert "missing controller snapshot artifacts" in job.trace["result_summary"]
+    assert job.trace["result_next_action"] == "Regenerate the controller snapshot artifacts and ensure changes.patch is present."
+    assert job.trace["controller_snapshot_autoship_error"] == {
+        "status": "failed",
+        "reason": "missing_snapshot_artifacts",
+    }
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    assert row == (
+        "failed",
+        "failed_root_caused",
+        "Controller snapshot autoship failed_root_caused: missing controller snapshot artifacts (reason=missing_snapshot_artifacts).",
     )
 
 

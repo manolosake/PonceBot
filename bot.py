@@ -14948,14 +14948,15 @@ def _controller_snapshot_delivery_candidate(trace: dict[str, Any] | None) -> dic
                 artifacts.append(path)
 
     snapshot = Path(snapshot_raw).expanduser()
-    patch_paths = [Path(path).expanduser() for path in artifacts if Path(str(path)).name == "changes.patch"]
+    artifact_patch_paths = [Path(path).expanduser() for path in artifacts if Path(str(path)).name == "changes.patch"]
+    patch_paths = list(artifact_patch_paths)
     fallback_patch = snapshot.parent / "changes.patch"
     if fallback_patch not in patch_paths:
         patch_paths.append(fallback_patch)
 
     patch = next((path for path in patch_paths if path.exists() and path.is_file() and path.stat().st_size > 0), None)
     if patch is None:
-        return {}
+        patch = artifact_patch_paths[0] if artifact_patch_paths else fallback_patch
     return {"snapshot_dir": str(snapshot), "patch_path": str(patch)}
 
 
