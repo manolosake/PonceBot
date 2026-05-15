@@ -15071,7 +15071,10 @@ def _recent_controller_snapshot_studio_order_rows(
                 WHERE sc.updated_at >= ?
                   AND sc.order_id IS NOT NULL
                   AND sc.outcome_status IN ('failed_root_caused', 'blocked_need_operator')
-                  AND j.trace LIKE '%controller_snapshot_workdir%'
+                  AND (
+                      j.trace LIKE '%controller_snapshot_workdir%'
+                      OR j.trace LIKE '%"controller_snapshot"%'
+                  )
                 ORDER BY sc.updated_at DESC
                 LIMIT ?
                 """,

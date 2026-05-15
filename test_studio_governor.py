@@ -832,6 +832,50 @@ def test_recent_controller_snapshot_rows_use_studio_updated_at_for_recovery(tmp_
     assert rows[0]["updated_at"] == 2_000.0
 
 
+def test_recent_controller_snapshot_rows_include_nested_snapshot_metadata(tmp_path):
+    db = tmp_path / "jobs.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE studio_cycles (order_id TEXT, status TEXT, outcome_status TEXT, updated_at REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE ceo_orders (order_id TEXT, chat_id INTEGER, status TEXT, phase TEXT, title TEXT, updated_at REAL)"
+        )
+        conn.execute("CREATE TABLE jobs (job_id TEXT, trace TEXT)")
+        conn.execute(
+            "INSERT INTO studio_cycles VALUES (?, ?, ?, ?)",
+            ("order-1", "active", "blocked_need_operator", 2_000.0),
+        )
+        conn.execute(
+            "INSERT INTO ceo_orders VALUES (?, ?, ?, ?, ?, ?)",
+            ("order-1", 123, "done", "done", "Snapshot order", 100.0),
+        )
+        conn.execute(
+            "INSERT INTO jobs VALUES (?, ?)",
+            (
+                "order-1",
+                json.dumps(
+                    {
+                        "structured_digest": {
+                            "controller_snapshot": {"workdir": "/tmp/snapshot"},
+                            "controller_recovery_artifacts": ["/tmp/changes.patch"],
+                        }
+                    }
+                ),
+            ),
+        )
+
+    orch_q = SimpleNamespace(_storage=SimpleNamespace(path=db))
+    rows = bot._recent_controller_snapshot_studio_order_rows(
+        orch_q=orch_q,
+        now=2_100.0,
+        max_age_seconds=300.0,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["order_id"] == "order-1"
+
+
 def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0):
     db = tmp_path / "jobs.sqlite"
     storage = SQLiteTaskStorage(db)
