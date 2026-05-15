@@ -1092,6 +1092,75 @@ def test_auto_merge_tick_recovers_aged_controller_snapshot_blocker_within_72h(tm
     assert "patch aged but recoverable" in job.trace["result_summary"]
 
 
+def test_controller_snapshot_autoship_success_records_shipped_to_main(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    patch = tmp_path / "changes.patch"
+    patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+    recorded = {}
+
+    class RecordingQueue:
+        def set_order_status(self, order_id, *, chat_id, status):
+            recorded["order_status"] = (order_id, chat_id, status)
+
+        def set_order_phase(self, order_id, *, chat_id, phase):
+            recorded["order_phase"] = (order_id, chat_id, phase)
+
+        def update_state(self, order_id, state, **kwargs):
+            recorded["state"] = (order_id, state)
+            recorded["trace"] = kwargs
+
+        def append_audit_event(self, **kwargs):
+            recorded["audit"] = kwargs
+
+    monkeypatch.setattr(bot, "_sync_repo_checkout_to_default_branch", lambda **kwargs: (True, "", None, None))
+    monkeypatch.setattr(bot, "_git_status_porcelain", lambda _repo: "")
+    monkeypatch.setattr(
+        bot,
+        "_run_git",
+        lambda _repo, args, **kwargs: SimpleNamespace(
+            returncode=(0 if args[:3] == ["apply", "--reverse", "--check"] else 1),
+            stdout=("abc123\n" if args[:2] == ["rev-parse", "--short"] else ""),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "_deploy_after_order_merge",
+        lambda **kwargs: {"status": "ok", "reason": "noop", "summary": "Deploy skipped."},
+    )
+    monkeypatch.setattr(bot, "_studio_complete_cycle_for_order", lambda **kwargs: recorded.setdefault("studio", kwargs))
+
+    result = bot._auto_ship_controller_snapshot_order(
+        cfg=SimpleNamespace(),
+        orch_q=RecordingQueue(),
+        order_id="snapshot-order",
+        chat_id=123,
+        trace={
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_status": "blocked_need_operator",
+            "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot.",
+        },
+        repo_record=None,
+        repo_dir=repo,
+        default_branch="main",
+        now=2_000.0,
+    )
+
+    assert result["status"] == "ok"
+    assert result["reason"] == "snapshot_patch_already_applied"
+    assert recorded["order_status"] == ("snapshot-order", 123, "done")
+    assert recorded["order_phase"] == ("snapshot-order", 123, "done")
+    assert recorded["state"] == ("snapshot-order", "done")
+    assert recorded["trace"]["result_status"] == "shipped_to_main"
+    assert recorded["trace"]["controller_snapshot_autoship_done"] is True
+    assert recorded["studio"]["outcome_status"] == "shipped_to_main"
+
+
 def test_controller_snapshot_autoship_success_reports_persistence_failure_after_push(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

@@ -15215,7 +15215,7 @@ def _auto_ship_controller_snapshot_order(
                     controller_snapshot_autoship_already_applied=True,
                     controller_snapshot_autoship_at=float(now),
                     controller_snapshot_autoship_commit=(commit_sha or None),
-                    result_status=("merged" if ok else "deploy_failed"),
+                    result_status=("shipped_to_main" if ok else "deploy_failed"),
                     result_summary=summary,
                     result_next_action=("Factory ready for next order." if ok else "Inspect deployment failure and complete rollout."),
                 )
@@ -15367,7 +15367,7 @@ def _auto_ship_controller_snapshot_order(
             controller_snapshot_autoship_paths=changed_paths,
             controller_snapshot_autoship_copied_untracked=copied_untracked,
             controller_snapshot_autoship_validation=validation_results,
-            result_status=("merged" if ok else "deploy_failed"),
+            result_status=("shipped_to_main" if ok else "deploy_failed"),
             result_summary=summary,
             result_next_action=("Factory ready for next order." if ok else "Inspect deployment failure and complete rollout."),
         )
