@@ -4085,6 +4085,56 @@ path_is_protected() {
   return 1
 }
 
+path_is_pytest_temp() {
+  candidate="$(normalize_path "$1")" || return 1
+  old_ifs="$IFS"
+  IFS=":"
+  for root in $guard_roots; do
+    [ -n "$root" ] || continue
+    root_path="$(normalize_path "$root")" || continue
+    case "$candidate" in
+      "$root_path"/.codexbot_tmp/pytest-of-*|"$root_path"/.codexbot_tmp/pytest-of-*/*|"$root_path"/.codexbot_tmp/pytest-*|"$root_path"/.codexbot_tmp/pytest-*/*)
+        IFS="$old_ifs"
+        return 0
+        ;;
+    esac
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+command_worktree_toplevel() {
+  if [ -n "$git_dir" ] && [ -n "$work_tree" ]; then
+    "$real_git" -C "$target_cwd" --git-dir="$git_dir" --work-tree="$work_tree" rev-parse --show-toplevel 2>/dev/null
+    return $?
+  fi
+  if [ -n "$work_tree" ]; then
+    "$real_git" -C "$target_cwd" --work-tree="$work_tree" rev-parse --show-toplevel 2>/dev/null
+    return $?
+  fi
+  if [ -n "$git_dir" ]; then
+    "$real_git" -C "$target_cwd" --git-dir="$git_dir" rev-parse --show-toplevel 2>/dev/null
+    return $?
+  fi
+  "$real_git" -C "$target_cwd" rev-parse --show-toplevel 2>/dev/null
+}
+
+path_is_allowed_pytest_worktree() {
+  [ -n "${PYTEST_CURRENT_TEST:-}" ] || return 1
+  path_is_pytest_temp "$1" || return 1
+  top_level="$(command_worktree_toplevel)" || return 1
+  top_level="$(normalize_path "$top_level")" || return 1
+  path_is_pytest_temp "$top_level" || return 1
+  return 0
+}
+
+protected_path_blocked() {
+  [ -n "$1" ] || return 1
+  path_is_protected "$1" || return 1
+  path_is_allowed_pytest_worktree "$1" && return 1
+  return 0
+}
+
 for arg in "$@"; do
   if [ "$skip_next" = "1" ]; then
     case "$prev_arg" in
@@ -4139,9 +4189,9 @@ done
 case "$cmd" in
   add|am|apply|bisect|branch|checkout|cherry-pick|clean|clone|commit|fetch|merge|mv|pull|push|rebase|reset|restore|revert|rm|stash|switch|tag|worktree)
     if [ -n "$guard_roots" ] && {
-      path_is_protected "$target_cwd" ||
-      path_is_protected "$git_dir" ||
-      path_is_protected "$work_tree"
+      protected_path_blocked "$target_cwd" ||
+      protected_path_blocked "$git_dir" ||
+      protected_path_blocked "$work_tree"
     }; then
       echo "PonceBot controller git write guard blocked: git $cmd" >&2
       exit 126
