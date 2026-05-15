@@ -15320,6 +15320,154 @@ def _auto_ship_controller_snapshot_order(
     }
 
 
+def _controller_snapshot_autoship_failure_outcome(autoship: dict[str, Any]) -> tuple[str, str, str]:
+    reason = str((autoship or {}).get("reason") or "unknown").strip() or "unknown"
+    detail = str((autoship or {}).get("detail") or "").strip()
+    deploy = (autoship or {}).get("deploy") if isinstance((autoship or {}).get("deploy"), dict) else {}
+    validation = (autoship or {}).get("validation") if isinstance((autoship or {}).get("validation"), list) else []
+
+    reason_labels = {
+        "missing_snapshot_artifacts": "missing controller snapshot artifacts",
+        "repo_sync_failed": "repository sync failed before autoship",
+        "repo_dirty_before_snapshot_autoship": "repository was dirty before autoship",
+        "snapshot_patch_check_failed": "snapshot patch check failed",
+        "snapshot_patch_apply_failed": "snapshot patch apply failed",
+        "snapshot_validation_failed": "snapshot validation failed",
+        "snapshot_git_add_failed": "git add failed after applying snapshot",
+        "snapshot_commit_failed": "snapshot commit failed",
+        "snapshot_push_failed": "snapshot push failed",
+        "snapshot_already_applied_deploy_failed": "already-applied snapshot deploy failed",
+        "snapshot_autoship_deploy_failed": "snapshot deploy failed after push",
+    }
+    label = reason_labels.get(reason, reason.replace("_", " "))
+    evidence = detail
+
+    if reason == "snapshot_validation_failed" and validation:
+        def _validation_failed(item: Any) -> bool:
+            if not isinstance(item, dict):
+                return False
+            try:
+                return int(item.get("returncode") or 0) != 0
+            except Exception:
+                return True
+
+        first_failed = next(
+            (
+                item
+                for item in validation
+                if _validation_failed(item)
+            ),
+            validation[0] if isinstance(validation[0], dict) else {},
+        )
+        command = str(first_failed.get("command") or "").strip()
+        stderr = str(first_failed.get("stderr") or "").strip()
+        stdout = str(first_failed.get("stdout") or "").strip()
+        evidence = "; ".join(piece for piece in (f"command={command}" if command else "", stderr or stdout) if piece)
+    elif reason in {"snapshot_already_applied_deploy_failed", "snapshot_autoship_deploy_failed"}:
+        deploy_reason = str(deploy.get("reason") or "").strip()
+        deploy_detail = str(deploy.get("detail") or "").strip()
+        deploy_summary = str(deploy.get("summary") or "").strip()
+        evidence = "; ".join(piece for piece in (deploy_reason, deploy_detail, deploy_summary) if piece)
+
+    if (autoship or {}).get("commit"):
+        evidence = "; ".join(piece for piece in (evidence, f"commit={autoship.get('commit')}") if piece)
+
+    summary = f"Controller snapshot autoship failed_root_caused: {label} (reason={reason})."
+    if evidence:
+        summary = f"{summary} Detail: {_studio_one_line(evidence, max_chars=360, default=evidence)}"
+
+    next_actions = {
+        "missing_snapshot_artifacts": "Regenerate the controller snapshot artifacts and ensure changes.patch is present.",
+        "repo_sync_failed": "Fix default-branch checkout sync, then rerun controller snapshot autoship.",
+        "repo_dirty_before_snapshot_autoship": "Clean or stash the repository changes, then rerun controller snapshot autoship.",
+        "snapshot_patch_check_failed": "Rebase or regenerate the snapshot patch against the current default branch.",
+        "snapshot_patch_apply_failed": "Inspect the patch apply error, repair the patch, and rerun autoship.",
+        "snapshot_validation_failed": "Fix the failing validation command, then rerun autoship.",
+        "snapshot_git_add_failed": "Inspect git index/add failure, restore a clean checkout, and rerun autoship.",
+        "snapshot_commit_failed": "Fix git commit prerequisites, then rerun autoship.",
+        "snapshot_push_failed": "Push or repair remote/default branch access for the generated commit.",
+        "snapshot_already_applied_deploy_failed": "Inspect deployment failure and complete rollout.",
+        "snapshot_autoship_deploy_failed": "Inspect deployment failure and complete rollout.",
+    }
+    next_action = next_actions.get(reason, "Inspect the controller snapshot autoship failure and rerun after the exact blocker is fixed.")
+    return "failed_root_caused", summary, next_action
+
+
+_CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS = {
+    "snapshot_already_applied_deploy_failed",
+    "snapshot_autoship_deploy_failed",
+}
+
+
+def _controller_snapshot_deploy_failure_already_recorded(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+) -> bool:
+    try:
+        order = orch_q.get_order(order_id, chat_id=int(chat_id)) or {}
+        root = orch_q.get_job(order_id)
+    except Exception:
+        return False
+    trace = dict((getattr(root, "trace", {}) or {}) if root else {})
+    return (
+        str((order or {}).get("status") or "").strip().lower() == "active"
+        and str((order or {}).get("phase") or "").strip().lower() == "review"
+        and str(getattr(root, "state", "") or "").strip().lower() == "blocked"
+        and str(getattr(root, "blocked_reason", "") or "").strip() == "deploy_failed"
+        and str(trace.get("deploy_status") or "").strip().lower() == "failed"
+        and str(trace.get("result_status") or "").strip() == "deploy_failed"
+    )
+
+
+def _finalize_controller_snapshot_autoship_failure(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    autoship: dict[str, Any],
+    now: float,
+) -> None:
+    outcome_status, summary, next_action = _controller_snapshot_autoship_failure_outcome(autoship)
+    reason = str((autoship or {}).get("reason") or "unknown").strip() or "unknown"
+    orch_q.set_order_status(order_id, chat_id=int(chat_id), status="failed")
+    orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="failed")
+    orch_q.update_state(
+        order_id,
+        "failed",
+        blocked_reason=f"controller_snapshot_autoship_failed:{reason}",
+        merge_ready=False,
+        merge_required=False,
+        controller_snapshot_autoship_error=autoship,
+        controller_snapshot_autoship_failed_at=float(now),
+        result_status=outcome_status,
+        result_summary=summary,
+        result_next_action=next_action,
+        operational_gate_status="terminal",
+        operational_gate_reason=f"controller_snapshot_autoship_failed:{reason}",
+        live_at=float(now),
+    )
+    _studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status=outcome_status,
+        outcome_summary=summary,
+        now=float(now),
+    )
+    orch_q.append_audit_event(
+        event_type="order.controller_snapshot_autoship_failed_root_caused",
+        actor="jarvis",
+        details={
+            "order_id": order_id,
+            "outcome_status": outcome_status,
+            "summary": summary,
+            "next_action": next_action,
+            "result": autoship,
+        },
+    )
+
+
 def _auto_merge_ready_orders_tick(
     *,
     cfg: BotConfig,
@@ -15437,17 +15585,34 @@ def _auto_merge_ready_orders_tick(
                     continue
                 if str(autoship.get("status") or "").strip().lower() == "failed":
                     try:
-                        orch_q.update_trace(
-                            oid,
-                            controller_snapshot_autoship_error=autoship,
-                            controller_snapshot_autoship_failed_at=float(now),
-                            live_at=float(now),
-                        )
-                        orch_q.append_audit_event(
-                            event_type="order.controller_snapshot_autoship_failed",
-                            actor="jarvis",
-                            details={"order_id": oid, "result": autoship},
-                        )
+                        autoship_reason = str(autoship.get("reason") or "").strip()
+                        if (
+                            autoship_reason in _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS
+                            and _controller_snapshot_deploy_failure_already_recorded(
+                                orch_q=orch_q,
+                                order_id=oid,
+                                chat_id=chat_for_order,
+                            )
+                        ):
+                            orch_q.update_trace(
+                                oid,
+                                controller_snapshot_autoship_error=autoship,
+                                controller_snapshot_autoship_failed_at=float(now),
+                                live_at=float(now),
+                            )
+                            orch_q.append_audit_event(
+                                event_type="order.controller_snapshot_autoship_deploy_failure_preserved",
+                                actor="jarvis",
+                                details={"order_id": oid, "result": autoship},
+                            )
+                        else:
+                            _finalize_controller_snapshot_autoship_failure(
+                                orch_q=orch_q,
+                                order_id=oid,
+                                chat_id=chat_for_order,
+                                autoship=autoship,
+                                now=float(now),
+                            )
                     except Exception:
                         pass
                     continue

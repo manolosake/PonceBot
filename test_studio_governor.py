@@ -7,6 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 import bot
+from orchestrator.queue import OrchestratorQueue
 from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
 
@@ -829,6 +830,189 @@ def test_recent_controller_snapshot_rows_use_studio_updated_at_for_recovery(tmp_
 
     assert len(rows) == 1
     assert rows[0]["updated_at"] == 2_000.0
+
+
+def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0):
+    db = tmp_path / "jobs.sqlite"
+    storage = SQLiteTaskStorage(db)
+    orch_q = OrchestratorQueue(storage)
+    chat_id = 123
+    order_id = "snapshot-order"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    patch = tmp_path / "changes.patch"
+    patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+    trace = {
+        "controller_snapshot_workdir": str(snapshot),
+        "result_artifacts": [str(patch)],
+        "result_status": "blocked_need_operator",
+        "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot.",
+        "result_next_action": "Run the validated patch in a write-enabled source checkout.",
+    }
+    orch_q.submit_task(
+        Task.new(
+            job_id=order_id,
+            source="test",
+            role="skynet",
+            input_text="recover snapshot",
+            request_type="exec",
+            priority=1,
+            model="gpt-5.5",
+            effort="high",
+            mode_hint="full",
+            requires_approval=False,
+            max_cost_window_usd=0,
+            chat_id=chat_id,
+            state="done",
+            trace=trace,
+        )
+    )
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=chat_id,
+        title="Snapshot order",
+        body="recover",
+        status="done",
+        phase="done",
+    )
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', 'repo-codexbot', 'DEEP_IMPROVEMENT', 'codexbot',
+                ?, 'core', 'Repair delivery.', 'Because autoship backlog.', 'Critic agrees.',
+                'No autoship backlog.', 'Tests.', 'Low.', 'packet', '[]',
+                'blocked_need_operator', 'PASS validated controller snapshot waiting for autoship recovery.',
+                ?, ?, ?)
+            """,
+            ("cycle-1", now - 60, str(tmp_path), order_id, now - 60, now - 60),
+        )
+        conn.commit()
+    return db, orch_q, chat_id, order_id
+
+
+def test_auto_merge_tick_root_causes_pre_deploy_controller_snapshot_autoship_failure(tmp_path, monkeypatch):
+    now = 2_000.0
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_patch_check_failed",
+        "detail": "error: patch failed: app.py:12",
+    }
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", lambda **kwargs: autoship_result)
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    assert merged == 0
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "failed"
+    assert order["phase"] == "failed"
+    assert job.state == "failed"
+    assert job.trace["result_status"] == "failed_root_caused"
+    assert "snapshot patch check failed" in job.trace["result_summary"]
+    assert "app.py:12" in job.trace["result_summary"]
+    assert "waiting for autoship" not in job.trace["result_summary"].lower()
+    assert job.trace["controller_snapshot_autoship_error"] == autoship_result
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    assert row == (
+        "failed",
+        "failed_root_caused",
+        "Controller snapshot autoship failed_root_caused: snapshot patch check failed (reason=snapshot_patch_check_failed). Detail: error: patch failed: app.py:12",
+    )
+
+
+def test_auto_merge_tick_preserves_recorded_controller_snapshot_deploy_failure(tmp_path, monkeypatch):
+    now = 2_000.0
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+    deploy_summary = "Auto-shipped validated controller snapshot to main commit=abc123. Deploy failed: service restart failed."
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_autoship_deploy_failed",
+        "summary": deploy_summary,
+        "commit": "abc123",
+        "deploy": {
+            "status": "failed",
+            "reason": "deploy_script_failed",
+            "detail": "service restart failed",
+            "summary": "Deploy failed: service restart failed.",
+        },
+    }
+
+    def record_deploy_failure(**kwargs):
+        orch_q.set_order_status(order_id, chat_id=chat_id, status="active")
+        orch_q.set_order_phase(order_id, chat_id=chat_id, phase="review")
+        orch_q.update_state(
+            order_id,
+            "blocked",
+            blocked_reason="deploy_failed",
+            merge_ready=False,
+            merge_required=False,
+            deploy_status="failed",
+            deploy_result="deploy_script_failed",
+            deploy_summary="Deploy failed: service restart failed.",
+            deployed_commit=None,
+            deploy_error="service restart failed",
+            result_status="deploy_failed",
+            result_summary=deploy_summary,
+            result_next_action="Inspect deployment failure and complete rollout.",
+        )
+        bot._studio_complete_cycle_for_order_from_queue(
+            orch_q=orch_q,
+            order_id=order_id,
+            outcome_status="failed_root_caused",
+            outcome_summary=deploy_summary,
+            now=now,
+        )
+        return autoship_result
+
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", record_deploy_failure)
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    assert merged == 0
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "active"
+    assert order["phase"] == "review"
+    assert job.state == "blocked"
+    assert job.blocked_reason == "deploy_failed"
+    assert job.trace["deploy_status"] == "failed"
+    assert job.trace["deploy_result"] == "deploy_script_failed"
+    assert job.trace["deploy_summary"] == "Deploy failed: service restart failed."
+    assert job.trace["deploy_error"] == "service restart failed"
+    assert job.trace["result_status"] == "deploy_failed"
+    assert job.trace["result_summary"] == deploy_summary
+    assert job.trace["result_next_action"] == "Inspect deployment failure and complete rollout."
+    assert job.trace["controller_snapshot_autoship_error"] == autoship_result
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    assert row == ("failed", "failed_root_caused", deploy_summary)
 
 
 def test_autonomous_commit_identity_ignores_stale_repo_config(tmp_path, monkeypatch):
