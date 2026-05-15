@@ -745,6 +745,58 @@ def test_controller_snapshot_delivery_candidate_accepts_published_project_summar
     assert candidate["patch_path"] == str(patch)
 
 
+def test_controller_snapshot_delivery_candidate_accepts_nested_structured_digest_metadata(tmp_path):
+    snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
+    snapshot.mkdir(parents=True)
+    recovery_dir = tmp_path / "recovery"
+    recovery_dir.mkdir()
+    patch = recovery_dir / "changes.patch"
+    patch.write_text("diff --git a/static/app.js b/static/app.js\n", encoding="utf-8")
+
+    candidate = bot._controller_snapshot_delivery_candidate(
+        {
+            "structured_digest": {
+                "controller_snapshot": {"workdir": str(snapshot)},
+                "controller_recovery_artifacts": [str(patch), str(patch)],
+            },
+            "result_summary": "PASS implementation/review. Outcome: blocked_need_operator.",
+            "result_next_action": "Apply the validated changes into the real repository checkout, commit, push, and deploy.",
+        }
+    )
+
+    assert candidate["snapshot_dir"] == str(snapshot)
+    assert candidate["patch_path"] == str(patch)
+
+
+def test_controller_snapshot_delivery_candidate_nested_metadata_still_requires_release_and_validation(tmp_path):
+    snapshot = tmp_path / "artifacts" / "order" / "controller_snapshot"
+    snapshot.mkdir(parents=True)
+    recovery_dir = tmp_path / "recovery"
+    recovery_dir.mkdir()
+    patch = recovery_dir / "changes.patch"
+    patch.write_text("diff --git a/static/app.js b/static/app.js\n", encoding="utf-8")
+    nested_metadata = {
+        "structured_digest": {
+            "controller_snapshot": {"workdir": str(snapshot)},
+            "controller_recovery_artifacts": [str(patch)],
+        }
+    }
+
+    assert not bot._controller_snapshot_delivery_candidate(
+        {
+            **nested_metadata,
+            "result_summary": "PASS implementation/review completed with tests.",
+        }
+    )
+    assert not bot._controller_snapshot_delivery_candidate(
+        {
+            **nested_metadata,
+            "result_summary": "Outcome: blocked_need_operator. Operator must apply changes.",
+            "result_next_action": "Ship to main is blocked.",
+        }
+    )
+
+
 def test_recent_controller_snapshot_rows_use_studio_updated_at_for_recovery(tmp_path):
     db = tmp_path / "jobs.sqlite"
     with sqlite3.connect(db) as conn:

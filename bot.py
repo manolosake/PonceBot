@@ -14830,6 +14830,10 @@ def _controller_snapshot_delivery_candidate(trace: dict[str, Any] | None) -> dic
     if not snapshot_raw:
         structured = tr.get("structured_digest") if isinstance(tr.get("structured_digest"), dict) else {}
         snapshot_raw = str(structured.get("workdir") or "").strip()
+        if not snapshot_raw:
+            structured_snapshot = structured.get("controller_snapshot")
+            if isinstance(structured_snapshot, dict):
+                snapshot_raw = str(structured_snapshot.get("workdir") or "").strip()
     if not snapshot_raw:
         return {}
 
@@ -14883,10 +14887,15 @@ def _controller_snapshot_delivery_candidate(trace: dict[str, Any] | None) -> dic
         path = str(raw or "").strip()
         if path:
             artifacts.append(path)
-    for raw in structured.get("result_artifacts") or structured.get("artifacts") or []:
-        path = str(raw or "").strip()
-        if path and path not in artifacts:
-            artifacts.append(path)
+    for values in (
+        structured.get("result_artifacts") or [],
+        structured.get("artifacts") or [],
+        structured.get("controller_recovery_artifacts") or [],
+    ):
+        for raw in values:
+            path = str(raw or "").strip()
+            if path and path not in artifacts:
+                artifacts.append(path)
 
     snapshot = Path(snapshot_raw).expanduser()
     patch_paths = [Path(path).expanduser() for path in artifacts if Path(str(path)).name == "changes.patch"]
