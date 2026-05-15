@@ -16033,6 +16033,22 @@ _STUDIO_DELIVERY_FAILURE_PATTERNS = (
     "claimed progress",
     "branch has no diff",
 )
+_STUDIO_AUTOSHIP_RECOVERY_EVIDENCE_PATTERNS = (
+    "validated controller snapshot",
+    "validated controller-snapshot",
+    "controller snapshot",
+    "controller-snapshot",
+    "validated snapshot",
+    "validated-snapshot",
+)
+_STUDIO_AUTOSHIP_RECOVERY_BACKLOG_PATTERNS = (
+    "autoship",
+    "autoship recovery",
+    "autoship/recovery",
+    "recovery",
+    "waiting",
+    "backlog",
+)
 _STUDIO_OPERATOR_BUSINESS_GOAL = (
     "The software factory should create assets that can make money: sellable products, rentable tools, "
     "automations that can earn or save money, and private projects that can become paid offerings."
@@ -16534,6 +16550,51 @@ def _studio_finalize_orphaned_active_cycles(
         return 0
 
 
+def _studio_autoship_recovery_blocker_summary(summary: str) -> bool:
+    text = str(summary or "").strip().lower()
+    if not text:
+        return False
+    has_snapshot_evidence = any(
+        pattern in text for pattern in _STUDIO_AUTOSHIP_RECOVERY_EVIDENCE_PATTERNS
+    )
+    has_backlog_signal = any(
+        pattern in text for pattern in _STUDIO_AUTOSHIP_RECOVERY_BACKLOG_PATTERNS
+    )
+    return bool(has_snapshot_evidence and has_backlog_signal)
+
+
+def _studio_is_autoship_recovery_core_cycle(cycle: dict[str, Any]) -> bool:
+    key = str((cycle or {}).get("selected_key") or "").strip().lower()
+    repo_id = str((cycle or {}).get("selected_repo_id") or "").strip().lower()
+    lane = str((cycle or {}).get("selected_lane") or "").strip().lower()
+    selected_type = str((cycle or {}).get("selected_type") or "").strip().upper()
+    repo_tokens = {key, repo_id}
+    core_repo = bool(
+        "codexbot" in repo_tokens
+        or "repo-codexbot" in repo_tokens
+        or "poncebot" in repo_tokens
+        or "repo-poncebot" in repo_tokens
+        or "poncebot-core" in repo_tokens
+    )
+    if lane != "core" or not core_repo or selected_type not in {"DEEP_IMPROVEMENT", "FEATURE", "PRODUCT_WORKFLOW"}:
+        return False
+    text = " ".join(
+        str((cycle or {}).get(field) or "")
+        for field in (
+            "selected_key",
+            "selected_repo_id",
+            "selected_type",
+            "thesis",
+            "rationale",
+            "debate_summary",
+            "operator_visible_outcome",
+            "evidence_target",
+            "risk_summary",
+        )
+    ).lower()
+    return _studio_autoship_recovery_blocker_summary(text)
+
+
 def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
     ts = float(now if now is not None else time.time())
     negatives = [entry for entry in memory.get("recent_studio_negative_outcomes", []) or [] if isinstance(entry, dict)]
@@ -16560,6 +16621,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     recent_negative = [entry for entry in negatives if _age_hours(entry) <= 72.0]
     recent_positive = [entry for entry in positives if _age_hours(entry) <= 72.0]
     delivery_failures: list[dict[str, Any]] = []
+    autoship_recovery_blocks: list[dict[str, Any]] = []
     write_policy_failures: list[dict[str, Any]] = []
     core_repair_loop_failures: list[dict[str, Any]] = []
     core_repair_loop_keys: list[str] = []
@@ -16569,11 +16631,14 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     new_project_cycles_24h = 0
     for entry in recent_negative:
         summary = str(entry.get("summary") or "").lower()
+        status = str(entry.get("status") or "").strip().lower()
         key = str(entry.get("key") or "").strip().lower()
         repo_id = str(entry.get("repo_id") or "").strip().lower()
         work_type = str(entry.get("type") or "").strip().upper()
         if any(pattern in summary for pattern in _STUDIO_DELIVERY_FAILURE_PATTERNS):
             delivery_failures.append(entry)
+        if status == "blocked_need_operator" and _studio_autoship_recovery_blocker_summary(summary):
+            autoship_recovery_blocks.append(entry)
         if "write policy violation" in summary or "modified repository files directly" in summary:
             write_policy_failures.append(entry)
         is_core_repair = (
@@ -16623,8 +16688,32 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     force_next_action = ""
 
     core_repair_loop_keys = list(dict.fromkeys(core_repair_loop_keys))[:8]
+    autoship_recovery_blocks_24h = [
+        entry for entry in autoship_recovery_blocks if _age_hours(entry) <= 24.0
+    ]
 
-    if delivery_failures and len(core_repair_loop_failures) >= 2 and non_core_positive_30m:
+    if len(autoship_recovery_blocks) >= 2:
+        mode = "autoship_recovery_gate"
+        severity = "red"
+        trigger = (
+            f"{len(autoship_recovery_blocks)} validated controller-snapshot autoship/recovery blockers in 72h "
+            f"({len(autoship_recovery_blocks_24h)} in 24h); validated work is waiting to be shipped instead of "
+            "opening more Studio churn."
+        )
+        force_next_action = (
+            "Recover, merge, push, deploy, or root-cause the validated controller snapshots waiting for autoship "
+            "before creating more Studio work."
+        )
+        prefer_lanes = ["core"]
+        avoid_keys = ["new-project-incubator"]
+        directives.extend(
+            [
+                "Treat repeated validated controller snapshots waiting for autoship/recovery as a shipping bottleneck.",
+                "Delegate bounded codexbot/core recovery work that converts validated snapshots into shipped outcomes or exact operator blockers.",
+                "Do not open fresh incubator or non-core portfolio work until the autoship backlog is recovered, merged, pushed, deployed, or root-caused.",
+            ]
+        )
+    elif delivery_failures and len(core_repair_loop_failures) >= 2 and non_core_positive_30m:
         mode = "repair_loop_cooldown"
         severity = "yellow"
         trigger = (
@@ -16737,6 +16826,8 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "prefer_lanes": prefer_lanes,
         "force_next_action": force_next_action,
         "delivery_failure_count_72h": len(delivery_failures),
+        "autoship_recovery_block_count_72h": len(autoship_recovery_blocks),
+        "autoship_recovery_block_count_24h": len(autoship_recovery_blocks_24h),
         "write_policy_failure_count_72h": len(write_policy_failures),
         "core_repair_loop_failure_count_6h": len(core_repair_loop_failures),
         "new_project_negative_24h": new_project_negative_24h,
@@ -17220,6 +17311,27 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             monetization_path = "Protect revenue work by ensuring every AI-built product or feature has real branch, validation, merge/push/deploy evidence."
         else:
             score -= 24
+    elif governor_mode == "autoship_recovery_gate":
+        if kind == "Core":
+            score += 58
+            thesis = (
+                "Recover the autoship backlog by converting validated controller snapshots into merged, pushed, "
+                "deployed outcomes or exact operator blockers."
+            )
+            outcome = (
+                "Validated controller snapshots stop accumulating as blocked outcomes; PonceBot either ships them "
+                "or records the concrete recovery blocker for the operator."
+            )
+            commercial_evidence = (
+                "before/after Studio evidence showing validated snapshots were merged, pushed, deployed, or "
+                "root-caused instead of re-selected as new churn"
+            )
+            monetization_path = (
+                "Protect factory throughput by turning already-validated controller work into shipped value before "
+                "spending cycles on new bets."
+            )
+        else:
+            score -= 30
     elif governor_mode == "repair_loop_breaker":
         if governor_avoids_this_repo:
             thesis = (
@@ -17305,6 +17417,8 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score = max(0, score)
     if governor_mode == "repair_delivery_contract" and kind == "Core":
         score = max(score, 140)
+    if governor_mode == "autoship_recovery_gate" and kind == "Core":
+        score = max(score, 150)
 
     base_risk = last_blocker or "risk is low if the slice stays bounded and lands through the normal review/release path"
     if governor_avoid_reason:
@@ -17328,6 +17442,11 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     why = f"{kind} work maps directly to the highest-value factory surface."
     if governor_mode == "repair_delivery_contract" and kind == "Core":
         why = "The Studio Governor detected ghost-delivery risk, so repairing PonceBot's delivery contract beats any new feature or incubator bet right now."
+    if governor_mode == "autoship_recovery_gate" and kind == "Core":
+        why = (
+            "The Studio Governor detected validated controller snapshots waiting for autoship, so codexbot/core "
+            "recovery work beats new incubator or portfolio churn right now."
+        )
     if recent_risks:
         why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
     elif recent_saturation:
@@ -17388,6 +17507,12 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         outcome = "No fresh incubator project should be selected unless the next step directly fixes or disproves the delivery-evidence failure."
         why = "Recent factory evidence says delivery reliability is the bottleneck; starting another project would amplify churn."
         risk += "; Studio Governor blocks fresh incubator work after ghost-delivery evidence"
+    elif governor_mode == "autoship_recovery_gate":
+        score -= 75
+        thesis = "Incubator is gated until validated controller snapshots waiting for autoship are recovered or root-caused."
+        outcome = "No fresh project is opened while already-validated controller work is waiting to merge, push, deploy, or receive an exact operator blocker."
+        why = "Validated Studio work is stuck at the shipping boundary; another project would create churn before recovery."
+        risk += "; autoship recovery gate is active"
     elif governor_mode == "repair_loop_cooldown":
         score -= 45
         thesis = "Incubator is cooling down because the factory already shipped a non-core bet after breaking a PonceBot repair loop."
@@ -17798,7 +17923,13 @@ def _studio_governor_should_preempt_active_cycle(
     cycle: dict[str, Any],
 ) -> bool:
     mode = str((governor or {}).get("mode") or "").strip().lower()
-    if mode not in {"repair_delivery_contract", "repair_loop_breaker", "repair_loop_cooldown", "incubator_quality_gate"}:
+    if mode not in {
+        "repair_delivery_contract",
+        "autoship_recovery_gate",
+        "repair_loop_breaker",
+        "repair_loop_cooldown",
+        "incubator_quality_gate",
+    }:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
     repo_id = str((cycle or {}).get("selected_repo_id") or "").strip().lower()
@@ -17811,6 +17942,12 @@ def _studio_governor_should_preempt_active_cycle(
     }
     if mode == "repair_delivery_contract":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
+    if mode == "autoship_recovery_gate":
+        return bool(
+            key in avoid_keys
+            or _studio_is_incubator_new_project_work(cycle)
+            or not _studio_is_autoship_recovery_core_cycle(cycle)
+        )
     if mode == "repair_loop_cooldown":
         return bool(key or lane or selected_type)
     if mode == "incubator_quality_gate":
@@ -17865,6 +18002,7 @@ def _studio_governor_preempt_active_orders(
     governor_mode = str(governor.get("mode") or "").strip().lower()
     if governor_mode not in {
         "repair_delivery_contract",
+        "autoship_recovery_gate",
         "repair_loop_breaker",
         "repair_loop_cooldown",
         "incubator_quality_gate",
@@ -17875,6 +18013,11 @@ def _studio_governor_preempt_active_orders(
         summary = (
             "Rejected low-value by Studio Governor: recent new-project outcomes failed quality gates, "
             "so another immediate incubator sprint is paused until the next bet has stronger buyer, demo, and validation evidence."
+        )
+    elif governor_mode == "autoship_recovery_gate":
+        summary = (
+            "Rejected low-value by Studio Governor: validated controller snapshots are waiting for autoship/recovery, "
+            "so the next Studio work must recover, merge, push, deploy, or root-cause that backlog before opening more churn."
         )
     elif governor_mode == "repair_loop_cooldown":
         summary = (
@@ -20061,6 +20204,7 @@ def _proactive_lane_tick(
             governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
             urgent_studio_repair = str(governor.get("mode") or "").strip().lower() in {
                 "repair_delivery_contract",
+                "autoship_recovery_gate",
                 "repair_loop_breaker",
             }
         except Exception:

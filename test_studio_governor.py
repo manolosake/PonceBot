@@ -29,6 +29,32 @@ def _delivery_failure_memory(now: float) -> dict:
     }
 
 
+def _autoship_recovery_memory(now: float) -> dict:
+    return {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "blocked_need_operator",
+                "summary": "PASS validated controller snapshot waiting for autoship recovery.",
+                "updated_at": now - 60,
+            },
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "blocked_need_operator",
+                "summary": "Validated controller snapshot waiting for autoship; operator recovery needed.",
+                "updated_at": now - (2 * 3600),
+            },
+        ],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+
+
 def test_studio_governor_forces_delivery_repair_after_ghost_delivery():
     now = 1_700_000_000.0
     governor = bot._studio_governor_assessment(_delivery_failure_memory(now), now=now)
@@ -37,6 +63,133 @@ def test_studio_governor_forces_delivery_repair_after_ghost_delivery():
     assert governor["severity"] == "red"
     assert "new-project-incubator" in governor["avoid_keys"]
     assert governor["delivery_failure_count_72h"] == 1
+
+
+def test_studio_governor_detects_autoship_recovery_backlog():
+    now = 1_700_000_000.0
+    governor = bot._studio_governor_assessment(_autoship_recovery_memory(now), now=now)
+
+    assert governor["mode"] == "autoship_recovery_gate"
+    assert governor["severity"] == "red"
+    assert governor["autoship_recovery_block_count_72h"] == 2
+    assert governor["autoship_recovery_block_count_24h"] == 2
+    assert "validated controller-snapshot autoship/recovery blockers" in governor["trigger"]
+    assert "Recover, merge, push, deploy, or root-cause" in governor["force_next_action"]
+    assert any("validated controller snapshots waiting" in directive for directive in governor["directives"])
+
+
+def test_studio_governor_does_not_treat_generic_autoship_waiting_as_recovery_backlog():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "blocked_need_operator",
+                "summary": "waiting for autoship",
+                "updated_at": now - 60,
+            },
+            {
+                "key": "repo-codexbot",
+                "repo_id": "codexbot",
+                "type": "DEEP_IMPROVEMENT",
+                "status": "blocked_need_operator",
+                "summary": "still waiting for autoship",
+                "updated_at": now - 120,
+            },
+        ],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "normal"
+    assert governor["autoship_recovery_block_count_72h"] == 0
+
+
+def test_studio_governor_requires_multiple_fresh_blocked_autoship_recovery_signals():
+    now = 1_700_000_000.0
+    base = _autoship_recovery_memory(now)
+
+    one_blocker = {
+        **base,
+        "recent_studio_negative_outcomes": base["recent_studio_negative_outcomes"][:1],
+    }
+    stale_blockers = {
+        **base,
+        "recent_studio_negative_outcomes": [
+            {**entry, "updated_at": now - (73 * 3600)}
+            for entry in base["recent_studio_negative_outcomes"]
+        ],
+    }
+    wrong_status = {
+        **base,
+        "recent_studio_negative_outcomes": [
+            {**entry, "status": "failed_root_caused"}
+            for entry in base["recent_studio_negative_outcomes"]
+        ],
+    }
+
+    assert bot._studio_governor_assessment(one_blocker, now=now)["mode"] == "normal"
+    assert bot._studio_governor_assessment(stale_blockers, now=now)["mode"] == "normal"
+    assert bot._studio_governor_assessment(wrong_status, now=now)["mode"] == "normal"
+
+
+def test_studio_governor_autoship_gate_makes_codexbot_beat_portfolio_and_incubator():
+    now = 1_700_000_000.0
+    memory = _autoship_recovery_memory(now)
+    memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
+    core_repo = {
+        "repo_id": "codexbot",
+        "path": "/home/aponce/codexbot",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
+    portfolio_repo = {
+        "repo_id": "portfolio-tool",
+        "path": "/home/aponce/portfolio-tool",
+        "priority": 1,
+        "status": "active",
+        "autonomy_enabled": True,
+        "metadata": {},
+    }
+
+    core = bot._studio_opportunity_for_repo(core_repo, now=now, memory=memory)
+    portfolio = bot._studio_opportunity_for_repo(portfolio_repo, now=now, memory=memory)
+    incubator = bot._studio_incubator_opportunity(cfg=SimpleNamespace(), now=now, memory=memory)
+
+    assert core["score"] >= 150
+    assert core["score"] > portfolio["score"]
+    assert core["score"] > incubator["score"]
+    assert "Recover the autoship backlog" in core["thesis"]
+    assert "autoship recovery gate is active" in incubator["risk_summary"]
+
+
+def test_studio_prompt_includes_autoship_recovery_governor_force_next_action():
+    now = 1_700_000_000.0
+    memory = _autoship_recovery_memory(now)
+    memory["studio_governor"] = bot._studio_governor_assessment(memory, now=now)
+    selected = {
+        "type": "DEEP_IMPROVEMENT",
+        "repo_name": "codexbot",
+        "score": 150,
+        "thesis": "Recover the autoship backlog.",
+        "operator_visible_outcome": "Validated snapshots ship or receive exact blockers.",
+        "business_model": "Factory leverage.",
+        "monetization_path": "Turn validated work into shipped outcomes.",
+        "commercial_evidence_target": "Merged, pushed, deployed, or root-caused snapshots.",
+    }
+
+    prompt = bot._studio_cycle_prompt_packet(selected=selected, opportunities=[selected], memory=memory)
+
+    assert "autoship_recovery_gate" in prompt
+    assert "Recover, merge, push, deploy, or root-cause" in prompt
+    assert "validated controller snapshots waiting for autoship/recovery" in prompt
 
 
 def test_studio_governor_makes_core_repair_beat_incubator():
@@ -385,6 +538,7 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
     }
     normal_governor = {"mode": "normal", "avoid_keys": []}
     repair_governor = {"mode": "repair_delivery_contract", "avoid_keys": ["new-project-incubator"]}
+    autoship_governor = {"mode": "autoship_recovery_gate", "avoid_keys": ["new-project-incubator"]}
     loop_governor = {"mode": "repair_loop_breaker", "avoid_keys": ["repo-codexbot"]}
     cooldown_governor = {"mode": "repair_loop_cooldown", "avoid_keys": ["new-project-incubator"]}
     quality_governor = {"mode": "incubator_quality_gate", "avoid_keys": ["new-project-incubator"]}
@@ -393,6 +547,14 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
         "selected_repo_id": "codexbot",
         "selected_type": "DEEP_IMPROVEMENT",
         "selected_lane": "core",
+    }
+    autoship_recovery_cycle = {
+        "selected_key": "repo-codexbot",
+        "selected_repo_id": "codexbot",
+        "selected_type": "DEEP_IMPROVEMENT",
+        "selected_lane": "core",
+        "thesis": "Recover the autoship backlog by converting validated controller snapshots into shipped outcomes.",
+        "operator_visible_outcome": "Validated controller snapshots are merged, pushed, deployed, or root-caused.",
     }
     dashboard_cycle = {
         "selected_key": "repo-executivedashboard",
@@ -403,6 +565,9 @@ def test_studio_governor_preempts_active_incubator_cycle_only_in_repair_mode():
 
     assert not bot._studio_governor_should_preempt_active_cycle(normal_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(repair_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(autoship_governor, cycle)
+    assert bot._studio_governor_should_preempt_active_cycle(autoship_governor, loop_cycle)
+    assert not bot._studio_governor_should_preempt_active_cycle(autoship_governor, autoship_recovery_cycle)
     assert bot._studio_governor_should_preempt_active_cycle(loop_governor, loop_cycle)
     assert not bot._studio_governor_should_preempt_active_cycle(loop_governor, cycle)
     assert bot._studio_governor_should_preempt_active_cycle(cooldown_governor, cycle)
