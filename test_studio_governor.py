@@ -876,7 +876,7 @@ def test_recent_controller_snapshot_rows_include_nested_snapshot_metadata(tmp_pa
     assert rows[0]["order_id"] == "order-1"
 
 
-def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0):
+def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0, updated_at: float | None = None):
     db = tmp_path / "jobs.sqlite"
     storage = SQLiteTaskStorage(db)
     orch_q = OrchestratorQueue(storage)
@@ -920,6 +920,7 @@ def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0):
         phase="done",
     )
     bot._studio_ensure_schema(db)
+    cycle_updated_at = float(now - 60 if updated_at is None else updated_at)
     with sqlite3.connect(db) as conn:
         conn.execute(
             """
@@ -934,7 +935,7 @@ def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0):
                 'blocked_need_operator', 'PASS validated controller snapshot waiting for autoship recovery.',
                 ?, ?, ?)
             """,
-            ("cycle-1", now - 60, str(tmp_path), order_id, now - 60, now - 60),
+            ("cycle-1", cycle_updated_at, str(tmp_path), order_id, cycle_updated_at, cycle_updated_at),
         )
         conn.commit()
     return db, orch_q, chat_id, order_id
@@ -1057,6 +1058,134 @@ def test_auto_merge_tick_preserves_recorded_controller_snapshot_deploy_failure(t
             (order_id,),
         ).fetchone()
     assert row == ("failed", "failed_root_caused", deploy_summary)
+
+
+def test_auto_merge_tick_recovers_aged_controller_snapshot_blocker_within_72h(tmp_path, monkeypatch):
+    now = 400_000.0
+    updated_at = now - (7 * 3600)
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now, updated_at=updated_at)
+    seen = {}
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_patch_check_failed",
+        "detail": "error: patch aged but recoverable",
+    }
+
+    def record_autoship(**kwargs):
+        seen["order_id"] = kwargs["order_id"]
+        return autoship_result
+
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", record_autoship)
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    assert merged == 0
+    assert seen["order_id"] == order_id
+    job = orch_q.get_job(order_id)
+    assert job.trace["result_status"] == "failed_root_caused"
+    assert "patch aged but recoverable" in job.trace["result_summary"]
+
+
+def test_controller_snapshot_autoship_success_reports_persistence_failure_after_push(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    patch = tmp_path / "changes.patch"
+    patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+    commands = []
+
+    class FailingUpdateQueue:
+        def set_order_status(self, *args, **kwargs):
+            return None
+
+        def set_order_phase(self, *args, **kwargs):
+            return None
+
+        def update_state(self, *args, **kwargs):
+            raise RuntimeError("sqlite is locked")
+
+        def append_audit_event(self, *args, **kwargs):
+            raise AssertionError("audit should not run after failed state persistence")
+
+    def fake_run_git(_repo, args, **kwargs):
+        commands.append(list(args))
+        stdout = "abc123\n" if args[:2] == ["rev-parse", "--short"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(bot, "_sync_repo_checkout_to_default_branch", lambda **kwargs: (True, "", None, None))
+    monkeypatch.setattr(bot, "_git_status_porcelain", lambda _repo: "" if len(commands) < 2 else " M app.py\n")
+    monkeypatch.setattr(bot, "_run_git", fake_run_git)
+    monkeypatch.setattr(bot, "_controller_snapshot_copy_safe_untracked_files", lambda **kwargs: [])
+    monkeypatch.setattr(bot, "_controller_snapshot_validation_commands", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bot, "_deploy_after_order_merge", lambda **kwargs: {"status": "ok", "reason": "noop", "summary": "Deploy skipped."})
+    monkeypatch.setattr(bot, "_studio_complete_cycle_for_order", lambda **kwargs: None)
+
+    result = bot._auto_ship_controller_snapshot_order(
+        cfg=SimpleNamespace(),
+        orch_q=FailingUpdateQueue(),
+        order_id="snapshot-order",
+        chat_id=123,
+        trace={
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_status": "blocked_need_operator",
+            "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot.",
+        },
+        repo_record=None,
+        repo_dir=repo,
+        default_branch="main",
+        now=2_000.0,
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "snapshot_autoship_persistence_failed"
+    assert result["original_reason"] == "snapshot_autoship_complete"
+    assert "sqlite is locked" in result["detail"]
+    assert result["commit"] == "abc123"
+    assert sum(1 for args in commands if args[:2] == ["push", "origin"]) == 1
+
+
+def test_controller_snapshot_autoship_failure_reports_persistence_failure(tmp_path):
+    class FailingFailureQueue:
+        def set_order_status(self, *args, **kwargs):
+            return None
+
+        def set_order_phase(self, *args, **kwargs):
+            return None
+
+        def update_state(self, *args, **kwargs):
+            raise RuntimeError("cannot persist root cause")
+
+        def append_audit_event(self, *args, **kwargs):
+            raise AssertionError("audit should not run after failed state persistence")
+
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_patch_check_failed",
+        "detail": "patch failed",
+    }
+
+    result = bot._finalize_controller_snapshot_autoship_failure(
+        orch_q=FailingFailureQueue(),
+        order_id="snapshot-order",
+        chat_id=123,
+        autoship=autoship_result,
+        now=2_000.0,
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "snapshot_autoship_persistence_failed"
+    assert result["original_reason"] == "snapshot_patch_check_failed"
+    assert "cannot persist root cause" in result["detail"]
+    assert result["original_result"] == autoship_result
 
 
 def test_autonomous_commit_identity_ignores_stale_repo_config(tmp_path, monkeypatch):

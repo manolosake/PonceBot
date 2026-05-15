@@ -15113,6 +15113,28 @@ def _controller_snapshot_revert_applied_delta(
     return result
 
 
+def _controller_snapshot_autoship_persistence_failure_result(
+    *,
+    exc: Exception,
+    phase: str,
+    original_reason: str,
+    summary: str = "",
+    commit: str = "",
+    deploy: dict[str, Any] | None = None,
+    original_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "reason": "snapshot_autoship_persistence_failed",
+        "detail": f"{phase}: {exc}",
+        "summary": summary,
+        "commit": commit,
+        "deploy": deploy or {},
+        "original_reason": original_reason,
+        "original_result": original_result or {},
+    }
+
+
 def _auto_ship_controller_snapshot_order(
     *,
     cfg: BotConfig,
@@ -15171,6 +15193,7 @@ def _auto_ship_controller_snapshot_order(
                 + (f" commit={commit_sha}" if commit_sha else "")
                 + (f". {deploy_summary}" if deploy_summary else ".")
             )
+            original_reason = "snapshot_patch_already_applied" if ok else "snapshot_already_applied_deploy_failed"
             try:
                 orch_q.set_order_status(order_id, chat_id=int(chat_id), status=("done" if ok else "active"))
                 orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase=("done" if ok else "review"))
@@ -15214,11 +15237,19 @@ def _auto_ship_controller_snapshot_order(
                         "deploy": deploy_result,
                     },
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                LOG.exception("Failed to persist controller snapshot autoship already-applied result. order_id=%s", order_id)
+                return _controller_snapshot_autoship_persistence_failure_result(
+                    exc=exc,
+                    phase="already_applied_result_persistence",
+                    original_reason=original_reason,
+                    summary=summary,
+                    commit=commit_sha,
+                    deploy=deploy_result,
+                )
             return {
                 "status": ("ok" if ok else "failed"),
-                "reason": ("snapshot_patch_already_applied" if ok else "snapshot_already_applied_deploy_failed"),
+                "reason": original_reason,
                 "summary": summary,
                 "commit": commit_sha,
                 "deploy": deploy_result,
@@ -15312,6 +15343,7 @@ def _auto_ship_controller_snapshot_order(
         + (f" commit={commit_sha}" if commit_sha else "")
         + (f". {deploy_summary}" if deploy_summary else ".")
     )
+    original_reason = "snapshot_autoship_complete" if ok else "snapshot_autoship_deploy_failed"
     try:
         orch_q.set_order_status(order_id, chat_id=int(chat_id), status=("done" if ok else "active"))
         orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase=("done" if ok else "review"))
@@ -15359,12 +15391,20 @@ def _auto_ship_controller_snapshot_order(
                 "deploy": deploy_result,
             },
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        LOG.exception("Failed to persist controller snapshot autoship result. order_id=%s", order_id)
+        return _controller_snapshot_autoship_persistence_failure_result(
+            exc=exc,
+            phase="autoship_result_persistence",
+            original_reason=original_reason,
+            summary=summary,
+            commit=commit_sha,
+            deploy=deploy_result,
+        )
 
     return {
         "status": ("ok" if ok else "failed"),
-        "reason": ("snapshot_autoship_complete" if ok else "snapshot_autoship_deploy_failed"),
+        "reason": original_reason,
         "summary": summary,
         "commit": commit_sha,
         "changed_paths": changed_paths,
@@ -15391,6 +15431,7 @@ def _controller_snapshot_autoship_failure_outcome(autoship: dict[str, Any]) -> t
         "snapshot_push_failed": "snapshot push failed",
         "snapshot_already_applied_deploy_failed": "already-applied snapshot deploy failed",
         "snapshot_autoship_deploy_failed": "snapshot deploy failed after push",
+        "snapshot_autoship_persistence_failed": "autoship result persistence failed",
     }
     label = reason_labels.get(reason, reason.replace("_", " "))
     evidence = detail
@@ -15424,6 +15465,9 @@ def _controller_snapshot_autoship_failure_outcome(autoship: dict[str, Any]) -> t
 
     if (autoship or {}).get("commit"):
         evidence = "; ".join(piece for piece in (evidence, f"commit={autoship.get('commit')}") if piece)
+    original_reason = str((autoship or {}).get("original_reason") or "").strip()
+    if original_reason:
+        evidence = "; ".join(piece for piece in (evidence, f"original_reason={original_reason}") if piece)
 
     summary = f"Controller snapshot autoship failed_root_caused: {label} (reason={reason})."
     if evidence:
@@ -15441,6 +15485,7 @@ def _controller_snapshot_autoship_failure_outcome(autoship: dict[str, Any]) -> t
         "snapshot_push_failed": "Push or repair remote/default branch access for the generated commit.",
         "snapshot_already_applied_deploy_failed": "Inspect deployment failure and complete rollout.",
         "snapshot_autoship_deploy_failed": "Inspect deployment failure and complete rollout.",
+        "snapshot_autoship_persistence_failed": "Inspect orchestrator/Studio persistence and reconcile the recorded autoship outcome before rerunning.",
     }
     next_action = next_actions.get(reason, "Inspect the controller snapshot autoship failure and rerun after the exact blocker is fixed.")
     return "failed_root_caused", summary, next_action
@@ -15481,44 +15526,63 @@ def _finalize_controller_snapshot_autoship_failure(
     chat_id: int,
     autoship: dict[str, Any],
     now: float,
-) -> None:
+) -> dict[str, Any]:
     outcome_status, summary, next_action = _controller_snapshot_autoship_failure_outcome(autoship)
     reason = str((autoship or {}).get("reason") or "unknown").strip() or "unknown"
-    orch_q.set_order_status(order_id, chat_id=int(chat_id), status="failed")
-    orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="failed")
-    orch_q.update_state(
-        order_id,
-        "failed",
-        blocked_reason=f"controller_snapshot_autoship_failed:{reason}",
-        merge_ready=False,
-        merge_required=False,
-        controller_snapshot_autoship_error=autoship,
-        controller_snapshot_autoship_failed_at=float(now),
-        result_status=outcome_status,
-        result_summary=summary,
-        result_next_action=next_action,
-        operational_gate_status="terminal",
-        operational_gate_reason=f"controller_snapshot_autoship_failed:{reason}",
-        live_at=float(now),
-    )
-    _studio_complete_cycle_for_order_from_queue(
-        orch_q=orch_q,
-        order_id=order_id,
-        outcome_status=outcome_status,
-        outcome_summary=summary,
-        now=float(now),
-    )
-    orch_q.append_audit_event(
-        event_type="order.controller_snapshot_autoship_failed_root_caused",
-        actor="jarvis",
-        details={
-            "order_id": order_id,
-            "outcome_status": outcome_status,
-            "summary": summary,
-            "next_action": next_action,
-            "result": autoship,
-        },
-    )
+    try:
+        orch_q.set_order_status(order_id, chat_id=int(chat_id), status="failed")
+        orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="failed")
+        orch_q.update_state(
+            order_id,
+            "failed",
+            blocked_reason=f"controller_snapshot_autoship_failed:{reason}",
+            merge_ready=False,
+            merge_required=False,
+            controller_snapshot_autoship_error=autoship,
+            controller_snapshot_autoship_failed_at=float(now),
+            result_status=outcome_status,
+            result_summary=summary,
+            result_next_action=next_action,
+            operational_gate_status="terminal",
+            operational_gate_reason=f"controller_snapshot_autoship_failed:{reason}",
+            live_at=float(now),
+        )
+        _studio_complete_cycle_for_order_from_queue(
+            orch_q=orch_q,
+            order_id=order_id,
+            outcome_status=outcome_status,
+            outcome_summary=summary,
+            now=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.controller_snapshot_autoship_failed_root_caused",
+            actor="jarvis",
+            details={
+                "order_id": order_id,
+                "outcome_status": outcome_status,
+                "summary": summary,
+                "next_action": next_action,
+                "result": autoship,
+            },
+        )
+    except Exception as exc:
+        LOG.exception("Failed to persist controller snapshot autoship failure. order_id=%s", order_id)
+        return _controller_snapshot_autoship_persistence_failure_result(
+            exc=exc,
+            phase="failure_result_persistence",
+            original_reason=reason,
+            summary=summary,
+            commit=str((autoship or {}).get("commit") or ""),
+            deploy=(autoship or {}).get("deploy") if isinstance((autoship or {}).get("deploy"), dict) else None,
+            original_result=autoship,
+        )
+    return {
+        "status": "ok",
+        "reason": "snapshot_autoship_failure_recorded",
+        "outcome_status": outcome_status,
+        "summary": summary,
+        "next_action": next_action,
+    }
 
 
 def _auto_merge_ready_orders_tick(
@@ -15567,6 +15631,16 @@ def _auto_merge_ready_orders_tick(
     except Exception:
         heal_done_max_age_hours = 6.0
     heal_done_max_age_s = max(300.0, min(168.0 * 3600.0, float(heal_done_max_age_hours) * 3600.0))
+    try:
+        snapshot_recovery_max_age_hours = float(
+            os.environ.get("BOT_CONTROLLER_SNAPSHOT_AUTOSHIP_RECOVERY_MAX_AGE_HOURS", "72").strip() or "72"
+        )
+    except Exception:
+        snapshot_recovery_max_age_hours = 72.0
+    snapshot_recovery_max_age_s = max(
+        300.0,
+        min(168.0 * 3600.0, float(snapshot_recovery_max_age_hours) * 3600.0),
+    )
 
     done_orders: list[dict[str, Any]] = []
     try:
@@ -15575,14 +15649,16 @@ def _auto_merge_ready_orders_tick(
         done_orders = []
     done_order_by_id = {str(row.get("order_id") or "").strip(): row for row in done_orders}
     seen_done_order_ids = set(done_order_by_id)
+    snapshot_recovery_order_ids: set[str] = set()
     for row in _recent_controller_snapshot_studio_order_rows(
         orch_q=orch_q,
         now=float(now),
-        max_age_seconds=heal_done_max_age_s,
+        max_age_seconds=snapshot_recovery_max_age_s,
     ):
         oid = str(row.get("order_id") or "").strip()
         if not oid:
             continue
+        snapshot_recovery_order_ids.add(oid)
         if oid in done_order_by_id:
             # Prefer the Studio recovery row because its updated_at reflects the
             # fresh recoverable autoship marker, while the CEO order may be old.
@@ -15603,7 +15679,8 @@ def _auto_merge_ready_orders_tick(
                 updated_at = float(row.get("updated_at") or 0.0)
             except Exception:
                 updated_at = 0.0
-            if updated_at > 0 and (float(now) - updated_at) > heal_done_max_age_s:
+            row_max_age_s = snapshot_recovery_max_age_s if oid in snapshot_recovery_order_ids else heal_done_max_age_s
+            if updated_at > 0 and (float(now) - updated_at) > row_max_age_s:
                 continue
 
             try:
@@ -15637,16 +15714,16 @@ def _auto_merge_ready_orders_tick(
                     snapshot_autoship_count += 1
                     continue
                 if str(autoship.get("status") or "").strip().lower() == "failed":
-                    try:
-                        autoship_reason = str(autoship.get("reason") or "").strip()
-                        if (
-                            autoship_reason in _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS
-                            and _controller_snapshot_deploy_failure_already_recorded(
-                                orch_q=orch_q,
-                                order_id=oid,
-                                chat_id=chat_for_order,
-                            )
-                        ):
+                    autoship_reason = str(autoship.get("reason") or "").strip()
+                    if (
+                        autoship_reason in _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS
+                        and _controller_snapshot_deploy_failure_already_recorded(
+                            orch_q=orch_q,
+                            order_id=oid,
+                            chat_id=chat_for_order,
+                        )
+                    ):
+                        try:
                             orch_q.update_trace(
                                 oid,
                                 controller_snapshot_autoship_error=autoship,
@@ -15658,16 +15735,23 @@ def _auto_merge_ready_orders_tick(
                                 actor="jarvis",
                                 details={"order_id": oid, "result": autoship},
                             )
-                        else:
-                            _finalize_controller_snapshot_autoship_failure(
-                                orch_q=orch_q,
-                                order_id=oid,
-                                chat_id=chat_for_order,
-                                autoship=autoship,
-                                now=float(now),
+                        except Exception:
+                            LOG.exception("Failed to preserve controller snapshot deploy failure metadata. order_id=%s", oid)
+                    else:
+                        finalize_result = _finalize_controller_snapshot_autoship_failure(
+                            orch_q=orch_q,
+                            order_id=oid,
+                            chat_id=chat_for_order,
+                            autoship=autoship,
+                            now=float(now),
+                        )
+                        if str(finalize_result.get("status") or "").strip().lower() == "failed":
+                            LOG.error(
+                                "Controller snapshot autoship failure could not be persisted. order_id=%s reason=%s detail=%s",
+                                oid,
+                                finalize_result.get("reason"),
+                                finalize_result.get("detail"),
                             )
-                    except Exception:
-                        pass
                     continue
             if bool(trace.get("merge_cancelled", False)):
                 continue
