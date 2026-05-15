@@ -4093,7 +4093,7 @@ path_is_pytest_temp() {
     [ -n "$root" ] || continue
     root_path="$(normalize_path "$root")" || continue
     case "$candidate" in
-      "$root_path"/.codexbot_tmp/pytest-of-*|"$root_path"/.codexbot_tmp/pytest-of-*/*|"$root_path"/.codexbot_tmp/pytest-*|"$root_path"/.codexbot_tmp/pytest-*/*)
+      "$root_path"/.codexbot_tmp/pytest-of-*|"$root_path"/.codexbot_tmp/pytest-of-*/*|"$root_path"/.codexbot_tmp/pytest-*|"$root_path"/.codexbot_tmp/pytest-*/*|"$root_path"/.codexbot_tmp/tmp*|"$root_path"/.codexbot_tmp/tmp*/*)
         IFS="$old_ifs"
         return 0
         ;;

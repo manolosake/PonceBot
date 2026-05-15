@@ -5580,6 +5580,45 @@ class TestBypassAwareEnforcement(unittest.TestCase):
             self.assertEqual(blocked_source.returncode, 126)
             self.assertIn("blocked: git add", blocked_source.stderr)
 
+    def test_controller_git_write_guard_allows_pytest_tmp_repos_under_protected_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            guard = root / "git"
+            guard.write_text(bot._controller_git_write_guard_script(), encoding="utf-8")
+            guard.chmod(0o755)
+
+            protected = root / "protected"
+            protected.mkdir()
+            subprocess.run(["git", "-C", str(protected), "init"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(protected), "config", "user.name", "tester"], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(protected), "config", "user.email", "tester@example.com"], check=True, capture_output=True, text=True)
+            (protected / "README.md").write_text("protected\n", encoding="utf-8")
+
+            pytest_repo = protected / ".codexbot_tmp" / "tmpabc123" / "repo"
+            pytest_repo.mkdir(parents=True)
+
+            env = dict(os.environ)
+            env["PONCEBOT_REAL_GIT"] = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "/usr/bin/git"
+            env["PONCEBOT_GIT_WRITE_GUARD_ROOTS"] = str(protected.resolve())
+
+            subprocess.run([str(guard), "-C", str(pytest_repo), "init"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(pytest_repo), "config", "user.name", "tester"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(pytest_repo), "config", "user.email", "tester@example.com"], env=env, check=True, capture_output=True, text=True)
+            (pytest_repo / "app.txt").write_text("temp\n", encoding="utf-8")
+
+            env.pop("PYTEST_CURRENT_TEST", None)
+            blocked_temp = subprocess.run([str(guard), "-C", str(pytest_repo), "add", "app.txt"], env=env, capture_output=True, text=True)
+            self.assertEqual(blocked_temp.returncode, 126)
+            self.assertIn("blocked: git add", blocked_temp.stderr)
+
+            env["PYTEST_CURRENT_TEST"] = "test_bot.py::test_guard (call)"
+            subprocess.run([str(guard), "-C", str(pytest_repo), "add", "app.txt"], env=env, check=True, capture_output=True, text=True)
+            subprocess.run([str(guard), "-C", str(pytest_repo), "commit", "-m", "init"], env=env, check=True, capture_output=True, text=True)
+
+            blocked_source = subprocess.run([str(guard), "-C", str(protected), "add", "README.md"], env=env, capture_output=True, text=True)
+            self.assertEqual(blocked_source.returncode, 126)
+            self.assertIn("blocked: git add", blocked_source.stderr)
+
     def test_codex_runner_exports_guard_roots_for_controller_git_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             workdir = Path(td) / "snapshot"
