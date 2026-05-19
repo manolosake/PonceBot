@@ -36,6 +36,56 @@ def _one_line(value: Any, *, default: str = "-") -> str:
     return text or default
 
 
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if value is None:
+        return []
+    return [value]
+
+
+def _source_line(source: Any) -> str:
+    if not isinstance(source, dict):
+        return _one_line(source)
+    parts = []
+    kind = _one_line(source.get("kind"), default="")
+    key = _one_line(source.get("key"), default="")
+    summary = _one_line(source.get("summary"), default="")
+    if kind:
+        parts.append(kind)
+    if key:
+        parts.append(key)
+    prefix = "/".join(parts)
+    if prefix and summary:
+        return f"{prefix}: {summary}"
+    return prefix or summary or "-"
+
+
+def _append_list(lines: list[str], title: str, values: Any) -> None:
+    lines.append(f"- {title}:")
+    items = [_one_line(item) for item in _as_list(values)]
+    if items:
+        for item in items:
+            lines.append(f"  - {item}")
+    else:
+        lines.append("  - -")
+
+
+def _find_top_order(report: dict[str, Any], order_id: Any) -> dict[str, Any]:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return {}
+    for lane in list(report.get("lanes") or []):
+        if not isinstance(lane, dict):
+            continue
+        for order in list(lane.get("orders") or []):
+            if isinstance(order, dict) and str(order.get("order_id") or "").strip() == oid:
+                return order
+    return {}
+
+
 def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str, Any]:
     storage = SQLiteTaskStorage(db_path)
     orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
@@ -76,6 +126,38 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {label}: {_one_line(count, default='0')}")
     else:
         lines.append("- No lanes returned.")
+
+    top_execution_packet = report.get("top_execution_packet") if isinstance(report.get("top_execution_packet"), dict) else None
+    if top_execution_packet is not None:
+        lines.extend(["", "## Top Execution Packet", ""])
+        for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
+            lines.append(f"- {key}: {_one_line(top_execution_packet.get(key))}")
+        _append_list(lines, "acceptance_criteria", top_execution_packet.get("acceptance_criteria"))
+        _append_list(lines, "evidence_required", top_execution_packet.get("evidence_required"))
+        _append_list(lines, "suggested_validation", top_execution_packet.get("suggested_validation"))
+        _append_list(lines, "definition_of_done", top_execution_packet.get("definition_of_done"))
+
+        top_order = _find_top_order(report, top_execution_packet.get("order_id"))
+        selection = top_order.get("selection_quality") if isinstance(top_order.get("selection_quality"), dict) else {}
+        if selection:
+            lines.extend(["", "### Top Order Selection Quality", ""])
+            lines.append(f"- status: {_one_line(selection.get('status'))}")
+            _append_list(lines, "flags", selection.get("flags"))
+            lines.append(f"- summary: {_one_line(selection.get('summary'))}")
+            if "evidence_sources" in selection:
+                lines.append("- evidence_sources:")
+                sources = [_source_line(source) for source in _as_list(selection.get("evidence_sources"))]
+                if sources:
+                    for source in sources:
+                        lines.append(f"  - {source}")
+                else:
+                    lines.append("  - -")
+
+    next_delegate = summary.get("next_delegate") if isinstance(summary.get("next_delegate"), dict) else None
+    if next_delegate is not None:
+        lines.extend(["", "## Next Delegate", ""])
+        for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
+            lines.append(f"- {key}: {_one_line(next_delegate.get(key))}")
 
     for lane in lanes:
         label = _one_line(lane.get("label") or lane.get("lane"))

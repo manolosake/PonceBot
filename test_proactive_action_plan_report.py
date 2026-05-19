@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import unittest
+
+from tools import proactive_action_plan_report as report_tool
+
+
+class TestProactiveActionPlanReport(unittest.TestCase):
+    def _base_report(self) -> dict:
+        return {
+            "generated_at": 123.0,
+            "chat_id": 7,
+            "limit": 10,
+            "summary": {
+                "active_proactive_orders": 1,
+                "returned": 1,
+                "lanes": {"advance": 1},
+                "selection_quality": {"ok": 1},
+                "top_lane": "advance",
+                "top_action": "Implement the bounded slice.",
+                "next_delegate": {
+                    "owner_role": "implementer_local",
+                    "order_id": "advance-order",
+                    "lane": "advance",
+                    "action": "Implement the bounded slice.",
+                    "inspect_endpoint": "/inspect/advance-order",
+                    "handoff_endpoint": "/handoff/advance-order",
+                },
+            },
+            "top_execution_packet": {
+                "owner_role": "implementer_local",
+                "order_id": "advance-order",
+                "lane": "advance",
+                "action": "Implement the bounded slice.",
+                "inspect_endpoint": "/inspect/advance-order",
+                "handoff_endpoint": "/handoff/advance-order",
+                "acceptance_criteria": ["Open the order."],
+                "evidence_required": ["pytest output"],
+                "suggested_validation": ["Run focused tests."],
+                "definition_of_done": ["Tests pass."],
+            },
+            "lanes": [
+                {
+                    "lane": "advance",
+                    "label": "Advance",
+                    "count": 1,
+                    "recommended_next_action": "Implement the bounded slice.",
+                    "orders": [
+                        {
+                            "rank": 1,
+                            "order_id": "advance-order",
+                            "order_id_short": "advance",
+                            "current_stage": "delivery",
+                            "readiness_verdict": "wait",
+                            "next_action": "Implement the bounded slice.",
+                            "selection_quality": {
+                                "status": "ok",
+                                "flags": ["selection_evidence_present"],
+                                "summary": "Commercial, factory-value, or studio-decision evidence is present.",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_render_markdown_includes_top_execution_packet_contract_and_delegate(self) -> None:
+        rendered = report_tool.render_markdown(self._base_report())
+
+        self.assertIn("## Top Execution Packet", rendered)
+        self.assertIn("- owner_role: implementer_local", rendered)
+        self.assertIn("- lane: advance", rendered)
+        self.assertIn("- order_id: advance-order", rendered)
+        self.assertIn("- action: Implement the bounded slice.", rendered)
+        self.assertIn("- inspect_endpoint: /inspect/advance-order", rendered)
+        self.assertIn("- handoff_endpoint: /handoff/advance-order", rendered)
+        self.assertIn("- acceptance_criteria:", rendered)
+        self.assertIn("  - Open the order.", rendered)
+        self.assertIn("- evidence_required:", rendered)
+        self.assertIn("  - pytest output", rendered)
+        self.assertIn("- suggested_validation:", rendered)
+        self.assertIn("  - Run focused tests.", rendered)
+        self.assertIn("- definition_of_done:", rendered)
+        self.assertIn("  - Tests pass.", rendered)
+        self.assertIn("## Next Delegate", rendered)
+
+        self.assertIn("| Rank | Order | Stage | Verdict | Selection | Next action |", rendered)
+        self.assertIn("| 1 | advance | delivery | wait | ok | Implement the bounded slice. |", rendered)
+
+    def test_render_markdown_includes_needs_review_selection_quality_evidence_sources(self) -> None:
+        report = self._base_report()
+        report["summary"]["selection_quality"] = {"needs_review": 1}
+        order = report["lanes"][0]["orders"][0]
+        order["selection_quality"] = {
+            "status": "needs_review",
+            "flags": ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"],
+            "summary": "Advance work needs a selection review before delivery continues.",
+            "evidence_sources": [
+                {
+                    "kind": "trace",
+                    "key": "factory_value",
+                    "summary": "Factory-value evidence was too weak to continue.",
+                }
+            ],
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn("### Top Order Selection Quality", rendered)
+        self.assertIn("- status: needs_review", rendered)
+        self.assertIn("- flags:", rendered)
+        self.assertIn("  - weak_selection_evidence", rendered)
+        self.assertIn("  - advance_without_commercial_factory_or_studio_evidence", rendered)
+        self.assertIn("- summary: Advance work needs a selection review before delivery continues.", rendered)
+        self.assertIn("- evidence_sources:", rendered)
+        self.assertIn("  - trace/factory_value: Factory-value evidence was too weak to continue.", rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()
