@@ -15,6 +15,28 @@ from orchestrator.schemas.task import Task
 from orchestrator.storage import SQLiteTaskStorage
 
 
+def test_repo_deploy_policy_uses_static_product_page_for_readme_repo(tmp_path):
+    codexbot = tmp_path / "codexbot"
+    monitor = codexbot / "tools" / "main_deploy_monitor.py"
+    monitor.parent.mkdir(parents=True)
+    monitor.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    repo = tmp_path / "20260511-studio-cycle-new-product-incubator-0f5a5cc0"
+    repo.mkdir()
+    (repo / "README.md").write_text("# QuoteKit Studio\n\nA sellable workflow.", encoding="utf-8")
+
+    policy = bot._repo_deploy_policy(
+        cfg=SimpleNamespace(codex_workdir=codexbot),
+        repo_record={"metadata": {"repo_name": "20260511-studio-cycle-new-product-incubator-0f5a5cc0"}},
+        repo_dir=repo,
+    )
+
+    assert policy["source"] == "factory_static_product_default"
+    assert policy["command"] == ["systemctl", "--user", "start", "codexbot-main-deploy-monitor.service"]
+    assert policy["url"] == "http://127.0.0.1:8890/quotekit-studio/"
+    assert policy["verify_command"][:2] == ["bash", "-lc"]
+    assert "Static product page published" in policy["success_summary"]
+
+
 def _delivery_failure_memory(now: float) -> dict:
     return {
         "recent_studio_negative_outcomes": [

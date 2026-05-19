@@ -19216,6 +19216,93 @@ def _discover_repo_deploy_metadata(cfg: "BotConfig", repo_path: Path) -> dict[st
     return {}
 
 
+_GENERATED_STATIC_REPO_NAME_RE = re.compile(
+    r"^20\d{6}-studio-cycle-new-product-incubator-[0-9a-f]{8}$",
+    re.IGNORECASE,
+)
+
+
+def _static_product_display_name(repo_dir: Path, metadata: dict[str, Any]) -> str:
+    metadata_name = str(metadata.get("repo_name") or "").strip()
+    if metadata_name and not _GENERATED_STATIC_REPO_NAME_RE.match(metadata_name):
+        return metadata_name
+    readme = repo_dir / "README.md"
+    if readme.is_file():
+        try:
+            for line in readme.read_text(encoding="utf-8", errors="replace").splitlines()[:80]:
+                text = line.strip()
+                if text.startswith("#"):
+                    heading = text.lstrip("#").strip()
+                    if heading:
+                        return heading
+        except Exception:
+            pass
+    return metadata_name or repo_dir.name
+
+
+def _static_product_deploy_metadata(
+    *,
+    cfg: "BotConfig",
+    repo_dir: Path,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    has_static_surface = (
+        (repo_dir / "index.html").is_file()
+        or (repo_dir / ".codexbot_preview" / "preview.html").is_file()
+        or (repo_dir / "README.md").is_file()
+    )
+    if not has_static_surface:
+        return {}
+    try:
+        codex_workdir = cfg.codex_workdir.expanduser().resolve()
+    except Exception:
+        codex_workdir = cfg.codex_workdir.expanduser()
+    monitor = codex_workdir / "tools" / "main_deploy_monitor.py"
+    if not monitor.is_file():
+        return {}
+    display_name = _static_product_display_name(repo_dir, metadata)
+    slug = _slug_token(display_name, max_len=80)
+    try:
+        static_port = int(os.environ.get("PONCEBOT_STATIC_PROD_PORT", "8890").strip() or "8890")
+    except Exception:
+        static_port = 8890
+    static_port = max(1, min(65535, int(static_port)))
+    url = f"http://127.0.0.1:{static_port}/{slug}/"
+    verify_script = (
+        "set -euo pipefail; "
+        "curl -fsSI \"$PONCEBOT_DEPLOY_URL\" >/dev/null; "
+        "python3 - <<'PY'\n"
+        "import json, os, sys\n"
+        "repo_id = os.environ.get('PONCEBOT_REPO_ID', '').strip()\n"
+        "commit = os.environ.get('PONCEBOT_DEPLOY_COMMIT', '').strip()\n"
+        "if not repo_id or not commit:\n"
+        "    raise SystemExit(0)\n"
+        "with open('/home/aponce/codexbot/data/main_deploy_state.json', encoding='utf-8') as handle:\n"
+        "    state = json.load(handle)\n"
+        "row = (state.get('repos') or {}).get(repo_id) or {}\n"
+        "if row.get('status') == 'failed':\n"
+        "    raise SystemExit('main deploy monitor reports failed status')\n"
+        "deployed = str(row.get('deployed_head') or '')\n"
+        "if not deployed.startswith(commit[:12]):\n"
+        "    raise SystemExit(f'main deploy monitor has {deployed or \"no deployed head\"}, expected {commit[:12]}')\n"
+        "PY"
+    )
+    return {
+        "deploy": {
+            "enabled": True,
+            "source": "factory_static_product_default",
+            "cwd": str(codex_workdir),
+            "command": ["systemctl", "--user", "start", "codexbot-main-deploy-monitor.service"],
+            "verify_command": ["bash", "-lc", verify_script],
+            "background": False,
+            "timeout_seconds": 180,
+            "service": "codexbot-main-deploy-monitor.service",
+            "url": url,
+            "success_summary": f"Static product page published at {url} by main deploy monitor.",
+        }
+    }
+
+
 def _repo_deploy_policy(
     *,
     cfg: BotConfig,
@@ -19233,6 +19320,15 @@ def _repo_deploy_policy(
     deploy = dict(metadata.get("deploy") or {})
     if not deploy:
         deploy = dict(_discover_repo_deploy_metadata(cfg, repo_dir).get("deploy") or {})
+    if not deploy:
+        deploy = dict(
+            _static_product_deploy_metadata(
+                cfg=cfg,
+                repo_dir=repo_dir,
+                metadata=metadata,
+            ).get("deploy")
+            or {}
+        )
     if not deploy:
         return {}
     if not bool(deploy.get("enabled", True)):
@@ -19257,6 +19353,8 @@ def _repo_deploy_policy(
         "background": bool(deploy.get("background", False)),
         "service": str(deploy.get("service") or "").strip(),
         "timeout_seconds": timeout_seconds,
+        "success_summary": str(deploy.get("success_summary") or "").strip(),
+        "url": str(deploy.get("url") or "").strip(),
     }
 
 
@@ -19406,6 +19504,7 @@ def _deploy_after_order_merge(
             "PONCEBOT_REPO_ID": str((repo_record or {}).get("repo_id") or ""),
             "PONCEBOT_REPO_PATH": str(deploy_repo_dir),
             "PONCEBOT_DEPLOY_REASON": "post_merge",
+            "PONCEBOT_DEPLOY_URL": str(policy.get("url") or ""),
         }
     )
     command = [str(piece) for piece in policy.get("command") or [] if str(piece).strip()]
@@ -19516,13 +19615,14 @@ def _deploy_after_order_merge(
     return {
         "status": "ok",
         "reason": "deploy_ok",
-        "summary": "Deploy completed successfully.",
+        "summary": str(policy.get("success_summary") or "").strip() or "Deploy completed successfully.",
         "command": command_text,
         "stdout": stdout_tail,
         "stderr": stderr_tail,
         "verify_command": (shlex.join(verify_command) if verify_command else None),
         "verify_attempts": (verify_result.get("attempts") if verify_command else None),
         "deployed_commit": (deployed_commit or merge_commit or None),
+        "url": str(policy.get("url") or "").strip(),
     }
 
 
