@@ -27,6 +27,16 @@ DEFAULT_EVENTS = Path("/home/aponce/codexbot/data/main_deploy_events.jsonl")
 DEFAULT_STATIC_ROOT = Path("/home/aponce/production-sites")
 DEFAULT_STATIC_PORT = 8890
 LOCK_PATH = Path("/tmp/poncebot-main-deploy-monitor.lock")
+FETCH_RETRY_ATTEMPTS = int(os.environ.get("PONCEBOT_MAIN_DEPLOY_FETCH_RETRIES", "3") or "3")
+FETCH_RETRY_SLEEP_SECONDS = float(os.environ.get("PONCEBOT_MAIN_DEPLOY_FETCH_RETRY_SLEEP_SECONDS", "5") or "5")
+TRANSIENT_FETCH_MARKERS = (
+    "temporary failure in name resolution",
+    "could not resolve hostname",
+    "connection timed out",
+    "connection reset",
+    "network is unreachable",
+    "connection refused",
+)
 
 
 @dataclass(frozen=True)
@@ -165,13 +175,46 @@ def git(repo: Path, args: list[str], timeout: int = 120) -> subprocess.Completed
     return run(["git", *args], cwd=repo, timeout=timeout)
 
 
+def transient_fetch_error(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    return any(marker in lowered for marker in TRANSIENT_FETCH_MARKERS)
+
+
+def preserve_transient_fetch_state(repo_state: dict[str, Any], detail: str) -> dict[str, Any] | None:
+    previous_head = str(repo_state.get("remote_head") or repo_state.get("deployed_head") or "").strip()
+    previous_status = str(repo_state.get("status") or "").strip().lower()
+    if not previous_head or previous_status in {"failed", "missing", "dirty"}:
+        return None
+    preserved = dict(repo_state)
+    preserved.update(
+        {
+            "status": "ok",
+            "reason": "fetch_transient_preserved",
+            "detail": tail(detail),
+            "remote_head": previous_head,
+            "last_checked_at": _now(),
+            "transient_fetch_error_at": _now(),
+            "transient_fetch_error": tail(detail),
+        }
+    )
+    return preserved
+
+
 def remote_head(repo: Path, branch: str) -> tuple[bool, str, str]:
     origin = git(repo, ["remote", "get-url", "origin"], timeout=30)
     if origin.returncode != 0:
         return False, "", "no_origin_remote"
-    fetch = git(repo, ["fetch", "origin", "--prune"], timeout=180)
-    if fetch.returncode != 0:
-        return False, "", tail(fetch.stderr or fetch.stdout)
+    fetch_detail = ""
+    attempts = max(1, FETCH_RETRY_ATTEMPTS)
+    for attempt in range(attempts):
+        fetch = git(repo, ["fetch", "origin", "--prune"], timeout=180)
+        if fetch.returncode == 0:
+            break
+        fetch_detail = tail(fetch.stderr or fetch.stdout)
+        if attempt < attempts - 1:
+            time.sleep(max(0.0, FETCH_RETRY_SLEEP_SECONDS))
+    else:
+        return False, "", fetch_detail
     rev = git(repo, ["rev-parse", f"origin/{branch}"], timeout=60)
     if rev.returncode != 0:
         return False, "", tail(rev.stderr or rev.stdout)
@@ -510,6 +553,21 @@ def monitor_once(
         if not ok:
             reason = "no_origin_remote" if detail == "no_origin_remote" else "fetch_failed"
             status = "skipped" if reason == "no_origin_remote" else "failed"
+            if reason == "fetch_failed" and transient_fetch_error(detail):
+                preserved_state = preserve_transient_fetch_state(repo_state, detail)
+                if preserved_state is not None:
+                    repos_state[target.repo_id] = preserved_state
+                    append_event(
+                        events_path,
+                        {
+                            "event": "fetch_transient_preserved",
+                            "repo_id": target.repo_id,
+                            "path": str(target.path),
+                            "detail": detail,
+                            "remote_head": preserved_state.get("remote_head"),
+                        },
+                    )
+                    continue
             if status == "failed":
                 failures += 1
             repo_state.update({"status": status, "reason": reason, "detail": detail, "last_checked_at": _now()})
