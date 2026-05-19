@@ -61,6 +61,86 @@ def test_static_policy_for_index_repo(tmp_path):
     assert policy["source"] == "static_index"
 
 
+def test_static_policy_for_codexbot_preview_repo(tmp_path):
+    repo = tmp_path / "preview"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    preview = repo / ".codexbot_preview"
+    preview.mkdir()
+    (preview / "preview.html").write_text("<h1>preview</h1>", encoding="utf-8")
+    target = mdm.RepoTarget("preview-1", repo, "main", {"repo_name": "Preview"})
+
+    policy = mdm.deploy_policy(target)
+
+    assert policy["type"] == "static"
+    assert policy["source"] == "codexbot_preview"
+    assert policy["source_dir"] == ".codexbot_preview"
+    assert policy["entrypoint"] == "preview.html"
+
+
+def test_landing_policy_for_readme_only_repo(tmp_path):
+    repo = tmp_path / "cli"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "README.md").write_text("# CLI Product\n\nA useful product.", encoding="utf-8")
+    target = mdm.RepoTarget("cli-1", repo, "main", {"repo_name": "CLI Product"})
+
+    policy = mdm.deploy_policy(target)
+
+    assert policy["type"] == "static_landing"
+    assert policy["source"] == "readme_landing"
+
+
+def test_static_preview_deploy_copies_preview_to_index(tmp_path, monkeypatch):
+    repo = tmp_path / "preview"
+    repo.mkdir()
+    preview = repo / ".codexbot_preview"
+    preview.mkdir()
+    (preview / "preview.html").write_text("<h1>Preview</h1>", encoding="utf-8")
+    target = mdm.RepoTarget("preview-1", repo, "main", {"repo_name": "Preview"})
+
+    monkeypatch.setattr(
+        mdm,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="HTTP/1.1 200 OK", stderr=""),
+    )
+
+    result = mdm.deploy_static(
+        target,
+        "abcdef1234567890",
+        tmp_path / "static",
+        {"repos": {}},
+        policy={"source_dir": ".codexbot_preview", "entrypoint": "preview.html"},
+    )
+
+    assert result["ok"] is True
+    deployed_index = tmp_path / "static" / "current" / "preview" / "index.html"
+    assert deployed_index.read_text(encoding="utf-8") == "<h1>Preview</h1>"
+
+
+def test_readme_landing_deploy_writes_product_page_and_index(tmp_path, monkeypatch):
+    repo = tmp_path / "cli"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "README.md").write_text("# CLI Product\n\n## Offer\n\n- Useful output", encoding="utf-8")
+    (repo / "VALIDATION.md").write_text("# Validation\n\nPASS demo command.", encoding="utf-8")
+    target = mdm.RepoTarget("cli-1", repo, "main", {"repo_name": "CLI Product"})
+
+    monkeypatch.setattr(
+        mdm,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout="HTTP/1.1 200 OK", stderr=""),
+    )
+
+    result = mdm.deploy_readme_landing(target, "abcdef1234567890", tmp_path / "static", {"repos": {}})
+
+    assert result["ok"] is True
+    assert result["reason"] == "static_landing_deploy_ok"
+    page = (tmp_path / "static" / "current" / "cli-product" / "index.html").read_text(encoding="utf-8")
+    assert "CLI Product" in page
+    assert "Validation Evidence" in page
+
+
 def test_remote_head_retries_transient_fetch(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

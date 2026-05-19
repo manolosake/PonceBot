@@ -9,6 +9,7 @@ that land on a repo's default branch outside the bot process.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -272,6 +273,14 @@ def static_candidate(target: RepoTarget) -> bool:
     return (target.path / "index.html").is_file()
 
 
+def preview_candidate(target: RepoTarget) -> bool:
+    return (target.path / ".codexbot_preview" / "preview.html").is_file()
+
+
+def readme_landing_candidate(target: RepoTarget) -> bool:
+    return (target.path / "README.md").is_file()
+
+
 def deploy_policy(target: RepoTarget) -> dict[str, Any]:
     metadata_policy = target.metadata.get("deploy")
     if isinstance(metadata_policy, dict) and metadata_policy.get("enabled", True):
@@ -284,6 +293,15 @@ def deploy_policy(target: RepoTarget) -> dict[str, Any]:
         return script_policy
     if static_candidate(target):
         return {"type": "static", "source": "static_index"}
+    if preview_candidate(target):
+        return {
+            "type": "static",
+            "source": "codexbot_preview",
+            "source_dir": ".codexbot_preview",
+            "entrypoint": "preview.html",
+        }
+    if readme_landing_candidate(target):
+        return {"type": "static_landing", "source": "readme_landing"}
     return {"type": "validated_checkout", "source": "no_runtime_policy"}
 
 
@@ -308,29 +326,40 @@ def _write_static_index(static_root: Path, state: dict[str, Any]) -> None:
     current_root.mkdir(parents=True, exist_ok=True)
     rows = []
     for repo_id, item in sorted((state.get("repos") or {}).items()):
-        if item.get("deploy_type") != "static":
+        if item.get("deploy_type") not in {"static", "static_landing"}:
             continue
         slug = str(item.get("static_slug") or slugify(repo_id))
         status = str(item.get("status") or "unknown")
         head = str(item.get("deployed_head") or "")[:12]
+        title = html.escape(str(item.get("title") or slug).strip() or slug)
+        deploy_type = html.escape(str(item.get("deploy_type") or "static"))
         rows.append(
-            f'<li><a href="./{slug}/">{slug}</a> '
-            f'<span>{status}</span> <code>{head}</code></li>'
+            f'<article><a href="./{slug}/">{title}</a>'
+            f'<span>{html.escape(status)}</span><small>{deploy_type}</small><code>{html.escape(head)}</code></article>'
         )
     html = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>PonceBot Production Sites</title>"
         "<style>body{font-family:system-ui,sans-serif;background:#071014;color:#dff;padding:32px}"
-        "a{color:#68e6ff}li{margin:10px 0}code{color:#9ef}</style></head>"
-        "<body><h1>PonceBot Production Sites</h1><ul>"
+        "main{max-width:1080px;margin:auto}section{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}"
+        "article{border:1px solid #194653;background:#0b1b22;border-radius:18px;padding:18px;display:grid;gap:10px}"
+        "a{color:#68e6ff;font-size:18px;font-weight:800;text-decoration:none}span,small,code{color:#9ef}</style></head>"
+        "<body><main><h1>PonceBot Production Sites</h1><section>"
         + "\n".join(rows)
-        + "</ul></body></html>"
+        + "</section></main></body></html>"
     )
     (current_root / "index.html").write_text(html, encoding="utf-8")
 
 
-def deploy_static(target: RepoTarget, head: str, static_root: Path, state: dict[str, Any]) -> dict[str, Any]:
+def deploy_static(
+    target: RepoTarget,
+    head: str,
+    static_root: Path,
+    state: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    policy = dict(policy or {})
     slug = slugify(target.metadata.get("repo_name") or target.repo_id)
     releases = static_root / "releases" / slug
     release_dir = releases / head[:12]
@@ -340,7 +369,22 @@ def deploy_static(target: RepoTarget, head: str, static_root: Path, state: dict[
     current_root.mkdir(parents=True, exist_ok=True)
     if release_dir.exists():
         shutil.rmtree(release_dir)
-    shutil.copytree(target.path, release_dir, ignore=_static_ignore)
+    source_dir = Path(str(policy.get("source_dir") or "."))
+    if source_dir.is_absolute() or ".." in source_dir.parts:
+        return {"ok": False, "status": "failed", "reason": "invalid_static_source_dir", "static_slug": slug}
+    source_path = (target.path / source_dir).resolve()
+    try:
+        source_path.relative_to(target.path.resolve())
+    except ValueError:
+        return {"ok": False, "status": "failed", "reason": "static_source_outside_repo", "static_slug": slug}
+    if not source_path.exists() or not source_path.is_dir():
+        return {"ok": False, "status": "failed", "reason": "static_source_missing", "static_slug": slug}
+    shutil.copytree(source_path, release_dir, ignore=_static_ignore)
+    entrypoint = str(policy.get("entrypoint") or "").strip()
+    if entrypoint and not (release_dir / "index.html").exists():
+        entry = release_dir / entrypoint
+        if entry.is_file():
+            shutil.copy2(entry, release_dir / "index.html")
     tmp_link = current_link.with_name(current_link.name + ".tmp")
     if tmp_link.exists() or tmp_link.is_symlink():
         tmp_link.unlink()
@@ -365,6 +409,181 @@ def deploy_static(target: RepoTarget, head: str, static_root: Path, state: dict[
         "url": verify_url,
         "static_slug": slug,
         "release_dir": str(release_dir),
+    }
+
+
+def _read_text(path: Path, limit: int = 12000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit].strip()
+    except Exception:
+        return ""
+
+
+def _first_markdown_heading(text: str, fallback: str) -> str:
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            title = line.lstrip("#").strip()
+            if title:
+                return title
+    return fallback
+
+
+def _markdown_excerpt_to_html(text: str, *, max_lines: int = 90) -> str:
+    output: list[str] = []
+    in_list = False
+    in_code = False
+    code_lines: list[str] = []
+    for raw in str(text or "").splitlines()[:max_lines]:
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                output.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+                code_lines = []
+                in_code = False
+            else:
+                if in_list:
+                    output.append("</ul>")
+                    in_list = False
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(line)
+            continue
+        if not stripped:
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            continue
+        if stripped.startswith("#"):
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            level = min(3, max(2, len(stripped) - len(stripped.lstrip("#")) + 1))
+            output.append(f"<h{level}>{html.escape(stripped.lstrip('#').strip())}</h{level}>")
+        elif stripped.startswith(("- ", "* ")):
+            if not in_list:
+                output.append("<ul>")
+                in_list = True
+            output.append(f"<li>{html.escape(stripped[2:].strip())}</li>")
+        else:
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            output.append(f"<p>{html.escape(stripped)}</p>")
+    if in_code:
+        output.append("<pre><code>" + html.escape("\n".join(code_lines)) + "</code></pre>")
+    if in_list:
+        output.append("</ul>")
+    return "\n".join(output)
+
+
+def _git_remote_url(repo: Path) -> str:
+    remote = git(repo, ["remote", "get-url", "origin"], timeout=30)
+    return str(remote.stdout or "").strip() if remote.returncode == 0 else ""
+
+
+def _render_landing_page(target: RepoTarget, head: str) -> tuple[str, str]:
+    repo_name = str(target.metadata.get("repo_name") or target.repo_id)
+    readme = _read_text(target.path / "README.md")
+    validation = _read_text(target.path / "VALIDATION.md", limit=5000)
+    title = _first_markdown_heading(readme, repo_name)
+    remote = _git_remote_url(target.path)
+    body = _markdown_excerpt_to_html(readme)
+    validation_html = _markdown_excerpt_to_html(validation, max_lines=45) if validation else "<p>No VALIDATION.md found.</p>"
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)} · PonceBot Production</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#071014; --panel:#0c1b23; --line:#1e5362; --ink:#e9fbff; --muted:#98b7c2; --cyan:#68e6ff; --green:#5dff9f; }}
+    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at 20% 0%, #123747 0, #071014 36rem); color:var(--ink); }}
+    main {{ max-width:1120px; margin:0 auto; padding:44px 22px 64px; }}
+    header {{ border:1px solid var(--line); border-radius:28px; padding:28px; background:linear-gradient(135deg, rgba(104,230,255,.14), rgba(12,27,35,.94)); box-shadow:0 24px 90px rgba(0,0,0,.35); }}
+    h1 {{ margin:0 0 12px; font-size:clamp(32px,5vw,64px); line-height:.95; letter-spacing:-.05em; }}
+    .meta {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }}
+    .pill {{ border:1px solid var(--line); border-radius:999px; padding:9px 12px; color:var(--muted); background:rgba(0,0,0,.22); }}
+    .pill strong {{ color:var(--green); }}
+    section {{ margin-top:18px; border:1px solid rgba(104,230,255,.22); border-radius:24px; padding:24px; background:rgba(7,16,20,.72); }}
+    h2,h3,h4 {{ letter-spacing:-.02em; color:#f4fdff; }}
+    p,li {{ color:#c7dde5; line-height:1.65; }}
+    a {{ color:var(--cyan); }}
+    pre {{ overflow:auto; padding:16px; border-radius:16px; background:#02090c; border:1px solid #17404c; }}
+    code {{ color:#a8f7ff; }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="pill"><strong>Live product page</strong> generated by PonceBot main deploy monitor</p>
+      <h1>{html.escape(title)}</h1>
+      <div class="meta">
+        <span class="pill">repo: {html.escape(target.repo_id)}</span>
+        <span class="pill">commit: {html.escape(head[:12])}</span>
+        <span class="pill">branch: {html.escape(target.default_branch)}</span>
+        {f'<a class="pill" href="{html.escape(remote)}">GitHub remote</a>' if remote.startswith('http') else f'<span class="pill">remote: {html.escape(remote)}</span>' if remote else ''}
+      </div>
+    </header>
+    <section>
+      {body or '<p>No README content available.</p>'}
+    </section>
+    <section>
+      <h2>Validation Evidence</h2>
+      {validation_html}
+    </section>
+  </main>
+</body>
+</html>
+"""
+    return title, html_doc
+
+
+def deploy_readme_landing(target: RepoTarget, head: str, static_root: Path, state: dict[str, Any]) -> dict[str, Any]:
+    validation = validate_checkout(target)
+    if not validation.get("ok"):
+        validation["deploy_type"] = "static_landing"
+        return validation
+    slug = slugify(target.metadata.get("repo_name") or target.repo_id)
+    releases = static_root / "releases" / slug
+    release_dir = releases / head[:12]
+    current_root = static_root / "current"
+    current_link = current_root / slug
+    releases.mkdir(parents=True, exist_ok=True)
+    current_root.mkdir(parents=True, exist_ok=True)
+    if release_dir.exists():
+        shutil.rmtree(release_dir)
+    release_dir.mkdir(parents=True)
+    title, rendered = _render_landing_page(target, head)
+    (release_dir / "index.html").write_text(rendered, encoding="utf-8")
+    tmp_link = current_link.with_name(current_link.name + ".tmp")
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
+    tmp_link.symlink_to(release_dir, target_is_directory=True)
+    tmp_link.replace(current_link)
+    _write_static_index(static_root, state)
+    verify_url = f"http://127.0.0.1:{DEFAULT_STATIC_PORT}/{slug}/"
+    verify = run(["curl", "-fsS", "-I", verify_url], timeout=20)
+    if verify.returncode != 0:
+        return {
+            "ok": False,
+            "status": "failed",
+            "reason": "static_landing_verify_failed",
+            "detail": tail(verify.stderr or verify.stdout),
+            "url": verify_url,
+            "static_slug": slug,
+            "title": title,
+        }
+    return {
+        "ok": True,
+        "status": "ok",
+        "reason": "static_landing_deploy_ok",
+        "url": verify_url,
+        "static_slug": slug,
+        "release_dir": str(release_dir),
+        "title": title,
     }
 
 
@@ -523,7 +742,9 @@ def deploy_target(target: RepoTarget, head: str, static_root: Path, state: dict[
     policy = deploy_policy(target)
     policy_type = str(policy.get("type") or "script")
     if policy_type == "static":
-        result = deploy_static(target, head, static_root, state)
+        result = deploy_static(target, head, static_root, state, policy=policy)
+    elif policy_type == "static_landing":
+        result = deploy_readme_landing(target, head, static_root, state)
     elif policy_type == "validated_checkout":
         result = validate_checkout(target)
     else:
@@ -615,6 +836,7 @@ def monitor_once(
                 "policy_source": result.get("policy_source"),
                 "static_slug": result.get("static_slug"),
                 "url": result.get("url"),
+                "title": result.get("title") or target.metadata.get("repo_name") or target.repo_id,
                 "detail": result.get("detail") or result.get("stderr") or result.get("stdout") or "",
                 "last_checked_at": _now(),
                 "last_deploy_at": _now(),
