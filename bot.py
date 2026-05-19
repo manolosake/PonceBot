@@ -4966,6 +4966,11 @@ def _extract_structured_result_payload(text: str) -> dict[str, Any] | None:
     return max(candidates, key=_score)
 
 
+def _studio_evidence_text_substantive(value: Any, *, min_chars: int = 16) -> bool:
+    text = str(value or "").strip()
+    return len(text) >= min_chars
+
+
 def _result_structured_digest(result: Any) -> Any:
     structured = getattr(result, "structured_digest", None)
     if structured is None and isinstance(result, dict):
@@ -21206,6 +21211,7 @@ def _enqueue_reviewer_local_rework_if_due(
         "attempt_n": int(retry_n),
         "improvement_verified": False,
     }
+    _inherit_studio_trace_context(root_trace, trace)
     if not use_cli_roles:
         trace["execution_policy"] = "local_only"
     if order_branch:
@@ -21283,6 +21289,7 @@ def _enqueue_reviewer_local_rework_if_due(
             "rework_for_job_id": child_id,
             "previous_review_job_id": str(getattr(latest_review, "job_id", "") or "").strip(),
         }
+        _inherit_studio_trace_context(root_trace, review_trace)
         if order_branch:
             review_trace["order_branch"] = str(order_branch)
         review_child = Task.new(
@@ -28069,6 +28076,39 @@ def _drain_backlog_tick(*, orch_q: OrchestratorQueue, now: float) -> int:
 
 
 
+_STUDIO_TRACE_CONTEXT_KEYS = (
+    "studio_cycle_id",
+    "studio_selected_type",
+    "studio_thesis",
+    "studio_operator_visible_outcome",
+    "studio_evidence_target",
+    "studio_risk_summary",
+)
+
+_STUDIO_DECISION_EVIDENCE_ROLES = frozenset(
+    {
+        "implementer_local",
+        "backend",
+        "frontend",
+        "sre",
+        "security",
+        "product_ops",
+    }
+)
+
+
+def _inherit_studio_trace_context(parent_trace: dict[str, Any], child_trace: dict[str, Any]) -> None:
+    for key in _STUDIO_TRACE_CONTEXT_KEYS:
+        if str(child_trace.get(key) or "").strip():
+            continue
+        value = parent_trace.get(key) if isinstance(parent_trace, dict) else None
+        if isinstance(value, str):
+            value = value.strip()
+        if value is None or value == "":
+            continue
+        child_trace[key] = value
+
+
 def _orchestrator_min_evidence_gate(
     *,
     task: Task,
@@ -28100,6 +28140,105 @@ def _orchestrator_min_evidence_gate(
         "logs_chars": int(len(logs_clean)),
         "summary_substantial": bool(summary_substantial),
     }
+
+    studio_cycle_id = str((task.trace or {}).get("studio_cycle_id") or "").strip()
+    studio_selected_type = str((task.trace or {}).get("studio_selected_type") or "").strip()
+    requires_studio_decision_evidence = (
+        role in _STUDIO_DECISION_EVIDENCE_ROLES
+        and bool(studio_cycle_id)
+        and studio_selected_type == "DEEP_IMPROVEMENT"
+    )
+    if requires_studio_decision_evidence:
+        evidence = structured.get("studio_decision_evidence") if isinstance(structured, dict) else None
+        evidence_meta["studio_decision_evidence_required"] = True
+        evidence_meta["studio_cycle_id"] = studio_cycle_id
+        evidence_meta["studio_selected_type"] = studio_selected_type
+        evidence_meta["studio_decision_evidence_present"] = isinstance(evidence, dict)
+
+        issues: list[str] = []
+        candidate_bets = evidence.get("candidate_bets") if isinstance(evidence, dict) else None
+        killed_bets = evidence.get("killed_bets") if isinstance(evidence, dict) else None
+        selected_bet = evidence.get("selected_bet") if isinstance(evidence, dict) else None
+        critic_answers = evidence.get("critic_answers") if isinstance(evidence, dict) else None
+        debate_summary = evidence.get("debate_summary") if isinstance(evidence, dict) else None
+
+        candidate_count = len(candidate_bets) if isinstance(candidate_bets, list) else 0
+        killed_count = len(killed_bets) if isinstance(killed_bets, list) else 0
+        if candidate_count < 3:
+            issues.append("candidate_bets must list at least 3 options")
+
+        killed_with_reason = 0
+        if isinstance(killed_bets, list):
+            for item in killed_bets:
+                if not isinstance(item, dict):
+                    continue
+                reason = item.get("reason") or item.get("why") or item.get("rationale")
+                if _studio_evidence_text_substantive(reason):
+                    killed_with_reason += 1
+        if killed_with_reason < 1:
+            issues.append("killed_bets must include at least 1 killed bet with substantive reason text")
+
+        selected_has_id = False
+        selected_has_summary = False
+        selected_has_reason = False
+        if isinstance(selected_bet, dict):
+            selected_has_id = bool(str(selected_bet.get("id") or "").strip())
+            selected_has_summary = _studio_evidence_text_substantive(
+                selected_bet.get("summary"),
+                min_chars=8,
+            )
+            selected_has_reason = _studio_evidence_text_substantive(
+                selected_bet.get("reason") or selected_bet.get("why") or selected_bet.get("rationale")
+            )
+        if not (selected_has_id and selected_has_summary and selected_has_reason):
+            issues.append("selected_bet must include id, summary, and substantive reason text")
+
+        critic_answer_count = 0
+        if isinstance(critic_answers, dict):
+            critic_answer_count = sum(
+                1
+                for answer in critic_answers.values()
+                if _studio_evidence_text_substantive(answer)
+            )
+        elif isinstance(critic_answers, list):
+            critic_answer_count = sum(
+                1
+                for answer in critic_answers
+                if (
+                    _studio_evidence_text_substantive(answer)
+                    if not isinstance(answer, dict)
+                    else _studio_evidence_text_substantive(
+                        answer.get("answer") or answer.get("response") or answer.get("reason")
+                    )
+                )
+            )
+        if critic_answer_count < 3:
+            issues.append("critic_answers must include at least 3 substantive answers")
+
+        debate_summary_substantial = _studio_evidence_text_substantive(debate_summary, min_chars=24)
+        if not debate_summary_substantial:
+            issues.append("debate_summary must be substantive")
+
+        evidence_meta["studio_decision_evidence"] = {
+            "candidate_bets_count": int(candidate_count),
+            "killed_bets_count": int(killed_count),
+            "killed_bets_with_reason_count": int(killed_with_reason),
+            "selected_bet_present": isinstance(selected_bet, dict),
+            "selected_bet_has_id": bool(selected_has_id),
+            "selected_bet_has_summary": bool(selected_has_summary),
+            "selected_bet_has_reason": bool(selected_has_reason),
+            "critic_answers_count": int(critic_answer_count),
+            "debate_summary_substantial": bool(debate_summary_substantial),
+            "issues": issues,
+        }
+        if issues:
+            return (
+                False,
+                "Studio DEEP_IMPROVEMENT decision evidence gate not met. "
+                + "; ".join(issues)
+                + ".",
+                evidence_meta,
+            )
 
     if role == "qa":
         qa_tokens = (
@@ -33190,7 +33329,7 @@ def _orchestrator_run_codex(
             structured["token_usage"] = token_usage
         agent_payload = _extract_structured_result_payload(body)
         if isinstance(agent_payload, dict):
-            for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason"):
+            for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason", "studio_decision_evidence"):
                 if key in agent_payload:
                     structured[key] = agent_payload.get(key)
         if order_branch:
@@ -36001,6 +36140,10 @@ def orchestrator_worker_loop(
                                 "eta_minutes": int(spec.eta_minutes or 0),
                                 "sla_tier": str(spec.sla_tier or "normal"),
                             }
+                            _inherit_studio_trace_context(
+                                dict((task.trace or {}) if isinstance(task.trace, dict) else {}),
+                                trace,
+                            )
                             max_retries = 2
                             if child_role == "implementer_local":
                                 max_retries = 1

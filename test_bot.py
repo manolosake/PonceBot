@@ -2538,6 +2538,223 @@ class TestPromptConstruction(unittest.TestCase):
         self.assertFalse(bot._response_signals_repo_access_blocker("FILES:\n- bot.py\nCHANGE:\n- tweak timeout"))
 
 
+class TestOrchestratorMinEvidenceGate(unittest.TestCase):
+    def _studio_task(self, *, role: str = "implementer_local") -> bot.Task:
+        return bot.Task.new(
+            job_id="studio-task",
+            source="test",
+            role=role,
+            input_text="Ship the selected Studio deep improvement slice.",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=0.0,
+            chat_id=1,
+            state="running",
+            trace={
+                "studio_cycle_id": "cycle-123",
+                "studio_selected_type": "DEEP_IMPROVEMENT",
+            },
+        )
+
+    def _valid_studio_evidence(self) -> dict[str, object]:
+        return {
+            "candidate_bets": [
+                {"id": "runtime_gate", "summary": "Runtime evidence gate"},
+                {"id": "backend_flag", "summary": "Backend guard default flag"},
+                {"id": "prompt_only", "summary": "Prompt-only instruction"},
+            ],
+            "killed_bets": [
+                {
+                    "id": "prompt_only",
+                    "reason": "Prompt-only text can be ignored by the runtime and leaves no auditable blocker.",
+                }
+            ],
+            "selected_bet": {
+                "id": "runtime_gate",
+                "summary": "Runtime Studio DEEP_IMPROVEMENT decision-evidence gate",
+                "reason": "It blocks completion exactly where missing decision evidence becomes harmful.",
+            },
+            "critic_answers": {
+                "blast_radius": "Scoped to successful non-controller Studio DEEP_IMPROVEMENT tasks only.",
+                "diagnosis": "Gate metadata records counts and missing evidence blocks for review.",
+                "tests": "Focused unit tests cover missing, partial, and valid evidence paths.",
+            },
+            "debate_summary": "Runtime gating was selected over broader rewrites because it preserves auditable decision evidence at completion.",
+        }
+
+    def test_extract_structured_result_payload_preserves_studio_decision_evidence(self) -> None:
+        payload = bot._extract_structured_result_payload(
+            "done\n```json\n"
+            "{"
+            "\"summary\":\"Ready with decision evidence.\","
+            "\"studio_decision_evidence\":{"
+            "\"candidate_bets\":[{\"id\":\"a\"},{\"id\":\"b\"},{\"id\":\"c\"}],"
+            "\"killed_bets\":[{\"id\":\"b\",\"reason\":\"Too broad for this sprint slice.\"}],"
+            "\"selected_bet\":{\"id\":\"a\",\"summary\":\"Runtime gate\",\"reason\":\"It blocks missing evidence at completion time.\"},"
+            "\"critic_answers\":{\"risk\":\"Runtime-only and scoped.\",\"test\":\"Unit tests pin behavior.\",\"ops\":\"Metadata aids diagnosis.\"},"
+            "\"debate_summary\":\"The runtime gate was selected because it is auditable and narrowly scoped.\""
+            "}"
+            "}\n```"
+        )
+
+        self.assertIsInstance(payload, dict)
+        self.assertIn("studio_decision_evidence", payload)
+
+    def test_blocks_missing_studio_deep_improvement_evidence(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT decision evidence", str(reason))
+        self.assertTrue(meta["studio_decision_evidence_required"])
+        self.assertFalse(meta["studio_decision_evidence_present"])
+        issues = meta["studio_decision_evidence"]["issues"]
+        self.assertIn("candidate_bets must list at least 3 options", issues)
+
+    def test_inherited_studio_context_blocks_delegated_child_without_decision_evidence(self) -> None:
+        parent_trace = {
+            "studio_cycle_id": "cycle-456",
+            "studio_selected_type": "DEEP_IMPROVEMENT",
+            "studio_thesis": "Runtime enforcement prevents prompt-only completion claims.",
+            "studio_operator_visible_outcome": "Operators get auditable Studio improvement decisions.",
+            "studio_evidence_target": "Completion is blocked without structured decision evidence.",
+            "studio_risk_summary": "Scoped to delegated non-controller Studio work.",
+        }
+        child_trace = {
+            "source": "telegram",
+            "delegated_by": "root-task",
+            "delegated_key": "implement_gate",
+            "requested_role": "implementer_local",
+            "profile_role": "implementer_local",
+            "slice_id": "root_slice",
+        }
+        bot._inherit_studio_trace_context(parent_trace, child_trace)
+
+        self.assertEqual(child_trace["studio_cycle_id"], "cycle-456")
+        self.assertEqual(child_trace["studio_selected_type"], "DEEP_IMPROVEMENT")
+        self.assertEqual(
+            child_trace["studio_operator_visible_outcome"],
+            "Operators get auditable Studio improvement decisions.",
+        )
+
+        child = bot.Task.new(
+            job_id="delegated-child",
+            source="test",
+            role="implementer_local",
+            input_text="Implement the delegated Studio deep improvement slice.",
+            request_type="task",
+            priority=1,
+            model="gpt-5.3-codex",
+            effort="medium",
+            mode_hint="rw",
+            requires_approval=False,
+            max_cost_window_usd=0.0,
+            chat_id=1,
+            state="running",
+            parent_job_id="root-task",
+            labels={"ticket": "root-task", "kind": "subtask", "key": "implement_gate"},
+            trace=child_trace,
+        )
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=child,
+            summary="Implemented the delegated Studio deep improvement slice with targeted validation evidence.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT decision evidence", str(reason))
+        self.assertEqual(meta["studio_cycle_id"], "cycle-456")
+        self.assertEqual(meta["studio_selected_type"], "DEEP_IMPROVEMENT")
+
+    def test_reviewer_local_inherited_studio_context_passes_without_decision_evidence(self) -> None:
+        task = self._studio_task(role="reviewer_local")
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=task,
+            summary=(
+                "Reviewed the implementation against the requested behavior and validation "
+                "contract; no blocking issues found."
+            ),
+            artifacts=[],
+            logs="review note with concrete validation detail " * 4,
+            structured={},
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertNotIn("studio_decision_evidence_required", meta)
+        self.assertTrue(meta["summary_substantial"])
+
+    def test_qa_inherited_studio_context_passes_without_decision_evidence(self) -> None:
+        task = self._studio_task(role="qa")
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=task,
+            summary=(
+                "PASS: validated the requested Studio improvement with focused tests and "
+                "checked the relevant regression behavior."
+            ),
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertNotIn("studio_decision_evidence_required", meta)
+        self.assertTrue(meta["summary_substantial"])
+
+    def test_blocks_partial_studio_deep_improvement_evidence(self) -> None:
+        evidence = self._valid_studio_evidence()
+        evidence["candidate_bets"] = [{"id": "only_one"}]
+        evidence["killed_bets"] = [{"id": "weak", "reason": "thin"}]
+        evidence["critic_answers"] = {"one": "This answer is substantive enough."}
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": evidence},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT decision evidence", str(reason))
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["candidate_bets_count"], 1)
+        self.assertEqual(diag["killed_bets_with_reason_count"], 0)
+        self.assertEqual(diag["critic_answers_count"], 1)
+
+    def test_valid_studio_deep_improvement_evidence_passes(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": self._valid_studio_evidence()},
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["candidate_bets_count"], 3)
+        self.assertEqual(diag["killed_bets_with_reason_count"], 1)
+        self.assertEqual(diag["critic_answers_count"], 3)
+        self.assertEqual(diag["issues"], [])
+
+
 class TestLocalSpecialistResponseHelpers(unittest.TestCase):
     def test_parse_orchestrator_subtasks_accepts_next_action_nested_subtasks(self) -> None:
         specs = bot.parse_orchestrator_subtasks(
