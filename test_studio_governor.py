@@ -4,6 +4,7 @@ import os
 import sqlite3
 import subprocess
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import bot
@@ -1499,6 +1500,56 @@ def test_unwritable_android_build_outputs_trigger_fresh_autoship_worktree(tmp_pa
         assert "poncebot/autoship/android-main-" in fresh_branch
     finally:
         app_build.chmod(0o755)
+
+
+def test_default_branch_tracked_changes_use_fresh_autoship_worktree(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dirty_file = repo / "bot.py"
+    dirty_file.write_text("local dirty source checkout\n", encoding="utf-8")
+    fresh_dir = tmp_path / "autoship" / "repo-main-fresh"
+    calls = []
+
+    def fake_run_git(target_repo, args, **kwargs):
+        calls.append((Path(target_repo), list(args)))
+        if args == ["fetch", "origin", "--prune"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if args == ["status", "--porcelain", "--untracked-files=no"]:
+            stdout = " M bot.py\n" if Path(target_repo) == repo else ""
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if args[:4] == ["worktree", "add", "-B", "poncebot/autoship/repo-main-fresh"]:
+            assert Path(args[4]) == fresh_dir
+            fresh_dir.mkdir(parents=True)
+            (fresh_dir / ".git").write_text("gitdir: fake\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ["merge", "--ff-only", "origin/main"]:
+            assert Path(target_repo) == fresh_dir
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if args == ["rev-parse", "--short", "HEAD"]:
+            assert Path(target_repo) == fresh_dir
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        raise AssertionError(f"unexpected git call: {target_repo} {args}")
+
+    monkeypatch.setattr(bot, "_run_git", fake_run_git)
+    monkeypatch.setattr(bot, "_git_fetch_remote_branch", lambda _repo, _branch: (True, ""))
+    monkeypatch.setattr(bot, "_repo_has_unwritable_build_outputs", lambda _repo: False)
+    monkeypatch.setattr(
+        bot,
+        "_fresh_autoship_worktree_dir",
+        lambda _repo, _branch: (fresh_dir, "poncebot/autoship/repo-main-fresh"),
+    )
+
+    synced, reason, deployed_commit, checkout = bot._sync_repo_checkout_to_default_branch(repo=repo, default_branch="main")
+
+    assert synced is True
+    assert reason == "synced"
+    assert deployed_commit == "abc123"
+    assert checkout == fresh_dir
+    assert dirty_file.read_text(encoding="utf-8") == "local dirty source checkout\n"
+    assert not any(target == repo and args[:2] == ["merge", "--ff-only"] for target, args in calls)
+    assert any(target == repo and args[:2] == ["worktree", "add"] for target, args in calls)
 
 
 def test_studio_governor_blocks_missing_validation_toolchain():

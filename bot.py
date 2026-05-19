@@ -10431,21 +10431,27 @@ def _sync_repo_checkout_to_default_branch(
             f"poncebot/runtime/{branch_slug}-deploy-{suffix}",
         )
 
+    def _finalize_fresh_autoship_worktree() -> tuple[bool, str, str | None, Path | None]:
+        fresh_dir, fresh_branch = _fresh_autoship_worktree_dir(repo, branch)
+        try:
+            fresh_dir.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return False, f"fresh_autoship_worktree_prepare_failed:{exc}", None, None
+        add = _run_git(repo, ["worktree", "add", "-B", fresh_branch, str(fresh_dir), f"origin/{branch}"], check=False)
+        if add.returncode != 0:
+            detail = (add.stderr or add.stdout or "").strip()
+            return False, detail or "fresh_autoship_worktree_add_failed", None, None
+        return _finalize_synced_checkout(fresh_dir)
+
     head = _run_git(repo, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     current_branch = str(head.stdout or "").strip() if head.returncode == 0 else ""
     if current_branch in ("", branch):
         if _repo_has_unwritable_build_outputs(repo):
-            fresh_dir, fresh_branch = _fresh_autoship_worktree_dir(repo, branch)
-            try:
-                fresh_dir.parent.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                return False, f"fresh_autoship_worktree_prepare_failed:{exc}", None, None
-            add = _run_git(repo, ["worktree", "add", "-B", fresh_branch, str(fresh_dir), f"origin/{branch}"], check=False)
-            if add.returncode != 0:
-                detail = (add.stderr or add.stdout or "").strip()
-                return False, detail or "fresh_autoship_worktree_add_failed", None, None
-            return _finalize_synced_checkout(fresh_dir)
-        return _finalize_synced_checkout(repo)
+            return _finalize_fresh_autoship_worktree()
+        synced = _finalize_synced_checkout(repo)
+        if synced[0] or str(synced[1]) != "tracked_changes_present":
+            return synced
+        return _finalize_fresh_autoship_worktree()
 
     worktree_dir = _runtime_worktree_dir()
     try:
