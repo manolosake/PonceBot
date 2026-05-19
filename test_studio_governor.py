@@ -894,6 +894,51 @@ def test_recent_controller_snapshot_rows_include_nested_snapshot_metadata(tmp_pa
     assert rows[0]["order_id"] == "order-1"
 
 
+def test_recent_controller_snapshot_rows_skip_terminal_autoship_failure(tmp_path):
+    db = tmp_path / "jobs.sqlite"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE studio_cycles (order_id TEXT, status TEXT, outcome_status TEXT, updated_at REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE ceo_orders (order_id TEXT, chat_id INTEGER, status TEXT, phase TEXT, title TEXT, updated_at REAL)"
+        )
+        conn.execute("CREATE TABLE jobs (job_id TEXT, trace TEXT)")
+        conn.execute(
+            "INSERT INTO studio_cycles VALUES (?, ?, ?, ?)",
+            ("order-1", "failed", "failed_root_caused", 2_000.0),
+        )
+        conn.execute(
+            "INSERT INTO ceo_orders VALUES (?, ?, ?, ?, ?, ?)",
+            ("order-1", 123, "failed", "failed", "Snapshot order", 2_000.0),
+        )
+        conn.execute(
+            "INSERT INTO jobs VALUES (?, ?)",
+            (
+                "order-1",
+                json.dumps(
+                    {
+                        "controller_snapshot_workdir": "/tmp/snapshot",
+                        "controller_snapshot_autoship_error": {
+                            "status": "failed",
+                            "reason": "snapshot_patch_check_failed",
+                        },
+                        "blocked_reason": "controller_snapshot_autoship_failed:snapshot_patch_check_failed",
+                    }
+                ),
+            ),
+        )
+
+    orch_q = SimpleNamespace(_storage=SimpleNamespace(path=db))
+    rows = bot._recent_controller_snapshot_studio_order_rows(
+        orch_q=orch_q,
+        now=2_100.0,
+        max_age_seconds=300.0,
+    )
+
+    assert rows == []
+
+
 def _seed_snapshot_autoship_recovery_order(tmp_path, *, now: float = 2_000.0, updated_at: float | None = None):
     db = tmp_path / "jobs.sqlite"
     storage = SQLiteTaskStorage(db)
@@ -999,6 +1044,48 @@ def test_auto_merge_tick_root_causes_pre_deploy_controller_snapshot_autoship_fai
         "failed_root_caused",
         "Controller snapshot autoship failed_root_caused: snapshot patch check failed (reason=snapshot_patch_check_failed). Detail: error: patch failed: app.py:12",
     )
+
+
+def test_auto_merge_tick_does_not_retry_terminal_controller_snapshot_autoship_failure(tmp_path, monkeypatch):
+    now = 2_000.0
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_patch_check_failed",
+        "detail": "error: patch failed: app.py:12",
+    }
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", lambda **kwargs: autoship_result)
+
+    bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    seen = {"called": False}
+
+    def fail_if_retried(**kwargs):
+        seen["called"] = True
+        raise AssertionError("terminal autoship failure should not be retried")
+
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", fail_if_retried)
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now + 30,
+    )
+
+    assert merged == 0
+    assert seen["called"] is False
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "failed"
+    assert order["phase"] == "failed"
+    assert job.trace["controller_snapshot_autoship_error"] == autoship_result
+    assert job.trace["blocked_reason"] == "controller_snapshot_autoship_failed:snapshot_patch_check_failed"
 
 
 def test_auto_merge_tick_root_causes_missing_controller_snapshot_patch(tmp_path, monkeypatch):
@@ -1123,6 +1210,76 @@ def test_auto_merge_tick_preserves_recorded_controller_snapshot_deploy_failure(t
             (order_id,),
         ).fetchone()
     assert row == ("failed", "failed_root_caused", deploy_summary)
+
+
+def test_auto_merge_tick_does_not_overwrite_recorded_controller_snapshot_deploy_failure(tmp_path, monkeypatch):
+    now = 2_000.0
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+    deploy_summary = "Auto-shipped validated controller snapshot to main commit=abc123. Deploy failed: service restart failed."
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_autoship_deploy_failed",
+        "summary": deploy_summary,
+        "commit": "abc123",
+        "deploy": {
+            "status": "failed",
+            "reason": "deploy_script_failed",
+            "detail": "service restart failed",
+            "summary": "Deploy failed: service restart failed.",
+        },
+    }
+    orch_q.set_order_status(order_id, chat_id=chat_id, status="active")
+    orch_q.set_order_phase(order_id, chat_id=chat_id, phase="review")
+    orch_q.update_state(
+        order_id,
+        "blocked",
+        blocked_reason="deploy_failed",
+        merge_ready=False,
+        merge_required=False,
+        deploy_status="failed",
+        deploy_result="deploy_script_failed",
+        deploy_summary="Deploy failed: service restart failed.",
+        deploy_error="service restart failed",
+        result_status="deploy_failed",
+        result_summary=deploy_summary,
+        result_next_action="Inspect deployment failure and complete rollout.",
+        controller_snapshot_autoship_error=autoship_result,
+    )
+    bot._studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status="failed_root_caused",
+        outcome_summary=deploy_summary,
+        now=now,
+    )
+
+    seen = {"called": False}
+
+    def fail_if_retried(**kwargs):
+        seen["called"] = True
+        raise AssertionError("recorded deploy failure should not be overwritten")
+
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: (None, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", fail_if_retried)
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now + 30,
+    )
+
+    assert merged == 0
+    assert seen["called"] is False
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "active"
+    assert order["phase"] == "review"
+    assert job.state == "blocked"
+    assert job.blocked_reason == "deploy_failed"
+    assert job.trace["result_status"] == "deploy_failed"
+    assert job.trace["result_summary"] == deploy_summary
+    assert job.trace["controller_snapshot_autoship_error"] == autoship_result
 
 
 def test_auto_merge_tick_recovers_aged_controller_snapshot_blocker_within_72h(tmp_path, monkeypatch):

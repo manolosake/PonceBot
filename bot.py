@@ -15076,6 +15076,13 @@ def _recent_controller_snapshot_studio_order_rows(
                       j.trace LIKE '%controller_snapshot_workdir%'
                       OR j.trace LIKE '%"controller_snapshot"%'
                   )
+                  AND NOT (
+                      sc.outcome_status = 'failed_root_caused'
+                      AND LOWER(COALESCE(o.status, '')) = 'failed'
+                      AND LOWER(COALESCE(o.phase, '')) = 'failed'
+                      AND COALESCE(j.trace, '') LIKE '%controller_snapshot_autoship_error%'
+                      AND COALESCE(j.trace, '') LIKE '%controller_snapshot_autoship_failed:%'
+                  )
                 ORDER BY sc.updated_at DESC
                 LIMIT ?
                 """,
@@ -15693,6 +15700,12 @@ def _auto_merge_ready_orders_tick(
 
             root = orch_q.get_job(oid)
             trace = dict((root.trace or {}) if root else {})
+            if _controller_snapshot_deploy_failure_already_recorded(
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=chat_for_order,
+            ):
+                continue
             if _controller_snapshot_delivery_candidate(trace):
                 _repo_record, repo_dir, default_branch = _repo_context_for_order(
                     cfg=cfg,
@@ -15811,6 +15824,13 @@ def _auto_merge_ready_orders_tick(
         except Exception:
             chat_for_order = 0
         if chat_for_order <= 0:
+            continue
+
+        if _controller_snapshot_deploy_failure_already_recorded(
+            orch_q=orch_q,
+            order_id=oid,
+            chat_id=chat_for_order,
+        ):
             continue
 
         root = orch_q.get_job(oid)
