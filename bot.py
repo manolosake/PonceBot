@@ -8358,6 +8358,51 @@ def _run_git(
     )
 
 
+def _git_transient_transport_error(detail: str) -> bool:
+    blob = str(detail or "").lower()
+    markers = (
+        "temporary failure in name resolution",
+        "could not resolve hostname",
+        "connection timed out",
+        "connection reset",
+        "network is unreachable",
+        "remote end hung up",
+    )
+    return any(marker in blob for marker in markers)
+
+
+def _run_git_retry_transient(
+    repo: Path,
+    args: list[str],
+    *,
+    check: bool = False,
+    env: dict[str, str] | None = None,
+    attempts: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    retry_attempts = attempts
+    if retry_attempts is None:
+        try:
+            retry_attempts = int(os.environ.get("BOT_GIT_TRANSPORT_RETRIES", "3") or "3")
+        except Exception:
+            retry_attempts = 3
+    retry_attempts = max(1, retry_attempts)
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(retry_attempts):
+        result = _run_git(repo, args, check=False, env=env)
+        if result.returncode == 0:
+            return result
+        detail = result.stderr or result.stdout or ""
+        if not _git_transient_transport_error(detail) or attempt >= retry_attempts - 1:
+            if check:
+                result.check_returncode()
+            return result
+        time.sleep(min(30.0, 2.0 * (attempt + 1)))
+    assert result is not None
+    if check:
+        result.check_returncode()
+    return result
+
+
 def _git_config_get(repo: Path, key: str) -> str:
     proc = _run_git(repo, ["config", "--get", str(key or "").strip()], check=False)
     if proc.returncode != 0:
@@ -15451,7 +15496,7 @@ def _auto_ship_controller_snapshot_order(
 
     rev = _run_git(target_repo, ["rev-parse", "--short", "HEAD"], check=False, env=env)
     commit_sha = str(rev.stdout or "").strip() if rev.returncode == 0 else ""
-    push = _run_git(target_repo, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False, env=env)
+    push = _run_git_retry_transient(target_repo, ["push", "origin", f"HEAD:refs/heads/{default_branch}"], check=False, env=env)
     if push.returncode != 0:
         return {"status": "failed", "reason": "snapshot_push_failed", "detail": (push.stderr or push.stdout or "").strip(), "commit": commit_sha}
 

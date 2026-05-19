@@ -1462,6 +1462,82 @@ def test_controller_snapshot_autoship_success_reports_persistence_failure_after_
     assert sum(1 for args in commands if args[:2] == ["push", "origin"]) == 1
 
 
+def test_controller_snapshot_autoship_retries_transient_push_failure(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    patch = tmp_path / "changes.patch"
+    patch.write_text("diff --git a/app.py b/app.py\n", encoding="utf-8")
+    commands = []
+    completed = {}
+    status_calls = {"count": 0}
+
+    class RecordingQueue:
+        def __init__(self):
+            self.state_call = None
+
+        def set_order_status(self, *args, **kwargs):
+            return None
+
+        def set_order_phase(self, *args, **kwargs):
+            return None
+
+        def update_state(self, *args, **kwargs):
+            self.state_call = (args, kwargs)
+
+        def append_audit_event(self, *args, **kwargs):
+            return None
+
+    def fake_run_git(_repo, args, **kwargs):
+        commands.append(list(args))
+        if args[:2] == ["rev-parse", "--short"]:
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if args[:2] == ["push", "origin"]:
+            push_count = sum(1 for command in commands if command[:2] == ["push", "origin"])
+            if push_count == 1:
+                return SimpleNamespace(returncode=128, stdout="", stderr="ssh: Could not resolve hostname github.com: Temporary failure in name resolution")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_status(_repo):
+        status_calls["count"] += 1
+        return "" if status_calls["count"] == 1 else " M app.py\n"
+
+    monkeypatch.setattr(bot, "_sync_repo_checkout_to_default_branch", lambda **kwargs: (True, "", None, None))
+    monkeypatch.setattr(bot, "_git_status_porcelain", fake_status)
+    monkeypatch.setattr(bot, "_run_git", fake_run_git)
+    monkeypatch.setattr(bot, "_controller_snapshot_copy_safe_untracked_files", lambda **kwargs: [])
+    monkeypatch.setattr(bot, "_controller_snapshot_validation_commands", lambda *args, **kwargs: [])
+    monkeypatch.setattr(bot, "_deploy_after_order_merge", lambda **kwargs: {"status": "skipped", "reason": "no_policy", "summary": "Deploy skipped."})
+    monkeypatch.setattr(bot, "_studio_complete_cycle_for_order", lambda **kwargs: completed.update(kwargs))
+    monkeypatch.setattr(bot.time, "sleep", lambda _seconds: None)
+
+    queue = RecordingQueue()
+    result = bot._auto_ship_controller_snapshot_order(
+        cfg=SimpleNamespace(),
+        orch_q=queue,
+        order_id="snapshot-order",
+        chat_id=123,
+        trace={
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_status": "blocked_need_operator",
+            "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot.",
+        },
+        repo_record=None,
+        repo_dir=repo,
+        default_branch="main",
+        now=2_000.0,
+    )
+
+    assert result["status"] == "ok"
+    assert result["reason"] == "snapshot_autoship_complete"
+    assert sum(1 for args in commands if args[:2] == ["push", "origin"]) == 2
+    assert queue.state_call[1]["controller_snapshot_autoship_done"] is True
+    assert completed["outcome_status"] == "shipped_to_main"
+
+
 def test_controller_snapshot_autoship_failure_reports_persistence_failure(tmp_path):
     class FailingFailureQueue:
         def set_order_status(self, *args, **kwargs):
