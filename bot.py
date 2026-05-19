@@ -15215,7 +15215,7 @@ def _controller_snapshot_no_delta_outcome_status(trace: dict[str, Any]) -> str:
     ).lower()
     if "published_project" in blob or "private github" in blob:
         return "published_project"
-    return "shipped_to_main"
+    return "rejected_low_value"
 
 
 def _auto_ship_controller_snapshot_order(
@@ -15278,12 +15278,18 @@ def _auto_ship_controller_snapshot_order(
                 deploy_summary = _deploy_result_display(deploy_result)
                 ok = deploy_status != "failed"
                 outcome_status = _controller_snapshot_no_delta_outcome_status(trace)
+                delivered = outcome_status in {"published_project", "shipped_to_main"}
                 summary = (
-                    f"Controller snapshot had no new delta; {default_branch} already contains the validated outcome"
+                    f"Controller snapshot had no new delta; not counted as shipped without a material patch"
                     + (f" commit={commit_sha}" if commit_sha else "")
                     + (f". {deploy_summary}" if deploy_summary else ".")
                 )
-                original_reason = "snapshot_no_delta_already_published" if ok else "snapshot_no_delta_deploy_failed"
+                if ok and outcome_status == "published_project":
+                    original_reason = "snapshot_no_delta_already_published"
+                elif ok:
+                    original_reason = "snapshot_no_delta_rejected_low_value"
+                else:
+                    original_reason = "snapshot_no_delta_deploy_failed"
                 try:
                     orch_q.set_order_status(order_id, chat_id=int(chat_id), status=("done" if ok else "active"))
                     orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase=("done" if ok else "review"))
@@ -15293,21 +15299,29 @@ def _auto_ship_controller_snapshot_order(
                         blocked_reason=(None if ok else "deploy_failed"),
                         merge_ready=False,
                         merge_required=False,
-                        merged_to_main=bool(ok),
-                        merge_commit=(commit_sha or None),
+                        merged_to_main=bool(ok and delivered),
+                        merge_commit=((commit_sha or None) if delivered else None),
                         deploy_status=deploy_status,
                         deploy_result=str(deploy_result.get("reason") or ""),
                         deploy_summary=deploy_summary,
-                        deployed_commit=deploy_result.get("deployed_commit"),
-                        deployed_at=(float(now) if ok else None),
+                        deployed_commit=(deploy_result.get("deployed_commit") if delivered else None),
+                        deployed_at=(float(now) if ok and delivered else None),
                         deploy_error=(deploy_result.get("detail") if not ok else None),
                         controller_snapshot_autoship_done=bool(ok),
                         controller_snapshot_autoship_no_delta=True,
                         controller_snapshot_autoship_at=float(now),
-                        controller_snapshot_autoship_commit=(commit_sha or None),
+                        controller_snapshot_autoship_commit=((commit_sha or None) if delivered else None),
                         result_status=(outcome_status if ok else "deploy_failed"),
                         result_summary=summary,
-                        result_next_action=("Factory ready for next order." if ok else "Inspect deployment failure and complete rollout."),
+                        result_next_action=(
+                            "Factory ready for next order."
+                            if ok and delivered
+                            else (
+                                "Reject this no-delta work and choose a stronger candidate."
+                                if ok
+                                else "Inspect deployment failure and complete rollout."
+                            )
+                        ),
                     )
                     _studio_complete_cycle_for_order(
                         cfg=cfg,
