@@ -352,6 +352,17 @@ def _write_static_index(static_root: Path, state: dict[str, Any]) -> None:
     (current_root / "index.html").write_text(html_doc, encoding="utf-8")
 
 
+def target_display_name(target: RepoTarget) -> str:
+    metadata_name = str(target.metadata.get("repo_name") or "").strip()
+    if metadata_name:
+        return metadata_name
+    readme = _read_text(target.path / "README.md", limit=3000)
+    heading = _first_markdown_heading(readme, "")
+    if heading:
+        return heading
+    return target.path.name or target.repo_id
+
+
 def deploy_static(
     target: RepoTarget,
     head: str,
@@ -360,7 +371,8 @@ def deploy_static(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     policy = dict(policy or {})
-    slug = slugify(target.metadata.get("repo_name") or target.repo_id)
+    title = target_display_name(target)
+    slug = slugify(title)
     releases = static_root / "releases" / slug
     release_dir = releases / head[:12]
     current_root = static_root / "current"
@@ -409,6 +421,7 @@ def deploy_static(
         "url": verify_url,
         "static_slug": slug,
         "release_dir": str(release_dir),
+        "title": title,
     }
 
 
@@ -485,7 +498,7 @@ def _git_remote_url(repo: Path) -> str:
 
 
 def _render_landing_page(target: RepoTarget, head: str) -> tuple[str, str]:
-    repo_name = str(target.metadata.get("repo_name") or target.repo_id)
+    repo_name = target_display_name(target)
     readme = _read_text(target.path / "README.md")
     validation = _read_text(target.path / "VALIDATION.md", limit=5000)
     title = _first_markdown_heading(readme, repo_name)
@@ -546,7 +559,8 @@ def deploy_readme_landing(target: RepoTarget, head: str, static_root: Path, stat
     if not validation.get("ok"):
         validation["deploy_type"] = "static_landing"
         return validation
-    slug = slugify(target.metadata.get("repo_name") or target.repo_id)
+    title = target_display_name(target)
+    slug = slugify(title)
     releases = static_root / "releases" / slug
     release_dir = releases / head[:12]
     current_root = static_root / "current"

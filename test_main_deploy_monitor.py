@@ -94,10 +94,11 @@ def test_landing_policy_for_readme_only_repo(tmp_path):
 def test_static_preview_deploy_copies_preview_to_index(tmp_path, monkeypatch):
     repo = tmp_path / "preview"
     repo.mkdir()
+    (repo / "README.md").write_text("# Preview Product\n", encoding="utf-8")
     preview = repo / ".codexbot_preview"
     preview.mkdir()
     (preview / "preview.html").write_text("<h1>Preview</h1>", encoding="utf-8")
-    target = mdm.RepoTarget("preview-1", repo, "main", {"repo_name": "Preview"})
+    target = mdm.RepoTarget("preview-1", repo, "main", {})
 
     monkeypatch.setattr(
         mdm,
@@ -114,7 +115,7 @@ def test_static_preview_deploy_copies_preview_to_index(tmp_path, monkeypatch):
     )
 
     assert result["ok"] is True
-    deployed_index = tmp_path / "static" / "current" / "preview" / "index.html"
+    deployed_index = tmp_path / "static" / "current" / "preview-product" / "index.html"
     assert deployed_index.read_text(encoding="utf-8") == "<h1>Preview</h1>"
 
 
