@@ -1,8 +1,10 @@
 import json
 import inspect
 import os
+import socket
 import sqlite3
 import subprocess
+import urllib.error
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -78,6 +80,18 @@ def test_studio_governor_detects_autoship_recovery_backlog():
     assert "validated controller-snapshot autoship/recovery blockers" in governor["trigger"]
     assert "Recover, merge, push, deploy, or root-cause" in governor["force_next_action"]
     assert any("validated controller snapshots waiting" in directive for directive in governor["directives"])
+
+
+def test_transient_network_exception_detection_handles_dns_cause():
+    try:
+        try:
+            raise urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Telegram URL error calling getUpdates: {exc}") from exc
+    except RuntimeError as exc:
+        assert bot._is_transient_network_exception(exc)
+
+    assert not bot._is_transient_network_exception(RuntimeError("database schema mismatch"))
 
 
 def test_studio_governor_does_not_treat_generic_autoship_waiting_as_recovery_backlog():

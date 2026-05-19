@@ -37173,6 +37173,27 @@ def worker_loop(
             jobs.task_done()
 
 
+def _is_transient_network_exception(exc: BaseException) -> bool:
+    markers = (
+        "temporary failure in name resolution",
+        "could not resolve hostname",
+        "connection timed out",
+        "connection reset",
+        "network is unreachable",
+        "remote end closed connection",
+        "temporarily unavailable",
+    )
+    pieces: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        pieces.append(str(current))
+        current = current.__cause__ or current.__context__
+    blob = " ".join(pieces).lower()
+    return any(marker in blob for marker in markers)
+
+
 def poll_loop(
     *,
     cfg: BotConfig,
@@ -38211,8 +38232,11 @@ def poll_loop(
                             reply_to_message_id=message_id if message_id else None,
                         )
 
-        except Exception:
-            LOG.exception("Polling error; backing off")
+        except Exception as exc:
+            if _is_transient_network_exception(exc):
+                LOG.warning("Polling transient network error; backing off: %s", exc)
+            else:
+                LOG.exception("Polling error; backing off")
             time.sleep(backoff)
             backoff = min(backoff * 2.0, 30.0)
 
