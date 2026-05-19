@@ -1974,7 +1974,7 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
     assert rows["orphan-cycle"] == ("failed", "failed_root_caused")
     assert rows["live-order-cycle"] == ("active", None)
     assert rows["live-job-cycle"] == ("active", None)
-    assert rows["snapshot-cycle"] == ("active", "blocked_need_operator")
+    assert rows["snapshot-cycle"] == ("blocked", "blocked_need_operator")
 
 
 def test_final_sweep_no_change_close_waits_for_open_nonblocking_children():

@@ -16979,7 +16979,7 @@ def _studio_finalize_orphaned_active_cycles(
             snapshot_cur = conn.execute(
                 """
                 UPDATE studio_cycles
-                SET status = 'active',
+                SET status = 'blocked',
                     outcome_status = 'blocked_need_operator',
                     outcome_summary = ?,
                     updated_at = ?
@@ -17012,7 +17012,7 @@ def _studio_finalize_orphaned_active_cycles(
                   )
                 """,
                 (
-                    "Studio cycle has a validated controller snapshot waiting for autoship; keep it recoverable instead of marking it failed.",
+                    "Studio cycle has a validated controller snapshot waiting for autoship; closed as blocked terminal recovery record.",
                     float(now),
                     cutoff,
                     *active_job_states,
