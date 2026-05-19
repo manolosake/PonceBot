@@ -46,6 +46,7 @@ def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str,
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     lane_counts = summary.get("lanes") if isinstance(summary.get("lanes"), dict) else {}
+    selection_quality = summary.get("selection_quality") if isinstance(summary.get("selection_quality"), dict) else {}
     lanes = [lane for lane in list(report.get("lanes") or []) if isinstance(lane, dict)]
 
     lines = [
@@ -61,6 +62,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Returned: {_one_line(summary.get('returned'), default='0')}",
         f"- Top lane: {_one_line(summary.get('top_lane'))}",
         f"- Top action: {_one_line(summary.get('top_action'))}",
+        f"- Selection needs review: {_one_line(selection_quality.get('needs_review'), default='0')}",
         "",
         "## Lane Counts",
         "",
@@ -85,13 +87,14 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 f"- Recommended next action: {_one_line(lane.get('recommended_next_action'))}",
                 "",
-                "| Rank | Order | Stage | Verdict | Next action |",
-                "| ---: | --- | --- | --- | --- |",
+                "| Rank | Order | Stage | Verdict | Selection | Next action |",
+                "| ---: | --- | --- | --- | --- | --- |",
             ]
         )
         if orders:
             for order in orders:
                 order_label = order.get("order_id_short") or order.get("order_id")
+                order_selection = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
                 lines.append(
                     "| "
                     + " | ".join(
@@ -100,13 +103,14 @@ def render_markdown(report: dict[str, Any]) -> str:
                             _one_line(order_label),
                             _one_line(order.get("current_stage")),
                             _one_line(order.get("readiness_verdict")),
+                            _one_line(order_selection.get("status")),
                             _one_line(order.get("next_action")),
                         ]
                     )
                     + " |"
                 )
         else:
-            lines.append("| - | - | - | - | No orders in this lane. |")
+            lines.append("| - | - | - | - | - | No orders in this lane. |")
 
     return "\n".join(lines) + "\n"
 

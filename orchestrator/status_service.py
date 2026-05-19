@@ -1415,6 +1415,210 @@ def _priority_next_action(order: dict[str, Any], decision: str, blocker: dict[st
     return existing or "Advance the proactive workflow evidence."
 
 
+_SELECTION_TEXT_MARKERS = (
+    "buyer",
+    "commercial",
+    "customer",
+    "deploy",
+    "factory",
+    "github",
+    "merge",
+    "monetiz",
+    "price",
+    "publish",
+    "release",
+    "retention",
+    "revenue",
+    "saving",
+    "selection",
+    "ship",
+    "user",
+    "validat",
+    "value",
+)
+_SELECTION_PLACEHOLDER_TEXT = {
+    "n/a",
+    "na",
+    "none",
+    "not assessed",
+    "not available",
+    "tbd",
+    "todo",
+    "unknown",
+}
+
+
+def _selection_one_line(value: Any, *, max_chars: int = 220) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\r", " ").replace("\n", " ").strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "..."
+    return text
+
+
+def _selection_flatten_text(value: Any, *, limit: int = 16) -> list[str]:
+    out: list[str] = []
+
+    def walk(item: Any) -> None:
+        if len(out) >= limit:
+            return
+        if isinstance(item, dict):
+            for nested in item.values():
+                walk(nested)
+                if len(out) >= limit:
+                    break
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                walk(nested)
+                if len(out) >= limit:
+                    break
+        else:
+            text = _selection_one_line(item)
+            if text:
+                out.append(text)
+
+    walk(value)
+    return out
+
+
+def _has_substantive_selection_text(value: Any, *, require_marker: bool = False) -> bool:
+    for text in _selection_flatten_text(value):
+        normalized = " ".join(text.lower().split())
+        if not normalized or normalized in _SELECTION_PLACEHOLDER_TEXT:
+            continue
+        if len(normalized) < 24:
+            continue
+        if require_marker and not any(marker in normalized for marker in _SELECTION_TEXT_MARKERS):
+            continue
+        return True
+    return False
+
+
+def _selection_evidence_sources(*, order_row: dict[str, Any] | None, root_task: Task | None) -> list[dict[str, Any]]:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(key: str, value: Any, *, require_marker: bool = False) -> None:
+        if key in seen:
+            return
+        if not _has_substantive_selection_text(value, require_marker=require_marker):
+            return
+        seen.add(key)
+        sources.append({"kind": "trace", "key": key, "summary": _selection_one_line(value)})
+
+    for key in ("proactive_improvement_verified", "proactive_no_change_validated"):
+        if bool(trace.get(key)) and key not in seen:
+            seen.add(key)
+            sources.append({"kind": "trace", "key": key, "summary": "true"})
+
+    commercial_evidence = trace.get("commercial_evidence")
+    if isinstance(commercial_evidence, dict):
+        add("commercial_evidence", commercial_evidence, require_marker=True)
+    add("commercial_evidence_target", trace.get("commercial_evidence_target"))
+
+    studio_decision_evidence = trace.get("studio_decision_evidence")
+    if isinstance(studio_decision_evidence, dict):
+        add("studio_decision_evidence", studio_decision_evidence)
+
+    factory_value = trace.get("factory_value")
+    if isinstance(factory_value, dict):
+        score = _coerce_int(factory_value.get("score"))
+        dimensions = factory_value.get("dimensions") if isinstance(factory_value.get("dimensions"), dict) else {}
+        dimension_ok = any(
+            bool(value.get("ok")) for value in dimensions.values() if isinstance(value, dict)
+        )
+        if score >= 50 or dimension_ok or _has_substantive_selection_text(factory_value, require_marker=True):
+            add("factory_value", factory_value)
+
+    terminal_outcome = str(trace.get("studio_terminal_outcome") or "").strip()
+    terminal_summary = trace.get("studio_terminal_outcome_summary") or trace.get("outcome_summary") or trace.get("result_summary")
+    if terminal_outcome and _has_substantive_selection_text(terminal_summary, require_marker=True):
+        add("studio_terminal_outcome", f"{terminal_outcome}: {terminal_summary}", require_marker=True)
+
+    add("outcome_summary", trace.get("outcome_summary"), require_marker=True)
+    add("result_summary", trace.get("result_summary"), require_marker=True)
+
+    body = str((order_row or {}).get("body") or "").strip()
+    if _has_substantive_selection_text(body, require_marker=True):
+        key = "order_body"
+        if key not in seen:
+            sources.append({"kind": "order", "key": key, "summary": _selection_one_line(body)})
+
+    return sources[:6]
+
+
+def _selection_review_action(order: dict[str, Any]) -> str:
+    oid = str(order.get("order_id_short") or order.get("order_id") or "this order").strip()
+    return (
+        f"Selection review for order {oid}: make a kill/continue decision before more implementation churn; "
+        "record concrete business, factory-value, or studio-decision evidence if continuing."
+    )
+
+
+def _selection_quality_metadata(
+    order: dict[str, Any],
+    *,
+    order_row: dict[str, Any] | None = None,
+    root_task: Task | None = None,
+) -> dict[str, Any]:
+    decision = str(order.get("decision") or "").strip().lower()
+    readiness_state = str(order.get("readiness_state") or "").strip().lower()
+    readiness_verdict = str(order.get("readiness_verdict") or "").strip().lower()
+    primary_blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else None
+    merge_ready = bool(order.get("merge_ready"))
+    merged_to_main = bool(order.get("merged_to_main"))
+
+    flags: list[str] = []
+    if decision != "advance":
+        return {
+            "status": "ok",
+            "flags": flags,
+            "summary": "Selection-quality gate only reviews advance/not-ready proactive work.",
+            "recommended_owner_role": None,
+        }
+    if merge_ready or merged_to_main or readiness_state in {"ready", "released"} or readiness_verdict == "go":
+        return {
+            "status": "ok",
+            "flags": ["release_ready_exempt"],
+            "summary": "Release-ready or already merged work is exempt from selection review.",
+            "recommended_owner_role": None,
+        }
+    if primary_blocker is not None or readiness_state == "blocked" or readiness_verdict == "no_go":
+        return {
+            "status": "ok",
+            "flags": ["blocked_exempt"],
+            "summary": "Blocked work should route through unblock ownership before selection review.",
+            "recommended_owner_role": None,
+        }
+    if readiness_state not in {"not_ready", "unknown", ""} and readiness_verdict not in {"wait", "unknown", ""}:
+        return {
+            "status": "ok",
+            "flags": flags,
+            "summary": "Order is not in the advance/not-ready selection-review lane.",
+            "recommended_owner_role": None,
+        }
+
+    evidence_sources = _selection_evidence_sources(order_row=order_row, root_task=root_task)
+    if evidence_sources:
+        return {
+            "status": "ok",
+            "flags": ["selection_evidence_present"],
+            "summary": "Commercial, factory-value, or studio-decision evidence is present.",
+            "recommended_owner_role": None,
+            "evidence_sources": evidence_sources,
+        }
+
+    flags = ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"]
+    return {
+        "status": "needs_review",
+        "flags": flags,
+        "summary": "Advance work has no substantive commercial, factory-value, or studio-decision evidence; review selection before more delivery churn.",
+        "recommended_owner_role": "architect_local",
+        "evidence_sources": [],
+    }
+
+
 def _handoff_role_for_stage(stage: str) -> str:
     return _HANDOFF_STAGE_ROLE.get(str(stage or "").strip().lower(), "implementer_local")
 
@@ -1425,6 +1629,11 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     handoff_path = f"/api/v1/orchestration/orders/handoff-digest?order_id={oid}" if oid else "/api/v1/orchestration/orders/handoff-digest"
 
     decision_key = str(decision or "").strip().lower()
+    selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+    selection_needs_review = (
+        decision_key == "advance"
+        and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
+    )
     primary_blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else None
     blocker_stage = str((primary_blocker or {}).get("stage") or stage).strip().lower()
     blocker_job = (primary_blocker or {}).get("job")
@@ -1434,13 +1643,33 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
         suggested_role = "release_mgr"
     elif decision_key == "unblock":
         suggested_role = blocker_role if blocker_role in _HANDOFF_ROLES else _handoff_role_for_stage(blocker_stage)
+    elif selection_needs_review:
+        suggested_role = "architect_local"
     else:
         suggested_role = _handoff_role_for_stage(stage)
 
     next_action = str(order.get("next_action") or "").strip() or "Advance the proactive workflow evidence."
     title = str(order.get("title") or "").strip() or "proactive order"
 
-    if decision_key == "release":
+    if selection_needs_review:
+        action = _selection_review_action(order)
+        definition_of_done = [
+            "Make an explicit kill/continue decision for this proactive order.",
+            "If continuing, record the business, factory-value, or studio-decision evidence that justifies implementation.",
+            "If killing or pausing, update the order next action so delivery churn stops.",
+        ]
+        checklist = [
+            "Open the handoff digest.",
+            "Inspect existing order and root trace evidence for commercial value, factory value, and studio decision rationale.",
+            "Do not implement the delivery slice until selection evidence is recorded or the order is killed/paused.",
+        ]
+        evidence_expectations = [
+            "kill/continue decision",
+            "business or factory-value evidence",
+            "studio-decision rationale or selected-bet evidence",
+        ]
+    elif decision_key == "release":
+        action = ""
         definition_of_done = [
             "Release or merge the order branch.",
             "Record release evidence on the order.",
@@ -1457,6 +1686,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
             "post-release status summary",
         ]
     elif decision_key == "monitor":
+        action = ""
         definition_of_done = [
             "Confirm deployed or merged status is still healthy.",
             "Attach post-release evidence or a no-action note.",
@@ -1472,6 +1702,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
             "post-release verification note",
         ]
     elif decision_key == "unblock":
+        action = ""
         definition_of_done = [
             next_action,
             "Recompute readiness after the blocker is cleared.",
@@ -1487,6 +1718,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
             "updated readiness or workflow status",
         ]
     else:
+        action = ""
         definition_of_done = [
             next_action,
             "Attach evidence that advances the proactive workflow.",
@@ -1502,7 +1734,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
             "updated order next action",
         ]
 
-    return {
+    payload = {
         "suggested_role": suggested_role,
         "suggested_endpoint": handoff_path,
         "inspect_path": handoff_path,
@@ -1511,6 +1743,9 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
         "evidence_expectations": evidence_expectations,
         "title": title,
     }
+    if action:
+        payload["action"] = action
+    return payload
 
 
 def _proactive_packet_text(value: Any, default: str = "") -> str:
@@ -1533,16 +1768,21 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
     handoff = order.get("handoff") if isinstance(order.get("handoff"), dict) else {}
     lane_key = _proactive_packet_text(lane, "advance").lower()
     lane_label = _proactive_packet_text(label, lane_key.title())
+    selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+    selection_needs_review = (
+        lane_key == "advance"
+        and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
+    )
     oid = _proactive_packet_text(order.get("order_id"))
     display_oid = _proactive_packet_text(order.get("order_id_short"), oid[:8] if oid else "unknown")
     stage = _proactive_packet_text(order.get("current_stage"), "skynet_plan")
     action = (
-        _proactive_packet_text(handoff.get("action"))
+        _selection_review_action(order) if selection_needs_review else _proactive_packet_text(handoff.get("action"))
         or _proactive_packet_text(order.get("next_action"))
         or f"Advance the {lane_label.lower()} lane order."
     )
 
-    owner_role = _proactive_packet_text(handoff.get("suggested_role"))
+    owner_role = "architect_local" if selection_needs_review else _proactive_packet_text(handoff.get("suggested_role"))
     if not owner_role:
         if lane_key in {"release", "monitor"}:
             owner_role = "release_mgr"
@@ -1589,7 +1829,27 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Verify acceptance criteria, definition of done, and evidence expectations are satisfied.",
         ]
 
-    assignment_prompt = _proactive_packet_text(handoff.get("assignment_prompt"))
+    if selection_needs_review:
+        acceptance_criteria = [
+            f"Inspect {inspect_endpoint}.",
+            "Make an explicit kill/continue decision before delivery work continues.",
+            "Record business, factory-value, or studio-decision evidence for any continue decision.",
+        ]
+        definition_of_done = [
+            "The order has a kill/continue decision.",
+            "Continuing work has concrete selection evidence, or killed/paused work has an updated next action.",
+        ]
+        evidence_required = [
+            "kill/continue decision",
+            "business or factory-value evidence",
+            "studio-decision rationale or selected-bet evidence",
+        ]
+        suggested_validation = [
+            "Re-read the inspect endpoint after the selection decision.",
+            "Verify implementation work has not continued without selection evidence.",
+        ]
+
+    assignment_prompt = "" if selection_needs_review else _proactive_packet_text(handoff.get("assignment_prompt"))
     if not assignment_prompt:
         prompt_lines = [
             f"ROLE: {owner_role}.",
@@ -3056,6 +3316,7 @@ class StatusService:
             stage_rank = int(_STAGE_RANK.get(current_stage, -1))
             decision_rank = int(_DECISION_RANK.get(decision, 9))
             updated_at = _coerce_float(order.get("updated_at")) or 0.0
+            next_action = _priority_next_action(order, decision, blocker)
 
             priority_item = {
                 "rank": 0,
@@ -3070,7 +3331,7 @@ class StatusService:
                 "decision": decision,
                 "why": why,
                 "primary_blocker": primary_blocker,
-                "next_action": _priority_next_action(order, decision, blocker),
+                "next_action": next_action,
                 "score_breakdown": {
                     "decision_rank": decision_rank,
                     "priority": priority,
@@ -3081,6 +3342,10 @@ class StatusService:
                 "merged_to_main": bool(order.get("merged_to_main")),
                 "updated_at": updated_at,
             }
+            selection_quality = _selection_quality_metadata(priority_item, order_row=order_row, root_task=root_task)
+            priority_item["selection_quality"] = selection_quality
+            if str(selection_quality.get("status") or "").strip().lower() == "needs_review":
+                priority_item["next_action"] = _selection_review_action(priority_item)
             priority_item["handoff"] = _proactive_handoff_metadata(priority_item, decision)
             ranked.append(priority_item)
 
@@ -3107,12 +3372,17 @@ class StatusService:
                 "decision": first.get("decision"),
                 "why": first.get("why"),
                 "next_action": first.get("next_action"),
+                "selection_quality": first.get("selection_quality"),
             }
 
         by_decision: dict[str, int] = {}
+        by_selection_quality: dict[str, int] = {}
         for order in ranked:
             decision = str(order.get("decision") or "unknown")
             by_decision[decision] = by_decision.get(decision, 0) + 1
+            selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+            selection_status = str(selection_quality.get("status") or "unknown")
+            by_selection_quality[selection_status] = by_selection_quality.get(selection_status, 0) + 1
 
         return {
             "api_version": "v1",
@@ -3124,6 +3394,7 @@ class StatusService:
                 "active_proactive_orders": len(ranked),
                 "returned": len(orders),
                 "by_decision": by_decision,
+                "by_selection_quality": by_selection_quality,
                 "top_decision": (str(top.get("decision")) if isinstance(top, dict) else None),
             },
             "top": top,
@@ -3159,6 +3430,7 @@ class StatusService:
             "updated_at",
             "merge_ready",
             "merged_to_main",
+            "selection_quality",
         ]
         for order in list(priorities.get("orders") or []):
             if not isinstance(order, dict):
@@ -3240,6 +3512,14 @@ class StatusService:
 
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())
+        selection_quality_counts: dict[str, int] = {}
+        for lane in lanes:
+            for order in list(lane.get("orders") or []):
+                if not isinstance(order, dict):
+                    continue
+                selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+                status = str(selection_quality.get("status") or "unknown")
+                selection_quality_counts[status] = selection_quality_counts.get(status, 0) + 1
         return {
             "api_version": "v1",
             "schema_version": 1,
@@ -3250,6 +3530,7 @@ class StatusService:
                 "active_proactive_orders": int((priorities.get("summary") or {}).get("active_proactive_orders") or 0),
                 "returned": returned,
                 "lanes": lane_counts,
+                "selection_quality": selection_quality_counts,
                 "top_lane": top_lane,
                 "top_action": (str(top_order.get("next_action") or "") if isinstance(top_order, dict) else None),
                 "next_delegate": next_delegate,

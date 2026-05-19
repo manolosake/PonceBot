@@ -168,6 +168,162 @@ class TestStatusService(unittest.TestCase):
             self.assertIsNone(plan["summary"]["next_delegate"])
             self.assertTrue(all(lane["execution_packet"] is None for lane in plan["lanes"]))
 
+    def test_proactive_action_plan_reroutes_weak_advance_order_to_selection_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "weak-advance-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Weak advance order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Weak advance order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={"proactive_lane": True, "result_summary": "Implementation requested."},
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            order = lanes["advance"]["orders"][0]
+            self.assertEqual(order["selection_quality"]["status"], "needs_review")
+            self.assertIn("weak_selection_evidence", order["selection_quality"]["flags"])
+            self.assertEqual(plan["summary"]["selection_quality"]["needs_review"], 1)
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(top_packet["order_id"], order_id)
+            self.assertEqual(top_packet["owner_role"], "architect_local")
+            self.assertIn("Selection review", top_packet["action"])
+            self.assertIn("kill/continue", top_packet["action"])
+            self.assertIn("factory-value", " ".join(top_packet["evidence_required"]))
+
+    def test_proactive_action_plan_selection_review_does_not_reroute_release_or_blocked_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+
+            release_id = "release-ready-order"
+            q.upsert_order(
+                order_id=release_id,
+                chat_id=7,
+                title="Release ready order",
+                body="Release it.",
+                status="active",
+                priority=1,
+                phase="review",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Release ready order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_validated": 1,
+                        "proactive_slices_closed": 1,
+                        "proactive_improvement_verified": True,
+                        "proactive_improvement_closed": True,
+                        "merge_ready": True,
+                        "order_branch": "orders/release-ready-order",
+                        "result_summary": "Validated release evidence for a shippable value path.",
+                    },
+                    job_id=release_id,
+                )
+            )
+
+            blocked_id = "blocked-advance-order"
+            q.upsert_order(
+                order_id=blocked_id,
+                chat_id=7,
+                title="Blocked advance order",
+                body="Blocked delivery.",
+                status="active",
+                priority=2,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Blocked advance order",
+                    request_type="task",
+                    priority=2,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=blocked_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="Implement blocked slice",
+                    request_type="task",
+                    priority=2,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="blocked",
+                    parent_job_id=blocked_id,
+                    blocked_reason="Delivery dependency is missing.",
+                    trace={"result_summary": "Delivery dependency is missing."},
+                    job_id="blocked-child",
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            release_packet = lanes["release"]["execution_packet"]
+            unblock_packet = lanes["unblock"]["execution_packet"]
+            self.assertEqual(release_packet["order_id"], release_id)
+            self.assertEqual(release_packet["owner_role"], "release_mgr")
+            self.assertEqual(lanes["release"]["orders"][0]["selection_quality"]["status"], "ok")
+            self.assertEqual(unblock_packet["order_id"], blocked_id)
+            self.assertEqual(unblock_packet["owner_role"], "implementer_local")
+            self.assertEqual(lanes["unblock"]["orders"][0]["selection_quality"]["status"], "ok")
+            self.assertNotIn("Selection review", unblock_packet["action"])
+
     def test_operator_focus_delegate_contract_is_populated(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
