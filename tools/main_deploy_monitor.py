@@ -337,7 +337,7 @@ def _write_static_index(static_root: Path, state: dict[str, Any]) -> None:
             f'<article><a href="./{slug}/">{title}</a>'
             f'<span>{html.escape(status)}</span><small>{deploy_type}</small><code>{html.escape(head)}</code></article>'
         )
-    html = (
+    html_doc = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<title>PonceBot Production Sites</title>"
@@ -349,7 +349,7 @@ def _write_static_index(static_root: Path, state: dict[str, Any]) -> None:
         + "\n".join(rows)
         + "</section></main></body></html>"
     )
-    (current_root / "index.html").write_text(html, encoding="utf-8")
+    (current_root / "index.html").write_text(html_doc, encoding="utf-8")
 
 
 def deploy_static(

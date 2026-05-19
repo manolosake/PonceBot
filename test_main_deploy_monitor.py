@@ -141,6 +141,28 @@ def test_readme_landing_deploy_writes_product_page_and_index(tmp_path, monkeypat
     assert "Validation Evidence" in page
 
 
+def test_static_index_renders_existing_static_landing_rows(tmp_path):
+    mdm._write_static_index(
+        tmp_path / "static",
+        {
+            "repos": {
+                "cli-1": {
+                    "deploy_type": "static_landing",
+                    "static_slug": "cli-product",
+                    "title": "CLI Product",
+                    "status": "ok",
+                    "deployed_head": "abcdef1234567890",
+                }
+            }
+        },
+    )
+
+    index = (tmp_path / "static" / "current" / "index.html").read_text(encoding="utf-8")
+    assert "CLI Product" in index
+    assert "./cli-product/" in index
+    assert "static_landing" in index
+
+
 def test_remote_head_retries_transient_fetch(monkeypatch, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
