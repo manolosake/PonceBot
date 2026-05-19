@@ -1306,6 +1306,7 @@ _PROACTIVE_MARKERS = ("[proactive:", "proactive sprint")
 _DECISION_RANK = {
     "release": 0,
     "unblock": 1,
+    "selection_review": 1.5,
     "advance": 2,
     "monitor": 3,
 }
@@ -1631,7 +1632,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     decision_key = str(decision or "").strip().lower()
     selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
     selection_needs_review = (
-        decision_key == "advance"
+        decision_key in {"advance", "selection_review"}
         and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
     )
     primary_blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else None
@@ -1770,7 +1771,7 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
     lane_label = _proactive_packet_text(label, lane_key.title())
     selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
     selection_needs_review = (
-        lane_key == "advance"
+        lane_key in {"advance", "selection_review"}
         and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
     )
     oid = _proactive_packet_text(order.get("order_id"))
@@ -3314,7 +3315,7 @@ class StatusService:
             priority = int(order.get("priority") or 2)
             current_stage = str(order.get("current_stage") or "skynet_plan")
             stage_rank = int(_STAGE_RANK.get(current_stage, -1))
-            decision_rank = int(_DECISION_RANK.get(decision, 9))
+            decision_rank = float(_DECISION_RANK.get(decision, 9))
             updated_at = _coerce_float(order.get("updated_at")) or 0.0
             next_action = _priority_next_action(order, decision, blocker)
 
@@ -3345,13 +3346,17 @@ class StatusService:
             selection_quality = _selection_quality_metadata(priority_item, order_row=order_row, root_task=root_task)
             priority_item["selection_quality"] = selection_quality
             if str(selection_quality.get("status") or "").strip().lower() == "needs_review":
+                decision = "selection_review"
+                decision_rank = float(_DECISION_RANK[decision])
+                priority_item["decision"] = decision
+                priority_item["score_breakdown"]["decision_rank"] = decision_rank
                 priority_item["next_action"] = _selection_review_action(priority_item)
             priority_item["handoff"] = _proactive_handoff_metadata(priority_item, decision)
             ranked.append(priority_item)
 
         ranked.sort(
             key=lambda order: (
-                int((order.get("score_breakdown") or {}).get("decision_rank") or 9),
+                float((order.get("score_breakdown") or {}).get("decision_rank") or 9),
                 int(order.get("priority") or 2),
                 -int((order.get("score_breakdown") or {}).get("stage_rank") or -1),
                 float(order.get("updated_at") or 0.0),
@@ -3408,6 +3413,7 @@ class StatusService:
         lane_defs = [
             ("release", "Release"),
             ("unblock", "Unblock"),
+            ("selection_review", "Selection Review"),
             ("advance", "Advance"),
             ("monitor", "Monitor"),
         ]
@@ -3423,6 +3429,7 @@ class StatusService:
             "current_stage",
             "readiness_state",
             "readiness_verdict",
+            "decision",
             "why",
             "primary_blocker",
             "next_action",
@@ -3436,9 +3443,14 @@ class StatusService:
             if not isinstance(order, dict):
                 continue
             lane = str(order.get("decision") or "").strip().lower()
+            selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+            if lane == "advance" and str(selection_quality.get("status") or "").strip().lower() == "needs_review":
+                lane = "selection_review"
             if lane not in lanes_by_key:
                 lane = "advance"
-            lanes_by_key[lane].append({key: order.get(key) for key in compact_keys})
+            compact_order = {key: order.get(key) for key in compact_keys}
+            compact_order["decision"] = lane
+            lanes_by_key[lane].append(compact_order)
 
         lanes: list[dict[str, Any]] = []
         for lane, label in lane_defs:
@@ -4845,6 +4857,7 @@ class StatusService:
         proactive_category = {
             "release": ("proactive_release", "high", "Release proactive order"),
             "unblock": ("proactive_unblock", "high", "Unblock proactive order"),
+            "selection_review": ("proactive_selection_review", "high", "Review proactive selection"),
             "advance": ("proactive_advance", "medium", "Advance proactive order"),
             "monitor": ("proactive_monitor", "low", "Monitor proactive order"),
         }

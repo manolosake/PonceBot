@@ -205,17 +205,164 @@ class TestStatusService(unittest.TestCase):
             plan = svc.proactive_action_plan(chat_id=7, limit=10)
 
             lanes = {lane["lane"]: lane for lane in plan["lanes"]}
-            order = lanes["advance"]["orders"][0]
+            self.assertLess(
+                [lane["lane"] for lane in plan["lanes"]].index("selection_review"),
+                [lane["lane"] for lane in plan["lanes"]].index("advance"),
+            )
+            order = lanes["selection_review"]["orders"][0]
+            self.assertEqual(order["decision"], "selection_review")
             self.assertEqual(order["selection_quality"]["status"], "needs_review")
             self.assertIn("weak_selection_evidence", order["selection_quality"]["flags"])
+            self.assertEqual(plan["summary"]["lanes"]["selection_review"], 1)
+            self.assertEqual(plan["summary"]["top_lane"], "selection_review")
             self.assertEqual(plan["summary"]["selection_quality"]["needs_review"], 1)
 
             top_packet = plan["top_execution_packet"]
             self.assertEqual(top_packet["order_id"], order_id)
             self.assertEqual(top_packet["owner_role"], "architect_local")
+            self.assertEqual(top_packet["lane"], "selection_review")
             self.assertIn("Selection review", top_packet["action"])
             self.assertIn("kill/continue", top_packet["action"])
+            self.assertIn("kill/continue decision", top_packet["evidence_required"])
             self.assertIn("factory-value", " ".join(top_packet["evidence_required"]))
+
+    def test_proactive_priorities_promotes_needs_review_advance_to_selection_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+
+            weak_id = "weak-selection-order"
+            q.upsert_order(
+                order_id=weak_id,
+                chat_id=7,
+                title="Weak selection order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=2,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Weak selection order",
+                    request_type="task",
+                    priority=2,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={"proactive_lane": True, "result_summary": "Implementation requested."},
+                    job_id=weak_id,
+                )
+            )
+
+            supported_id = "supported-advance-order"
+            q.upsert_order(
+                order_id=supported_id,
+                chat_id=7,
+                title="Supported advance order",
+                body="Advance the selected value slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Supported advance order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "factory_value": {
+                            "score": 75,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence shows this user-facing workflow should advance.",
+                        },
+                    },
+                    job_id=supported_id,
+                )
+            )
+
+            blocked_id = "blocked-order"
+            q.upsert_order(
+                order_id=blocked_id,
+                chat_id=7,
+                title="Blocked order",
+                body="Blocked delivery.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Blocked order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={"proactive_lane": True},
+                    job_id=blocked_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="implementer_local",
+                    input_text="Blocked task",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="blocked",
+                    parent_job_id=blocked_id,
+                    blocked_reason="Missing dependency.",
+                    job_id="blocked-child-priority",
+                )
+            )
+
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            priorities = svc.proactive_priorities(chat_id=7, limit=10)
+
+            orders_by_id = {order["order_id"]: order for order in priorities["orders"]}
+            weak_order = orders_by_id[weak_id]
+            supported_order = orders_by_id[supported_id]
+            blocked_order = orders_by_id[blocked_id]
+
+            self.assertEqual(blocked_order["decision"], "unblock")
+            self.assertEqual(weak_order["decision"], "selection_review")
+            self.assertEqual(supported_order["decision"], "advance")
+            self.assertGreater(weak_order["score_breakdown"]["decision_rank"], blocked_order["score_breakdown"]["decision_rank"])
+            self.assertLess(weak_order["score_breakdown"]["decision_rank"], supported_order["score_breakdown"]["decision_rank"])
+            self.assertEqual(weak_order["selection_quality"]["status"], "needs_review")
+            self.assertIn("Selection review", weak_order["next_action"])
+            self.assertEqual(weak_order["handoff"]["suggested_role"], "architect_local")
+            self.assertIn("kill/continue decision", weak_order["handoff"]["evidence_expectations"])
+            self.assertEqual(priorities["summary"]["by_decision"]["selection_review"], 1)
 
     def test_proactive_action_plan_selection_review_does_not_reroute_release_or_blocked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as td:

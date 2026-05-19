@@ -90,7 +90,16 @@ class TestProactiveActionPlanReport(unittest.TestCase):
     def test_render_markdown_includes_needs_review_selection_quality_evidence_sources(self) -> None:
         report = self._base_report()
         report["summary"]["selection_quality"] = {"needs_review": 1}
+        report["summary"]["lanes"] = {"selection_review": 1, "advance": 0}
+        report["summary"]["top_lane"] = "selection_review"
+        report["summary"]["next_delegate"]["owner_role"] = "architect_local"
+        report["summary"]["next_delegate"]["lane"] = "selection_review"
+        report["top_execution_packet"]["owner_role"] = "architect_local"
+        report["top_execution_packet"]["lane"] = "selection_review"
+        report["lanes"][0]["lane"] = "selection_review"
+        report["lanes"][0]["label"] = "Selection Review"
         order = report["lanes"][0]["orders"][0]
+        order["decision"] = "selection_review"
         order["selection_quality"] = {
             "status": "needs_review",
             "flags": ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"],
@@ -107,6 +116,11 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         rendered = report_tool.render_markdown(report)
 
         self.assertIn("### Top Order Selection Quality", rendered)
+        self.assertIn("- Top lane: selection_review", rendered)
+        self.assertIn("- Selection Review: 1", rendered)
+        self.assertIn("- owner_role: architect_local", rendered)
+        self.assertIn("- lane: selection_review", rendered)
+        self.assertIn("## Selection Review", rendered)
         self.assertIn("- status: needs_review", rendered)
         self.assertIn("- flags:", rendered)
         self.assertIn("  - weak_selection_evidence", rendered)
