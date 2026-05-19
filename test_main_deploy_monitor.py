@@ -12,6 +12,21 @@ def test_slugify_is_stable():
     assert mdm.slugify("") == "repo"
 
 
+def test_target_display_name_prefers_readme_over_generated_registry_name(tmp_path):
+    repo = tmp_path / "20260511-studio-cycle-new-product-incubator-0f5a5cc0"
+    repo.mkdir()
+    (repo / "README.md").write_text("# QuoteKit Studio\n\nOffer tooling.", encoding="utf-8")
+    target = mdm.RepoTarget(
+        "repo-1",
+        repo,
+        "main",
+        {"repo_name": "20260511-studio-cycle-new-product-incubator-0f5a5cc0"},
+    )
+
+    assert mdm.target_display_name(target) == "QuoteKit Studio"
+    assert mdm.expected_static_slug(target, {"type": "static_landing"}) == "quotekit-studio"
+
+
 def test_load_targets_reads_active_repos(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

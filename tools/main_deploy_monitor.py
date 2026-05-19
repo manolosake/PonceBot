@@ -12,6 +12,7 @@ import argparse
 import html
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -38,6 +39,7 @@ TRANSIENT_FETCH_MARKERS = (
     "network is unreachable",
     "connection refused",
 )
+GENERATED_REPO_NAME_RE = re.compile(r"^20\d{6}-studio-cycle-new-product-incubator-[0-9a-f]{8}$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -352,15 +354,29 @@ def _write_static_index(static_root: Path, state: dict[str, Any]) -> None:
     (current_root / "index.html").write_text(html_doc, encoding="utf-8")
 
 
+def generated_repo_name(value: str) -> bool:
+    return bool(GENERATED_REPO_NAME_RE.match(str(value or "").strip()))
+
+
 def target_display_name(target: RepoTarget) -> str:
     metadata_name = str(target.metadata.get("repo_name") or "").strip()
-    if metadata_name:
+    if metadata_name and not generated_repo_name(metadata_name):
         return metadata_name
     readme = _read_text(target.path / "README.md", limit=3000)
     heading = _first_markdown_heading(readme, "")
     if heading:
         return heading
+    if metadata_name:
+        return metadata_name
     return target.path.name or target.repo_id
+
+
+def expected_static_slug(target: RepoTarget, policy: dict[str, Any] | None = None) -> str:
+    policy = dict(policy or deploy_policy(target))
+    policy_type = str(policy.get("type") or "")
+    if policy_type not in {"static", "static_landing"}:
+        return ""
+    return slugify(target_display_name(target))
 
 
 def deploy_static(
@@ -810,7 +826,20 @@ def monitor_once(
             append_event(events_path, {"event": reason, "repo_id": target.repo_id, "path": str(target.path), "detail": detail})
             continue
         previous = str(repo_state.get("deployed_head") or "")
-        should_deploy = deploy_current or previous != head
+        policy = deploy_policy(target)
+        expected_slug = expected_static_slug(target, policy)
+        current_slug = str(repo_state.get("static_slug") or "")
+        current_deploy_type = str(repo_state.get("deploy_type") or "")
+        expected_deploy_type = str(policy.get("type") or "")
+        static_policy_changed = bool(
+            expected_slug
+            and (
+                current_slug != expected_slug
+                or current_deploy_type != expected_deploy_type
+                or str(repo_state.get("url") or "").rstrip("/").endswith(f"/{expected_slug}") is False
+            )
+        )
+        should_deploy = deploy_current or previous != head or static_policy_changed
         if not should_deploy:
             repo_state.update({"status": "ok", "remote_head": head, "last_checked_at": _now()})
             repos_state[target.repo_id] = repo_state
@@ -870,6 +899,8 @@ def monitor_once(
                 "url": repo_state.get("url"),
             },
         )
+    if not dry_run:
+        _write_static_index(static_root, state)
     state["updated_at"] = _now()
     state["target_count"] = len(targets)
     state["changed_count"] = changed
