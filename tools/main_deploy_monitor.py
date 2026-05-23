@@ -42,6 +42,10 @@ TRANSIENT_FETCH_MARKERS = (
 GENERATED_REPO_NAME_RE = re.compile(r"^20\d{6}-studio-cycle-new-product-incubator-[0-9a-f]{8}$", re.IGNORECASE)
 
 
+class DeployMonitorAlreadyActive(RuntimeError):
+    """Raised when another live deploy monitor process already owns the lock."""
+
+
 @dataclass(frozen=True)
 class RepoTarget:
     repo_id: str
@@ -122,7 +126,7 @@ def acquire_lock(path: Path) -> Any:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close()
-        raise SystemExit("another main deploy monitor run is active")
+        raise DeployMonitorAlreadyActive("another main deploy monitor run is active")
     handle.write(f"{os.getpid()}\n")
     handle.flush()
     return handle
@@ -921,7 +925,14 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    lock = acquire_lock(LOCK_PATH)
+    try:
+        lock = acquire_lock(LOCK_PATH)
+    except DeployMonitorAlreadyActive as exc:
+        # This monitor is often triggered both by the timer and by post-merge
+        # shipping. A live run already owns the deploy decision, so the second
+        # trigger is idempotent rather than a failed production rollout.
+        print(json.dumps({"status": "already_active", "detail": str(exc)}, sort_keys=True))
+        return 0
     try:
         return monitor_once(
             db_path=args.db,
