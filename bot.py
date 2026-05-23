@@ -27079,6 +27079,19 @@ def _sync_order_phase_from_runtime(
             root_ticket=rid,
         )
 
+    merged_to_main = bool(root_trace.get("merged_to_main", False))
+    deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
+    if proactive_order and merged_to_main and deploy_failed:
+        if _recover_late_successful_deploy(
+            orch_q=orch_q,
+            order_id=rid,
+            chat_id=int(chat_id),
+            repo_record=_repo_record,
+            root_trace=root_trace,
+            now=time.time(),
+        ):
+            return
+
     studio_terminal = _studio_terminal_outcome_for_order(orch_q, rid) if proactive_order else None
     if studio_terminal:
         outcome = str(studio_terminal.get("outcome_status") or "").strip().lower()
@@ -27171,19 +27184,6 @@ def _sync_order_phase_from_runtime(
     if status == "paused":
         orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="paused")
         return
-
-    merged_to_main = bool(root_trace.get("merged_to_main", False))
-    deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
-    if proactive_order and merged_to_main and deploy_failed:
-        if _recover_late_successful_deploy(
-            orch_q=orch_q,
-            order_id=rid,
-            chat_id=int(chat_id),
-            repo_record=_repo_record,
-            root_trace=root_trace,
-            now=time.time(),
-        ):
-            return
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     phase_children = [child for child in children if not _task_requests_local_controller_recovery(child)]

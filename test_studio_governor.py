@@ -662,6 +662,55 @@ def test_late_deploy_success_recovery_clears_deploy_failed_order(monkeypatch, tm
     assert queue.audit_events[-1][1]["event_type"] == "order.late_deploy_success_recovered"
 
 
+def test_sync_order_phase_recovers_late_deploy_before_failed_terminal(monkeypatch, tmp_path):
+    recovered = []
+
+    class Queue:
+        def get_order(self, *_args, **_kwargs):
+            return {
+                "status": "active",
+                "phase": "review",
+                "title": "AUTONOMOUS PROACTIVE SPRINT",
+                "body": "[proactive:studio-repo-omnicrewapp]",
+            }
+
+        def get_job(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                trace={
+                    "merged_to_main": True,
+                    "deploy_status": "failed",
+                    "merge_commit": "4c046e4",
+                },
+                state="blocked",
+                blocked_reason="deploy_failed",
+            )
+
+    monkeypatch.setattr(
+        bot,
+        "_repo_context_for_order",
+        lambda **_kwargs: ({"repo_id": "omnicrewapp.android-ba7b4a67"}, tmp_path, "main"),
+    )
+    monkeypatch.setattr(bot, "_order_trace_requires_merge", lambda *_args, **_kwargs: (False, ""))
+    monkeypatch.setattr(bot, "_trace_has_operator_verified_deployment", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bot, "_trace_has_project_incubator_delivery_evidence", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bot, "_order_has_verified_no_change_resolution", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        bot,
+        "_recover_late_successful_deploy",
+        lambda **kwargs: recovered.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        bot,
+        "_studio_terminal_outcome_for_order",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("terminal outcome should not win before recovery")),
+    )
+
+    bot._sync_order_phase_from_runtime(orch_q=Queue(), root_ticket="order-1", chat_id=123)
+
+    assert recovered
+    assert recovered[0]["order_id"] == "order-1"
+
+
 def test_studio_governor_ignores_ordinary_product_workflow_debt():
     now = 1_700_000_000.0
     memory = {
