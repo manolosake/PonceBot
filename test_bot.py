@@ -22,6 +22,73 @@ if str(HERE) not in sys.path:
 import bot  # noqa: E402
 
 
+class TestFactoryRepoHygiene(unittest.TestCase):
+    def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def _repo(self, tmp: Path) -> Path:
+        repo = tmp / "repo"
+        repo.mkdir()
+        self._git(repo, "init", "-b", "main")
+        self._git(repo, "config", "user.name", "Tester")
+        self._git(repo, "config", "user.email", "tester@example.com")
+        (repo / "README.md").write_text("# Demo\n", encoding="utf-8")
+        self._git(repo, "add", "README.md")
+        self._git(repo, "commit", "-m", "init")
+        return repo
+
+    def test_factory_autocleans_only_ephemeral_untracked_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            preview = repo / ".codexbot_preview"
+            preview.mkdir()
+            (preview / "screenshot.png").write_bytes(b"png")
+            output = repo / "output" / "playwright"
+            output.mkdir(parents=True)
+            (output / "trace.json").write_text("{}", encoding="utf-8")
+
+            blocker = bot._factory_repo_autonomy_blocker(repo, default_branch="main")
+
+            self.assertEqual("", blocker)
+            self.assertFalse((preview / "screenshot.png").exists())
+            self.assertFalse(output.exists())
+
+    def test_factory_keeps_untracked_preview_html_as_material_work(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            preview = repo / ".codexbot_preview"
+            preview.mkdir()
+            (preview / "preview.html").write_text("<h1>Ship me</h1>", encoding="utf-8")
+
+            blocker = bot._factory_repo_autonomy_blocker(repo, default_branch="main")
+
+            self.assertIn("repo checkout has uncommitted changes", blocker)
+            self.assertTrue((preview / "preview.html").exists())
+
+    def test_no_runtime_deploy_policy_is_validated_checkout_not_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            result = bot._deploy_after_order_merge(
+                cfg=SimpleNamespace(codex_workdir=Path(td) / "codexbot"),
+                repo_record={"repo_id": "demo", "metadata": {}},
+                repo_dir=repo,
+                default_branch="main",
+                order_id="order-1",
+                order_branch="feature/order-1-demo",
+                merge_commit="abc123",
+            )
+
+            self.assertEqual("ok", result["status"])
+            self.assertEqual("validated_checkout", result["reason"])
+            self.assertNotIn("skipped", result["summary"].lower())
+
+
 class TestStateHandling(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:
         return bot.BotConfig(

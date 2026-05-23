@@ -2649,6 +2649,78 @@ def _factory_is_temporary_default_branch(branch: str) -> bool:
     return bool(token and any(token.startswith(prefix) for prefix in _FACTORY_TEMPORARY_DEFAULT_BRANCH_PREFIXES))
 
 
+_FACTORY_AUTOCLEAN_UNTRACKED_DIR_PREFIXES = (
+    ".codexbot_tmp/",
+    ".pytest_cache/",
+    "output/playwright/",
+    "playwright-report/",
+    "test-results/",
+)
+_FACTORY_AUTOCLEAN_PREVIEW_SUFFIXES = {
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".log",
+    ".png",
+    ".webp",
+}
+
+
+def _factory_status_line_path(line: str) -> tuple[str, str]:
+    raw = str(line or "")
+    if len(raw) < 4:
+        return raw.strip(), ""
+    code = raw[:2]
+    path = raw[3:].strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1].strip()
+    return code, path.strip('"')
+
+
+def _factory_untracked_tree_is_autocleanable(repo: Path, rel_path: str) -> bool:
+    rel = str(rel_path or "").strip().rstrip("/")
+    if not rel:
+        return False
+    path = repo / rel
+    if path.is_file():
+        parts = Path(rel).parts
+        if rel.startswith(_FACTORY_AUTOCLEAN_UNTRACKED_DIR_PREFIXES):
+            return True
+        if parts and parts[0] == ".codexbot_preview":
+            return path.suffix.lower() in _FACTORY_AUTOCLEAN_PREVIEW_SUFFIXES
+        return False
+    if not path.is_dir():
+        return False
+    for child in path.rglob("*"):
+        if child.is_dir():
+            continue
+        try:
+            child_rel = child.relative_to(repo).as_posix()
+        except Exception:
+            return False
+        if not _factory_untracked_tree_is_autocleanable(repo, child_rel):
+            return False
+    return True
+
+
+def _factory_autoclean_generated_status_lines(repo: Path, dirty_lines: list[str]) -> list[str]:
+    cleanable: list[str] = []
+    for line in dirty_lines:
+        code, rel = _factory_status_line_path(line)
+        if code != "??" or not rel:
+            continue
+        if _factory_untracked_tree_is_autocleanable(repo, rel):
+            cleanable.append(rel)
+    if not cleanable:
+        return dirty_lines
+    _run_git(repo, ["clean", "-fd", "--", *cleanable], check=False)
+    status = _run_git(repo, ["status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        return dirty_lines
+    return [line for line in str(status.stdout or "").splitlines() if line.strip()]
+
+
 def _factory_repo_default_branch_for_sync(
     *,
     existing: dict[str, Any],
@@ -2686,6 +2758,8 @@ def _factory_repo_autonomy_blocker(repo: Path, *, default_branch: str) -> str:
         err = (status.stderr or status.stdout or "").strip()
         return f"git status failed for registered repo: {err[:300] or 'unknown error'}"
     dirty_lines = [line for line in str(status.stdout or "").splitlines() if line.strip()]
+    if dirty_lines:
+        dirty_lines = _factory_autoclean_generated_status_lines(repo, dirty_lines)
     if dirty_lines:
         preview = "; ".join(dirty_lines[:5])
         extra = "" if len(dirty_lines) <= 5 else f"; +{len(dirty_lines) - 5} more"
@@ -19475,9 +19549,10 @@ def _deploy_after_order_merge(
     policy = _repo_deploy_policy(cfg=cfg, repo_record=repo_record, repo_dir=repo_dir)
     if not policy:
         return {
-            "status": "skipped",
-            "reason": "no_deploy_policy",
-            "summary": "No deploy policy configured for this repo.",
+            "status": "ok",
+            "reason": "validated_checkout",
+            "summary": "No runtime deploy policy is configured; default-branch checkout is the production artifact.",
+            "deployed_commit": (merge_commit or None),
         }
 
     sync_ok, sync_msg, deployed_commit, deploy_repo_dir = _sync_repo_checkout_to_default_branch(
