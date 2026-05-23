@@ -1557,6 +1557,49 @@ def _selection_review_action(order: dict[str, Any]) -> str:
     )
 
 
+_FACTORY_DELTA_GUARD_COMMAND = (
+    "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-factory-delta"
+)
+
+
+def _factory_delta_contract_from_trace(root_task: Task | None) -> dict[str, Any] | None:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    if str(trace.get("studio_selected_type") or "").strip() != "DEEP_IMPROVEMENT":
+        return None
+
+    studio_cycle_id = str(trace.get("studio_cycle_id") or "").strip()
+    expected_delta = str(trace.get("expected_measurable_delta") or "").strip()
+    contract = {
+        "required_fields": ["capability_changed", "measurable_delta", "evidence"],
+        "capability_changed": (
+            "Name the internal factory capability changed by this Studio DEEP_IMPROVEMENT work."
+        ),
+        "measurable_delta": expected_delta
+        or "State the measurable before/after or acceptance delta this work is expected to move.",
+        "evidence": (
+            "Return a structured factory_delta object and cite concrete validation evidence for the claimed delta."
+        ),
+        "definition": (
+            "Final structured output must include factory_delta with capability_changed, measurable_delta, "
+            f"and evidence; validate with `{_FACTORY_DELTA_GUARD_COMMAND}`."
+        ),
+        "evidence_required": [
+            "structured factory_delta.capability_changed",
+            "structured factory_delta.measurable_delta",
+            "structured factory_delta.evidence",
+            f"factory delta guard result from `{_FACTORY_DELTA_GUARD_COMMAND}` or equivalent validation",
+        ],
+        "suggested_validation": [
+            _FACTORY_DELTA_GUARD_COMMAND,
+        ],
+    }
+    if studio_cycle_id:
+        contract["studio_cycle_id"] = studio_cycle_id
+    if expected_delta:
+        contract["expected_measurable_delta"] = expected_delta
+    return contract
+
+
 def _selection_churn_risk_metadata(
     order: dict[str, Any],
     *,
@@ -1808,6 +1851,9 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
         "evidence_expectations": evidence_expectations,
         "title": title,
     }
+    factory_delta_contract = order.get("factory_delta_contract")
+    if isinstance(factory_delta_contract, dict):
+        payload["factory_delta_contract"] = factory_delta_contract
     if action:
         payload["action"] = action
     return payload
@@ -1914,6 +1960,20 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Verify implementation work has not continued without selection evidence.",
         ]
 
+    factory_delta_contract = order.get("factory_delta_contract")
+    if not isinstance(factory_delta_contract, dict):
+        factory_delta_contract = handoff.get("factory_delta_contract") if isinstance(handoff.get("factory_delta_contract"), dict) else None
+    if isinstance(factory_delta_contract, dict):
+        for item in _proactive_packet_list(factory_delta_contract.get("evidence_required")):
+            if item not in evidence_required:
+                evidence_required.append(item)
+        for item in _proactive_packet_list(factory_delta_contract.get("suggested_validation")):
+            if item not in suggested_validation:
+                suggested_validation.append(item)
+        definition = _proactive_packet_text(factory_delta_contract.get("definition"))
+        if definition and definition not in definition_of_done:
+            definition_of_done.append(definition)
+
     assignment_prompt = "" if selection_needs_review else _proactive_packet_text(handoff.get("assignment_prompt"))
     if not assignment_prompt:
         prompt_lines = [
@@ -1937,9 +1997,25 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Suggested validation:",
             *(f"- {validation}" for validation in suggested_validation),
         ]
+        if isinstance(factory_delta_contract, dict):
+            prompt_lines.extend(
+                [
+                    "",
+                    "Factory delta contract:",
+                    *(f"- {field}" for field in _proactive_packet_list(factory_delta_contract.get("required_fields"))),
+                    f"- validation: {_FACTORY_DELTA_GUARD_COMMAND}",
+                ]
+            )
         assignment_prompt = "\n".join(prompt_lines)
+    elif isinstance(factory_delta_contract, dict) and _FACTORY_DELTA_GUARD_COMMAND not in assignment_prompt:
+        assignment_prompt = (
+            assignment_prompt.rstrip()
+            + "\n\nFactory delta contract:\n"
+            + "\n".join(f"- {field}" for field in _proactive_packet_list(factory_delta_contract.get("required_fields")))
+            + f"\n- validation: {_FACTORY_DELTA_GUARD_COMMAND}"
+        )
 
-    return {
+    packet = {
         "owner_role": owner_role,
         "action": action,
         "inspect_endpoint": inspect_endpoint,
@@ -1952,6 +2028,9 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
         "order_id": oid or None,
         "lane": lane_key,
     }
+    if isinstance(factory_delta_contract, dict):
+        packet["factory_delta_contract"] = factory_delta_contract
+    return packet
 
 
 def _handoff_action_profile(
@@ -3409,6 +3488,9 @@ class StatusService:
                 "children_by_role": order.get("children_by_role") if isinstance(order.get("children_by_role"), dict) else {},
                 "updated_at": updated_at,
             }
+            factory_delta_contract = _factory_delta_contract_from_trace(root_task)
+            if factory_delta_contract is not None:
+                priority_item["factory_delta_contract"] = factory_delta_contract
             selection_quality = _selection_quality_metadata(priority_item, order_row=order_row, root_task=root_task)
             priority_item["selection_quality"] = selection_quality
             if str(selection_quality.get("status") or "").strip().lower() == "needs_review":
@@ -3506,6 +3588,7 @@ class StatusService:
             "children_total",
             "children_by_role",
             "selection_quality",
+            "factory_delta_contract",
         ]
         for order in list(priorities.get("orders") or []):
             if not isinstance(order, dict):
@@ -3589,6 +3672,8 @@ class StatusService:
                 "inspect_endpoint": top_execution_packet.get("inspect_endpoint"),
                 "handoff_endpoint": top_execution_packet.get("handoff_endpoint"),
             }
+            if isinstance(top_execution_packet.get("factory_delta_contract"), dict):
+                next_delegate["factory_delta_contract"] = top_execution_packet.get("factory_delta_contract")
 
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())

@@ -28447,6 +28447,19 @@ _STUDIO_DECISION_EVIDENCE_ROLES = frozenset(
         "product_ops",
     }
 )
+_STUDIO_FACTORY_DELTA_ROLES = frozenset(
+    {
+        "implementer_local",
+        "backend",
+        "frontend",
+        "sre",
+        "security",
+        "product_ops",
+        "reviewer_local",
+        "qa",
+        "release_mgr",
+    }
+)
 
 
 def _inherit_studio_trace_context(parent_trace: dict[str, Any], child_trace: dict[str, Any]) -> None:
@@ -28587,6 +28600,50 @@ def _orchestrator_min_evidence_gate(
             return (
                 False,
                 "Studio DEEP_IMPROVEMENT decision evidence gate not met. "
+                + "; ".join(issues)
+                + ".",
+                evidence_meta,
+            )
+
+    requires_factory_delta = (
+        role in _STUDIO_FACTORY_DELTA_ROLES
+        and bool(studio_cycle_id)
+        and studio_selected_type == "DEEP_IMPROVEMENT"
+    )
+    if requires_factory_delta:
+        factory_delta = structured.get("factory_delta") if isinstance(structured, dict) else None
+        evidence_meta["factory_delta_required"] = True
+        evidence_meta["studio_cycle_id"] = studio_cycle_id
+        evidence_meta["studio_selected_type"] = studio_selected_type
+        evidence_meta["factory_delta_present"] = isinstance(factory_delta, dict)
+
+        issues: list[str] = []
+        capability_changed = factory_delta.get("capability_changed") if isinstance(factory_delta, dict) else None
+        measurable_delta = factory_delta.get("measurable_delta") if isinstance(factory_delta, dict) else None
+        delta_evidence = factory_delta.get("evidence") if isinstance(factory_delta, dict) else None
+        capability_ok = _studio_evidence_text_substantive(capability_changed, min_chars=16)
+        measurable_ok = _studio_evidence_text_substantive(measurable_delta, min_chars=16)
+        evidence_ok = _studio_evidence_text_substantive(delta_evidence, min_chars=16)
+        if not capability_ok:
+            issues.append("factory_delta.capability_changed must name the factory capability changed")
+        if not measurable_ok:
+            issues.append("factory_delta.measurable_delta must state the measurable delta")
+        if not evidence_ok:
+            issues.append("factory_delta.evidence must cite concrete validation evidence")
+
+        evidence_meta["factory_delta"] = {
+            "capability_changed_present": bool(capability_ok),
+            "measurable_delta_present": bool(measurable_ok),
+            "evidence_present": bool(evidence_ok),
+            "issues": issues,
+            "suggested_validation": (
+                "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-factory-delta"
+            ),
+        }
+        if issues:
+            return (
+                False,
+                "Studio DEEP_IMPROVEMENT factory delta gate not met. "
                 + "; ".join(issues)
                 + ".",
                 evidence_meta,
@@ -33681,7 +33738,7 @@ def _orchestrator_run_codex(
             structured["token_usage"] = token_usage
         agent_payload = _extract_structured_result_payload(body)
         if isinstance(agent_payload, dict):
-            for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason", "studio_decision_evidence"):
+            for key in ("subtasks", "next_action", "summary", "artifacts", "status", "reason", "studio_decision_evidence", "factory_delta"):
                 if key in agent_payload:
                     structured[key] = agent_payload.get(key)
         if order_branch:

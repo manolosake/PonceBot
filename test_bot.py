@@ -2665,6 +2665,13 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
             "debate_summary": "Runtime gating was selected over broader rewrites because it preserves auditable decision evidence at completion.",
         }
 
+    def _valid_factory_delta(self) -> dict[str, object]:
+        return {
+            "capability_changed": "Studio DEEP_IMPROVEMENT completion now requires a named factory capability delta.",
+            "measurable_delta": "Missing capability delta evidence changes completion from accepted to blocked.",
+            "evidence": "Focused unit tests validate missing, partial, and valid factory_delta payloads.",
+        }
+
     def test_extract_structured_result_payload_preserves_studio_decision_evidence(self) -> None:
         payload = bot._extract_structured_result_payload(
             "done\n```json\n"
@@ -2682,6 +2689,22 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
 
         self.assertIsInstance(payload, dict)
         self.assertIn("studio_decision_evidence", payload)
+
+    def test_extract_structured_result_payload_preserves_factory_delta(self) -> None:
+        payload = bot._extract_structured_result_payload(
+            "done\n```json\n"
+            "{"
+            "\"summary\":\"Ready with factory delta.\","
+            "\"factory_delta\":{"
+            "\"capability_changed\":\"Factory completion now names changed capability.\","
+            "\"measurable_delta\":\"Missing deltas are blocked instead of accepted.\","
+            "\"evidence\":\"Focused tests cover the validation contract.\""
+            "}"
+            "}\n```"
+        )
+
+        self.assertIsInstance(payload, dict)
+        self.assertIn("factory_delta", payload)
 
     def test_blocks_missing_studio_deep_improvement_evidence(self) -> None:
         ok, reason, meta = bot._orchestrator_min_evidence_gate(
@@ -2768,12 +2791,13 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
             ),
             artifacts=[],
             logs="review note with concrete validation detail " * 4,
-            structured={},
+            structured={"factory_delta": self._valid_factory_delta()},
         )
 
         self.assertTrue(ok)
         self.assertIsNone(reason)
         self.assertNotIn("studio_decision_evidence_required", meta)
+        self.assertTrue(meta["factory_delta_required"])
         self.assertTrue(meta["summary_substantial"])
 
     def test_qa_inherited_studio_context_passes_without_decision_evidence(self) -> None:
@@ -2787,13 +2811,45 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
             ),
             artifacts=[],
             logs="",
-            structured={},
+            structured={"factory_delta": self._valid_factory_delta()},
         )
 
         self.assertTrue(ok)
         self.assertIsNone(reason)
         self.assertNotIn("studio_decision_evidence_required", meta)
+        self.assertTrue(meta["factory_delta_required"])
         self.assertTrue(meta["summary_substantial"])
+
+    def test_blocks_missing_studio_deep_improvement_factory_delta_for_qa(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(role="qa"),
+            summary="PASS: validated the requested Studio improvement with focused tests.",
+            artifacts=[],
+            logs="",
+            structured={},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT factory delta", str(reason))
+        self.assertTrue(meta["factory_delta_required"])
+        self.assertFalse(meta["factory_delta_present"])
+        self.assertIn("factory_delta.capability_changed", "; ".join(meta["factory_delta"]["issues"]))
+
+    def test_blocks_partial_studio_deep_improvement_factory_delta_for_reviewer(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(role="reviewer_local"),
+            summary="Reviewed the implementation against the requested behavior and validation contract.",
+            artifacts=[],
+            logs="review note with concrete validation detail " * 4,
+            structured={"factory_delta": {"capability_changed": "Factory capability names changed."}},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT factory delta", str(reason))
+        diag = meta["factory_delta"]
+        self.assertTrue(diag["capability_changed_present"])
+        self.assertFalse(diag["measurable_delta_present"])
+        self.assertFalse(diag["evidence_present"])
 
     def test_blocks_partial_studio_deep_improvement_evidence(self) -> None:
         evidence = self._valid_studio_evidence()
@@ -2822,7 +2878,10 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
             summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
             artifacts=[],
             logs="validation output " * 12,
-            structured={"studio_decision_evidence": self._valid_studio_evidence()},
+            structured={
+                "studio_decision_evidence": self._valid_studio_evidence(),
+                "factory_delta": self._valid_factory_delta(),
+            },
         )
 
         self.assertTrue(ok)
@@ -2832,6 +2891,7 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
         self.assertEqual(diag["killed_bets_with_reason_count"], 1)
         self.assertEqual(diag["critic_answers_count"], 3)
         self.assertEqual(diag["issues"], [])
+        self.assertEqual(meta["factory_delta"]["issues"], [])
 
 
 class TestLocalSpecialistResponseHelpers(unittest.TestCase):

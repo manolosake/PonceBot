@@ -145,6 +145,115 @@ class TestStatusService(unittest.TestCase):
                 },
             )
 
+    def test_proactive_action_plan_surfaces_deep_improvement_factory_delta_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            order_id = "deep-order"
+            root = Task.new(
+                job_id=order_id,
+                source="test",
+                role="skynet",
+                input_text="[proactive: studio deep improvement]",
+                request_type="task",
+                priority=1,
+                model="gpt-5.3-codex",
+                effort="medium",
+                mode_hint="rw",
+                requires_approval=False,
+                max_cost_window_usd=0.0,
+                chat_id=7,
+                state="running",
+                trace={
+                    "proactive_lane": True,
+                    "studio_cycle_id": "cycle-123",
+                    "studio_selected_type": "DEEP_IMPROVEMENT",
+                    "expected_measurable_delta": "Factory completion cannot pass without named capability delta.",
+                },
+            )
+            q.submit_task(root)
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Studio deep improvement",
+                body="[proactive: studio deep improvement]",
+                status="active",
+                priority=1,
+            )
+            board = {
+                "orders": [
+                    {
+                        "order_id": order_id,
+                        "order_id_short": "deep",
+                        "title": "Studio deep improvement",
+                        "priority": 1,
+                        "phase": "executing",
+                        "current_stage": "delivery",
+                        "readiness_state": "not_ready",
+                        "readiness_verdict": "wait",
+                        "merge_ready": False,
+                        "merged_to_main": False,
+                        "children_total": 0,
+                        "children_by_role": {},
+                        "updated_at": 10.0,
+                    }
+                ]
+            }
+
+            with mock.patch.object(svc, "autonomy_board", return_value=board):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            packet = plan["top_execution_packet"]
+            contract = packet.get("factory_delta_contract")
+            self.assertIsInstance(contract, dict)
+            self.assertEqual(contract.get("studio_cycle_id"), "cycle-123")
+            self.assertEqual(contract.get("required_fields"), ["capability_changed", "measurable_delta", "evidence"])
+            self.assertIn("--require-factory-delta", " ".join(contract.get("suggested_validation") or []))
+            self.assertIn("--require-factory-delta", " ".join(packet.get("suggested_validation") or []))
+            self.assertIn("structured factory_delta.capability_changed", packet.get("evidence_required") or [])
+            self.assertEqual(plan["summary"]["next_delegate"].get("factory_delta_contract"), contract)
+
+    def test_proactive_action_plan_omits_factory_delta_contract_for_non_deep_order(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 1},
+                "orders": [
+                    {
+                        "rank": 1,
+                        "order_id": "non-deep-order",
+                        "order_id_short": "nondeep",
+                        "title": "Non-deep order",
+                        "priority": 1,
+                        "phase": "executing",
+                        "current_stage": "delivery",
+                        "readiness_state": "not_ready",
+                        "readiness_verdict": "wait",
+                        "decision": "advance",
+                        "why": "Needs delivery evidence.",
+                        "next_action": "Implement the bounded slice.",
+                        "handoff": {"suggested_role": "implementer_local"},
+                        "updated_at": 10.0,
+                    }
+                ],
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            self.assertNotIn("factory_delta_contract", plan["top_execution_packet"])
+            self.assertNotIn("factory_delta_contract", plan["summary"]["next_delegate"])
+
     def test_proactive_action_plan_empty_packets_are_none(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
