@@ -15952,6 +15952,23 @@ def _auto_merge_ready_orders_tick(
 
             root = orch_q.get_job(oid)
             trace = dict((root.trace or {}) if root else {})
+            if str(trace.get("deploy_status") or "").strip().lower() == "failed":
+                _repo_record, _repo_dir, _default_branch = _repo_context_for_order(
+                    cfg=cfg,
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=chat_for_order,
+                )
+                if _recover_late_successful_deploy(
+                    orch_q=orch_q,
+                    order_id=oid,
+                    chat_id=chat_for_order,
+                    repo_record=_repo_record,
+                    root_trace=trace,
+                    now=float(now),
+                ):
+                    snapshot_autoship_count += 1
+                    continue
             if _controller_snapshot_deploy_failure_already_recorded(
                 orch_q=orch_q,
                 order_id=oid,
@@ -16093,6 +16110,17 @@ def _auto_merge_ready_orders_tick(
             order_id=oid,
             chat_id=chat_for_order,
         )
+        if str(trace.get("deploy_status") or "").strip().lower() == "failed":
+            if _recover_late_successful_deploy(
+                orch_q=orch_q,
+                order_id=oid,
+                chat_id=chat_for_order,
+                repo_record=_repo_record,
+                root_trace=trace,
+                now=float(now),
+            ):
+                merged_count += 1
+                continue
         merge_required_now, _branch = _order_trace_requires_merge(
             trace,
             repo=(repo_dir if (repo_dir / ".git").exists() else None),
