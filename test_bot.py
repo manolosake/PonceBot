@@ -88,6 +88,18 @@ class TestFactoryRepoHygiene(unittest.TestCase):
             self.assertEqual("validated_checkout", result["reason"])
             self.assertNotIn("skipped", result["summary"].lower())
 
+    def test_no_delta_controller_snapshot_never_counts_as_published_project(self) -> None:
+        self.assertEqual(
+            "rejected_low_value",
+            bot._controller_snapshot_no_delta_outcome_status(
+                {
+                    "result_status": "published_project",
+                    "result_summary": "Private GitHub repo exists, but no material patch was produced.",
+                    "result_next_action": "published_project",
+                }
+            ),
+        )
+
 
 class TestStateHandling(unittest.TestCase):
     def _cfg(self, state_file: Path) -> bot.BotConfig:

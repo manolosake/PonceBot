@@ -15284,16 +15284,9 @@ def _controller_snapshot_patch_has_meaningful_diff(patch_path: Path) -> bool:
 
 
 def _controller_snapshot_no_delta_outcome_status(trace: dict[str, Any]) -> str:
-    blob = " ".join(
-        str(piece or "")
-        for piece in (
-            trace.get("result_status"),
-            trace.get("result_summary"),
-            trace.get("result_next_action"),
-        )
-    ).lower()
-    if "published_project" in blob or "private github" in blob:
-        return "published_project"
+    # A controller snapshot without a material repo delta is never a shipped
+    # product outcome. Publication claims still need a real committed project
+    # artifact or repo-state change; otherwise Studio learns to count chatter.
     return "rejected_low_value"
 
 
