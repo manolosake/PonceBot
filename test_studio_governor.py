@@ -590,6 +590,78 @@ def test_studio_build_opportunities_excludes_governor_avoided_incubator(monkeypa
     assert any(item["repo_id"] == "executivedashboard-9ab2eb91" for item in opportunities)
 
 
+def test_late_deploy_success_recovery_clears_deploy_failed_order(monkeypatch, tmp_path):
+    state_path = tmp_path / "main_deploy_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "repos": {
+                    "omnicrewapp.android-ba7b4a67": {
+                        "status": "ok",
+                        "deployed_head": "4c046e4ff4ed257c5da6887db18eae1af10ecc1d",
+                        "last_deploy_at": 1_700_000_100.0,
+                        "url": "http://127.0.0.1:8890/omnicrewapp-android/",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = {}
+
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Queue:
+        _storage = SimpleNamespace(path=tmp_path / "jobs.sqlite")
+
+        def __init__(self):
+            self.status = None
+            self.phase = None
+            self.state_call = None
+            self.audit_events = []
+
+        def set_order_status(self, *args, **kwargs):
+            self.status = (args, kwargs)
+
+        def set_order_phase(self, *args, **kwargs):
+            self.phase = (args, kwargs)
+
+        def update_state(self, *args, **kwargs):
+            self.state_call = (args, kwargs)
+
+        def append_audit_event(self, *args, **kwargs):
+            self.audit_events.append((args, kwargs))
+
+    monkeypatch.setattr(bot.urllib.request, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(bot, "_studio_complete_cycle_for_order_from_queue", lambda **kwargs: completed.update(kwargs))
+    queue = Queue()
+
+    assert bot._recover_late_successful_deploy(
+        orch_q=queue,
+        order_id="order-1",
+        chat_id=123,
+        repo_record={"repo_id": "omnicrewapp.android-ba7b4a67"},
+        root_trace={"merge_commit": "4c046e4", "deploy_status": "failed"},
+        now=1_700_000_200.0,
+    )
+
+    assert queue.status[1]["status"] == "done"
+    assert queue.phase[1]["phase"] == "done"
+    assert queue.state_call[0][1] == "done"
+    assert queue.state_call[1]["blocked_reason"] is None
+    assert queue.state_call[1]["deploy_status"] == "ok"
+    assert queue.state_call[1]["deploy_result"] == "deploy_ok_recovered"
+    assert completed["outcome_status"] == "shipped_to_main"
+    assert queue.audit_events[-1][1]["event_type"] == "order.late_deploy_success_recovered"
+
+
 def test_studio_governor_ignores_ordinary_product_workflow_debt():
     now = 1_700_000_000.0
     memory = {

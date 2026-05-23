@@ -19738,6 +19738,124 @@ def _deploy_result_display(result: dict[str, Any] | None) -> str:
     return label
 
 
+def _main_deploy_state_path_for_queue(orch_q: OrchestratorQueue) -> Path:
+    try:
+        storage = getattr(orch_q, "_storage", None)
+        db_path = getattr(storage, "path", None)
+        if db_path is not None:
+            return Path(db_path).expanduser().resolve().parent / "main_deploy_state.json"
+    except Exception:
+        pass
+    return Path(__file__).resolve().parent / "data" / "main_deploy_state.json"
+
+
+def _main_deploy_state_repo_row(orch_q: OrchestratorQueue, repo_id: str) -> dict[str, Any]:
+    rid = str(repo_id or "").strip()
+    if not rid:
+        return {}
+    state_path = _main_deploy_state_path_for_queue(orch_q)
+    try:
+        with state_path.open(encoding="utf-8") as handle:
+            state = json.load(handle)
+    except Exception:
+        return {}
+    row = (state.get("repos") or {}).get(rid) if isinstance(state, dict) else None
+    return dict(row or {}) if isinstance(row, dict) else {}
+
+
+def _main_deploy_state_matches_commit(row: dict[str, Any], commit: str) -> bool:
+    if str((row or {}).get("status") or "").strip().lower() != "ok":
+        return False
+    expected = str(commit or "").strip()
+    if not expected:
+        return False
+    deployed = str((row or {}).get("deployed_head") or "").strip()
+    if not deployed:
+        return False
+    return deployed.startswith(expected[:12]) or expected.startswith(deployed[:12])
+
+
+def _recover_late_successful_deploy(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    repo_record: dict[str, Any] | None,
+    root_trace: dict[str, Any],
+    now: float,
+) -> bool:
+    repo_id = str((repo_record or {}).get("repo_id") or root_trace.get("repo_id") or "").strip()
+    commit = str(
+        root_trace.get("merge_commit")
+        or root_trace.get("deployed_commit")
+        or root_trace.get("PONCEBOT_DEPLOY_COMMIT")
+        or ""
+    ).strip()
+    row = _main_deploy_state_repo_row(orch_q, repo_id)
+    if not _main_deploy_state_matches_commit(row, commit):
+        return False
+    url = str(row.get("url") or "").strip()
+    if url:
+        try:
+            request = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(request, timeout=8) as response:
+                if int(getattr(response, "status", 0) or 0) >= 400:
+                    return False
+        except Exception:
+            return False
+    summary = (
+        f"Recovered deploy success: main deploy monitor reports OK for {repo_id or 'repo'} "
+        f"commit={commit[:12] or 'unknown'}"
+        + (f" at {url}." if url else ".")
+    )
+    try:
+        orch_q.set_order_status(order_id, chat_id=int(chat_id), status="done")
+        orch_q.set_order_phase(order_id, chat_id=int(chat_id), phase="done")
+        orch_q.update_state(
+            order_id,
+            "done",
+            blocked_reason=None,
+            merge_ready=False,
+            merge_required=False,
+            deploy_status="ok",
+            deploy_result="deploy_ok_recovered",
+            deploy_summary=summary,
+            deployed_commit=str(row.get("deployed_head") or commit),
+            deployed_at=float(row.get("last_deploy_at") or now),
+            proactive_operator_verified_deployment=True,
+            proactive_improvement_verified=True,
+            proactive_improvement_closed=True,
+            proactive_improvement_closed_at=float(now),
+            result_status="merged",
+            result_summary=summary,
+            result_next_action="Factory ready for next order.",
+            operational_gate_status="terminal",
+            operational_gate_reason="late_deploy_success_recovered",
+            live_at=float(now),
+        )
+        _studio_complete_cycle_for_order_from_queue(
+            orch_q=orch_q,
+            order_id=order_id,
+            outcome_status="shipped_to_main",
+            outcome_summary=summary,
+            now=float(now),
+        )
+        orch_q.append_audit_event(
+            event_type="order.late_deploy_success_recovered",
+            actor="skynet",
+            details={
+                "order_id": str(order_id),
+                "repo_id": repo_id,
+                "commit": commit,
+                "url": url,
+            },
+        )
+        return True
+    except Exception:
+        LOG.exception("Failed to recover late deploy success for order_id=%s", order_id)
+        return False
+
+
 def _factory_sync_repo_registry(
     *,
     cfg: BotConfig,
@@ -27056,6 +27174,16 @@ def _sync_order_phase_from_runtime(
 
     merged_to_main = bool(root_trace.get("merged_to_main", False))
     deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
+    if proactive_order and merged_to_main and deploy_failed:
+        if _recover_late_successful_deploy(
+            orch_q=orch_q,
+            order_id=rid,
+            chat_id=int(chat_id),
+            repo_record=_repo_record,
+            root_trace=root_trace,
+            now=time.time(),
+        ):
+            return
 
     children = orch_q.jobs_by_parent(parent_job_id=rid, limit=600)
     phase_children = [child for child in children if not _task_requests_local_controller_recovery(child)]
