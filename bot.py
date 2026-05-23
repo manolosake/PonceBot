@@ -18154,6 +18154,27 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
     return _studio_apply_factory_value_assessment(opportunity)
 
 
+def _studio_governor_avoids_opportunity(governor: dict[str, Any] | None, opportunity: dict[str, Any]) -> bool:
+    if not isinstance(governor, dict) or not isinstance(opportunity, dict):
+        return False
+    avoid_keys = {
+        str(item or "").strip().lower()
+        for item in (governor.get("avoid_keys") or [])
+        if str(item or "").strip()
+    }
+    if not avoid_keys:
+        return False
+    tokens = {str(opportunity.get("key") or "").strip().lower()}
+    repo_id = str(opportunity.get("repo_id") or "").strip().lower()
+    if repo_id:
+        tokens.add(repo_id)
+        tokens.add(f"repo-{repo_id}")
+    if _studio_is_incubator_new_project_work(opportunity):
+        tokens.add("new-project-incubator")
+        tokens.add("project-incubator")
+    return bool({token for token in tokens if token} & avoid_keys)
+
+
 def _studio_build_opportunities(
     *,
     cfg: BotConfig,
@@ -18169,6 +18190,7 @@ def _studio_build_opportunities(
     readiness = _studio_operational_readiness(cfg=cfg, repos=repos, now=now)
     memory["studio_readiness"] = readiness
     memory["studio_governor"] = _studio_governor_assessment(memory, now=now)
+    governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     _studio_record_maturity_snapshot(cfg=cfg, readiness=readiness, now=now)
     opportunities: list[dict[str, Any]] = []
     for repo in repos:
@@ -18181,10 +18203,15 @@ def _studio_build_opportunities(
         item = _studio_opportunity_for_repo(repo, now=now, memory=memory)
         if str(item.get("key") or "").strip().lower() in occupied_keys:
             continue
+        if _studio_governor_avoids_opportunity(governor, item):
+            continue
         opportunities.append(item)
 
     if _project_incubator_enabled() and "project-incubator" not in occupied_keys and "new-project-incubator" not in occupied_keys:
         incubator = _studio_incubator_opportunity(cfg=cfg, now=now, memory=memory)
+        if _studio_governor_avoids_opportunity(governor, incubator):
+            opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
+            return opportunities[:5]
         try:
             if _project_incubator_due(cfg, occupied_keys=occupied_keys):
                 incubator["score"] = int(incubator.get("score") or 0) + 18

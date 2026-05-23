@@ -540,6 +540,56 @@ def test_studio_governor_counts_incubator_like_product_workflow_debt():
     assert governor["new_project_failure_ratio_24h"] == 1.0
 
 
+def test_studio_build_opportunities_excludes_governor_avoided_incubator(monkeypatch, tmp_path):
+    now = 1_700_000_000.0
+    repo_dir = tmp_path / "ExecutiveDashboard"
+    repo_dir.mkdir()
+    memory = {
+        "recent_studio_negative_outcomes": [
+            {
+                "key": "new-project-incubator",
+                "repo_id": "",
+                "type": "NEW_PROJECT",
+                "status": "rejected_low_value",
+                "summary": f"Rejected new project without material delta {idx}.",
+                "updated_at": now - (idx * 60),
+            }
+            for idx in range(1, 3)
+        ],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+    cfg = SimpleNamespace(orchestrator_db_path=tmp_path / "jobs.sqlite")
+    repos = [
+        {
+            "repo_id": "executivedashboard-9ab2eb91",
+            "path": str(repo_dir),
+            "priority": 1,
+            "status": "active",
+            "autonomy_enabled": True,
+            "metadata": {"kind": "Dashboard", "repo_name": "ExecutiveDashboard"},
+        }
+    ]
+
+    monkeypatch.setattr(bot, "_project_incubator_enabled", lambda: True)
+    monkeypatch.setattr(bot, "_project_incubator_due", lambda cfg, occupied_keys: True)
+
+    opportunities = bot._studio_build_opportunities(
+        cfg=cfg,
+        orch_q=SimpleNamespace(),
+        repos=repos,
+        occupied_keys=set(),
+        occupied_repo_ids=set(),
+        now=now,
+        memory=memory,
+    )
+
+    assert memory["studio_governor"]["mode"] == "incubator_quality_gate"
+    assert all(item["key"] != "new-project-incubator" for item in opportunities)
+    assert any(item["repo_id"] == "executivedashboard-9ab2eb91" for item in opportunities)
+
+
 def test_studio_governor_ignores_ordinary_product_workflow_debt():
     now = 1_700_000_000.0
     memory = {
@@ -886,13 +936,13 @@ def test_controller_snapshot_autoship_closes_empty_published_project_patch_as_no
     )
 
     assert result["status"] == "ok"
-    assert result["reason"] == "snapshot_no_delta_already_published"
+    assert result["reason"] == "snapshot_no_delta_rejected_low_value"
     assert queue.status_calls[-1][1]["status"] == "done"
     assert queue.phase_calls[-1][1]["phase"] == "done"
     assert queue.state_call[0][1] == "done"
-    assert queue.state_call[1]["result_status"] == "published_project"
+    assert queue.state_call[1]["result_status"] == "rejected_low_value"
     assert queue.state_call[1]["controller_snapshot_autoship_no_delta"] is True
-    assert completed["outcome_status"] == "published_project"
+    assert completed["outcome_status"] == "rejected_low_value"
     assert queue.audit_events[-1][1]["event_type"] == "order.controller_snapshot_autoship_no_delta"
 
 
