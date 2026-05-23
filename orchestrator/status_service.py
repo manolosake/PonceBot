@@ -1552,9 +1552,57 @@ def _selection_evidence_sources(*, order_row: dict[str, Any] | None, root_task: 
 def _selection_review_action(order: dict[str, Any]) -> str:
     oid = str(order.get("order_id_short") or order.get("order_id") or "this order").strip()
     return (
-        f"Selection review for order {oid}: make a kill/continue decision before more implementation churn; "
+        f"Selection review for order {oid}: make a kill/continue/replan decision before more implementation churn; "
         "record concrete business, factory-value, or studio-decision evidence if continuing."
     )
+
+
+def _selection_churn_risk_metadata(
+    order: dict[str, Any],
+    *,
+    root_task: Task | None = None,
+) -> dict[str, Any]:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    started_count = _coerce_int(trace.get("proactive_slices_started"))
+    applied_count = _coerce_int(trace.get("proactive_slices_applied"))
+    validated_count = _coerce_int(trace.get("proactive_slices_validated"))
+    closed_count = _coerce_int(trace.get("proactive_slices_closed"))
+    validated_or_closed = max(validated_count, closed_count)
+
+    children_total = _coerce_int(order.get("children_total"))
+    children_by_role = order.get("children_by_role") if isinstance(order.get("children_by_role"), dict) else {}
+    delivery_children = sum(
+        _coerce_int(count)
+        for role, count in children_by_role.items()
+        if str(role or "").strip().lower() in _DELIVERY_ROLES
+    )
+
+    churn_flags: list[str] = []
+    if started_count >= 3 and started_count >= validated_or_closed + 2:
+        churn_flags.append("started_slices_exceed_validated_or_closed")
+    if delivery_children >= 2 and validated_or_closed == 0:
+        churn_flags.append("repeated_delivery_children_without_validation")
+    elif children_total >= 3 and validated_or_closed == 0:
+        churn_flags.append("multiple_child_jobs_without_validation")
+
+    needs_review = bool(churn_flags and (started_count > 0 or applied_count > 0 or children_total > 0))
+    return {
+        "status": "needs_review" if needs_review else "ok",
+        "flags": churn_flags,
+        "summary": (
+            "Implementation activity is outpacing validation; review selection before more delivery delegation."
+            if needs_review
+            else "No implementation churn risk detected."
+        ),
+        "counters": {
+            "proactive_slices_started": started_count,
+            "proactive_slices_applied": applied_count,
+            "proactive_slices_validated": validated_count,
+            "proactive_slices_closed": closed_count,
+            "children_total": children_total,
+            "delivery_children": delivery_children,
+        },
+    }
 
 
 def _selection_quality_metadata(
@@ -1600,23 +1648,39 @@ def _selection_quality_metadata(
             "recommended_owner_role": None,
         }
 
+    churn_risk = _selection_churn_risk_metadata(order, root_task=root_task)
+    churn_needs_review = str(churn_risk.get("status") or "").strip().lower() == "needs_review"
     evidence_sources = _selection_evidence_sources(order_row=order_row, root_task=root_task)
-    if evidence_sources:
+    if evidence_sources and not churn_needs_review:
         return {
             "status": "ok",
             "flags": ["selection_evidence_present"],
             "summary": "Commercial, factory-value, or studio-decision evidence is present.",
             "recommended_owner_role": None,
             "evidence_sources": evidence_sources,
+            "churn_risk": churn_risk,
         }
 
-    flags = ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"]
+    if churn_needs_review and evidence_sources:
+        flags = ["implementation_churn_without_validation"]
+        flags.extend(str(flag) for flag in list(churn_risk.get("flags") or []) if str(flag or "").strip())
+        flags.append("selection_evidence_present")
+    else:
+        flags = ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"]
+        if churn_needs_review:
+            flags.append("implementation_churn_without_validation")
+            flags.extend(str(flag) for flag in list(churn_risk.get("flags") or []) if str(flag or "").strip())
     return {
         "status": "needs_review",
         "flags": flags,
-        "summary": "Advance work has no substantive commercial, factory-value, or studio-decision evidence; review selection before more delivery churn.",
+        "summary": (
+            "Implementation churn is outpacing validation; make a kill/continue/replan decision before more delivery delegation."
+            if churn_needs_review
+            else "Advance work has no substantive commercial, factory-value, or studio-decision evidence; review selection before more delivery churn."
+        ),
         "recommended_owner_role": "architect_local",
-        "evidence_sources": [],
+        "evidence_sources": evidence_sources,
+        "churn_risk": churn_risk,
     }
 
 
@@ -1655,7 +1719,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     if selection_needs_review:
         action = _selection_review_action(order)
         definition_of_done = [
-            "Make an explicit kill/continue decision for this proactive order.",
+            "Make an explicit kill/continue/replan decision for this proactive order.",
             "If continuing, record the business, factory-value, or studio-decision evidence that justifies implementation.",
             "If killing or pausing, update the order next action so delivery churn stops.",
         ]
@@ -1833,11 +1897,11 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
     if selection_needs_review:
         acceptance_criteria = [
             f"Inspect {inspect_endpoint}.",
-            "Make an explicit kill/continue decision before delivery work continues.",
+            "Make an explicit kill/continue/replan decision before delivery work continues.",
             "Record business, factory-value, or studio-decision evidence for any continue decision.",
         ]
         definition_of_done = [
-            "The order has a kill/continue decision.",
+            "The order has a kill/continue/replan decision.",
             "Continuing work has concrete selection evidence, or killed/paused work has an updated next action.",
         ]
         evidence_required = [
@@ -3341,6 +3405,8 @@ class StatusService:
                 },
                 "merge_ready": bool(order.get("merge_ready")),
                 "merged_to_main": bool(order.get("merged_to_main")),
+                "children_total": int(order.get("children_total") or 0),
+                "children_by_role": order.get("children_by_role") if isinstance(order.get("children_by_role"), dict) else {},
                 "updated_at": updated_at,
             }
             selection_quality = _selection_quality_metadata(priority_item, order_row=order_row, root_task=root_task)
@@ -3437,6 +3503,8 @@ class StatusService:
             "updated_at",
             "merge_ready",
             "merged_to_main",
+            "children_total",
+            "children_by_role",
             "selection_quality",
         ]
         for order in list(priorities.get("orders") or []):

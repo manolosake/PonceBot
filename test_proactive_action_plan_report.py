@@ -102,7 +102,11 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         order["decision"] = "selection_review"
         order["selection_quality"] = {
             "status": "needs_review",
-            "flags": ["weak_selection_evidence", "advance_without_commercial_factory_or_studio_evidence"],
+            "flags": [
+                "weak_selection_evidence",
+                "advance_without_commercial_factory_or_studio_evidence",
+                "implementation_churn_without_validation",
+            ],
             "summary": "Advance work needs a selection review before delivery continues.",
             "evidence_sources": [
                 {
@@ -111,6 +115,16 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "summary": "Factory-value evidence was too weak to continue.",
                 }
             ],
+            "churn_risk": {
+                "status": "needs_review",
+                "flags": ["started_slices_exceed_validated_or_closed"],
+                "counters": {
+                    "delivery_children": 3,
+                    "proactive_slices_closed": 0,
+                    "proactive_slices_started": 4,
+                    "proactive_slices_validated": 0,
+                },
+            },
         }
 
         rendered = report_tool.render_markdown(report)
@@ -125,9 +139,13 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- flags:", rendered)
         self.assertIn("  - weak_selection_evidence", rendered)
         self.assertIn("  - advance_without_commercial_factory_or_studio_evidence", rendered)
+        self.assertIn("  - implementation_churn_without_validation", rendered)
         self.assertIn("- summary: Advance work needs a selection review before delivery continues.", rendered)
         self.assertIn("- evidence_sources:", rendered)
         self.assertIn("  - trace/factory_value: Factory-value evidence was too weak to continue.", rendered)
+        self.assertIn("- churn_risk: needs_review", rendered)
+        self.assertIn("  - started_slices_exceed_validated_or_closed", rendered)
+        self.assertIn("proactive_slices_started=4", rendered)
 
 
 if __name__ == "__main__":

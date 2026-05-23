@@ -226,6 +226,100 @@ class TestStatusService(unittest.TestCase):
             self.assertIn("kill/continue decision", top_packet["evidence_required"])
             self.assertIn("factory-value", " ".join(top_packet["evidence_required"]))
 
+    def test_proactive_action_plan_reroutes_evidence_backed_churn_without_validation_to_selection_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "churn-heavy-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Churn-heavy proactive order",
+                body="Factory-value evidence says this selected workflow should continue.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Churn-heavy proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 4,
+                        "proactive_slices_applied": 3,
+                        "proactive_slices_validated": 0,
+                        "proactive_slices_closed": 0,
+                        "factory_value": {
+                            "score": 82,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence says this selected workflow should advance.",
+                        },
+                        "result_summary": "More implementation slices were started.",
+                    },
+                    job_id=order_id,
+                )
+            )
+            for index in range(3):
+                q.submit_task(
+                    Task.new(
+                        source="telegram",
+                        role="implementer_local",
+                        input_text=f"Implement slice {index + 1}",
+                        request_type="task",
+                        priority=1,
+                        model="gpt-5.2",
+                        effort="medium",
+                        mode_hint="rw",
+                        requires_approval=False,
+                        max_cost_window_usd=1.0,
+                        chat_id=7,
+                        state="done",
+                        parent_job_id=order_id,
+                        trace={"result_summary": f"Implemented slice {index + 1}."},
+                        job_id=f"churn-child-{index + 1}",
+                    )
+                )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("implementation_churn_without_validation", selection_quality["flags"])
+            self.assertIn("selection_evidence_present", selection_quality["flags"])
+            self.assertNotIn("weak_selection_evidence", selection_quality["flags"])
+            self.assertNotIn("advance_without_commercial_factory_or_studio_evidence", selection_quality["flags"])
+            self.assertIn("started_slices_exceed_validated_or_closed", selection_quality["flags"])
+            self.assertIn("repeated_delivery_children_without_validation", selection_quality["flags"])
+            self.assertTrue(selection_quality["evidence_sources"])
+            self.assertEqual(selection_quality["evidence_sources"][0]["key"], "factory_value")
+            self.assertEqual(selection_quality["churn_risk"]["status"], "needs_review")
+            self.assertEqual(selection_quality["churn_risk"]["counters"]["proactive_slices_started"], 4)
+            self.assertEqual(selection_quality["churn_risk"]["counters"]["delivery_children"], 3)
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(plan["summary"]["top_lane"], "selection_review")
+            self.assertEqual(top_packet["order_id"], order_id)
+            self.assertEqual(top_packet["owner_role"], "architect_local")
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "architect_local")
+            self.assertEqual(plan["summary"]["next_delegate"]["lane"], "selection_review")
+            self.assertIn("kill/continue/replan", top_packet["action"])
+
     def test_proactive_priorities_promotes_needs_review_advance_to_selection_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

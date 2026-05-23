@@ -152,6 +152,14 @@ def render_markdown(report: dict[str, Any]) -> str:
                         lines.append(f"  - {source}")
                 else:
                     lines.append("  - -")
+            churn_risk = selection.get("churn_risk") if isinstance(selection.get("churn_risk"), dict) else {}
+            if churn_risk:
+                lines.append(f"- churn_risk: {_one_line(churn_risk.get('status'))}")
+                _append_list(lines, "churn_flags", churn_risk.get("flags"))
+                counters = churn_risk.get("counters") if isinstance(churn_risk.get("counters"), dict) else {}
+                if counters:
+                    counter_text = ", ".join(f"{_one_line(key)}={_one_line(value)}" for key, value in sorted(counters.items()))
+                    lines.append(f"- churn_counters: {counter_text}")
 
     next_delegate = summary.get("next_delegate") if isinstance(summary.get("next_delegate"), dict) else None
     if next_delegate is not None:
