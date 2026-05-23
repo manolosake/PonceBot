@@ -27081,7 +27081,8 @@ def _sync_order_phase_from_runtime(
 
     merged_to_main = bool(root_trace.get("merged_to_main", False))
     deploy_failed = str(root_trace.get("deploy_status") or "").strip().lower() == "failed"
-    if proactive_order and merged_to_main and deploy_failed:
+    deploy_commit = str(root_trace.get("merge_commit") or root_trace.get("deployed_commit") or "").strip()
+    if proactive_order and deploy_failed and (merged_to_main or deploy_commit):
         if _recover_late_successful_deploy(
             orch_q=orch_q,
             order_id=rid,

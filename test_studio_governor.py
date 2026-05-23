@@ -677,7 +677,7 @@ def test_sync_order_phase_recovers_late_deploy_before_failed_terminal(monkeypatc
         def get_job(self, *_args, **_kwargs):
             return SimpleNamespace(
                 trace={
-                    "merged_to_main": True,
+                    "merged_to_main": False,
                     "deploy_status": "failed",
                     "merge_commit": "4c046e4",
                 },
