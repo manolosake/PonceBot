@@ -38,6 +38,8 @@ AUTONOMY_MINIMUM_SLO = {
     'closed_over_started_gte': 0.50,
 }
 IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS = 5
+OUTCOME_QUALITY_TREND_MIN_STARTED = 3
+OUTCOME_QUALITY_CHURN_GAP_WARN = 3
 
 
 def worst_status(*values: str) -> str:
@@ -399,6 +401,46 @@ def order_autonomy_funnel(children, *, order_id: str, now: float, since: float) 
     }
 
 
+def summarize_outcome_quality(funnel_totals: dict) -> dict:
+    started = int((funnel_totals or {}).get('slices_started', 0) or 0)
+    applied = int((funnel_totals or {}).get('slices_applied', 0) or 0)
+    validated = int((funnel_totals or {}).get('slices_validated', 0) or 0)
+    closed = int((funnel_totals or {}).get('slices_closed', 0) or 0)
+    attempted = max(started, applied)
+    verified_outcomes = closed
+    churn_gap = max(0, attempted - verified_outcomes)
+    validated_outcome_rate = 0.0
+    verified_outcome_rate = 0.0
+    if started > 0:
+        validated_outcome_rate = float(validated) / float(started)
+        verified_outcome_rate = float(verified_outcomes) / float(started)
+
+    threshold = float(AUTONOMY_MINIMUM_SLO['closed_over_started_gte'])
+    status = 'OK'
+    reason = 'no_started_slices' if started <= 0 else 'within_slo'
+    if (
+        started >= OUTCOME_QUALITY_TREND_MIN_STARTED
+        and churn_gap >= OUTCOME_QUALITY_CHURN_GAP_WARN
+        and verified_outcome_rate < threshold
+    ):
+        status = 'WARN'
+        reason = 'high_churn_low_verified_outcomes'
+
+    return {
+        'outcome_quality_status': status,
+        'outcome_quality_reason': reason,
+        'validated_outcome_rate': round(float(validated_outcome_rate), 4),
+        'verified_outcome_rate': round(float(verified_outcome_rate), 4),
+        'closed_outcome_rate': round(float(verified_outcome_rate), 4),
+        'churn_gap': int(churn_gap),
+        'verified_outcomes': int(verified_outcomes),
+        'minimum_started_slices': OUTCOME_QUALITY_TREND_MIN_STARTED,
+        'churn_gap_warn_threshold': OUTCOME_QUALITY_CHURN_GAP_WARN,
+        'verified_outcome_rate_threshold': threshold,
+        'closed_outcome_rate_threshold': threshold,
+    }
+
+
 def order_evidence_state(children):
     delivery_ok = False
     validation_ok = False
@@ -626,6 +668,14 @@ def build_recommended_actions(anomalies: list, trend_flags: list) -> list:
                 'Final sweep volume crossed the 24h threshold.',
                 evidence_type,
                 count=(flag or {}).get('count'),
+            )
+        elif evidence_type == 'low_outcome_quality':
+            add(
+                'P1',
+                'Tighten proactive selection or replan slices before delegating more work.',
+                'Started/applied slice churn is high relative to verified outcomes.',
+                evidence_type,
+                count=(flag or {}).get('churn_gap'),
             )
 
     priority_rank = {'P0': 0, 'P1': 1, 'P2': 2}
@@ -1095,6 +1145,7 @@ def main() -> int:
     mean_time_to_validated_improvement = None
     if mtv_samples:
         mean_time_to_validated_improvement = float(sum(mtv_samples) / max(1, len(mtv_samples)))
+    outcome_quality = summarize_outcome_quality(funnel_totals)
 
     metrics = {
         'proactive_active_orders': len(order_reports),
@@ -1107,6 +1158,12 @@ def main() -> int:
         'implementer_fail_rate': round(float(implementer_fail_rate), 4),
         'mean_time_to_validated_improvement': mean_time_to_validated_improvement,
         'loop_breaker_count': int(funnel_totals['loop_breaker_count']),
+        'outcome_quality_status': outcome_quality['outcome_quality_status'],
+        'validated_outcome_rate': outcome_quality['validated_outcome_rate'],
+        'verified_outcome_rate': outcome_quality['verified_outcome_rate'],
+        'closed_outcome_rate': outcome_quality['closed_outcome_rate'],
+        'churn_gap': outcome_quality['churn_gap'],
+        'verified_outcomes': outcome_quality['verified_outcomes'],
         'empty_response_failures_24h': int(empty_response_failures),
         'proactive_cli_takeovers_24h': audit_count('delegation.proactive_cli_takeover'),
         'proactive_cli_seeded_24h': audit_count('delegation.proactive_cli_seeded'),
@@ -1198,6 +1255,24 @@ def main() -> int:
             'threshold': implementer_fail_rate_threshold,
             'minimum_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
         })
+    if outcome_quality['outcome_quality_status'] == 'WARN':
+        trend_flags.append({
+            'type': 'low_outcome_quality',
+            'outcome_quality_status': outcome_quality['outcome_quality_status'],
+            'validated_outcome_rate': outcome_quality['validated_outcome_rate'],
+            'verified_outcome_rate': outcome_quality['verified_outcome_rate'],
+            'closed_outcome_rate': outcome_quality['closed_outcome_rate'],
+            'churn_gap': outcome_quality['churn_gap'],
+            'verified_outcomes': outcome_quality['verified_outcomes'],
+            'slices_started': metrics['slices_started'],
+            'slices_applied': metrics['slices_applied'],
+            'slices_validated': metrics['slices_validated'],
+            'slices_closed': metrics['slices_closed'],
+            'threshold': outcome_quality['verified_outcome_rate_threshold'],
+            'verified_outcome_rate_threshold': outcome_quality['verified_outcome_rate_threshold'],
+            'minimum_started_slices': OUTCOME_QUALITY_TREND_MIN_STARTED,
+            'churn_gap_warn_threshold': OUTCOME_QUALITY_CHURN_GAP_WARN,
+        })
     trend_status = 'WARN' if trend_flags else 'OK'
     status = worst_status(operational_status, trend_status)
     recommended_actions = build_recommended_actions(anomalies, trend_flags)
@@ -1243,6 +1318,12 @@ def main() -> int:
             'implementer_fail_rate': metrics['implementer_fail_rate'],
             'mean_time_to_validated_improvement': metrics['mean_time_to_validated_improvement'],
             'loop_breaker_count': metrics['loop_breaker_count'],
+            'outcome_quality': outcome_quality,
+            'outcome_quality_status': outcome_quality['outcome_quality_status'],
+            'validated_outcome_rate': outcome_quality['validated_outcome_rate'],
+            'verified_outcome_rate': outcome_quality['verified_outcome_rate'],
+            'closed_outcome_rate': outcome_quality['closed_outcome_rate'],
+            'churn_gap': outcome_quality['churn_gap'],
             'autonomy_minimum_slo': AUTONOMY_MINIMUM_SLO,
             'implementer_fail_rate_trend_min_attempts': IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS,
         },
@@ -1264,6 +1345,7 @@ def main() -> int:
         f"- Factory stale heartbeats: {metrics['factory_stale_heartbeats']}",
         f"- Active proactive orders: {metrics['proactive_active_orders']}",
         f"- Autonomy funnel (24h): started={metrics['slices_started']} applied={metrics['slices_applied']} validated={metrics['slices_validated']} closed={metrics['slices_closed']}",
+        f"- Outcome quality (24h): status={metrics['outcome_quality_status']} validated_rate={metrics['validated_outcome_rate']:.2%} verified_rate={metrics['verified_outcome_rate']:.2%} churn_gap={metrics['churn_gap']} verified={metrics['verified_outcomes']}",
         f"- Implementer fail rate (24h): {metrics['implementer_fail_rate']:.2%}",
         f"- Mean time to validated improvement: {('n/a' if metrics['mean_time_to_validated_improvement'] is None else str(int(metrics['mean_time_to_validated_improvement'])) + 's')}",
         f"- Loop breaker count (24h): {metrics['loop_breaker_count']}",

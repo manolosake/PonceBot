@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tools.proactive_health_report import order_autonomy_funnel
+from tools.proactive_health_report import order_autonomy_funnel, summarize_outcome_quality
 from tools.proactive_health_report import classify_open_job_mode, is_blocked_without_open_jobs
 from tools.proactive_health_report import AUTONOMY_MINIMUM_SLO, IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS
 from tools.proactive_health_report import STALE_HEARTBEAT_DETAIL_LIMIT
@@ -248,6 +248,127 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(payload["metrics"]["implementer_failures"], 1)
             self.assertEqual(payload["metrics"]["implementer_fail_rate"], 0.5)
 
+    def test_churn_heavy_low_outcome_quality_sets_trend_warn(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE ceo_orders (
+                        order_id TEXT,
+                        status TEXT,
+                        phase TEXT,
+                        title TEXT,
+                        body TEXT,
+                        updated_at REAL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT,
+                        parent_job_id TEXT,
+                        state TEXT,
+                        role TEXT,
+                        labels TEXT,
+                        trace TEXT,
+                        updated_at REAL,
+                        created_at REAL
+                    )
+                    """
+                )
+                con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("order-churn", "active", "planning", "Proactive Sprint: churn", "", now),
+                )
+                con.executemany(
+                    """
+                    INSERT INTO jobs(job_id, parent_job_id, state, role, labels, trace, updated_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            f"impl-churn-{idx}",
+                            "order-churn",
+                            "done",
+                            "implementer_local",
+                            "{}",
+                            json.dumps(
+                                {
+                                    "slice_id": f"slice_{idx}",
+                                    "slice_patch_applied": True,
+                                    "slice_validation_ok": True,
+                                    "result_summary": "Applied and locally validated a patch but no closed outcome yet.",
+                                }
+                            ),
+                            now - idx,
+                            now - idx - 1,
+                        )
+                        for idx in range(4)
+                    ],
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("trend_status"), "WARN")
+            self.assertEqual(payload.get("status"), "WARN")
+            self.assertEqual(payload["metrics"]["outcome_quality_status"], "WARN")
+            self.assertEqual(payload["metrics"]["validated_outcome_rate"], 1.0)
+            self.assertEqual(payload["metrics"]["verified_outcome_rate"], 0.0)
+            self.assertEqual(payload["metrics"]["closed_outcome_rate"], 0.0)
+            self.assertEqual(payload["metrics"]["verified_outcomes"], 0)
+            self.assertEqual(payload["metrics"]["churn_gap"], 4)
+            self.assertEqual(payload["autonomy_funnel"]["outcome_quality_status"], "WARN")
+            self.assertEqual(payload["autonomy_funnel"]["outcome_quality"]["churn_gap"], 4)
+            flags = payload.get("trend_flags") or []
+            flag = next((item for item in flags if item.get("type") == "low_outcome_quality"), None)
+            self.assertIsNotNone(flag)
+            self.assertEqual(flag.get("outcome_quality_status"), "WARN")
+            self.assertEqual(flag.get("validated_outcome_rate"), 1.0)
+            self.assertEqual(flag.get("verified_outcome_rate"), 0.0)
+            self.assertEqual(flag.get("slices_started"), 4)
+            self.assertEqual(flag.get("slices_applied"), 4)
+            self.assertEqual(flag.get("slices_validated"), 4)
+            self.assertEqual(flag.get("slices_closed"), 0)
+            self.assertEqual(flag.get("churn_gap"), 4)
+            actions = payload.get("recommended_actions") or []
+            action = next((item for item in actions if item.get("evidence_type") == "low_outcome_quality"), None)
+            self.assertIsNotNone(action)
+            self.assertEqual(action.get("priority"), "P1")
+            self.assertEqual(action.get("count"), 4)
+            self.assertIn("replan", action.get("action") or "")
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("Outcome quality (24h): status=WARN", markdown)
+            self.assertIn("low_outcome_quality", markdown)
+
+    def test_summarize_outcome_quality_treats_validated_without_closed_as_churn(self) -> None:
+        summary = summarize_outcome_quality(
+            {
+                "slices_started": 4,
+                "slices_applied": 4,
+                "slices_validated": 4,
+                "slices_closed": 0,
+            }
+        )
+
+        self.assertEqual(summary["outcome_quality_status"], "WARN")
+        self.assertEqual(summary["validated_outcome_rate"], 1.0)
+        self.assertEqual(summary["verified_outcome_rate"], 0.0)
+        self.assertEqual(summary["closed_outcome_rate"], 0.0)
+        self.assertEqual(summary["verified_outcomes"], 0)
+        self.assertGreater(summary["churn_gap"], 0)
+
     def test_factory_stale_heartbeats_excludes_disabled_and_blocked_repos(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -473,8 +594,11 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
             self.assertEqual(payload.get("status"), "OK")
             self.assertEqual(payload.get("recommended_actions"), [])
+            self.assertEqual(payload["metrics"]["outcome_quality_status"], "OK")
+            self.assertFalse(any(item.get("type") == "low_outcome_quality" for item in payload.get("trend_flags") or []))
 
             markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("Outcome quality (24h): status=OK", markdown)
             self.assertIn("## Recommended Actions", markdown)
             self.assertIn("- None", markdown)
 
