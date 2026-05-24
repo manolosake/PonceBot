@@ -28537,36 +28537,122 @@ def _orchestrator_min_evidence_gate(
         critic_answers = evidence.get("critic_answers") if isinstance(evidence, dict) else None
         debate_summary = evidence.get("debate_summary") if isinstance(evidence, dict) else None
 
+        def _decision_entry_id(entry: dict[str, Any]) -> str:
+            return str(entry.get("id") or entry.get("key") or entry.get("name") or "").strip()
+
+        def _decision_entry_has_text(entry: dict[str, Any], keys: tuple[str, ...]) -> bool:
+            return any(_studio_evidence_text_substantive(entry.get(key)) for key in keys)
+
+        candidate_text_keys = (
+            "summary",
+            "thesis",
+            "expected_delta",
+            "reason",
+            "rationale",
+            "why",
+            "value",
+            "impact",
+        )
+        reason_text_keys = ("reason", "rationale", "why", "explanation")
+
         candidate_count = len(candidate_bets) if isinstance(candidate_bets, list) else 0
         killed_count = len(killed_bets) if isinstance(killed_bets, list) else 0
         if candidate_count < 3:
             issues.append("candidate_bets must list at least 3 options")
 
-        killed_with_reason = 0
-        if isinstance(killed_bets, list):
-            for item in killed_bets:
+        candidate_ids: set[str] = set()
+        candidate_ids_ordered: list[str] = []
+        candidate_missing_id_indexes: list[int] = []
+        candidate_non_dict_indexes: list[int] = []
+        candidate_missing_text_ids: list[str] = []
+        candidate_duplicate_ids: list[str] = []
+        if isinstance(candidate_bets, list):
+            for index, item in enumerate(candidate_bets):
                 if not isinstance(item, dict):
+                    candidate_non_dict_indexes.append(index)
                     continue
-                reason = item.get("reason") or item.get("why") or item.get("rationale")
-                if _studio_evidence_text_substantive(reason):
+                candidate_id = _decision_entry_id(item)
+                if not candidate_id:
+                    candidate_missing_id_indexes.append(index)
+                    continue
+                if candidate_id in candidate_ids:
+                    candidate_duplicate_ids.append(candidate_id)
+                else:
+                    candidate_ids.add(candidate_id)
+                    candidate_ids_ordered.append(candidate_id)
+                if not _decision_entry_has_text(item, candidate_text_keys):
+                    candidate_missing_text_ids.append(candidate_id)
+        if candidate_non_dict_indexes:
+            issues.append("candidate_bets items must be objects")
+        if candidate_missing_id_indexes:
+            issues.append("candidate_bets items must include non-empty id, key, or name")
+        if candidate_duplicate_ids:
+            issues.append("candidate_bets ids must be unique")
+        if candidate_missing_text_ids:
+            issues.append("candidate_bets items must include substantive decision text")
+
+        killed_with_reason = 0
+        killed_ids: set[str] = set()
+        killed_ids_ordered: list[str] = []
+        killed_non_dict_indexes: list[int] = []
+        killed_missing_id_indexes: list[int] = []
+        killed_missing_reason_ids: list[str] = []
+        unknown_killed_ids: list[str] = []
+        if isinstance(killed_bets, list):
+            for index, item in enumerate(killed_bets):
+                if not isinstance(item, dict):
+                    killed_non_dict_indexes.append(index)
+                    continue
+                killed_id = _decision_entry_id(item)
+                if not killed_id:
+                    killed_missing_id_indexes.append(index)
+                    continue
+                if killed_id not in killed_ids:
+                    killed_ids.add(killed_id)
+                    killed_ids_ordered.append(killed_id)
+                if killed_id not in candidate_ids:
+                    unknown_killed_ids.append(killed_id)
+                if _decision_entry_has_text(item, reason_text_keys):
                     killed_with_reason += 1
+                else:
+                    killed_missing_reason_ids.append(killed_id)
         if killed_with_reason < 1:
             issues.append("killed_bets must include at least 1 killed bet with substantive reason text")
+        if killed_non_dict_indexes:
+            issues.append("killed_bets items must be objects")
+        if killed_missing_id_indexes:
+            issues.append("killed_bets items must include non-empty id, key, or name")
+        if killed_missing_reason_ids:
+            issues.append("killed_bets items must include substantive reason text")
+        if unknown_killed_ids:
+            issues.append("killed_bets ids must exist in candidate_bets")
 
         selected_has_id = False
         selected_has_summary = False
         selected_has_reason = False
+        selected_id = ""
         if isinstance(selected_bet, dict):
-            selected_has_id = bool(str(selected_bet.get("id") or "").strip())
+            selected_id = _decision_entry_id(selected_bet)
+            selected_has_id = bool(selected_id)
             selected_has_summary = _studio_evidence_text_substantive(
                 selected_bet.get("summary"),
                 min_chars=8,
             )
-            selected_has_reason = _studio_evidence_text_substantive(
-                selected_bet.get("reason") or selected_bet.get("why") or selected_bet.get("rationale")
-            )
+            selected_has_reason = _decision_entry_has_text(selected_bet, reason_text_keys)
         if not (selected_has_id and selected_has_summary and selected_has_reason):
             issues.append("selected_bet must include id, summary, and substantive reason text")
+        selected_in_candidates = bool(selected_id and selected_id in candidate_ids)
+        selected_killed = bool(selected_id and selected_id in killed_ids)
+        if selected_has_id and not selected_in_candidates:
+            issues.append("selected_bet id must exist in candidate_bets")
+        if selected_killed:
+            issues.append("selected_bet must not also be listed in killed_bets")
+
+        unresolved_candidate_ids: list[str] = []
+        if selected_in_candidates:
+            unresolved_candidate_ids = sorted(candidate_ids - killed_ids - {selected_id})
+            if unresolved_candidate_ids:
+                issues.append("every non-selected candidate_bets item must be killed or selected")
 
         critic_answer_count = 0
         if isinstance(critic_answers, dict):
@@ -28602,6 +28688,20 @@ def _orchestrator_min_evidence_gate(
             "selected_bet_has_id": bool(selected_has_id),
             "selected_bet_has_summary": bool(selected_has_summary),
             "selected_bet_has_reason": bool(selected_has_reason),
+            "candidate_bet_ids": candidate_ids_ordered,
+            "candidate_bet_non_dict_indexes": candidate_non_dict_indexes,
+            "candidate_bet_missing_id_indexes": candidate_missing_id_indexes,
+            "candidate_bet_missing_text_ids": sorted(candidate_missing_text_ids),
+            "candidate_bet_duplicate_ids": sorted(candidate_duplicate_ids),
+            "killed_bet_ids": killed_ids_ordered,
+            "killed_bet_non_dict_indexes": killed_non_dict_indexes,
+            "killed_bet_missing_id_indexes": killed_missing_id_indexes,
+            "killed_bet_missing_reason_ids": sorted(killed_missing_reason_ids),
+            "unknown_killed_bet_ids": sorted(unknown_killed_ids),
+            "selected_bet_id": selected_id,
+            "selected_bet_in_candidates": bool(selected_in_candidates),
+            "selected_bet_killed": bool(selected_killed),
+            "unresolved_candidate_bet_ids": unresolved_candidate_ids,
             "critic_answers_count": int(critic_answer_count),
             "debate_summary_substantial": bool(debate_summary_substantial),
             "issues": issues,

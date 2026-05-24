@@ -2648,6 +2648,10 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
             ],
             "killed_bets": [
                 {
+                    "id": "backend_flag",
+                    "reason": "Backend-only validation would miss runtime completion payloads before acceptance.",
+                },
+                {
                     "id": "prompt_only",
                     "reason": "Prompt-only text can be ignored by the runtime and leaves no auditable blocker.",
                 }
@@ -2872,6 +2876,115 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
         self.assertEqual(diag["killed_bets_with_reason_count"], 0)
         self.assertEqual(diag["critic_answers_count"], 1)
 
+    def test_blocks_unresolved_non_selected_studio_candidate_bet(self) -> None:
+        evidence = self._valid_studio_evidence()
+        evidence["killed_bets"] = [
+            {
+                "id": "prompt_only",
+                "reason": "Prompt-only text can be ignored by the runtime and leaves no auditable blocker.",
+            }
+        ]
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": evidence},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("non-selected candidate", str(reason))
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["unresolved_candidate_bet_ids"], ["backend_flag"])
+        self.assertIn(
+            "every non-selected candidate_bets item must be killed or selected",
+            diag["issues"],
+        )
+
+    def test_blocks_unknown_killed_studio_bet(self) -> None:
+        evidence = self._valid_studio_evidence()
+        evidence["killed_bets"] = [
+            {
+                "id": "backend_flag",
+                "reason": "Backend-only validation would miss runtime completion payloads before acceptance.",
+            },
+            {
+                "id": "prompt_only",
+                "reason": "Prompt-only text can be ignored by the runtime and leaves no auditable blocker.",
+            },
+            {
+                "id": "ghost_bet",
+                "reason": "This killed bet is not one of the candidates and should be rejected.",
+            },
+        ]
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": evidence},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("killed_bets ids must exist in candidate_bets", str(reason))
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["unknown_killed_bet_ids"], ["ghost_bet"])
+
+    def test_blocks_unknown_selected_studio_bet(self) -> None:
+        evidence = self._valid_studio_evidence()
+        evidence["selected_bet"] = {
+            "id": "ghost_selected",
+            "summary": "Runtime Studio DEEP_IMPROVEMENT decision-evidence gate",
+            "reason": "This selected bet is not one of the candidates and should be rejected.",
+        }
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": evidence},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("selected_bet id must exist in candidate_bets", str(reason))
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["selected_bet_id"], "ghost_selected")
+        self.assertFalse(diag["selected_bet_in_candidates"])
+
+    def test_blocks_selected_studio_bet_also_killed(self) -> None:
+        evidence = self._valid_studio_evidence()
+        evidence["killed_bets"] = [
+            {
+                "id": "runtime_gate",
+                "reason": "The selected bet cannot also be killed by the same decision record.",
+            },
+            {
+                "id": "backend_flag",
+                "reason": "Backend-only validation would miss runtime completion payloads before acceptance.",
+            },
+            {
+                "id": "prompt_only",
+                "reason": "Prompt-only text can be ignored by the runtime and leaves no auditable blocker.",
+            },
+        ]
+
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(),
+            summary="Implemented the chosen Studio deep improvement slice with tests and validation output.",
+            artifacts=[],
+            logs="validation output " * 12,
+            structured={"studio_decision_evidence": evidence},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("selected_bet must not also be listed in killed_bets", str(reason))
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["selected_bet_id"], "runtime_gate")
+        self.assertTrue(diag["selected_bet_killed"])
+
     def test_valid_studio_deep_improvement_evidence_passes(self) -> None:
         ok, reason, meta = bot._orchestrator_min_evidence_gate(
             task=self._studio_task(),
@@ -2888,7 +3001,10 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
         self.assertIsNone(reason)
         diag = meta["studio_decision_evidence"]
         self.assertEqual(diag["candidate_bets_count"], 3)
-        self.assertEqual(diag["killed_bets_with_reason_count"], 1)
+        self.assertEqual(diag["killed_bets_with_reason_count"], 2)
+        self.assertEqual(diag["unresolved_candidate_bet_ids"], [])
+        self.assertTrue(diag["selected_bet_in_candidates"])
+        self.assertFalse(diag["selected_bet_killed"])
         self.assertEqual(diag["critic_answers_count"], 3)
         self.assertEqual(diag["issues"], [])
         self.assertEqual(meta["factory_delta"]["issues"], [])
