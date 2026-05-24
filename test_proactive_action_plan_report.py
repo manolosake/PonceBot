@@ -25,6 +25,18 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "action": "Implement the bounded slice.",
                     "inspect_endpoint": "/inspect/advance-order",
                     "handoff_endpoint": "/handoff/advance-order",
+                    "studio_decision_evidence_contract": {
+                        "required_fields": [
+                            "studio_decision_evidence.candidate_bets",
+                            "studio_decision_evidence.killed_bets",
+                            "studio_decision_evidence.selected_bet",
+                            "studio_decision_evidence.critic_answers",
+                            "studio_decision_evidence.debate_summary",
+                        ],
+                        "suggested_validation": [
+                            "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-studio-decision-evidence"
+                        ],
+                    },
                 },
             },
             "top_execution_packet": {
@@ -38,6 +50,18 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "evidence_required": ["pytest output"],
                 "suggested_validation": ["Run focused tests."],
                 "definition_of_done": ["Tests pass."],
+                "studio_decision_evidence_contract": {
+                    "required_fields": [
+                        "studio_decision_evidence.candidate_bets",
+                        "studio_decision_evidence.killed_bets",
+                        "studio_decision_evidence.selected_bet",
+                        "studio_decision_evidence.critic_answers",
+                        "studio_decision_evidence.debate_summary",
+                    ],
+                    "suggested_validation": [
+                        "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-studio-decision-evidence"
+                    ],
+                },
             },
             "lanes": [
                 {
@@ -82,6 +106,10 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("  - Run focused tests.", rendered)
         self.assertIn("- definition_of_done:", rendered)
         self.assertIn("  - Tests pass.", rendered)
+        self.assertIn("- studio_decision_evidence_contract:", rendered)
+        self.assertIn("    - studio_decision_evidence.candidate_bets", rendered)
+        self.assertIn("    - studio_decision_evidence.debate_summary", rendered)
+        self.assertIn("    - python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-studio-decision-evidence", rendered)
         self.assertIn("## Next Delegate", rendered)
 
         self.assertIn("| Rank | Order | Stage | Verdict | Selection | Next action |", rendered)

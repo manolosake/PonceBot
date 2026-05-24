@@ -245,6 +245,29 @@ class TestStatusService(unittest.TestCase):
             self.assertIn("structured factory_delta.capability_changed", packet.get("evidence_required") or [])
             self.assertEqual(plan["summary"]["next_delegate"].get("factory_delta_contract"), contract)
 
+            studio_contract = packet.get("studio_decision_evidence_contract")
+            self.assertIsInstance(studio_contract, dict)
+            self.assertEqual(studio_contract.get("studio_cycle_id"), "cycle-123")
+            self.assertEqual(
+                studio_contract.get("required_fields"),
+                [
+                    "studio_decision_evidence.candidate_bets",
+                    "studio_decision_evidence.killed_bets",
+                    "studio_decision_evidence.selected_bet",
+                    "studio_decision_evidence.critic_answers",
+                    "studio_decision_evidence.debate_summary",
+                ],
+            )
+            self.assertIn("--require-studio-decision-evidence", " ".join(studio_contract.get("suggested_validation") or []))
+            self.assertIn("--require-studio-decision-evidence", " ".join(packet.get("suggested_validation") or []))
+            self.assertIn("structured studio_decision_evidence.candidate_bets", packet.get("evidence_required") or [])
+            self.assertIn("structured studio_decision_evidence.killed_bets", packet.get("evidence_required") or [])
+            self.assertIn("structured studio_decision_evidence.selected_bet", packet.get("evidence_required") or [])
+            self.assertIn("structured studio_decision_evidence.critic_answers", packet.get("evidence_required") or [])
+            self.assertIn("structured studio_decision_evidence.debate_summary", packet.get("evidence_required") or [])
+            self.assertIn("Studio decision evidence contract:", packet.get("assignment_prompt") or "")
+            self.assertEqual(plan["summary"]["next_delegate"].get("studio_decision_evidence_contract"), studio_contract)
+
     def test_proactive_action_plan_omits_factory_delta_contract_for_non_deep_order(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -283,6 +306,8 @@ class TestStatusService(unittest.TestCase):
 
             self.assertNotIn("factory_delta_contract", plan["top_execution_packet"])
             self.assertNotIn("factory_delta_contract", plan["summary"]["next_delegate"])
+            self.assertNotIn("studio_decision_evidence_contract", plan["top_execution_packet"])
+            self.assertNotIn("studio_decision_evidence_contract", plan["summary"]["next_delegate"])
 
     def test_proactive_action_plan_empty_packets_are_none(self) -> None:
         with tempfile.TemporaryDirectory() as td:

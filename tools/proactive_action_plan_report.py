@@ -73,6 +73,22 @@ def _append_list(lines: list[str], title: str, values: Any) -> None:
         lines.append("  - -")
 
 
+def _append_contract(lines: list[str], title: str, contract: Any) -> None:
+    if not isinstance(contract, dict):
+        return
+    lines.append(f"- {title}:")
+    fields = [_one_line(item) for item in _as_list(contract.get("required_fields"))]
+    if fields:
+        lines.append("  - required_fields:")
+        for field in fields:
+            lines.append(f"    - {field}")
+    validation = [_one_line(item) for item in _as_list(contract.get("suggested_validation"))]
+    if validation:
+        lines.append("  - suggested_validation:")
+        for item in validation:
+            lines.append(f"    - {item}")
+
+
 def _find_top_order(report: dict[str, Any], order_id: Any) -> dict[str, Any]:
     oid = str(order_id or "").strip()
     if not oid:
@@ -136,6 +152,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         _append_list(lines, "evidence_required", top_execution_packet.get("evidence_required"))
         _append_list(lines, "suggested_validation", top_execution_packet.get("suggested_validation"))
         _append_list(lines, "definition_of_done", top_execution_packet.get("definition_of_done"))
+        _append_contract(
+            lines,
+            "studio_decision_evidence_contract",
+            top_execution_packet.get("studio_decision_evidence_contract"),
+        )
 
         top_order = _find_top_order(report, top_execution_packet.get("order_id"))
         selection = top_order.get("selection_quality") if isinstance(top_order.get("selection_quality"), dict) else {}
@@ -166,6 +187,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Next Delegate", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(next_delegate.get(key))}")
+        _append_contract(
+            lines,
+            "studio_decision_evidence_contract",
+            next_delegate.get("studio_decision_evidence_contract"),
+        )
 
     for lane in lanes:
         label = _one_line(lane.get("label") or lane.get("lane"))

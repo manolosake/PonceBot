@@ -1560,6 +1560,9 @@ def _selection_review_action(order: dict[str, Any]) -> str:
 _FACTORY_DELTA_GUARD_COMMAND = (
     "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-factory-delta"
 )
+_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND = (
+    "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-studio-decision-evidence"
+)
 _PROACTIVE_TERMINAL_OUTCOMES = [
     "shipped_to_main",
     "published_project",
@@ -1640,6 +1643,50 @@ def _factory_delta_contract_from_trace(root_task: Task | None) -> dict[str, Any]
         contract["studio_cycle_id"] = studio_cycle_id
     if expected_delta:
         contract["expected_measurable_delta"] = expected_delta
+    return contract
+
+
+def _studio_decision_evidence_contract_from_trace(root_task: Task | None) -> dict[str, Any] | None:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    if str(trace.get("studio_selected_type") or "").strip() != "DEEP_IMPROVEMENT":
+        return None
+
+    studio_cycle_id = str(trace.get("studio_cycle_id") or "").strip()
+    contract = {
+        "required_fields": [
+            "studio_decision_evidence.candidate_bets",
+            "studio_decision_evidence.killed_bets",
+            "studio_decision_evidence.selected_bet",
+            "studio_decision_evidence.critic_answers",
+            "studio_decision_evidence.debate_summary",
+        ],
+        "candidate_bets": "Return structured studio_decision_evidence.candidate_bets for considered bets.",
+        "killed_bets": "Return structured studio_decision_evidence.killed_bets with kill rationale.",
+        "selected_bet": "Return structured studio_decision_evidence.selected_bet for the chosen DEEP_IMPROVEMENT bet.",
+        "critic_answers": "Return structured studio_decision_evidence.critic_answers for objections and answers.",
+        "debate_summary": "Return structured studio_decision_evidence.debate_summary summarizing the decision.",
+        "definition": (
+            "Final structured output must include studio_decision_evidence with candidate_bets, killed_bets, "
+            "selected_bet, critic_answers, and debate_summary; validate with "
+            f"`{_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND}`."
+        ),
+        "evidence_required": [
+            "structured studio_decision_evidence.candidate_bets",
+            "structured studio_decision_evidence.killed_bets",
+            "structured studio_decision_evidence.selected_bet",
+            "structured studio_decision_evidence.critic_answers",
+            "structured studio_decision_evidence.debate_summary",
+            (
+                "studio decision evidence guard result from "
+                f"`{_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND}` or equivalent validation"
+            ),
+        ],
+        "suggested_validation": [
+            _STUDIO_DECISION_EVIDENCE_GUARD_COMMAND,
+        ],
+    }
+    if studio_cycle_id:
+        contract["studio_cycle_id"] = studio_cycle_id
     return contract
 
 
@@ -1897,6 +1944,9 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     factory_delta_contract = order.get("factory_delta_contract")
     if isinstance(factory_delta_contract, dict):
         payload["factory_delta_contract"] = factory_delta_contract
+    studio_decision_evidence_contract = order.get("studio_decision_evidence_contract")
+    if isinstance(studio_decision_evidence_contract, dict):
+        payload["studio_decision_evidence_contract"] = studio_decision_evidence_contract
     if action:
         payload["action"] = action
     return payload
@@ -2026,6 +2076,21 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
         definition = _proactive_packet_text(factory_delta_contract.get("definition"))
         _append_unique_text(definition_of_done, definition)
 
+    studio_decision_evidence_contract = order.get("studio_decision_evidence_contract")
+    if not isinstance(studio_decision_evidence_contract, dict):
+        studio_decision_evidence_contract = (
+            handoff.get("studio_decision_evidence_contract")
+            if isinstance(handoff.get("studio_decision_evidence_contract"), dict)
+            else None
+        )
+    if isinstance(studio_decision_evidence_contract, dict):
+        for item in _proactive_packet_list(studio_decision_evidence_contract.get("evidence_required")):
+            _append_unique_text(evidence_required, item)
+        for item in _proactive_packet_list(studio_decision_evidence_contract.get("suggested_validation")):
+            _append_unique_text(suggested_validation, item)
+        definition = _proactive_packet_text(studio_decision_evidence_contract.get("definition"))
+        _append_unique_text(definition_of_done, definition)
+
     assignment_prompt = "" if selection_needs_review else _proactive_packet_text(handoff.get("assignment_prompt"))
     if not assignment_prompt:
         prompt_lines = [
@@ -2063,6 +2128,18 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
                     f"- validation: {_FACTORY_DELTA_GUARD_COMMAND}",
                 ]
             )
+        if isinstance(studio_decision_evidence_contract, dict):
+            prompt_lines.extend(
+                [
+                    "",
+                    "Studio decision evidence contract:",
+                    *(
+                        f"- {field}"
+                        for field in _proactive_packet_list(studio_decision_evidence_contract.get("required_fields"))
+                    ),
+                    f"- validation: {_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND}",
+                ]
+            )
         assignment_prompt = "\n".join(prompt_lines)
     elif "Outcome contract:" not in assignment_prompt:
         assignment_prompt = (
@@ -2079,6 +2156,19 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             + "\n\nFactory delta contract:\n"
             + "\n".join(f"- {field}" for field in _proactive_packet_list(factory_delta_contract.get("required_fields")))
             + f"\n- validation: {_FACTORY_DELTA_GUARD_COMMAND}"
+        )
+    if (
+        isinstance(studio_decision_evidence_contract, dict)
+        and _STUDIO_DECISION_EVIDENCE_GUARD_COMMAND not in assignment_prompt
+    ):
+        assignment_prompt = (
+            assignment_prompt.rstrip()
+            + "\n\nStudio decision evidence contract:\n"
+            + "\n".join(
+                f"- {field}"
+                for field in _proactive_packet_list(studio_decision_evidence_contract.get("required_fields"))
+            )
+            + f"\n- validation: {_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND}"
         )
 
     packet = {
@@ -2097,6 +2187,8 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
     }
     if isinstance(factory_delta_contract, dict):
         packet["factory_delta_contract"] = factory_delta_contract
+    if isinstance(studio_decision_evidence_contract, dict):
+        packet["studio_decision_evidence_contract"] = studio_decision_evidence_contract
     return packet
 
 
@@ -3558,6 +3650,9 @@ class StatusService:
             factory_delta_contract = _factory_delta_contract_from_trace(root_task)
             if factory_delta_contract is not None:
                 priority_item["factory_delta_contract"] = factory_delta_contract
+            studio_decision_evidence_contract = _studio_decision_evidence_contract_from_trace(root_task)
+            if studio_decision_evidence_contract is not None:
+                priority_item["studio_decision_evidence_contract"] = studio_decision_evidence_contract
             selection_quality = _selection_quality_metadata(priority_item, order_row=order_row, root_task=root_task)
             priority_item["selection_quality"] = selection_quality
             if str(selection_quality.get("status") or "").strip().lower() == "needs_review":
@@ -3656,6 +3751,7 @@ class StatusService:
             "children_by_role",
             "selection_quality",
             "factory_delta_contract",
+            "studio_decision_evidence_contract",
         ]
         for order in list(priorities.get("orders") or []):
             if not isinstance(order, dict):
@@ -3743,6 +3839,10 @@ class StatusService:
                 next_delegate["outcome_contract"] = top_execution_packet.get("outcome_contract")
             if isinstance(top_execution_packet.get("factory_delta_contract"), dict):
                 next_delegate["factory_delta_contract"] = top_execution_packet.get("factory_delta_contract")
+            if isinstance(top_execution_packet.get("studio_decision_evidence_contract"), dict):
+                next_delegate["studio_decision_evidence_contract"] = top_execution_packet.get(
+                    "studio_decision_evidence_contract"
+                )
 
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())
