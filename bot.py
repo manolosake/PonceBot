@@ -21405,7 +21405,10 @@ def _enqueue_reviewer_local_rework_if_due(
         if ts <= 0 or (float(now) - ts) > rework_lookback_s:
             continue
         trace = dict((getattr(child, "trace", {}) or {}) if isinstance(getattr(child, "trace", {}), dict) else {})
-        if latest_impl_no_change_ts <= 0.0 and _trace_local_no_change(trace):
+        summary = str(trace.get("result_summary") or "").strip()
+        if latest_impl_no_change_ts <= 0.0 and (
+            _trace_local_no_change(trace) or _response_signals_no_code_change(summary)
+        ):
             latest_impl_no_change_ts = ts
         if _trace_has_validated_slice_evidence(trace) or _task_has_skynet_delivery_validation_evidence(child, trace=trace):
             latest_impl = child
@@ -25035,8 +25038,15 @@ def _response_signals_no_code_change(text: str) -> bool:
         "no code changes required",
         "no code changes are required",
         "no_code_change",
+        "no repo code change required",
+        "no repo code change was required",
+        "no repository code change required",
+        "no repository code change was required",
+        "no repository code changes required",
+        "no repository code changes were required",
         "no code change required",
         "no code change is required",
+        "no code change was required",
         "no code change to apply",
         "no concrete code change to apply",
         "no actionable code change",
