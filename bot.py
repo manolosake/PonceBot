@@ -15757,6 +15757,46 @@ _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS = {
 }
 
 
+def _recover_controller_snapshot_autoship_deploy_failure(
+    *,
+    orch_q: OrchestratorQueue,
+    order_id: str,
+    chat_id: int,
+    repo_record: dict[str, Any] | None,
+    root_trace: dict[str, Any],
+    autoship: dict[str, Any],
+    now: float,
+) -> bool:
+    reason = str((autoship or {}).get("reason") or "").strip()
+    if reason not in _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS:
+        return False
+    deploy = (autoship or {}).get("deploy") if isinstance((autoship or {}).get("deploy"), dict) else {}
+    commit = str(
+        (autoship or {}).get("commit")
+        or deploy.get("deployed_commit")
+        or deploy.get("commit")
+        or root_trace.get("merge_commit")
+        or root_trace.get("deployed_commit")
+        or ""
+    ).strip()
+    if not commit:
+        return False
+    recovery_trace = dict(root_trace or {})
+    recovery_trace["merge_commit"] = commit
+    recovery_trace.setdefault("deployed_commit", commit)
+    repo_id = str((repo_record or {}).get("repo_id") or recovery_trace.get("repo_id") or "").strip()
+    if repo_id:
+        recovery_trace["repo_id"] = repo_id
+    return _recover_late_successful_deploy(
+        orch_q=orch_q,
+        order_id=order_id,
+        chat_id=int(chat_id),
+        repo_record=repo_record,
+        root_trace=recovery_trace,
+        now=float(now),
+    )
+
+
 def _controller_snapshot_deploy_failure_already_recorded(
     *,
     orch_q: OrchestratorQueue,
@@ -15998,6 +16038,17 @@ def _auto_merge_ready_orders_tick(
                     continue
                 if str(autoship.get("status") or "").strip().lower() == "failed":
                     autoship_reason = str(autoship.get("reason") or "").strip()
+                    if _recover_controller_snapshot_autoship_deploy_failure(
+                        orch_q=orch_q,
+                        order_id=oid,
+                        chat_id=chat_for_order,
+                        repo_record=_repo_record,
+                        root_trace=trace,
+                        autoship=autoship,
+                        now=float(now),
+                    ):
+                        snapshot_autoship_count += 1
+                        continue
                     if (
                         autoship_reason in _CONTROLLER_SNAPSHOT_AUTOSHIP_DEPLOY_FAILURE_REASONS
                         and _controller_snapshot_deploy_failure_already_recorded(
@@ -19850,6 +19901,9 @@ def _recover_late_successful_deploy(
             deploy_summary=summary,
             deployed_commit=str(row.get("deployed_head") or commit),
             deployed_at=float(row.get("last_deploy_at") or now),
+            controller_snapshot_autoship_done=True,
+            controller_snapshot_autoship_at=float(now),
+            controller_snapshot_autoship_commit=commit,
             proactive_operator_verified_deployment=True,
             proactive_improvement_verified=True,
             proactive_improvement_closed=True,

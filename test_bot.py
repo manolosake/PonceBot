@@ -8312,6 +8312,66 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertEqual(q.submitted, [])
         self.assertEqual(q.phases, [])
 
+    def test_autoship_deploy_failure_recovers_from_main_deploy_state(self) -> None:
+        class FakeQueue:
+            def __init__(self, db_path: Path) -> None:
+                self._storage = SimpleNamespace(path=db_path)
+                self.order_status: list[tuple[str, str]] = []
+                self.order_phase: list[tuple[str, str]] = []
+                self.state_updates: list[dict[str, object]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.order_status.append((order_id, status))
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.order_phase.append((order_id, phase))
+
+            def update_state(self, job_id: str, state: str, **kwargs: object) -> bool:
+                self.state_updates.append({"job_id": job_id, "state": state, **kwargs})
+                return True
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            (Path(td) / "main_deploy_state.json").write_text(
+                json.dumps(
+                    {
+                        "repos": {
+                            "repo-1": {
+                                "status": "ok",
+                                "deployed_head": "abc1234567890fed",
+                                "url": "",
+                                "last_deploy_at": 123.0,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            q = FakeQueue(db_path)
+
+            recovered = bot._recover_controller_snapshot_autoship_deploy_failure(
+                orch_q=q,
+                order_id="order-1",
+                chat_id=1,
+                repo_record={"repo_id": "repo-1"},
+                root_trace={"repo_id": "repo-1"},
+                autoship={"reason": "snapshot_autoship_deploy_failed", "commit": "abc1234567890fed"},
+                now=200.0,
+            )
+
+        self.assertTrue(recovered)
+        self.assertEqual(q.order_status[-1], ("order-1", "done"))
+        self.assertEqual(q.order_phase[-1], ("order-1", "done"))
+        self.assertEqual(q.state_updates[-1]["state"], "done")
+        self.assertEqual(q.state_updates[-1]["deploy_status"], "ok")
+        self.assertEqual(q.state_updates[-1]["controller_snapshot_autoship_done"], True)
+        self.assertEqual(q.state_updates[-1]["controller_snapshot_autoship_commit"], "abc1234567890fed")
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.late_deploy_success_recovered")
+
     def test_recovery_rework_includes_original_controller_patch_artifacts(self) -> None:
         class FakeQueue:
             def __init__(self, children: list[SimpleNamespace]) -> None:
