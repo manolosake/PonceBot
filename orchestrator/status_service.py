@@ -1560,6 +1560,49 @@ def _selection_review_action(order: dict[str, Any]) -> str:
 _FACTORY_DELTA_GUARD_COMMAND = (
     "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-factory-delta"
 )
+_PROACTIVE_TERMINAL_OUTCOMES = [
+    "shipped_to_main",
+    "published_project",
+    "blocked_need_operator",
+    "rejected_low_value",
+    "failed_root_caused",
+]
+_PROACTIVE_OUTCOME_REQUIRED_FIELDS = ["outcome", "evidence", "residual_risk"]
+_PROACTIVE_OUTCOME_DEFINITION = (
+    "Branch-only or done-only work is not completion without merge, publish, block, reject, "
+    "or root-cause evidence."
+)
+_PROACTIVE_OUTCOME_DOD = (
+    "Final evidence records one allowed terminal outcome with evidence and residual_risk."
+)
+_PROACTIVE_OUTCOME_EVIDENCE = (
+    "terminal outcome evidence with outcome, evidence, and residual_risk"
+)
+_PROACTIVE_RELEASE_OUTCOME_DOD = (
+    "Release completion includes merge or release evidence, not branch-only or done-only status."
+)
+_PROACTIVE_RELEASE_OUTCOME_EVIDENCE = "merge or release evidence for the terminal outcome"
+_PROACTIVE_SELECTION_OUTCOME_DOD = (
+    "If ending the order, record one allowed terminal outcome with evidence and residual_risk."
+)
+_PROACTIVE_SELECTION_OUTCOME_EVIDENCE = (
+    "If ending the order, include terminal outcome evidence with outcome, evidence, and residual_risk."
+)
+
+
+def _proactive_outcome_contract() -> dict[str, Any]:
+    return {
+        "allowed_outcomes": list(_PROACTIVE_TERMINAL_OUTCOMES),
+        "required_fields": list(_PROACTIVE_OUTCOME_REQUIRED_FIELDS),
+        "definition": _PROACTIVE_OUTCOME_DEFINITION,
+    }
+
+
+def _append_unique_text(items: list[str], *values: str) -> None:
+    for value in values:
+        text = _proactive_packet_text(value)
+        if text and text not in items:
+            items.append(text)
 
 
 def _factory_delta_contract_from_trace(root_task: Task | None) -> dict[str, Any] | None:
@@ -1772,7 +1815,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
             "Do not implement the delivery slice until selection evidence is recorded or the order is killed/paused.",
         ]
         evidence_expectations = [
-            "kill/continue decision",
+            "kill/continue/replan decision",
             "business or factory-value evidence",
             "studio-decision rationale or selected-bet evidence",
         ]
@@ -1951,7 +1994,7 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Continuing work has concrete selection evidence, or killed/paused work has an updated next action.",
         ]
         evidence_required = [
-            "kill/continue decision",
+            "kill/continue/replan decision",
             "business or factory-value evidence",
             "studio-decision rationale or selected-bet evidence",
         ]
@@ -1960,19 +2003,28 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Verify implementation work has not continued without selection evidence.",
         ]
 
+    outcome_contract = _proactive_outcome_contract()
+    selection_review_packet = lane_key == "selection_review" or selection_needs_review
+    if selection_review_packet:
+        _append_unique_text(definition_of_done, _PROACTIVE_SELECTION_OUTCOME_DOD)
+        _append_unique_text(evidence_required, _PROACTIVE_SELECTION_OUTCOME_EVIDENCE)
+    else:
+        _append_unique_text(definition_of_done, _PROACTIVE_OUTCOME_DOD)
+        _append_unique_text(evidence_required, _PROACTIVE_OUTCOME_EVIDENCE)
+    if lane_key == "release":
+        _append_unique_text(definition_of_done, _PROACTIVE_RELEASE_OUTCOME_DOD)
+        _append_unique_text(evidence_required, _PROACTIVE_RELEASE_OUTCOME_EVIDENCE)
+
     factory_delta_contract = order.get("factory_delta_contract")
     if not isinstance(factory_delta_contract, dict):
         factory_delta_contract = handoff.get("factory_delta_contract") if isinstance(handoff.get("factory_delta_contract"), dict) else None
     if isinstance(factory_delta_contract, dict):
         for item in _proactive_packet_list(factory_delta_contract.get("evidence_required")):
-            if item not in evidence_required:
-                evidence_required.append(item)
+            _append_unique_text(evidence_required, item)
         for item in _proactive_packet_list(factory_delta_contract.get("suggested_validation")):
-            if item not in suggested_validation:
-                suggested_validation.append(item)
+            _append_unique_text(suggested_validation, item)
         definition = _proactive_packet_text(factory_delta_contract.get("definition"))
-        if definition and definition not in definition_of_done:
-            definition_of_done.append(definition)
+        _append_unique_text(definition_of_done, definition)
 
     assignment_prompt = "" if selection_needs_review else _proactive_packet_text(handoff.get("assignment_prompt"))
     if not assignment_prompt:
@@ -1996,6 +2048,11 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "",
             "Suggested validation:",
             *(f"- {validation}" for validation in suggested_validation),
+            "",
+            "Outcome contract:",
+            *(f"- allowed_outcome: {outcome}" for outcome in _proactive_packet_list(outcome_contract.get("allowed_outcomes"))),
+            *(f"- required_field: {field}" for field in _proactive_packet_list(outcome_contract.get("required_fields"))),
+            f"- definition: {_proactive_packet_text(outcome_contract.get('definition'))}",
         ]
         if isinstance(factory_delta_contract, dict):
             prompt_lines.extend(
@@ -2007,7 +2064,16 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
                 ]
             )
         assignment_prompt = "\n".join(prompt_lines)
-    elif isinstance(factory_delta_contract, dict) and _FACTORY_DELTA_GUARD_COMMAND not in assignment_prompt:
+    elif "Outcome contract:" not in assignment_prompt:
+        assignment_prompt = (
+            assignment_prompt.rstrip()
+            + "\n\nOutcome contract:\n"
+            + "\n".join(f"- allowed_outcome: {outcome}" for outcome in _proactive_packet_list(outcome_contract.get("allowed_outcomes")))
+            + "\n"
+            + "\n".join(f"- required_field: {field}" for field in _proactive_packet_list(outcome_contract.get("required_fields")))
+            + f"\n- definition: {_proactive_packet_text(outcome_contract.get('definition'))}"
+        )
+    if isinstance(factory_delta_contract, dict) and _FACTORY_DELTA_GUARD_COMMAND not in assignment_prompt:
         assignment_prompt = (
             assignment_prompt.rstrip()
             + "\n\nFactory delta contract:\n"
@@ -2027,6 +2093,7 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
         "assignment_prompt": assignment_prompt,
         "order_id": oid or None,
         "lane": lane_key,
+        "outcome_contract": outcome_contract,
     }
     if isinstance(factory_delta_contract, dict):
         packet["factory_delta_contract"] = factory_delta_contract
@@ -3672,6 +3739,8 @@ class StatusService:
                 "inspect_endpoint": top_execution_packet.get("inspect_endpoint"),
                 "handoff_endpoint": top_execution_packet.get("handoff_endpoint"),
             }
+            if isinstance(top_execution_packet.get("outcome_contract"), dict):
+                next_delegate["outcome_contract"] = top_execution_packet.get("outcome_contract")
             if isinstance(top_execution_packet.get("factory_delta_contract"), dict):
                 next_delegate["factory_delta_contract"] = top_execution_packet.get("factory_delta_contract")
 

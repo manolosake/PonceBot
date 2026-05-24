@@ -333,6 +333,7 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertTrue(advance_packet["suggested_validation"])
             self.assertIn("ROLE:", advance_packet["assignment_prompt"])
             self.assertEqual(plan["top_execution_packet"], advance_packet)
+            self.assertIsInstance(advance_packet.get("outcome_contract"), dict)
             self.assertEqual(
                 plan["summary"]["next_delegate"],
                 {
@@ -342,6 +343,7 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                     "action": advance_packet["action"],
                     "inspect_endpoint": advance_packet["inspect_endpoint"],
                     "handoff_endpoint": advance_packet["handoff_endpoint"],
+                    "outcome_contract": advance_packet["outcome_contract"],
                 },
             )
 
@@ -379,6 +381,8 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertIn(order_id, release_packet["inspect_endpoint"])
             self.assertIn(order_id, release_packet["handoff_endpoint"])
             self.assertIn("Release or merge", " ".join(release_packet["definition_of_done"]))
+            self.assertIn("merge or release evidence", " ".join(release_packet["evidence_required"]))
+            self.assertIsInstance(release_packet.get("outcome_contract"), dict)
             self.assertTrue(release_packet["acceptance_criteria"])
             self.assertTrue(release_packet["evidence_required"])
             self.assertTrue(release_packet["suggested_validation"])
@@ -387,6 +391,7 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
             self.assertEqual(plan["summary"]["next_delegate"]["order_id"], order_id)
             self.assertEqual(plan["summary"]["next_delegate"]["lane"], "release")
+            self.assertEqual(plan["summary"]["next_delegate"]["outcome_contract"], release_packet["outcome_contract"])
 
 
 if __name__ == "__main__":

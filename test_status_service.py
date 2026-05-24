@@ -120,6 +120,20 @@ class TestStatusService(unittest.TestCase):
             self.assertIsNone(lanes["monitor"]["execution_packet"])
 
             top_packet = plan["top_execution_packet"]
+            expected_outcome_contract = {
+                "allowed_outcomes": [
+                    "shipped_to_main",
+                    "published_project",
+                    "blocked_need_operator",
+                    "rejected_low_value",
+                    "failed_root_caused",
+                ],
+                "required_fields": ["outcome", "evidence", "residual_risk"],
+                "definition": (
+                    "Branch-only or done-only work is not completion without merge, publish, block, reject, "
+                    "or root-cause evidence."
+                ),
+            }
             self.assertEqual(top_packet, lanes["advance"]["execution_packet"])
             self.assertEqual(top_packet["order_id"], "advance-order")
             self.assertEqual(top_packet["owner_role"], "implementer_local")
@@ -128,10 +142,25 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(top_packet["inspect_endpoint"], "/inspect/advance-order")
             self.assertEqual(top_packet["handoff_endpoint"], "/handoff/advance-order")
             self.assertEqual(top_packet["acceptance_criteria"], ["Open the order."])
-            self.assertEqual(top_packet["definition_of_done"], ["Tests pass."])
-            self.assertEqual(top_packet["evidence_required"], ["pytest output"])
+            self.assertEqual(
+                top_packet["definition_of_done"],
+                ["Tests pass.", "Final evidence records one allowed terminal outcome with evidence and residual_risk."],
+            )
+            self.assertEqual(
+                top_packet["evidence_required"],
+                ["pytest output", "terminal outcome evidence with outcome, evidence, and residual_risk"],
+            )
             self.assertEqual(top_packet["suggested_validation"], ["Run focused tests."])
+            self.assertEqual(top_packet["outcome_contract"], expected_outcome_contract)
             self.assertIn("ROLE: implementer_local.", top_packet["assignment_prompt"])
+            self.assertIn("Outcome contract:", top_packet["assignment_prompt"])
+
+            release_packet = lanes["release"]["execution_packet"]
+            self.assertEqual(release_packet["outcome_contract"], expected_outcome_contract)
+            self.assertIn("Final evidence records one allowed terminal outcome with evidence and residual_risk.", release_packet["definition_of_done"])
+            self.assertIn("Release completion includes merge or release evidence, not branch-only or done-only status.", release_packet["definition_of_done"])
+            self.assertIn("terminal outcome evidence with outcome, evidence, and residual_risk", release_packet["evidence_required"])
+            self.assertIn("merge or release evidence for the terminal outcome", release_packet["evidence_required"])
 
             self.assertEqual(
                 plan["summary"]["next_delegate"],
@@ -142,6 +171,7 @@ class TestStatusService(unittest.TestCase):
                     "action": "Implement the bounded slice.",
                     "inspect_endpoint": "/inspect/advance-order",
                     "handoff_endpoint": "/handoff/advance-order",
+                    "outcome_contract": expected_outcome_contract,
                 },
             )
 
@@ -332,8 +362,25 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(top_packet["lane"], "selection_review")
             self.assertIn("Selection review", top_packet["action"])
             self.assertIn("kill/continue", top_packet["action"])
-            self.assertIn("kill/continue decision", top_packet["evidence_required"])
+            self.assertIn("kill/continue/replan decision", top_packet["evidence_required"])
             self.assertIn("factory-value", " ".join(top_packet["evidence_required"]))
+            self.assertNotIn(
+                "Final evidence records one allowed terminal outcome with evidence and residual_risk.",
+                top_packet["definition_of_done"],
+            )
+            self.assertNotIn(
+                "terminal outcome evidence with outcome, evidence, and residual_risk",
+                top_packet["evidence_required"],
+            )
+            self.assertIn(
+                "If ending the order, record one allowed terminal outcome with evidence and residual_risk.",
+                top_packet["definition_of_done"],
+            )
+            self.assertIn(
+                "If ending the order, include terminal outcome evidence with outcome, evidence, and residual_risk.",
+                top_packet["evidence_required"],
+            )
+            self.assertEqual(top_packet["outcome_contract"], plan["summary"]["next_delegate"]["outcome_contract"])
 
     def test_proactive_action_plan_reroutes_evidence_backed_churn_without_validation_to_selection_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -564,7 +611,7 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(weak_order["selection_quality"]["status"], "needs_review")
             self.assertIn("Selection review", weak_order["next_action"])
             self.assertEqual(weak_order["handoff"]["suggested_role"], "architect_local")
-            self.assertIn("kill/continue decision", weak_order["handoff"]["evidence_expectations"])
+            self.assertIn("kill/continue/replan decision", weak_order["handoff"]["evidence_expectations"])
             self.assertEqual(priorities["summary"]["by_decision"]["selection_review"], 1)
 
     def test_proactive_action_plan_selection_review_does_not_reroute_release_or_blocked_orders(self) -> None:
