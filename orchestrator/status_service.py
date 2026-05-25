@@ -1495,6 +1495,106 @@ def _has_substantive_selection_text(value: Any, *, require_marker: bool = False)
     return False
 
 
+_STUDIO_DECISION_CANDIDATE_TEXT_KEYS = (
+    "summary",
+    "thesis",
+    "expected_delta",
+    "reason",
+    "rationale",
+    "why",
+    "value",
+    "impact",
+)
+_STUDIO_DECISION_REASON_KEYS = ("reason", "rationale", "why", "explanation")
+
+
+def _studio_decision_id(value: Any) -> str:
+    return str(value.get("id") or "").strip() if isinstance(value, dict) else ""
+
+
+def _has_substantive_studio_decision_text(value: Any) -> bool:
+    return isinstance(value, str) and _has_substantive_selection_text(value)
+
+
+def _studio_decision_has_keyed_text(value: Any, keys: tuple[str, ...]) -> bool:
+    return isinstance(value, dict) and any(
+        _has_substantive_studio_decision_text(value.get(key)) for key in keys if key in value
+    )
+
+
+def _has_structured_studio_decision_evidence(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+
+    candidate_bets = value.get("candidate_bets")
+    if not isinstance(candidate_bets, list) or len(candidate_bets) < 3:
+        return False
+
+    candidate_ids: list[str] = []
+    for candidate in candidate_bets:
+        if not isinstance(candidate, dict):
+            return False
+        candidate_id = _studio_decision_id(candidate)
+        if not candidate_id or not _studio_decision_has_keyed_text(candidate, _STUDIO_DECISION_CANDIDATE_TEXT_KEYS):
+            return False
+        candidate_ids.append(candidate_id)
+    candidate_id_set = set(candidate_ids)
+    if len(candidate_id_set) != len(candidate_ids):
+        return False
+
+    killed_bets = value.get("killed_bets")
+    if not isinstance(killed_bets, list) or not killed_bets:
+        return False
+
+    killed_ids: set[str] = set()
+    for killed in killed_bets:
+        if not isinstance(killed, dict):
+            return False
+        killed_id = _studio_decision_id(killed)
+        if not killed_id or killed_id not in candidate_id_set:
+            return False
+        if not _studio_decision_has_keyed_text(killed, _STUDIO_DECISION_REASON_KEYS):
+            return False
+        killed_ids.add(killed_id)
+
+    selected_bet = value.get("selected_bet")
+    if not isinstance(selected_bet, dict):
+        return False
+    selected_id = _studio_decision_id(selected_bet)
+    if (
+        not selected_id
+        or selected_id not in candidate_id_set
+        or selected_id in killed_ids
+        or not _studio_decision_has_keyed_text(selected_bet, _STUDIO_DECISION_REASON_KEYS)
+    ):
+        return False
+
+    unresolved_ids = candidate_id_set - killed_ids - {selected_id}
+    if unresolved_ids:
+        return False
+
+    critic_answers = value.get("critic_answers")
+    if isinstance(critic_answers, dict):
+        critic_answer_values = list(critic_answers.values())
+    elif isinstance(critic_answers, list):
+        critic_answer_values = critic_answers
+    else:
+        return False
+    if len(critic_answer_values) < 3:
+        return False
+    substantive_answers = 0
+    for answer in critic_answer_values:
+        if isinstance(critic_answers, list):
+            if isinstance(answer, dict) and _has_substantive_studio_decision_text(answer.get("answer")):
+                substantive_answers += 1
+        elif _has_substantive_studio_decision_text(answer):
+            substantive_answers += 1
+    if substantive_answers < 3:
+        return False
+
+    return _has_substantive_studio_decision_text(value.get("debate_summary"))
+
+
 def _selection_evidence_sources(*, order_row: dict[str, Any] | None, root_task: Task | None) -> list[dict[str, Any]]:
     trace = dict((root_task.trace or {}) if root_task is not None else {})
     sources: list[dict[str, Any]] = []
@@ -1519,7 +1619,7 @@ def _selection_evidence_sources(*, order_row: dict[str, Any] | None, root_task: 
     add("commercial_evidence_target", trace.get("commercial_evidence_target"))
 
     studio_decision_evidence = trace.get("studio_decision_evidence")
-    if isinstance(studio_decision_evidence, dict):
+    if _has_structured_studio_decision_evidence(studio_decision_evidence):
         add("studio_decision_evidence", studio_decision_evidence)
 
     factory_value = trace.get("factory_value")

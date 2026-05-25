@@ -9,9 +9,108 @@ from orchestrator.queue import OrchestratorQueue
 from orchestrator.schemas.task import Task
 from orchestrator.status_service import StatusService
 from orchestrator.storage import SQLiteTaskStorage
+from tools.backend_done_evidence_guard import _studio_decision_evidence_error
 
 
 class TestStatusService(unittest.TestCase):
+    def _valid_studio_decision_evidence(self) -> dict:
+        return {
+            "candidate_bets": [
+                {
+                    "id": "bet-a",
+                    "summary": "Tighten proactive selection evidence before delegating implementation slices.",
+                },
+                {
+                    "id": "bet-b",
+                    "summary": "Add broad dashboard polish that does not change autonomy decisions.",
+                },
+                {
+                    "id": "bet-c",
+                    "summary": "Refactor unrelated queue plumbing without a measurable factory outcome.",
+                },
+            ],
+            "killed_bets": [
+                {
+                    "id": "bet-b",
+                    "reason": "Killed because dashboard polish would not reduce mistaken delegation or improve factory quality.",
+                },
+                {
+                    "id": "bet-c",
+                    "reason": "Killed because unrelated queue plumbing is wider than this bounded autonomy improvement slice.",
+                },
+            ],
+            "selected_bet": {
+                "id": "bet-a",
+                "reason": "Selected because it directly prevents weak narrative evidence from causing more implementation churn.",
+            },
+            "critic_answers": [
+                {
+                    "answer": "The scope is bounded to the evidence gate and preserves existing commercial and factory-value signals.",
+                },
+                {
+                    "answer": "The test plan covers both rejected narrative evidence and accepted structured decision evidence.",
+                },
+                {
+                    "answer": "The change is reversible and does not alter downstream terminal completion guard behavior.",
+                },
+            ],
+            "debate_summary": "Three candidate bets were compared, two were killed with reasons, and the structured evidence gate was selected.",
+        }
+
+    def _guard_compatible_studio_decision_evidence(self) -> dict:
+        return {
+            "candidate_bets": [
+                {
+                    "id": "bet-a",
+                    "thesis": "Require structured Studio decision evidence before allowing proactive implementation to continue.",
+                    "impact": "Reduces mistaken delegation by routing weak evidence back to selection review.",
+                },
+                {
+                    "id": "bet-b",
+                    "thesis": "Tune execution packet copy without changing the autonomy decision path.",
+                    "impact": "Small presentation improvement with no measurable factory selection benefit.",
+                },
+                {
+                    "id": "bet-c",
+                    "thesis": "Broaden unrelated dashboard telemetry outside the bounded factory improvement slice.",
+                    "impact": "Useful eventually, but it does not prove this proactive selection should continue.",
+                },
+            ],
+            "killed_bets": [
+                {
+                    "id": "bet-b",
+                    "explanation": "Killed because copy tuning does not address weak selection evidence or delegation quality.",
+                },
+                {
+                    "id": "bet-c",
+                    "explanation": "Killed because dashboard telemetry is too broad for this bounded autonomy improvement.",
+                },
+            ],
+            "selected_bet": {
+                "id": "bet-a",
+                "explanation": "Selected because it directly aligns the early selection gate with final guard-compatible evidence.",
+            },
+            "critic_answers": {
+                "scope": "The change is local to selection evidence and does not alter commercial or factory-value evidence.",
+                "risk": "The regression test uses guard-compatible fields so valid structured evidence keeps advancing.",
+                "validation": "The previous narrative-only and selected-is-killed reject paths continue to require review.",
+            },
+            "debate_summary": "The guard-compatible decision compared three bets, killed two alternatives, and selected the bounded evidence gate.",
+        }
+
+    def _title_only_studio_decision_evidence(self) -> dict:
+        evidence = self._valid_studio_decision_evidence()
+        for candidate in evidence["candidate_bets"]:
+            candidate["title"] = candidate.pop("summary")
+        return evidence
+
+    def _nested_summary_studio_decision_evidence(self) -> dict:
+        evidence = self._valid_studio_decision_evidence()
+        evidence["candidate_bets"][0]["summary"] = {
+            "text": "Nested candidate summary should not count because the final guard only accepts string values."
+        }
+        return evidence
+
     def test_proactive_action_plan_adds_execution_packets_and_next_delegate(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -411,6 +510,333 @@ class TestStatusService(unittest.TestCase):
                 top_packet["evidence_required"],
             )
             self.assertEqual(top_packet["outcome_contract"], plan["summary"]["next_delegate"]["outcome_contract"])
+
+    def test_proactive_action_plan_ignores_narrative_studio_decision_evidence_for_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "narrative-studio-evidence-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Narrative studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Narrative studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": {
+                            "summary": "Studio considered this important and decided to continue with implementation.",
+                            "notes": "Narrative-only evidence lacks killed bets, selected bet rationale, critic answers, and debate summary.",
+                        },
+                        "result_summary": "Implementation requested.",
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("weak_selection_evidence", selection_quality["flags"])
+            self.assertNotIn("selection_evidence_present", selection_quality["flags"])
+            self.assertEqual(selection_quality["evidence_sources"], [])
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(top_packet["order_id"], order_id)
+            self.assertEqual(top_packet["owner_role"], "architect_local")
+            self.assertEqual(top_packet["lane"], "selection_review")
+
+    def test_proactive_action_plan_accepts_structured_studio_decision_evidence_for_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "structured-studio-evidence-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Structured studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Structured studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": self._valid_studio_decision_evidence(),
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 0)
+            self.assertEqual(lanes["advance"]["count"], 1)
+            order = lanes["advance"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "advance")
+            self.assertEqual(selection_quality["status"], "ok")
+            self.assertEqual(selection_quality["flags"], ["selection_evidence_present"])
+            self.assertEqual(selection_quality["evidence_sources"][0]["key"], "studio_decision_evidence")
+            self.assertEqual(plan["top_execution_packet"]["lane"], "advance")
+
+    def test_proactive_action_plan_accepts_guard_compatible_dict_critic_studio_decision_evidence(self) -> None:
+        guard_error = _studio_decision_evidence_error(
+            payload={"studio_decision_evidence": self._guard_compatible_studio_decision_evidence()},
+            summary_path=Path("summary.json"),
+        )
+        self.assertIsNone(guard_error)
+
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "guard-compatible-studio-evidence-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Guard compatible studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Guard compatible studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": self._guard_compatible_studio_decision_evidence(),
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 0)
+            self.assertEqual(lanes["advance"]["count"], 1)
+            order = lanes["advance"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "advance")
+            self.assertEqual(selection_quality["status"], "ok")
+            self.assertEqual(selection_quality["flags"], ["selection_evidence_present"])
+            self.assertEqual(selection_quality["evidence_sources"][0]["key"], "studio_decision_evidence")
+
+    def test_proactive_action_plan_rejects_title_only_studio_decision_candidate_text(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "title-only-studio-evidence-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Title only studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Title only studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": self._title_only_studio_decision_evidence(),
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("weak_selection_evidence", selection_quality["flags"])
+            self.assertNotIn("selection_evidence_present", selection_quality["flags"])
+            self.assertEqual(selection_quality["evidence_sources"], [])
+
+    def test_proactive_action_plan_rejects_nested_studio_decision_candidate_text(self) -> None:
+        evidence = self._nested_summary_studio_decision_evidence()
+        guard_error = _studio_decision_evidence_error(
+            payload={"studio_decision_evidence": evidence},
+            summary_path=Path("summary.json"),
+        )
+        self.assertIsNotNone(guard_error)
+        self.assertEqual(guard_error.get("reason"), "studio_decision_candidate_bet_text_missing")
+
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "nested-studio-evidence-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Nested studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Nested studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": evidence,
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("weak_selection_evidence", selection_quality["flags"])
+            self.assertNotIn("selection_evidence_present", selection_quality["flags"])
+            self.assertEqual(selection_quality["evidence_sources"], [])
+
+    def test_proactive_action_plan_rejects_studio_decision_evidence_when_selected_bet_is_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "killed-selected-studio-order"
+            evidence = self._valid_studio_decision_evidence()
+            evidence["killed_bets"].append(
+                {
+                    "id": "bet-a",
+                    "reason": "Killed because this edge case proves selected bets cannot also be rejected.",
+                }
+            )
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Killed selected studio evidence order",
+                body="Implement another bounded slice.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Killed selected studio evidence order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "studio_decision_evidence": evidence,
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("weak_selection_evidence", selection_quality["flags"])
+            self.assertNotIn("selection_evidence_present", selection_quality["flags"])
 
     def test_proactive_action_plan_reroutes_evidence_backed_churn_without_validation_to_selection_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
