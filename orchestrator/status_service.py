@@ -1557,6 +1557,43 @@ def _selection_review_action(order: dict[str, Any]) -> str:
     )
 
 
+def _selection_quality_flags(selection_quality: dict[str, Any]) -> set[str]:
+    flags = {
+        str(flag).strip()
+        for flag in list(selection_quality.get("flags") or [])
+        if str(flag or "").strip()
+    }
+    churn_risk = selection_quality.get("churn_risk") if isinstance(selection_quality.get("churn_risk"), dict) else {}
+    flags.update(
+        str(flag).strip()
+        for flag in list(churn_risk.get("flags") or [])
+        if str(flag or "").strip()
+    )
+    return flags
+
+
+def _has_validated_closure_debt(selection_quality: dict[str, Any]) -> bool:
+    return "validated_slices_without_terminal_closure" in _selection_quality_flags(selection_quality)
+
+
+def _selection_review_owner_role(selection_quality: dict[str, Any]) -> str:
+    owner_role = str(selection_quality.get("recommended_owner_role") or "").strip().lower()
+    if owner_role in _HANDOFF_ROLES:
+        return owner_role
+    if _has_validated_closure_debt(selection_quality):
+        return "release_mgr"
+    return "architect_local"
+
+
+def _closure_debt_action(order: dict[str, Any]) -> str:
+    oid = str(order.get("order_id_short") or order.get("order_id") or "this order").strip()
+    return (
+        f"Closure debt review for order {oid}: close, release, or replan the already validated work before any more "
+        "implementation; record terminal outcome evidence such as merge/release evidence, an explicit block, "
+        "rejection, or root-cause result."
+    )
+
+
 _FACTORY_DELTA_GUARD_COMMAND = (
     "python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-factory-delta"
 )
@@ -1796,6 +1833,13 @@ def _selection_quality_metadata(
             "churn_risk": churn_risk,
         }
 
+    validated_closure_debt = _has_validated_closure_debt(churn_risk)
+    recommended_owner_role = "release_mgr" if validated_closure_debt else "architect_local"
+    delegation_reason = (
+        "validated_slices_without_terminal_closure"
+        if validated_closure_debt
+        else "selection_review_required"
+    )
     if churn_needs_review and evidence_sources:
         flags = ["implementation_churn_without_validation"]
         flags.extend(str(flag) for flag in list(churn_risk.get("flags") or []) if str(flag or "").strip())
@@ -1809,11 +1853,15 @@ def _selection_quality_metadata(
         "status": "needs_review",
         "flags": flags,
         "summary": (
-            "Implementation churn is outpacing validation; make a kill/continue/replan decision before more delivery delegation."
+            "Validated work has not reached terminal closure; route closure debt to release ownership for close/release/replan evidence."
+            if validated_closure_debt
+            else "Implementation churn is outpacing validation; make a kill/continue/replan decision before more delivery delegation."
             if churn_needs_review
             else "Advance work has no substantive commercial, factory-value, or studio-decision evidence; review selection before more delivery churn."
         ),
-        "recommended_owner_role": "architect_local",
+        "recommended_owner_role": recommended_owner_role,
+        "delegation_reason": delegation_reason,
+        "delegation_focus": "terminal_outcome_closure" if validated_closure_debt else "selection_quality_review",
         "evidence_sources": evidence_sources,
         "churn_risk": churn_risk,
     }
@@ -1844,7 +1892,7 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     elif decision_key == "unblock":
         suggested_role = blocker_role if blocker_role in _HANDOFF_ROLES else _handoff_role_for_stage(blocker_stage)
     elif selection_needs_review:
-        suggested_role = "architect_local"
+        suggested_role = _selection_review_owner_role(selection_quality)
     else:
         suggested_role = _handoff_role_for_stage(stage)
 
@@ -1852,22 +1900,40 @@ def _proactive_handoff_metadata(order: dict[str, Any], decision: str) -> dict[st
     title = str(order.get("title") or "").strip() or "proactive order"
 
     if selection_needs_review:
-        action = _selection_review_action(order)
-        definition_of_done = [
-            "Make an explicit kill/continue/replan decision for this proactive order.",
-            "If continuing, record the business, factory-value, or studio-decision evidence that justifies implementation.",
-            "If killing or pausing, update the order next action so delivery churn stops.",
-        ]
-        checklist = [
-            "Open the handoff digest.",
-            "Inspect existing order and root trace evidence for commercial value, factory value, and studio decision rationale.",
-            "Do not implement the delivery slice until selection evidence is recorded or the order is killed/paused.",
-        ]
-        evidence_expectations = [
-            "kill/continue/replan decision",
-            "business or factory-value evidence",
-            "studio-decision rationale or selected-bet evidence",
-        ]
+        if _has_validated_closure_debt(selection_quality):
+            action = _closure_debt_action(order)
+            definition_of_done = [
+                "Make an explicit close/release/replan decision for the validated proactive work.",
+                "Record terminal outcome evidence, or identify the exact blocker preventing terminal closure.",
+                "Do not start another implementation slice until the closure decision is recorded.",
+            ]
+            checklist = [
+                "Open the handoff digest.",
+                "Inspect validated slice evidence, release readiness, and existing terminal outcome fields.",
+                "Close, release, or replan the validated work with terminal outcome evidence.",
+            ]
+            evidence_expectations = [
+                "close/release/replan decision",
+                "terminal outcome evidence",
+                "merge, release, block, reject, or root-cause evidence",
+            ]
+        else:
+            action = _selection_review_action(order)
+            definition_of_done = [
+                "Make an explicit kill/continue/replan decision for this proactive order.",
+                "If continuing, record the business, factory-value, or studio-decision evidence that justifies implementation.",
+                "If killing or pausing, update the order next action so delivery churn stops.",
+            ]
+            checklist = [
+                "Open the handoff digest.",
+                "Inspect existing order and root trace evidence for commercial value, factory value, and studio decision rationale.",
+                "Do not implement the delivery slice until selection evidence is recorded or the order is killed/paused.",
+            ]
+            evidence_expectations = [
+                "kill/continue/replan decision",
+                "business or factory-value evidence",
+                "studio-decision rationale or selected-bet evidence",
+            ]
     elif decision_key == "release":
         action = ""
         definition_of_done = [
@@ -1979,16 +2045,25 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
         lane_key in {"advance", "selection_review"}
         and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
     )
+    closure_debt_review = selection_needs_review and _has_validated_closure_debt(selection_quality)
     oid = _proactive_packet_text(order.get("order_id"))
     display_oid = _proactive_packet_text(order.get("order_id_short"), oid[:8] if oid else "unknown")
     stage = _proactive_packet_text(order.get("current_stage"), "skynet_plan")
     action = (
-        _selection_review_action(order) if selection_needs_review else _proactive_packet_text(handoff.get("action"))
+        _closure_debt_action(order)
+        if closure_debt_review
+        else _selection_review_action(order)
+        if selection_needs_review
+        else _proactive_packet_text(handoff.get("action"))
         or _proactive_packet_text(order.get("next_action"))
         or f"Advance the {lane_label.lower()} lane order."
     )
 
-    owner_role = "architect_local" if selection_needs_review else _proactive_packet_text(handoff.get("suggested_role"))
+    owner_role = (
+        _selection_review_owner_role(selection_quality)
+        if selection_needs_review
+        else _proactive_packet_text(handoff.get("suggested_role"))
+    )
     if not owner_role:
         if lane_key in {"release", "monitor"}:
             owner_role = "release_mgr"
@@ -2035,7 +2110,27 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Verify acceptance criteria, definition of done, and evidence expectations are satisfied.",
         ]
 
-    if selection_needs_review:
+    if closure_debt_review:
+        acceptance_criteria = [
+            f"Inspect {inspect_endpoint}.",
+            "Make an explicit close/release/replan decision for validated work before delivery work continues.",
+            "Record terminal outcome evidence or the concrete blocker that prevents terminal closure.",
+        ]
+        definition_of_done = [
+            "The order has a close/release/replan decision for the validated slices.",
+            "Terminal outcome evidence is recorded, or the order is replanned/blocked with owner and evidence gap.",
+            "No new implementation slice is delegated from this packet.",
+        ]
+        evidence_required = [
+            "close/release/replan decision",
+            "terminal outcome evidence",
+            "merge, release, block, reject, or root-cause evidence",
+        ]
+        suggested_validation = [
+            "Re-read the inspect endpoint after the closure decision.",
+            "Verify validated slices now have terminal closure evidence or an explicit replan/blocker.",
+        ]
+    elif selection_needs_review:
         acceptance_criteria = [
             f"Inspect {inspect_endpoint}.",
             "Make an explicit kill/continue/replan decision before delivery work continues.",
@@ -2187,6 +2282,15 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
         "lane": lane_key,
         "outcome_contract": outcome_contract,
     }
+    if selection_needs_review:
+        packet["delegation_reason"] = _proactive_packet_text(
+            selection_quality.get("delegation_reason"),
+            "selection_review_required",
+        )
+        packet["delegation_focus"] = _proactive_packet_text(
+            selection_quality.get("delegation_focus"),
+            "selection_quality_review",
+        )
     if isinstance(factory_delta_contract, dict):
         packet["factory_delta_contract"] = factory_delta_contract
     if isinstance(studio_decision_evidence_contract, dict):
@@ -3662,7 +3766,11 @@ class StatusService:
                 decision_rank = float(_DECISION_RANK[decision])
                 priority_item["decision"] = decision
                 priority_item["score_breakdown"]["decision_rank"] = decision_rank
-                priority_item["next_action"] = _selection_review_action(priority_item)
+                priority_item["next_action"] = (
+                    _closure_debt_action(priority_item)
+                    if _has_validated_closure_debt(selection_quality)
+                    else _selection_review_action(priority_item)
+                )
             priority_item["handoff"] = _proactive_handoff_metadata(priority_item, decision)
             ranked.append(priority_item)
 
@@ -3842,6 +3950,10 @@ class StatusService:
                 "definition_of_done": top_execution_packet.get("definition_of_done"),
                 "assignment_prompt": top_execution_packet.get("assignment_prompt"),
             }
+            if top_execution_packet.get("delegation_reason"):
+                next_delegate["delegation_reason"] = top_execution_packet.get("delegation_reason")
+            if top_execution_packet.get("delegation_focus"):
+                next_delegate["delegation_focus"] = top_execution_packet.get("delegation_focus")
             if isinstance(top_execution_packet.get("outcome_contract"), dict):
                 next_delegate["outcome_contract"] = top_execution_packet.get("outcome_contract")
             if isinstance(top_execution_packet.get("factory_delta_contract"), dict):

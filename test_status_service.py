@@ -570,12 +570,30 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(churn_risk["counters"]["proactive_slices_applied"], 2)
             self.assertEqual(churn_risk["counters"]["proactive_slices_validated"], 2)
             self.assertEqual(churn_risk["counters"]["proactive_slices_closed"], 0)
+            self.assertEqual(selection_quality["recommended_owner_role"], "release_mgr")
+            self.assertEqual(selection_quality["delegation_reason"], "validated_slices_without_terminal_closure")
+            self.assertEqual(selection_quality["delegation_focus"], "terminal_outcome_closure")
 
             top_packet = plan["top_execution_packet"]
             self.assertEqual(top_packet["order_id"], order_id)
             self.assertEqual(top_packet["lane"], "selection_review")
-            self.assertEqual(top_packet["owner_role"], "architect_local")
-            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "architect_local")
+            self.assertEqual(top_packet["owner_role"], "release_mgr")
+            self.assertEqual(top_packet["delegation_reason"], "validated_slices_without_terminal_closure")
+            self.assertEqual(top_packet["delegation_focus"], "terminal_outcome_closure")
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
+            self.assertEqual(
+                plan["summary"]["next_delegate"]["delegation_reason"],
+                "validated_slices_without_terminal_closure",
+            )
+            self.assertIn("close, release, or replan", top_packet["action"])
+            self.assertIn("terminal outcome evidence", top_packet["action"])
+            self.assertNotIn("kill/continue", top_packet["action"])
+            self.assertIn("close/release/replan decision", top_packet["evidence_required"])
+            self.assertIn("terminal outcome evidence", top_packet["evidence_required"])
+            self.assertIn(
+                "No new implementation slice is delegated from this packet.",
+                top_packet["definition_of_done"],
+            )
 
     def test_proactive_action_plan_allows_single_validated_slice_without_closure_to_advance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
