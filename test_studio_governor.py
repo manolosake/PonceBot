@@ -861,6 +861,134 @@ def test_studio_recent_cycle_outcome_memory_preserves_selected_lane(tmp_path):
     assert memory["recent_studio_negative_outcomes"][0]["lane"] == "incubator"
 
 
+def test_studio_reconciles_incomplete_published_portfolio_projects(tmp_path):
+    now = 1_700_000_000.0
+    db_path = tmp_path / "studio.sqlite"
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_portfolio_projects(
+                project_key, project_name, project_path, github_repo, github_url,
+                default_branch, latest_head, private, status, source_order_id,
+                latest_order_id, latest_outcome_status, latest_summary,
+                validation_summary, monetization_summary, next_milestone,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "/home/aponce/delay-notice-desk",
+                "Delay Notice Desk",
+                "/home/aponce/delay-notice-desk",
+                "",
+                "",
+                "main",
+                "",
+                1,
+                "published_private",
+                "order-1",
+                "order-1",
+                "published_project",
+                "Local project was validated.",
+                "",
+                "",
+                "",
+                now - 10,
+                now - 10,
+            ),
+        )
+        conn.commit()
+
+    changed = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now)
+
+    assert changed == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT status, latest_summary FROM studio_portfolio_projects WHERE project_key = ?",
+            ("/home/aponce/delay-notice-desk",),
+        ).fetchone()
+    assert row[0] == "needs_publication"
+    assert "missing github_repo, github_url, latest_head" in row[1]
+
+    memory = bot._studio_recent_cycle_outcome_memory(db_path, now=now)
+
+    assert memory["studio_portfolio_total"] == 0
+
+
+def test_studio_quality_audit_flags_incomplete_published_project(tmp_path):
+    now = 1_700_000_000.0
+    db_path = tmp_path / "studio.sqlite"
+    order_id = "order-quality-1"
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type,
+                selected_repo_id, selected_repo_path, selected_lane, thesis,
+                rationale, debate_summary, operator_visible_outcome, evidence_target,
+                risk_summary, prompt_packet, opportunities_json, outcome_status,
+                outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "cycle-quality-1",
+                1,
+                now,
+                "active",
+                "new-project-incubator",
+                "NEW_PROJECT",
+                "",
+                "",
+                "incubator",
+                "Create a sellable buyer workflow.",
+                "rationale",
+                "debate",
+                "A private GitHub project with demo and buyer evidence.",
+                "tests, GitHub publication, and demo evidence",
+                "bounded risk",
+                "prompt",
+                "[]",
+                None,
+                None,
+                order_id,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    bot._studio_complete_cycle_for_order_db(
+        db_path=db_path,
+        order_id=order_id,
+        outcome_status="published_project",
+        outcome_summary="PASS. Outcome: `published_project`. Local project /home/aponce/delay-notice-desk has tests and buyer demo evidence.",
+        now=now + 5,
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        audit = conn.execute(
+            "SELECT quality_status, score, summary, checks_json FROM studio_quality_audits WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        portfolio = conn.execute(
+            "SELECT status FROM studio_portfolio_projects WHERE project_key = ?",
+            ("/home/aponce/delay-notice-desk",),
+        ).fetchone()
+
+    assert audit["quality_status"] == "needs_publication"
+    assert audit["score"] < 60
+    assert "github_repo" in audit["summary"]
+    assert json.loads(audit["checks_json"])["publication_complete"] is False
+    assert portfolio["status"] == "needs_publication"
+
+    memory = bot._studio_recent_cycle_outcome_memory(db_path, now=now + 10)
+
+    assert memory["studio_quality_low_24h"] == 1
+    assert any("needs_publication" in item for item in memory["studio_quality_warnings"])
+
+
 def test_workspace_lease_reaps_terminal_job_holder(tmp_path):
     storage = SQLiteTaskStorage(tmp_path / "jobs.sqlite")
     stale = Task.new(

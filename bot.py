@@ -16813,11 +16813,27 @@ def _studio_ensure_schema(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_quality_audits (
+                audit_id TEXT PRIMARY KEY,
+                order_id TEXT UNIQUE,
+                cycle_id TEXT,
+                outcome_status TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                checks_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_ts ON studio_cycles(ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_status ON studio_cycles(status, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_updated ON studio_portfolio_projects(updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_github ON studio_portfolio_projects(github_repo)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_maturity_ts ON studio_maturity_snapshots(ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_quality_created ON studio_quality_audits(created_at DESC)")
         conn.commit()
 
 
@@ -16923,6 +16939,10 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         "studio_portfolio_recent_projects": [],
         "studio_portfolio_recent_count_6h": 0,
         "studio_portfolio_recent_count_24h": 0,
+        "studio_quality_recent": [],
+        "studio_quality_warnings": [],
+        "studio_quality_avg_24h": None,
+        "studio_quality_low_24h": 0,
     }
     cutoff = float(now) - 72.0 * 3600.0
     try:
@@ -17046,6 +17066,55 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
             bits.append(summary)
         recent_projects.append(_studio_one_line(" · ".join(bits), max_chars=180))
     memory["studio_portfolio_recent_projects"] = list(dict.fromkeys(recent_projects))[:8]
+    try:
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            audit_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_quality_audits'"
+            ).fetchone()
+            audit_rows = []
+            if audit_table:
+                audit_rows = conn.execute(
+                    """
+                    SELECT order_id, outcome_status, quality_status, score, summary, created_at
+                    FROM studio_quality_audits
+                    WHERE created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 60
+                    """,
+                    (cutoff,),
+                ).fetchall()
+    except Exception:
+        audit_rows = []
+    recent_quality: list[str] = []
+    quality_warnings: list[str] = []
+    scores_24h: list[int] = []
+    cutoff_24h = float(now) - 24.0 * 3600.0
+    for row in audit_rows or []:
+        try:
+            score = int(row["score"] or 0)
+        except Exception:
+            score = 0
+        try:
+            created_at = float(row["created_at"] or 0.0)
+        except Exception:
+            created_at = 0.0
+        quality_status = str(row["quality_status"] or "").strip()
+        outcome_status = str(row["outcome_status"] or "").strip()
+        order_id = str(row["order_id"] or "").strip()
+        summary = _studio_one_line(row["summary"], max_chars=100, default=quality_status or outcome_status)
+        line = f"{order_id[:8] or '-'} {quality_status} {score}/100 {outcome_status}: {summary}"
+        recent_quality.append(_studio_one_line(line, max_chars=160))
+        if created_at >= cutoff_24h:
+            scores_24h.append(score)
+            if score < 60:
+                memory["studio_quality_low_24h"] = int(memory["studio_quality_low_24h"]) + 1
+        if score < 60 or quality_status in {"needs_publication", "fail"}:
+            quality_warnings.append(_studio_one_line(line, max_chars=180))
+    memory["studio_quality_recent"] = list(dict.fromkeys(recent_quality))[:8]
+    memory["studio_quality_warnings"] = list(dict.fromkeys(quality_warnings))[:8]
+    if scores_24h:
+        memory["studio_quality_avg_24h"] = int(round(sum(scores_24h) / max(1, len(scores_24h))))
     return memory
 
 
@@ -17671,9 +17740,77 @@ def _studio_record_maturity_snapshot(*, cfg: BotConfig, readiness: dict[str, Any
         LOG.exception("Failed to record Studio maturity snapshot")
 
 
+def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not str(project.get("github_repo") or "").strip():
+        missing.append("github_repo")
+    if not str(project.get("github_url") or "").strip():
+        missing.append("github_url")
+    if not str(project.get("latest_head") or "").strip():
+        missing.append("latest_head")
+    return missing
+
+
+def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: float) -> int:
+    try:
+        db = Path(db_path).expanduser()
+        if not db.exists():
+            return 0
+        _studio_ensure_schema(db)
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            columns = {
+                str(row["name"] or "").strip().lower()
+                for row in conn.execute("PRAGMA table_info(studio_portfolio_projects)").fetchall()
+            }
+            required = {"project_key", "status", "github_repo", "github_url", "latest_head", "latest_summary"}
+            if not required.issubset(columns):
+                return 0
+            rows = conn.execute(
+                """
+                SELECT project_key, github_repo, github_url, latest_head, latest_summary
+                FROM studio_portfolio_projects
+                WHERE status LIKE 'published%'
+                  AND (
+                    github_repo IS NULL OR TRIM(github_repo) = ''
+                    OR github_url IS NULL OR TRIM(github_url) = ''
+                    OR latest_head IS NULL OR TRIM(latest_head) = ''
+                  )
+                """
+            ).fetchall()
+            changed = 0
+            for row in rows or []:
+                missing = _studio_publication_contract_missing(dict(row))
+                if not missing:
+                    continue
+                current_summary = str(row["latest_summary"] or "").strip()
+                prefix = f"Publication incomplete: missing {', '.join(missing)}."
+                summary = (
+                    current_summary
+                    if current_summary.lower().startswith("publication incomplete:")
+                    else _studio_one_line(f"{prefix} {current_summary}", max_chars=500, default=prefix)
+                )
+                conn.execute(
+                    """
+                    UPDATE studio_portfolio_projects
+                    SET status = 'needs_publication',
+                        latest_summary = ?
+                    WHERE project_key = ?
+                    """,
+                    (summary, row["project_key"]),
+                )
+                changed += 1
+            conn.commit()
+            return changed
+    except Exception:
+        LOG.exception("Failed to reconcile Studio portfolio publication contract")
+        return 0
+
+
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
     _studio_finalize_stale_selected_cycles(cfg.orchestrator_db_path, now=now)
     _studio_finalize_orphaned_active_cycles(cfg.orchestrator_db_path, now=now)
+    _studio_reconcile_portfolio_publication_contract(cfg.orchestrator_db_path, now=now)
     memory = _studio_recent_order_memory(orch_q, now=now)
     cycle_memory = _studio_recent_cycle_outcome_memory(cfg.orchestrator_db_path, now=now)
     memory.update(cycle_memory)
@@ -18416,6 +18553,10 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
     portfolio_projects = "; ".join(str(x) for x in memory.get("studio_portfolio_recent_projects", [])[:6]) or "none"
+    quality_recent = "; ".join(str(x) for x in memory.get("studio_quality_recent", [])[:4]) or "none"
+    quality_warnings = "; ".join(str(x) for x in memory.get("studio_quality_warnings", [])[:4]) or "none"
+    quality_avg = memory.get("studio_quality_avg_24h")
+    quality_avg_text = f"{quality_avg}/100" if quality_avg is not None else "n/a"
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_mode = str(governor.get("mode") or "normal")
     governor_trigger = _studio_one_line(governor.get("trigger"), max_chars=220, default="none")
@@ -18449,6 +18590,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
+            f"- Studio quality audit: avg24h={quality_avg_text}; low24h={memory.get('studio_quality_low_24h', 0)}; warnings={quality_warnings}; recent={quality_recent}",
             f"- Operational readiness: status={readiness.get('status', 'unknown')} score={readiness.get('score', 'n/a')}; missing={readiness_missing}; {readiness_summary}",
             "",
             "Studio governor:",
@@ -18823,6 +18965,233 @@ def _studio_governor_preempt_active_orders(
     return int(preempted)
 
 
+def _studio_quality_audit_for_outcome(
+    *,
+    conn: sqlite3.Connection,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+) -> dict[str, Any]:
+    order_id = str(order_id or "").strip()
+    outcome_status = str(outcome_status or "").strip()
+    summary = str(outcome_summary or "").strip()
+    cycle: dict[str, Any] = {}
+    try:
+        row = conn.execute(
+            """
+            SELECT cycle_id, selected_type, selected_repo_id, selected_lane, thesis,
+                   operator_visible_outcome, evidence_target
+            FROM studio_cycles
+            WHERE order_id = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (order_id,),
+        ).fetchone()
+        if row is not None:
+            cycle = dict(row) if isinstance(row, sqlite3.Row) else {}
+    except Exception:
+        cycle = {}
+
+    project = (
+        _studio_extract_portfolio_project_from_order(
+            conn=conn,
+            order_id=order_id,
+            outcome_status=outcome_status,
+            outcome_summary=summary,
+        )
+        if outcome_status == "published_project"
+        else None
+    )
+    joined = " ".join(
+        str(part or "")
+        for part in (
+            summary,
+            cycle.get("thesis"),
+            cycle.get("operator_visible_outcome"),
+            cycle.get("evidence_target"),
+            (project or {}).get("github_repo"),
+            (project or {}).get("github_url"),
+            (project or {}).get("latest_head"),
+        )
+    ).lower()
+
+    def has_any(markers: tuple[str, ...]) -> bool:
+        return any(marker in joined for marker in markers)
+
+    has_commit = bool(re.search(r"\b(?:commit|head)=?[ :]?[0-9a-f]{7,40}\b", joined)) or bool(
+        (project or {}).get("latest_head")
+    )
+    deploy_evidence = has_any(
+        (
+            "deploy ok",
+            "deploy completed",
+            "deploy scheduled",
+            "static product page",
+            "published at http",
+            "recovered deploy success",
+        )
+    )
+    validation_evidence = has_any(
+        (
+            "test",
+            "pytest",
+            "validation",
+            "verified",
+            "passed",
+            "screenshot",
+            "demo",
+            "http://",
+            "200",
+        )
+    )
+    value_evidence = has_any(
+        (
+            "feature",
+            "dashboard",
+            "workflow",
+            "operator",
+            "user",
+            "buyer",
+            "demo",
+            "product",
+            "milestone",
+            "capability",
+        )
+    )
+    money_evidence = has_any(
+        (
+            "buyer",
+            "pricing",
+            "sellable",
+            "rentable",
+            "revenue",
+            "money",
+            "offer",
+            "customer",
+            "save",
+            "savings",
+            "paid",
+        )
+    )
+    no_delta = has_any(("no new delta", "no-delta", "no material repo delta", "branch has no diff"))
+    root_cause = has_any(("root cause", "root-caused", "reason=", "detail:", "failed_root_caused"))
+    publication_missing = _studio_publication_contract_missing(project or {}) if outcome_status == "published_project" else []
+    publication_complete = outcome_status != "published_project" or not publication_missing
+
+    checks = {
+        "commit_or_head_evidence": has_commit,
+        "deploy_evidence": deploy_evidence,
+        "validation_evidence": validation_evidence,
+        "visible_value_evidence": value_evidence,
+        "monetization_or_savings_evidence": money_evidence,
+        "material_delta_or_controlled_rejection": bool((not no_delta) or outcome_status == "rejected_low_value"),
+        "publication_complete": publication_complete,
+        "publication_missing": publication_missing,
+        "root_cause_evidence": root_cause,
+    }
+
+    if outcome_status == "rejected_low_value":
+        score = 78 if no_delta else 58
+        quality_status = "controlled_rejection" if no_delta else "watch"
+    elif outcome_status == "blocked_need_operator":
+        score = 64 if summary and len(summary) >= 80 else 42
+        quality_status = "watch" if score >= 60 else "fail"
+    elif outcome_status == "failed_root_caused":
+        score = 62 if root_cause and summary else 36
+        quality_status = "watch" if score >= 60 else "fail"
+    else:
+        score = 0
+        score += 18 if has_commit else 0
+        score += 18 if deploy_evidence or outcome_status == "published_project" else 0
+        score += 16 if validation_evidence else 0
+        score += 16 if value_evidence else 0
+        score += 14 if money_evidence else 0
+        score += 18 if publication_complete and not no_delta else 0
+        if outcome_status == "published_project" and not publication_complete:
+            score = min(score, 55)
+            quality_status = "needs_publication"
+        elif no_delta:
+            score = min(score, 45)
+            quality_status = "fail"
+        elif score >= 80:
+            quality_status = "pass"
+        elif score >= 60:
+            quality_status = "watch"
+        else:
+            quality_status = "fail"
+
+    missing_bits: list[str] = []
+    if outcome_status in {"shipped_to_main", "published_project"}:
+        if not has_commit:
+            missing_bits.append("commit/head")
+        if outcome_status == "shipped_to_main" and not deploy_evidence:
+            missing_bits.append("deploy")
+        if not validation_evidence:
+            missing_bits.append("validation")
+        if not value_evidence:
+            missing_bits.append("visible value")
+        if not money_evidence:
+            missing_bits.append("money/savings")
+        for field in publication_missing:
+            missing_bits.append(field)
+    if quality_status == "pass":
+        audit_summary = "Outcome has commit/head, deploy/publication, validation, visible value, and money/savings evidence."
+    elif quality_status == "controlled_rejection":
+        audit_summary = "Rejected low-value work because no material delta was evidenced."
+    elif missing_bits:
+        audit_summary = f"Quality warning: missing {', '.join(list(dict.fromkeys(missing_bits)))}."
+    else:
+        audit_summary = _studio_one_line(summary, max_chars=220, default=quality_status)
+
+    return {
+        "cycle_id": str(cycle.get("cycle_id") or "").strip(),
+        "outcome_status": outcome_status,
+        "quality_status": quality_status,
+        "score": max(0, min(100, int(score))),
+        "summary": _studio_one_line(audit_summary, max_chars=260, default=quality_status),
+        "checks": checks,
+    }
+
+
+def _studio_record_quality_audit_for_order_conn(
+    *,
+    conn: sqlite3.Connection,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float,
+) -> None:
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return
+    audit = _studio_quality_audit_for_outcome(
+        conn=conn,
+        order_id=order_id,
+        outcome_status=outcome_status,
+        outcome_summary=outcome_summary,
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO studio_quality_audits(
+            audit_id, order_id, cycle_id, outcome_status, quality_status,
+            score, summary, checks_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            order_id,
+            order_id,
+            audit.get("cycle_id") or None,
+            audit["outcome_status"],
+            audit["quality_status"],
+            int(audit["score"]),
+            audit["summary"],
+            _studio_json(audit.get("checks") or {}),
+            float(now),
+        ),
+    )
+
+
 def _studio_complete_cycle_for_order_db(
     *,
     db_path: Path,
@@ -18863,6 +19232,13 @@ def _studio_complete_cycle_for_order_db(
                 ),
             )
             _studio_upsert_portfolio_project_for_order_conn(
+                conn=conn,
+                order_id=order_id,
+                outcome_status=outcome_status,
+                outcome_summary=outcome_summary,
+                now=ts,
+            )
+            _studio_record_quality_audit_for_order_conn(
                 conn=conn,
                 order_id=order_id,
                 outcome_status=outcome_status,
@@ -19020,6 +19396,21 @@ def _studio_extract_portfolio_project_from_order(
     milestone_match = re.search(r"(next [^.;\n]{10,180})", summary, flags=re.IGNORECASE)
     if milestone_match:
         next_milestone = _studio_one_line(milestone_match.group(1), max_chars=180, default="")
+    publication_probe = {
+        "github_repo": github_repo,
+        "github_url": remote_url,
+        "latest_head": latest_head,
+    }
+    publication_missing = _studio_publication_contract_missing(publication_probe)
+    status = "published_private" if private else "published"
+    if publication_missing:
+        status = "needs_publication"
+        missing_line = f"Publication incomplete: missing {', '.join(publication_missing)}."
+        validation_summary = _studio_one_line(
+            f"{missing_line} {validation_summary or summary}",
+            max_chars=260,
+            default=missing_line,
+        )
     return {
         "project_key": project_key,
         "project_name": project_name,
@@ -19029,7 +19420,7 @@ def _studio_extract_portfolio_project_from_order(
         "default_branch": branch,
         "latest_head": latest_head,
         "private": private,
-        "status": "published_private" if private else "published",
+        "status": status,
         "validation_summary": validation_summary,
         "monetization_summary": monetization_summary,
         "next_milestone": next_milestone,
