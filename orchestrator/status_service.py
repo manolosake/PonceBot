@@ -3834,6 +3834,11 @@ class StatusService:
                 "action": top_execution_packet.get("action"),
                 "inspect_endpoint": top_execution_packet.get("inspect_endpoint"),
                 "handoff_endpoint": top_execution_packet.get("handoff_endpoint"),
+                "acceptance_criteria": top_execution_packet.get("acceptance_criteria"),
+                "evidence_required": top_execution_packet.get("evidence_required"),
+                "suggested_validation": top_execution_packet.get("suggested_validation"),
+                "definition_of_done": top_execution_packet.get("definition_of_done"),
+                "assignment_prompt": top_execution_packet.get("assignment_prompt"),
             }
             if isinstance(top_execution_packet.get("outcome_contract"), dict):
                 next_delegate["outcome_contract"] = top_execution_packet.get("outcome_contract")

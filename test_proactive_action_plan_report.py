@@ -25,6 +25,11 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "action": "Implement the bounded slice.",
                     "inspect_endpoint": "/inspect/advance-order",
                     "handoff_endpoint": "/handoff/advance-order",
+                    "acceptance_criteria": ["Open the order."],
+                    "evidence_required": ["pytest output"],
+                    "suggested_validation": ["Run focused tests."],
+                    "definition_of_done": ["Tests pass."],
+                    "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
                     "studio_decision_evidence_contract": {
                         "required_fields": [
                             "studio_decision_evidence.candidate_bets",
@@ -50,6 +55,7 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "evidence_required": ["pytest output"],
                 "suggested_validation": ["Run focused tests."],
                 "definition_of_done": ["Tests pass."],
+                "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
                 "studio_decision_evidence_contract": {
                     "required_fields": [
                         "studio_decision_evidence.candidate_bets",
@@ -111,6 +117,16 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("    - studio_decision_evidence.debate_summary", rendered)
         self.assertIn("    - python3 tools/backend_done_evidence_guard.py --artifacts-dir <dir> --require-studio-decision-evidence", rendered)
         self.assertIn("## Next Delegate", rendered)
+        next_delegate_section = rendered.split("## Next Delegate", 1)[1].split("## Advance", 1)[0]
+        self.assertIn("- acceptance_criteria:", next_delegate_section)
+        self.assertIn("  - Open the order.", next_delegate_section)
+        self.assertIn("- evidence_required:", next_delegate_section)
+        self.assertIn("  - pytest output", next_delegate_section)
+        self.assertIn("- suggested_validation:", next_delegate_section)
+        self.assertIn("  - Run focused tests.", next_delegate_section)
+        self.assertIn("- definition_of_done:", next_delegate_section)
+        self.assertIn("  - Tests pass.", next_delegate_section)
+        self.assertIn("- assignment_prompt: ROLE: implementer_local. Action: Implement the bounded slice.", next_delegate_section)
 
         self.assertIn("| Rank | Order | Stage | Verdict | Selection | Next action |", rendered)
         self.assertIn("| 1 | advance | delivery | wait | ok | Implement the bounded slice. |", rendered)

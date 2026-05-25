@@ -171,6 +171,11 @@ class TestStatusService(unittest.TestCase):
                     "action": "Implement the bounded slice.",
                     "inspect_endpoint": "/inspect/advance-order",
                     "handoff_endpoint": "/handoff/advance-order",
+                    "acceptance_criteria": top_packet["acceptance_criteria"],
+                    "evidence_required": top_packet["evidence_required"],
+                    "suggested_validation": top_packet["suggested_validation"],
+                    "definition_of_done": top_packet["definition_of_done"],
+                    "assignment_prompt": top_packet["assignment_prompt"],
                     "outcome_contract": expected_outcome_contract,
                 },
             )

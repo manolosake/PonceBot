@@ -187,6 +187,21 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Next Delegate", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(next_delegate.get(key))}")
+        _append_list(lines, "acceptance_criteria", next_delegate.get("acceptance_criteria"))
+        _append_list(lines, "evidence_required", next_delegate.get("evidence_required"))
+        _append_list(lines, "suggested_validation", next_delegate.get("suggested_validation"))
+        _append_list(lines, "definition_of_done", next_delegate.get("definition_of_done"))
+        lines.append(f"- assignment_prompt: {_one_line(next_delegate.get('assignment_prompt'))}")
+        _append_contract(
+            lines,
+            "outcome_contract",
+            next_delegate.get("outcome_contract"),
+        )
+        _append_contract(
+            lines,
+            "factory_delta_contract",
+            next_delegate.get("factory_delta_contract"),
+        )
         _append_contract(
             lines,
             "studio_decision_evidence_contract",

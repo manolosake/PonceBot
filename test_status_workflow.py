@@ -343,6 +343,11 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                     "action": advance_packet["action"],
                     "inspect_endpoint": advance_packet["inspect_endpoint"],
                     "handoff_endpoint": advance_packet["handoff_endpoint"],
+                    "acceptance_criteria": advance_packet["acceptance_criteria"],
+                    "evidence_required": advance_packet["evidence_required"],
+                    "suggested_validation": advance_packet["suggested_validation"],
+                    "definition_of_done": advance_packet["definition_of_done"],
+                    "assignment_prompt": advance_packet["assignment_prompt"],
                     "outcome_contract": advance_packet["outcome_contract"],
                 },
             )
@@ -391,6 +396,11 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
             self.assertEqual(plan["summary"]["next_delegate"]["order_id"], order_id)
             self.assertEqual(plan["summary"]["next_delegate"]["lane"], "release")
+            self.assertEqual(plan["summary"]["next_delegate"]["acceptance_criteria"], release_packet["acceptance_criteria"])
+            self.assertEqual(plan["summary"]["next_delegate"]["evidence_required"], release_packet["evidence_required"])
+            self.assertEqual(plan["summary"]["next_delegate"]["suggested_validation"], release_packet["suggested_validation"])
+            self.assertEqual(plan["summary"]["next_delegate"]["definition_of_done"], release_packet["definition_of_done"])
+            self.assertEqual(plan["summary"]["next_delegate"]["assignment_prompt"], release_packet["assignment_prompt"])
             self.assertEqual(plan["summary"]["next_delegate"]["outcome_contract"], release_packet["outcome_contract"])
 
 
