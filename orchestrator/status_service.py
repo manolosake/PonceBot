@@ -1713,17 +1713,19 @@ def _selection_churn_risk_metadata(
     churn_flags: list[str] = []
     if started_count >= 3 and started_count >= validated_or_closed + 2:
         churn_flags.append("started_slices_exceed_validated_or_closed")
+    if validated_count >= 2 and closed_count == 0:
+        churn_flags.append("validated_slices_without_terminal_closure")
     if delivery_children >= 2 and validated_or_closed == 0:
         churn_flags.append("repeated_delivery_children_without_validation")
     elif children_total >= 3 and validated_or_closed == 0:
         churn_flags.append("multiple_child_jobs_without_validation")
 
-    needs_review = bool(churn_flags and (started_count > 0 or applied_count > 0 or children_total > 0))
+    needs_review = bool(churn_flags and (started_count > 0 or applied_count > 0 or validated_count > 0 or children_total > 0))
     return {
         "status": "needs_review" if needs_review else "ok",
         "flags": churn_flags,
         "summary": (
-            "Implementation activity is outpacing validation; review selection before more delivery delegation."
+            "Implementation activity is outpacing validation or closure; review selection before more delivery delegation."
             if needs_review
             else "No implementation churn risk detected."
         ),

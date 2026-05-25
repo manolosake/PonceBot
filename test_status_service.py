@@ -506,6 +506,138 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(plan["summary"]["next_delegate"]["lane"], "selection_review")
             self.assertIn("kill/continue/replan", top_packet["action"])
 
+    def test_proactive_action_plan_reroutes_validated_closure_debt_to_selection_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "closure-debt-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Closure-debt proactive order",
+                body="Validated slices exist, but no terminal closure was recorded.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Closure-debt proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 2,
+                        "proactive_slices_applied": 2,
+                        "proactive_slices_validated": 2,
+                        "proactive_slices_closed": 0,
+                        "factory_value": {
+                            "score": 80,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence supports the selected workflow.",
+                        },
+                        "result_summary": "Two slices validated without closure.",
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            churn_risk = selection_quality["churn_risk"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("implementation_churn_without_validation", selection_quality["flags"])
+            self.assertIn("selection_evidence_present", selection_quality["flags"])
+            self.assertIn("validated_slices_without_terminal_closure", selection_quality["flags"])
+            self.assertEqual(churn_risk["status"], "needs_review")
+            self.assertIn("validated_slices_without_terminal_closure", churn_risk["flags"])
+            self.assertEqual(churn_risk["counters"]["proactive_slices_applied"], 2)
+            self.assertEqual(churn_risk["counters"]["proactive_slices_validated"], 2)
+            self.assertEqual(churn_risk["counters"]["proactive_slices_closed"], 0)
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(top_packet["order_id"], order_id)
+            self.assertEqual(top_packet["lane"], "selection_review")
+            self.assertEqual(top_packet["owner_role"], "architect_local")
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "architect_local")
+
+    def test_proactive_action_plan_allows_single_validated_slice_without_closure_to_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "single-validated-slice-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Single validated slice order",
+                body="One validated slice should continue through normal advance routing.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Single validated slice order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 1,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_validated": 1,
+                        "proactive_slices_closed": 0,
+                        "factory_value": {
+                            "score": 72,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence supports one more normal advance step.",
+                        },
+                    },
+                    job_id=order_id,
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 0)
+            self.assertEqual(lanes["advance"]["count"], 1)
+            order = lanes["advance"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "advance")
+            self.assertEqual(selection_quality["status"], "ok")
+            self.assertIn("selection_evidence_present", selection_quality["flags"])
+            self.assertEqual(selection_quality["churn_risk"]["status"], "ok")
+            self.assertNotIn(
+                "validated_slices_without_terminal_closure",
+                selection_quality["churn_risk"]["flags"],
+            )
+
     def test_proactive_priorities_promotes_needs_review_advance_to_selection_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
