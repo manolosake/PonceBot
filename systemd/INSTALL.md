@@ -53,11 +53,19 @@ If you installed Ollama as a service:
 systemctl --user enable --now ollama
 ```
 
+Operational timers for 24/7 mode:
+```bash
+/home/aponce/codexbot/scripts/install_main_deploy_monitor.sh
+```
+
+That installs the static production server, main-branch deploy monitor, proactive health report timer, and retention timer.
+
 4. Logs:
 ```bash
 journalctl --user -u codexbot -f
 journalctl --user -u codexbot-alert-user@codexbot.service -n 50 --no-pager
 journalctl --user -u ollama -f
+systemctl --user list-timers 'codexbot-*' 'proactive-*' 'poncebot-*'
 ```
 
 ## Notes

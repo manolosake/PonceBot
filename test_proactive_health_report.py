@@ -402,7 +402,7 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertFalse(any(item.get("type") == "factory_stale_heartbeats" for item in anomalies))
             self.assertEqual(payload.get("operational_status"), "OK")
 
-    def test_factory_stale_heartbeats_includes_active_autonomy_enabled_repos(self) -> None:
+    def test_factory_stale_heartbeats_are_advisory_for_uncovered_repos(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             out_dir = root / "out"
@@ -432,11 +432,14 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
             self.assertEqual(payload["metrics"]["factory_enabled_repos"], 3)
             self.assertEqual(payload["metrics"]["factory_registered_repos"], 5)
-            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 3)
-            self.assertEqual(payload["factory"]["stale_heartbeats"], 3)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 0)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats_total"], 3)
+            self.assertEqual(payload["factory"]["stale_heartbeats"], 0)
+            self.assertEqual(payload["factory"]["stale_heartbeats_total"], 3)
             self.assertEqual(payload["factory"]["stale_heartbeat_detail_limit"], STALE_HEARTBEAT_DETAIL_LIMIT)
             self.assertFalse(payload["factory"]["stale_heartbeat_details_truncated"])
-            details = payload["factory"]["stale_heartbeat_details"]
+            self.assertEqual(payload["factory"]["stale_heartbeat_details"], [])
+            details = payload["factory"]["stale_heartbeat_total_details"]
             self.assertEqual([item["repo_id"] for item in details], ["enabled-missing", "enabled-no-row", "enabled-repo"])
             self.assertEqual(details[0]["agent_key"], "enabled-missing-1")
             self.assertEqual(details[0]["role"], "skynet")
@@ -453,23 +456,62 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertGreaterEqual(details[2]["heartbeat_age_s"], 3600)
             self.assertEqual(details[2]["reason"], "stale_heartbeat")
             anomalies = payload.get("anomalies") or []
-            stale_anomaly = next((item for item in anomalies if item.get("type") == "factory_stale_heartbeats"), None)
-            self.assertIsNotNone(stale_anomaly)
-            self.assertEqual(stale_anomaly.get("count"), 3)
-            self.assertEqual(stale_anomaly.get("details"), details)
-            self.assertFalse(stale_anomaly.get("details_truncated"))
-            self.assertEqual(stale_anomaly.get("detail_limit"), STALE_HEARTBEAT_DETAIL_LIMIT)
-            self.assertEqual(payload.get("operational_status"), "WARN")
+            self.assertFalse(any(item.get("type") == "factory_stale_heartbeats" for item in anomalies))
+            self.assertEqual(payload.get("operational_status"), "OK")
             actions = payload.get("recommended_actions") or []
             action = next((item for item in actions if item.get("evidence_type") == "factory_stale_heartbeats"), None)
-            self.assertIsNotNone(action)
-            self.assertEqual(action.get("priority"), "P1")
-            self.assertEqual(action.get("count"), 3)
-            self.assertEqual(action.get("repo_id"), "enabled-missing")
+            self.assertIsNone(action)
 
             markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("Factory stale active heartbeats: 0 total_unhealthy=3", markdown)
             self.assertIn("## Recommended Actions", markdown)
-            self.assertIn("factory_stale_heartbeats", markdown)
+
+    def test_factory_stale_heartbeats_warn_for_covered_active_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            stale = time.time() - 3600
+            self._create_factory_report_db(
+                db,
+                repos=[
+                    ("enabled-repo", "active", 1),
+                    ("uncovered-repo", "active", 1),
+                ],
+                heartbeats=[
+                    ("enabled-repo", stale),
+                    ("uncovered-repo", stale),
+                ],
+            )
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "order-covered",
+                        "active",
+                        "planning",
+                        "Proactive Sprint: enabled-repo",
+                        "[repo:enabled-repo]",
+                        time.time(),
+                    ),
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 1)
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats_total"], 2)
+            details = payload["factory"]["stale_heartbeat_details"]
+            self.assertEqual([item["repo_id"] for item in details], ["enabled-repo"])
+            self.assertEqual(details[0]["coverage_state"], "covered_active")
+            stale_anomaly = next((item for item in payload.get("anomalies") or [] if item.get("type") == "factory_stale_heartbeats"), None)
+            self.assertIsNotNone(stale_anomaly)
+            self.assertEqual(stale_anomaly.get("count"), 1)
+            self.assertEqual(payload.get("operational_status"), "WARN")
 
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -553,6 +595,60 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertIn("## Recommended Actions", markdown)
             self.assertIn("paused_idle_backlog", markdown)
             self.assertIn("resume_or_close_stale_order", markdown)
+
+    def test_ancient_paused_idle_backlog_is_historical_not_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            ancient = now - 10 * 86400
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE ceo_orders (
+                        order_id TEXT,
+                        status TEXT,
+                        phase TEXT,
+                        title TEXT,
+                        body TEXT,
+                        updated_at REAL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT,
+                        parent_job_id TEXT,
+                        state TEXT,
+                        role TEXT,
+                        labels TEXT,
+                        trace TEXT,
+                        updated_at REAL,
+                        created_at REAL
+                    )
+                    """
+                )
+                con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("ancient-paused", "paused", "planning", "Proactive Sprint: old paused", "", ancient),
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["historical_paused_backlog"], 1)
+            self.assertFalse(any(item.get("type") == "paused_idle_backlog" for item in payload.get("anomalies") or []))
+            self.assertEqual(payload.get("recommended_actions"), [])
+            historical = payload["factory"]["historical_paused_backlog"]
+            self.assertEqual(historical[0]["order_id"], "ancient-paused")
+            self.assertEqual(historical[0]["recommended_action"], "archived_history_no_current_action")
 
     def test_healthy_report_has_no_recommended_actions(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -27,6 +27,7 @@ IGNORE_ARTIFACT_TOKENS = (
     'local_ollama_prompt',
 )
 STALE_LOCAL_S = 15 * 60
+PAUSED_BACKLOG_ACTIONABLE_MAX_AGE_S = int(os.environ.get('CODEXBOT_PAUSED_BACKLOG_ACTIONABLE_MAX_AGE_SECONDS', str(7 * 86400)))
 STALE_HEARTBEAT_DETAIL_LIMIT = 25
 UNCOVERED_REPO_DETAIL_LIMIT = 25
 FACTORY_COVERAGE_DETAIL_LIMIT = 100
@@ -902,6 +903,7 @@ def main() -> int:
     order_reports = []
     order_activity_age_by_id = {}
     anomalies = []
+    historical_paused_backlog = []
     funnel_totals = {
         'slices_started': 0,
         'slices_applied': 0,
@@ -996,14 +998,20 @@ def main() -> int:
         order_status = str(order.get('status') or '').strip().lower()
         if (not open_children) and (not improvement) and (last_activity_age_s is not None) and last_activity_age_s >= 900:
             if order_status == 'paused':
-                anomalies.append({
+                paused_backlog_item = {
                     'type': 'paused_idle_backlog',
                     'order_id': order_id,
                     'phase': order.get('phase'),
                     'open_jobs': len(open_children),
                     'last_activity_age_s': last_activity_age_s,
                     'recommended_action': 'resume_or_close_stale_order',
-                })
+                }
+                if last_activity_age_s >= PAUSED_BACKLOG_ACTIONABLE_MAX_AGE_S:
+                    paused_backlog_item['type'] = 'historical_paused_backlog'
+                    paused_backlog_item['recommended_action'] = 'archived_history_no_current_action'
+                    historical_paused_backlog.append(paused_backlog_item)
+                else:
+                    anomalies.append(paused_backlog_item)
             else:
                 anomalies.append({
                     'type': 'idle_without_improvement',
@@ -1088,48 +1096,52 @@ def main() -> int:
     next_targets_limited = next_targets[:FACTORY_NEXT_TARGET_LIMIT]
     next_targets_truncated = next_target_count > len(next_targets_limited)
     stale_heartbeat_details = []
-    seen_enabled_repo_ids = set()
-    for hb in heartbeat_rows:
-        repo_id = str(hb.get('repo_id') or '').strip()
-        if repo_id not in enabled_repo_ids:
+    stale_heartbeat_total_details = []
+    heartbeat_unhealthy_states = {'missing_runtime_state_row', 'missing', 'missing_heartbeat', 'stale', 'stale_heartbeat'}
+    for item in coverage_details:
+        heartbeat = item.get('runtime_heartbeat') or {}
+        heartbeat_state = str(heartbeat.get('state') or '').strip()
+        heartbeat_reason = str(heartbeat.get('reason') or heartbeat_state or '').strip()
+        if heartbeat_reason == 'stale':
+            normalized_reason = 'stale_heartbeat'
+        elif heartbeat_reason == 'missing':
+            normalized_reason = 'missing_heartbeat'
+        else:
+            normalized_reason = heartbeat_reason
+        if normalized_reason not in heartbeat_unhealthy_states:
             continue
-        seen_enabled_repo_ids.add(repo_id)
-        try:
-            heartbeat_at = float(hb.get('heartbeat_at') or 0.0)
-        except Exception:
-            heartbeat_at = 0.0
-        if heartbeat_at <= 0 or (now - heartbeat_at) >= STALE_LOCAL_S:
-            repo = enabled_repo_by_id.get(repo_id) or {}
-            stale_heartbeat_details.append({
-                'repo_id': repo_id,
-                'repo_path': str(repo.get('path') or ''),
-                'agent_key': str(hb.get('agent_key') or ''),
-                'role': str(hb.get('role') or ''),
-                'heartbeat_at': heartbeat_at if heartbeat_at > 0 else None,
-                'heartbeat_age_s': max(0, int(now - heartbeat_at)) if heartbeat_at > 0 else None,
-                'updated_at': hb.get('updated_at'),
-                'reason': 'missing_heartbeat' if heartbeat_at <= 0 else 'stale_heartbeat',
-            })
-    for repo_id in sorted(enabled_repo_ids - seen_enabled_repo_ids):
-        repo = enabled_repo_by_id.get(repo_id) or {}
-        stale_heartbeat_details.append({
-            'repo_id': repo_id,
-            'repo_path': str(repo.get('path') or ''),
-            'agent_key': '',
-            'role': '',
-            'heartbeat_at': None,
-            'heartbeat_age_s': None,
-            'updated_at': None,
-            'reason': 'missing_runtime_state_row',
-        })
+        detail = {
+            'repo_id': str(item.get('repo_id') or ''),
+            'repo_path': str(item.get('repo_path') or item.get('path') or ''),
+            'agent_key': str(heartbeat.get('agent_key') or ''),
+            'role': str(heartbeat.get('role') or ''),
+            'heartbeat_at': heartbeat.get('heartbeat_at'),
+            'heartbeat_age_s': heartbeat.get('heartbeat_age_s'),
+            'updated_at': heartbeat.get('updated_at'),
+            'reason': normalized_reason,
+            'coverage_state': str(item.get('coverage_state') or ''),
+            'order_id': str(item.get('order_id') or ''),
+        }
+        stale_heartbeat_total_details.append(detail)
+        if detail['coverage_state'] == 'covered_active':
+            stale_heartbeat_details.append(detail)
     stale_heartbeat_details.sort(key=lambda item: (
         str(item.get('repo_id') or ''),
         str(item.get('role') or ''),
         str(item.get('agent_key') or ''),
     ))
+    stale_heartbeat_total_details.sort(key=lambda item: (
+        str(item.get('coverage_state') or ''),
+        str(item.get('repo_id') or ''),
+        str(item.get('role') or ''),
+        str(item.get('agent_key') or ''),
+    ))
     stale_heartbeat_count = len(stale_heartbeat_details)
+    stale_heartbeat_total_count = len(stale_heartbeat_total_details)
     stale_heartbeat_details_limited = stale_heartbeat_details[:STALE_HEARTBEAT_DETAIL_LIMIT]
     stale_heartbeat_details_truncated = stale_heartbeat_count > len(stale_heartbeat_details_limited)
+    stale_heartbeat_total_details_limited = stale_heartbeat_total_details[:STALE_HEARTBEAT_DETAIL_LIMIT]
+    stale_heartbeat_total_details_truncated = stale_heartbeat_total_count > len(stale_heartbeat_total_details_limited)
 
     def audit_count(event_type: str) -> int:
         return int(
@@ -1175,7 +1187,9 @@ def main() -> int:
         'factory_enabled_repos': len(enabled_repos),
         'factory_registered_repos': len(repo_rows),
         'factory_stale_heartbeats': int(stale_heartbeat_count),
+        'factory_stale_heartbeats_total': int(stale_heartbeat_total_count),
         'factory_uncovered_enabled_repos': int(uncovered_repo_count),
+        'historical_paused_backlog': len(historical_paused_backlog),
     }
 
     operational_status = 'OK'
@@ -1211,7 +1225,7 @@ def main() -> int:
             'detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
         })
         operational_status = worst_status(operational_status, 'WARN')
-    if metrics['factory_uncovered_enabled_repos'] > 0:
+    if metrics['factory_uncovered_enabled_repos'] > 0 and not proactive_orders:
         anomalies.append({
             'type': 'factory_uncovered_enabled_repos',
             'count': metrics['factory_uncovered_enabled_repos'],
@@ -1298,6 +1312,12 @@ def main() -> int:
             'stale_heartbeat_details': stale_heartbeat_details_limited,
             'stale_heartbeat_details_truncated': stale_heartbeat_details_truncated,
             'stale_heartbeat_detail_limit': STALE_HEARTBEAT_DETAIL_LIMIT,
+            'stale_heartbeats_total': int(stale_heartbeat_total_count),
+            'stale_heartbeat_total_details': stale_heartbeat_total_details_limited,
+            'stale_heartbeat_total_details_truncated': stale_heartbeat_total_details_truncated,
+            'historical_paused_backlog': historical_paused_backlog[:25],
+            'historical_paused_backlog_count': len(historical_paused_backlog),
+            'paused_backlog_actionable_max_age_s': PAUSED_BACKLOG_ACTIONABLE_MAX_AGE_S,
             'coverage_details': coverage_details_limited,
             'coverage_count': int(coverage_count),
             'coverage_truncated': coverage_truncated,
@@ -1341,8 +1361,9 @@ def main() -> int:
         f'- Trend status: {trend_status}',
         f"- Factory state: {'hard_stop' if factory_hard_stop else ('soft_pause' if factory_soft_pause_active else 'active')}",
         f"- Factory repos: registered={metrics['factory_registered_repos']} enabled={metrics['factory_enabled_repos']}",
-        f"- Factory uncovered enabled repos: {metrics['factory_uncovered_enabled_repos']}",
-        f"- Factory stale heartbeats: {metrics['factory_stale_heartbeats']}",
+        f"- Factory uncovered backlog: {metrics['factory_uncovered_enabled_repos']}",
+        f"- Factory stale active heartbeats: {metrics['factory_stale_heartbeats']} total_unhealthy={metrics['factory_stale_heartbeats_total']}",
+        f"- Historical paused backlog: {metrics['historical_paused_backlog']}",
         f"- Active proactive orders: {metrics['proactive_active_orders']}",
         f"- Autonomy funnel (24h): started={metrics['slices_started']} applied={metrics['slices_applied']} validated={metrics['slices_validated']} closed={metrics['slices_closed']}",
         f"- Outcome quality (24h): status={metrics['outcome_quality_status']} validated_rate={metrics['validated_outcome_rate']:.2%} verified_rate={metrics['verified_outcome_rate']:.2%} churn_gap={metrics['churn_gap']} verified={metrics['verified_outcomes']}",

@@ -1,0 +1,15 @@
+[Unit]
+Description=codexbot retention/index/backup (artifacts + health reports + user journald)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/codexbot
+ExecStart=%h/codexbot/.venv/bin/python %h/codexbot/tools/retention_maintenance.py
+Environment=CODEXBOT_KEEP_DAYS_ARTIFACTS=30
+Environment=CODEXBOT_KEEP_DAYS_PROACTIVE_HEALTH_REPORTS=7
+Environment=CODEXBOT_KEEP_LATEST_PROACTIVE_HEALTH_REPORTS=288
+Environment=CODEXBOT_KEEP_DAYS_ARCHIVES=180
+Environment=CODEXBOT_KEEP_DAYS_BACKUPS=30
+Environment=CODEXBOT_KEEP_LATEST_APKS=20
+Environment=CODEXBOT_JOURNALD_VACUUM_TIME=14d
+Environment=CODEXBOT_JOURNALD_VACUUM_SIZE=200M

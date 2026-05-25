@@ -29,14 +29,17 @@ from typing import Any
 @dataclass
 class RetentionConfig:
     artifacts_dir: Path
+    proactive_health_dir: Path
     archive_dir: Path
     backups_dir: Path
     index_json: Path
     index_jsonl: Path
     keep_days_artifacts: int
+    keep_days_proactive_health_reports: int
     keep_days_archives: int
     keep_days_backups: int
     keep_latest_apks: int
+    keep_latest_proactive_health_reports: int
     journald_vacuum_time: str
     journald_vacuum_size: str
     max_index_entries: int
@@ -116,14 +119,17 @@ def load_config() -> RetentionConfig:
     backups_dir = Path(_env_str("CODEXBOT_BACKUPS_DIR", str(base / "backups")))
     return RetentionConfig(
         artifacts_dir=artifacts_dir,
+        proactive_health_dir=Path(_env_str("CODEXBOT_PROACTIVE_HEALTH_DIR", str(artifacts_dir / "proactive_health"))),
         archive_dir=archive_dir,
         backups_dir=backups_dir,
         index_json=Path(_env_str("CODEXBOT_ARTIFACTS_INDEX_JSON", str(base / "artifacts_index.json"))),
         index_jsonl=Path(_env_str("CODEXBOT_ARTIFACTS_INDEX_JSONL", str(base / "artifacts_index.jsonl"))),
         keep_days_artifacts=_env_int("CODEXBOT_KEEP_DAYS_ARTIFACTS", 30),
+        keep_days_proactive_health_reports=_env_int("CODEXBOT_KEEP_DAYS_PROACTIVE_HEALTH_REPORTS", 7),
         keep_days_archives=_env_int("CODEXBOT_KEEP_DAYS_ARCHIVES", 180),
         keep_days_backups=_env_int("CODEXBOT_KEEP_DAYS_BACKUPS", 30),
         keep_latest_apks=_env_int("CODEXBOT_KEEP_LATEST_APKS", 20),
+        keep_latest_proactive_health_reports=_env_int("CODEXBOT_KEEP_LATEST_PROACTIVE_HEALTH_REPORTS", 288),
         journald_vacuum_time=_env_str("CODEXBOT_JOURNALD_VACUUM_TIME", "14d"),
         journald_vacuum_size=_env_str("CODEXBOT_JOURNALD_VACUUM_SIZE", "200M"),
         max_index_entries=_env_int("CODEXBOT_MAX_INDEX_ENTRIES", 5000),
@@ -218,6 +224,60 @@ def prune_artifacts(cfg: RetentionConfig) -> dict[str, int]:
             stats["deleted"] += 1
         except Exception:
             continue
+    return stats
+
+
+def _proactive_report_key(path: Path) -> str:
+    name = path.name
+    if not name.startswith("report_"):
+        return ""
+    if name.endswith(".json"):
+        return name[: -len(".json")]
+    if name.endswith(".md"):
+        return name[: -len(".md")]
+    return ""
+
+
+def prune_proactive_health_reports(cfg: RetentionConfig) -> dict[str, int]:
+    stats = {"deleted_files": 0, "deleted_bytes": 0, "kept_files": 0, "kept_groups": 0}
+    root = cfg.proactive_health_dir
+    if not root.exists():
+        return stats
+
+    groups: dict[str, list[Path]] = {}
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        key = _proactive_report_key(path)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(path)
+
+    ordered = sorted(
+        groups.items(),
+        key=lambda pair: max((p.stat().st_mtime for p in pair[1] if p.exists()), default=0.0),
+        reverse=True,
+    )
+    keep_latest = max(0, int(cfg.keep_latest_proactive_health_reports or 0))
+    keep_keys = {key for key, _paths in ordered[:keep_latest]}
+    cutoff = _now() - max(0, int(cfg.keep_days_proactive_health_reports or 0)) * 86400
+
+    for key, paths in ordered:
+        newest_mtime = max((p.stat().st_mtime for p in paths if p.exists()), default=0.0)
+        if key in keep_keys or newest_mtime >= cutoff:
+            stats["kept_groups"] += 1
+            stats["kept_files"] += len(paths)
+            continue
+        for path in paths:
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                stats["deleted_files"] += 1
+                stats["deleted_bytes"] += int(size)
+            except FileNotFoundError:
+                continue
+            except Exception:
+                stats["kept_files"] += 1
     return stats
 
 
@@ -332,6 +392,7 @@ def main() -> int:
     write_index(cfg, entries)
 
     prune_stats = prune_artifacts(cfg)
+    proactive_health_prune_stats = prune_proactive_health_reports(cfg)
     archive_prune_stats = prune_archives(cfg)
 
     vacuum_stats = run_journald_vacuum(cfg)
@@ -343,10 +404,12 @@ def main() -> int:
         "artifacts_dir": str(cfg.artifacts_dir),
         "archives_dir": str(cfg.archive_dir),
         "backups_dir": str(cfg.backups_dir),
+        "proactive_health_dir": str(cfg.proactive_health_dir),
         "index_json": str(cfg.index_json),
         "index_jsonl": str(cfg.index_jsonl),
         "index_entries": len(entries),
         "prune_artifacts": prune_stats,
+        "prune_proactive_health_reports": proactive_health_prune_stats,
         "prune_archives": archive_prune_stats,
         "journald_vacuum": vacuum_stats,
         "backup": backup_stats,
@@ -359,4 +422,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

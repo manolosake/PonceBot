@@ -1,0 +1,9 @@
+[Unit]
+Description=PonceBot proactive health report
+After=codexbot.service
+Requires=codexbot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/codexbot
+ExecStart=%h/codexbot/.venv/bin/python %h/codexbot/tools/proactive_health_report.py
