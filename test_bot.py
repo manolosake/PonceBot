@@ -2726,6 +2726,21 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
         issues = meta["studio_decision_evidence"]["issues"]
         self.assertIn("candidate_bets must list at least 3 options", issues)
 
+    def test_architect_local_blocks_missing_studio_deep_improvement_evidence(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(role="architect_local"),
+            summary="Completed the Studio selection review and chose the deep improvement continuation path.",
+            artifacts=[],
+            logs="architect selection-review validation output " * 4,
+            structured={"factory_delta": self._valid_factory_delta()},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("Studio DEEP_IMPROVEMENT decision evidence", str(reason))
+        self.assertTrue(meta["studio_decision_evidence_required"])
+        self.assertFalse(meta["studio_decision_evidence_present"])
+        self.assertEqual(meta["studio_selected_type"], "DEEP_IMPROVEMENT")
+
     def test_inherited_studio_context_blocks_delegated_child_without_decision_evidence(self) -> None:
         parent_trace = {
             "studio_cycle_id": "cycle-456",
@@ -3008,6 +3023,25 @@ class TestOrchestratorMinEvidenceGate(unittest.TestCase):
         self.assertEqual(diag["critic_answers_count"], 3)
         self.assertEqual(diag["issues"], [])
         self.assertEqual(meta["factory_delta"]["issues"], [])
+
+    def test_valid_architect_local_studio_deep_improvement_evidence_passes(self) -> None:
+        ok, reason, meta = bot._orchestrator_min_evidence_gate(
+            task=self._studio_task(role="architect_local"),
+            summary="Completed the Studio selection review and chose the deep improvement continuation path.",
+            artifacts=[],
+            logs="architect selection-review validation output " * 4,
+            structured={
+                "studio_decision_evidence": self._valid_studio_evidence(),
+                "factory_delta": self._valid_factory_delta(),
+            },
+        )
+
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        diag = meta["studio_decision_evidence"]
+        self.assertEqual(diag["candidate_bets_count"], 3)
+        self.assertEqual(diag["killed_bets_with_reason_count"], 2)
+        self.assertEqual(diag["issues"], [])
 
 
 class TestLocalSpecialistResponseHelpers(unittest.TestCase):

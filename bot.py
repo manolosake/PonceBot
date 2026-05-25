@@ -28503,6 +28503,7 @@ _STUDIO_TRACE_CONTEXT_KEYS = (
 
 _STUDIO_DECISION_EVIDENCE_ROLES = frozenset(
     {
+        "architect_local",
         "implementer_local",
         "backend",
         "frontend",
