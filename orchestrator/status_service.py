@@ -1595,6 +1595,170 @@ def _has_structured_studio_decision_evidence(value: Any) -> bool:
     return _has_substantive_studio_decision_text(value.get("debate_summary"))
 
 
+def _structured_studio_decision_evidence_flags(value: Any) -> list[str]:
+    if _has_structured_studio_decision_evidence(value):
+        return []
+    if not isinstance(value, dict):
+        return [
+            "studio_decision_evidence_missing",
+            "studio_decision_evidence_candidate_bets_missing_or_weak",
+            "studio_decision_evidence_killed_bets_missing_or_weak",
+            "studio_decision_evidence_selected_bet_missing_or_weak",
+            "studio_decision_evidence_critic_answers_missing_or_weak",
+            "studio_decision_evidence_debate_summary_missing_or_weak",
+        ]
+
+    flags: list[str] = []
+    candidate_bets = value.get("candidate_bets")
+    candidate_ids: list[str] = []
+    candidate_id_set: set[str] = set()
+    if not isinstance(candidate_bets, list) or len(candidate_bets) < 3:
+        flags.append("studio_decision_evidence_candidate_bets_missing_or_weak")
+    else:
+        for candidate in candidate_bets:
+            candidate_id = _studio_decision_id(candidate)
+            if (
+                not isinstance(candidate, dict)
+                or not candidate_id
+                or not _studio_decision_has_keyed_text(candidate, _STUDIO_DECISION_CANDIDATE_TEXT_KEYS)
+            ):
+                flags.append("studio_decision_evidence_candidate_bets_missing_or_weak")
+                break
+            candidate_ids.append(candidate_id)
+        candidate_id_set = set(candidate_ids)
+        if len(candidate_id_set) != len(candidate_ids):
+            flags.append("studio_decision_evidence_candidate_bets_missing_or_weak")
+
+    killed_bets = value.get("killed_bets")
+    killed_ids: set[str] = set()
+    if not isinstance(killed_bets, list) or not killed_bets:
+        flags.append("studio_decision_evidence_killed_bets_missing_or_weak")
+    else:
+        for killed in killed_bets:
+            killed_id = _studio_decision_id(killed)
+            if (
+                not isinstance(killed, dict)
+                or not killed_id
+                or (candidate_id_set and killed_id not in candidate_id_set)
+                or not _studio_decision_has_keyed_text(killed, _STUDIO_DECISION_REASON_KEYS)
+            ):
+                flags.append("studio_decision_evidence_killed_bets_missing_or_weak")
+                break
+            killed_ids.add(killed_id)
+
+    selected_bet = value.get("selected_bet")
+    selected_id = _studio_decision_id(selected_bet)
+    if (
+        not isinstance(selected_bet, dict)
+        or not selected_id
+        or (candidate_id_set and selected_id not in candidate_id_set)
+        or selected_id in killed_ids
+        or not _studio_decision_has_keyed_text(selected_bet, _STUDIO_DECISION_REASON_KEYS)
+    ):
+        flags.append("studio_decision_evidence_selected_bet_missing_or_weak")
+    elif candidate_id_set and candidate_id_set - killed_ids - {selected_id}:
+        flags.append("studio_decision_evidence_selected_bet_missing_or_weak")
+
+    critic_answers = value.get("critic_answers")
+    if isinstance(critic_answers, dict):
+        critic_answer_values = list(critic_answers.values())
+        substantive_answers = sum(1 for answer in critic_answer_values if _has_substantive_studio_decision_text(answer))
+    elif isinstance(critic_answers, list):
+        critic_answer_values = critic_answers
+        substantive_answers = sum(
+            1
+            for answer in critic_answer_values
+            if isinstance(answer, dict) and _has_substantive_studio_decision_text(answer.get("answer"))
+        )
+    else:
+        critic_answer_values = []
+        substantive_answers = 0
+    if len(critic_answer_values) < 3 or substantive_answers < 3:
+        flags.append("studio_decision_evidence_critic_answers_missing_or_weak")
+
+    if not _has_substantive_studio_decision_text(value.get("debate_summary")):
+        flags.append("studio_decision_evidence_debate_summary_missing_or_weak")
+
+    return flags or ["studio_decision_evidence_missing_or_weak"]
+
+
+_FACTORY_DELTA_CAPABILITY_FAMILIES = (
+    "choose",
+    "selection",
+    "delegate",
+    "validation",
+    "merge",
+    "ship",
+    "deploy",
+    "learn",
+    "governor",
+    "studio",
+    "autonomy",
+    "outcome",
+    "delivery",
+    "quality",
+    "revenue",
+)
+_FACTORY_DELTA_PLACEHOLDER_TEXT = {
+    "done",
+    "n/a",
+    "na",
+    "none",
+    "todo",
+    "tbd",
+    "proof",
+    "proof.log",
+    "test",
+    "unknown",
+}
+
+
+def _is_deep_improvement_root(root_task: Task | None) -> bool:
+    trace = (root_task.trace or {}) if root_task is not None else {}
+    return str(trace.get("studio_selected_type") or "").strip() == "DEEP_IMPROVEMENT"
+
+
+def _has_substantive_factory_delta_text(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text or text.lower() in _FACTORY_DELTA_PLACEHOLDER_TEXT:
+        return False
+    words = text.split()
+    non_space_chars = sum(1 for char in text if not char.isspace())
+    return len(words) >= 2 or non_space_chars >= 16
+
+
+def _structured_factory_delta_flags(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return [
+            "factory_delta_missing",
+            "factory_delta_capability_changed_missing_or_weak",
+            "factory_delta_measurable_delta_missing_or_weak",
+            "factory_delta_evidence_missing_or_weak",
+        ]
+
+    flags: list[str] = []
+    capability_changed = value.get("capability_changed")
+    measurable_delta = value.get("measurable_delta")
+    evidence = value.get("evidence")
+    if not _has_substantive_factory_delta_text(capability_changed):
+        flags.append("factory_delta_capability_changed_missing_or_weak")
+    if not _has_substantive_factory_delta_text(measurable_delta):
+        flags.append("factory_delta_measurable_delta_missing_or_weak")
+    if not _has_substantive_factory_delta_text(evidence):
+        flags.append("factory_delta_evidence_missing_or_weak")
+
+    normalized_capability = str(capability_changed or "").strip().lower()
+    if normalized_capability and not any(family in normalized_capability for family in _FACTORY_DELTA_CAPABILITY_FAMILIES):
+        flags.append("factory_delta_capability_not_factory_relevant")
+    return flags
+
+
+def _has_structured_factory_delta(value: Any) -> bool:
+    return not _structured_factory_delta_flags(value)
+
+
 def _selection_evidence_sources(*, order_row: dict[str, Any] | None, root_task: Task | None) -> list[dict[str, Any]]:
     trace = dict((root_task.trace or {}) if root_task is not None else {})
     sources: list[dict[str, Any]] = []
@@ -1923,6 +2087,29 @@ def _selection_quality_metadata(
     churn_risk = _selection_churn_risk_metadata(order, root_task=root_task)
     churn_needs_review = str(churn_risk.get("status") or "").strip().lower() == "needs_review"
     evidence_sources = _selection_evidence_sources(order_row=order_row, root_task=root_task)
+    if _is_deep_improvement_root(root_task):
+        trace = dict((root_task.trace or {}) if root_task is not None else {})
+        deep_flags: list[str] = []
+        factory_delta = trace.get("factory_delta")
+        factory_delta_flags = _structured_factory_delta_flags(factory_delta)
+        if factory_delta_flags:
+            deep_flags.extend(factory_delta_flags)
+        studio_decision_evidence = trace.get("studio_decision_evidence")
+        deep_flags.extend(_structured_studio_decision_evidence_flags(studio_decision_evidence))
+        if deep_flags:
+            return {
+                "status": "needs_review",
+                "flags": deep_flags,
+                "summary": (
+                    "DEEP_IMPROVEMENT needs structured factory_delta and studio_decision_evidence before more "
+                    "delivery delegation."
+                ),
+                "recommended_owner_role": "architect_local",
+                "delegation_reason": "deep_improvement_evidence_required",
+                "delegation_focus": "deep_improvement_selection_quality",
+                "evidence_sources": evidence_sources,
+                "churn_risk": churn_risk,
+            }
     if evidence_sources and not churn_needs_review:
         return {
             "status": "ok",
