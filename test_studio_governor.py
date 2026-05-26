@@ -1772,6 +1772,72 @@ def test_auto_merge_tick_preserves_recorded_controller_snapshot_deploy_failure(t
     assert row == ("failed", "failed_root_caused", deploy_summary)
 
 
+def test_auto_merge_tick_recovers_controller_snapshot_deploy_failure_from_main_deploy_state(tmp_path, monkeypatch):
+    now = 2_000.0
+    commit = "abc1234567890fed"
+    db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
+    (tmp_path / "main_deploy_state.json").write_text(
+        json.dumps(
+            {
+                "repos": {
+                    "codexbot": {
+                        "status": "ok",
+                        "deployed_head": commit,
+                        "last_deploy_at": now - 10,
+                        "url": "",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    autoship_result = {
+        "status": "failed",
+        "reason": "snapshot_autoship_deploy_failed",
+        "summary": "Auto-shipped validated controller snapshot to main commit=abc123. Deploy failed: monitor lagged.",
+        "commit": commit,
+        "deploy": {
+            "status": "failed",
+            "reason": "deploy_script_failed",
+            "detail": "monitor lagged",
+            "summary": "Deploy failed: monitor lagged.",
+        },
+    }
+
+    monkeypatch.setattr(bot, "_repo_context_for_order", lambda **kwargs: ({"repo_id": "codexbot"}, tmp_path, "main"))
+    monkeypatch.setattr(bot, "_auto_ship_controller_snapshot_order", lambda **kwargs: autoship_result)
+
+    merged = bot._auto_merge_ready_orders_tick(
+        cfg=SimpleNamespace(orchestrator_db_path=db, codex_workdir=tmp_path),
+        api=SimpleNamespace(),
+        orch_q=orch_q,
+        now=now,
+    )
+
+    assert merged == 1
+    order = orch_q.get_order(order_id, chat_id=chat_id)
+    job = orch_q.get_job(order_id)
+    assert order["status"] == "done"
+    assert order["phase"] == "done"
+    assert job.state == "done"
+    assert job.blocked_reason is None
+    assert job.trace["deploy_status"] == "ok"
+    assert job.trace["deploy_result"] == "deploy_ok_recovered"
+    assert job.trace["deployed_commit"] == commit
+    assert job.trace["controller_snapshot_autoship_done"] is True
+    assert job.trace["controller_snapshot_autoship_commit"] == commit
+    assert job.trace["result_status"] == "merged"
+    assert "Recovered deploy success" in job.trace["result_summary"]
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, outcome_status, outcome_summary FROM studio_cycles WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+    assert row[0] == "done"
+    assert row[1] == "shipped_to_main"
+    assert "Recovered deploy success" in row[2]
+
+
 def test_auto_merge_tick_does_not_overwrite_recorded_controller_snapshot_deploy_failure(tmp_path, monkeypatch):
     now = 2_000.0
     db, orch_q, chat_id, order_id = _seed_snapshot_autoship_recovery_order(tmp_path, now=now)
