@@ -17350,6 +17350,37 @@ def _studio_finalize_orphaned_active_cycles(
             return 0
         _studio_ensure_schema(db)
         with sqlite3.connect(str(db), timeout=8.0) as conn:
+            parent_done_cur = conn.execute(
+                """
+                UPDATE studio_cycles
+                SET status = 'rejected',
+                    outcome_status = 'rejected_low_value',
+                    outcome_summary = ?,
+                    updated_at = ?
+                WHERE status = 'active'
+                  AND order_id IS NOT NULL
+                  AND TRIM(order_id) <> ''
+                  AND updated_at <= ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM ceo_orders
+                      WHERE ceo_orders.order_id = studio_cycles.order_id
+                        AND ceo_orders.status = 'done'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jobs
+                      WHERE (jobs.job_id = studio_cycles.order_id OR jobs.parent_job_id = studio_cycles.order_id)
+                        AND jobs.state IN (?, ?, ?, ?, ?, ?)
+                  )
+                """,
+                (
+                    "Studio cycle parent order is terminal done and has no active child work; classified as rejected_low_value instead of an operator blocker.",
+                    float(now),
+                    cutoff,
+                    *active_job_states,
+                ),
+            )
             snapshot_cur = conn.execute(
                 """
                 UPDATE studio_cycles
@@ -17435,7 +17466,7 @@ def _studio_finalize_orphaned_active_cycles(
                 ),
             )
             conn.commit()
-            return int(snapshot_cur.rowcount or 0) + int(failed_cur.rowcount or 0)
+            return int(parent_done_cur.rowcount or 0) + int(snapshot_cur.rowcount or 0) + int(failed_cur.rowcount or 0)
     except Exception:
         LOG.exception("Failed to finalize orphaned active Studio cycles")
         return 0

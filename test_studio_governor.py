@@ -2325,10 +2325,34 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
                     now - 900,
                     now - 900,
                 ),
+                (
+                    "parent-done-cycle",
+                    now - 900,
+                    "repo-codexbot",
+                    "codexbot",
+                    "parent-done-order",
+                    now - 900,
+                    now - 900,
+                ),
             ],
         )
         conn.execute("INSERT INTO ceo_orders(order_id, status) VALUES (?, ?)", ("live-order", "active"))
+        conn.execute("INSERT INTO ceo_orders(order_id, status) VALUES (?, ?)", ("parent-done-order", "done"))
         conn.execute("INSERT INTO jobs(job_id, parent_job_id, state, trace) VALUES (?, ?, ?, ?)", ("live-job", "", "running", "{}"))
+        conn.execute(
+            "INSERT INTO jobs(job_id, parent_job_id, state, trace) VALUES (?, ?, ?, ?)",
+            (
+                "parent-done-order",
+                "",
+                "done",
+                json.dumps(
+                    {
+                        "controller_snapshot_workdir": "/tmp/controller_snapshot",
+                        "result_summary": "Parent order completed without active implementation.",
+                    }
+                ),
+            ),
+        )
         conn.execute(
             "INSERT INTO jobs(job_id, parent_job_id, state, trace) VALUES (?, ?, ?, ?)",
             (
@@ -2348,7 +2372,7 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
 
     closed = bot._studio_finalize_orphaned_active_cycles(db, now=now, max_age_seconds=300)
 
-    assert closed == 2
+    assert closed == 3
     with sqlite3.connect(db) as conn:
         rows = {
             row[0]: row[1:]
@@ -2357,6 +2381,7 @@ def test_studio_finalize_orphaned_active_cycles_keeps_live_work(tmp_path):
             )
         }
     assert rows["orphan-cycle"] == ("failed", "failed_root_caused")
+    assert rows["parent-done-cycle"] == ("rejected", "rejected_low_value")
     assert rows["live-order-cycle"] == ("active", None)
     assert rows["live-job-cycle"] == ("active", None)
     assert rows["snapshot-cycle"] == ("blocked", "blocked_need_operator")
