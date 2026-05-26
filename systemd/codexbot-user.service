@@ -8,7 +8,7 @@ OnFailure=codexbot-alert-user@%n
 
 [Service]
 Type=simple
-WorkingDirectory=%h/codexbot/data/runtime_worktrees/main
+WorkingDirectory=%h/codexbot/data/runtime_worktrees/current
 EnvironmentFile=%h/codexbot/codexbot.env
 Environment=ENV_FILE=%h/codexbot/codexbot.env
 Environment=CODEXBOT_PYTHON_BIN=%h/codexbot/.venv/bin/python
@@ -16,12 +16,18 @@ Environment=BOT_STATE_FILE=%h/codexbot/state.json
 Environment=BOT_AUTH_USERS_FILE=%h/codexbot/users.json
 Environment=BOT_AUTH_PROFILES_FILE=%h/codexbot/profiles.json
 Environment=BOT_ORCHESTRATOR_DB_PATH=%h/codexbot/data/jobs.sqlite
-Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=%h/codexbot/orchestrator/agents.yaml
-Environment=BOT_RUNBOOKS_PATH=%h/codexbot/orchestrator/runbooks.yaml
+Environment=BOT_CEO_PLANE_ROUTE_ENABLED=1
+Environment=BOT_CEO_PLANE_DB_PATH=%h/codexbot/data/ceo_jobs.sqlite
+Environment=BOT_CEO_PLANE_WORKTREE_ROOT=%h/codexbot/data/ceo_worktrees
+Environment=BOT_CEO_PLANE_ARTIFACTS_ROOT=%h/codexbot/data/ceo_artifacts
+Environment=BOT_CEO_PLANE_STATE_FILE=%h/codexbot/ceo_state.json
+Environment=BOT_CEO_PLANE_SERVICE_NAME=poncebot-ceo.service
+Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=%h/codexbot/data/runtime_worktrees/current/orchestrator/agents.yaml
+Environment=BOT_RUNBOOKS_PATH=%h/codexbot/data/runtime_worktrees/current/orchestrator/runbooks.yaml
 Environment=BOT_WORKTREE_ROOT=%h/codexbot/data/worktrees
 Environment=BOT_ARTIFACTS_ROOT=%h/codexbot/data/artifacts
-ExecStartPre=%h/codexbot/data/runtime_worktrees/main/run.sh --check-env
-ExecStart=%h/codexbot/data/runtime_worktrees/main/run.sh
+ExecStartPre=%h/codexbot/data/runtime_worktrees/current/run.sh --check-env
+ExecStart=%h/codexbot/data/runtime_worktrees/current/run.sh
 Restart=on-failure
 RestartSec=5
 

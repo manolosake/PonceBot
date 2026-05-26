@@ -33752,6 +33752,74 @@ def _submit_orchestrator_task(
         raise RuntimeError(f"Failed to submit orchestrator task: {e}") from e
 
 
+def _ceo_plane_route_enabled() -> bool:
+    raw = str(os.environ.get("BOT_CEO_PLANE_ROUTE_ENABLED", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _ceo_plane_db_path(cfg: BotConfig) -> Path:
+    raw = str(os.environ.get("BOT_CEO_PLANE_DB_PATH", "") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return cfg.orchestrator_db_path.parent / "ceo_jobs.sqlite"
+
+
+def _ceo_plane_submission_config(cfg: BotConfig) -> BotConfig:
+    db_path = _ceo_plane_db_path(cfg)
+    worktree_root = Path(
+        os.environ.get("BOT_CEO_PLANE_WORKTREE_ROOT", str(cfg.orchestrator_db_path.parent / "ceo_worktrees"))
+    ).expanduser().resolve()
+    artifacts_root = Path(
+        os.environ.get("BOT_CEO_PLANE_ARTIFACTS_ROOT", str(cfg.orchestrator_db_path.parent / "ceo_artifacts"))
+    ).expanduser().resolve()
+    state_file = Path(
+        os.environ.get("BOT_CEO_PLANE_STATE_FILE", str(cfg.orchestrator_db_path.parent / "ceo_state.json"))
+    ).expanduser().resolve()
+    return BotConfig(
+        **{
+            **cfg.__dict__,
+            "orchestrator_db_path": db_path,
+            "worktree_root": worktree_root,
+            "artifacts_root": artifacts_root,
+            "state_file": state_file,
+            "proactive_lane_enabled": False,
+            "proactive_iteration_enabled": False,
+            "orchestrator_daily_digest_seconds": 0,
+        }
+    )
+
+
+def _should_route_to_ceo_plane(cfg: BotConfig, job: Job | None) -> bool:
+    if job is None:
+        return False
+    if not cfg.orchestrator_enabled:
+        return False
+    if not _ceo_plane_route_enabled():
+        return False
+    if str(os.environ.get("BOT_CEO_PLANE_ONLY", "0") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    raw = str(job.user_text or "").strip()
+    if not raw:
+        return False
+    if raw.startswith("/"):
+        return False
+    # Keep binary/file/image jobs on the gateway until the CEO worker has explicit
+    # artifact handoff guarantees.
+    if job.image_paths or job.upload_paths:
+        return False
+    return True
+
+
+def _open_ceo_plane_queue(
+    cfg: BotConfig,
+    profiles: dict[str, dict[str, Any]] | None,
+) -> tuple[BotConfig, OrchestratorQueue]:
+    ceo_cfg = _ceo_plane_submission_config(cfg)
+    storage = SQLiteTaskStorage(ceo_cfg.orchestrator_db_path)
+    queue_obj = OrchestratorQueue(storage=storage, role_profiles=profiles)
+    return ceo_cfg, queue_obj
+
+
 def _orchestrator_apply_task_flags(task: Task, argv: list[str]) -> list[str]:
     args = list(argv)
     if task.model:
@@ -39744,10 +39812,22 @@ def poll_loop(
 
                     enqueued_to_orchestrator = False
                     if orchestrator_queue is not None and cfg.orchestrator_enabled:
+                        submit_cfg = cfg
+                        submit_queue = orchestrator_queue
+                        ceo_plane_routed = False
+                        if _should_route_to_ceo_plane(cfg, job):
+                            try:
+                                submit_cfg, submit_queue = _open_ceo_plane_queue(cfg, orchestrator_profiles)
+                                ceo_plane_routed = True
+                            except Exception:
+                                submit_cfg = cfg
+                                submit_queue = orchestrator_queue
+                                ceo_plane_routed = False
+                                LOG.exception("Failed to open isolated CEO command plane queue; using primary queue")
                         try:
                             did_submit, orch_job_id = _submit_orchestrator_task(
-                                cfg=cfg,
-                                orch_q=orchestrator_queue,
+                                cfg=submit_cfg,
+                                orch_q=submit_queue,
                                 profiles=orchestrator_profiles,
                                 job=job,
                                 user_id=user_id,
@@ -39761,10 +39841,22 @@ def poll_loop(
                             LOG.exception("Failed to submit orchestrator task")
                         if did_submit:
                             enqueued_to_orchestrator = True
+                            if ceo_plane_routed:
+                                try:
+                                    submit_queue.update_trace(
+                                        orch_job_id,
+                                        ceo_plane_isolated=True,
+                                        ceo_plane_db_path=str(submit_cfg.orchestrator_db_path),
+                                        ceo_plane_submitted_at=time.time(),
+                                        gateway_service="codexbot.service",
+                                        worker_service=str(os.environ.get("BOT_CEO_PLANE_SERVICE_NAME", "poncebot-ceo.service") or "poncebot-ceo.service"),
+                                    )
+                                except Exception:
+                                    pass
 
                             suppress_ticket_card = False
                             try:
-                                task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
+                                task = submit_queue.get_job(orch_job_id) if submit_queue is not None else None
                                 tr = (task.trace or {}) if task is not None else {}
                                 suppress_ticket_card = bool(tr.get("suppress_ticket_card", False)) or (
                                     task is not None and str(task.request_type or "") in ("query", "status")
@@ -39775,8 +39867,8 @@ def poll_loop(
                             if suppress_ticket_card:
                                 # Audit-only: keep trace evidence without spamming a ticket card.
                                 try:
-                                    if orchestrator_queue is not None:
-                                        orchestrator_queue.update_trace(
+                                    if submit_queue is not None:
+                                        submit_queue.update_trace(
                                             orch_job_id,
                                             suppress_ticket_card=True,
                                             ticket_card_suppressed_at=time.time(),
@@ -39785,26 +39877,29 @@ def poll_loop(
                                     pass
                             else:
                                 try:
-                                    card_task = orchestrator_queue.get_job(orch_job_id) if orchestrator_queue is not None else None
+                                    card_task = submit_queue.get_job(orch_job_id) if submit_queue is not None else None
                                     ticket_target_id = (
                                         str((card_task.parent_job_id if card_task is not None else "") or "").strip()
                                         or orch_job_id
                                     )
-                                    card = _ticket_card_text(orchestrator_queue, ticket_id=ticket_target_id)
+                                    card = _ticket_card_text(submit_queue, ticket_id=ticket_target_id)
                                 except Exception:
                                     card = f"Ticket {orch_job_id[:8]} queued. Track: /ticket {orch_job_id[:8]} | /agents"
                                     ticket_target_id = orch_job_id
+                                if ceo_plane_routed:
+                                    card = "CEO Command Plane (isolated)\n" + card
                                 mid = api.send_message(
                                     chat_id,
                                     card,
                                     reply_to_message_id=message_id if message_id else None,
                                 )
                                 try:
-                                    if mid is not None and orchestrator_queue is not None:
-                                        orchestrator_queue.update_trace(
+                                    if mid is not None and submit_queue is not None:
+                                        submit_queue.update_trace(
                                             ticket_target_id,
                                             ticket_card_message_id=int(mid),
                                             ticket_card_created_at=time.time(),
+                                            ceo_plane_isolated=bool(ceo_plane_routed),
                                         )
                                 except Exception:
                                     pass

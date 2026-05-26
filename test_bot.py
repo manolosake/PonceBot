@@ -409,6 +409,60 @@ class TestStateHandling(unittest.TestCase):
         self.assertEqual(synced["status"], "disabled")
         self.assertIn("portfolio focus gate", synced["metadata"]["last_autonomy_blocker"])
 
+    def test_ceo_plane_routes_plain_on_demand_text_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=2,
+                user_text="Mejora el dashboard sin tocar la proactividad",
+                argv=["exec", "Mejora el dashboard sin tocar la proactividad"],
+                mode_hint="full",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+
+            with patch.dict(os.environ, {"BOT_CEO_PLANE_ROUTE_ENABLED": "1"}):
+                self.assertTrue(bot._should_route_to_ceo_plane(cfg, job))
+
+            with patch.dict(os.environ, {"BOT_CEO_PLANE_ROUTE_ENABLED": "0"}):
+                self.assertFalse(bot._should_route_to_ceo_plane(cfg, job))
+
+    def test_ceo_plane_does_not_route_local_commands_or_artifact_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cfg = self._cfg(Path(td) / "state.json")
+            command_job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=2,
+                user_text="/orders",
+                argv=["orders"],
+                mode_hint="ro",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[],
+                force_new_thread=False,
+            )
+            upload_job = bot.Job(
+                chat_id=1,
+                reply_to_message_id=2,
+                user_text="revisa este archivo",
+                argv=["exec", "revisa este archivo"],
+                mode_hint="ro",
+                epoch=0,
+                threaded=True,
+                image_paths=[],
+                upload_paths=[Path("/tmp/file.txt")],
+                force_new_thread=False,
+            )
+
+            with patch.dict(os.environ, {"BOT_CEO_PLANE_ROUTE_ENABLED": "1"}):
+                self.assertFalse(bot._should_route_to_ceo_plane(cfg, command_job))
+                self.assertFalse(bot._should_route_to_ceo_plane(cfg, upload_job))
+
     def test_factory_sync_recovers_blocked_repo_when_preflight_clears(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

@@ -1,0 +1,34 @@
+[Unit]
+Description=PonceBot CEO Command Plane (isolated on-demand worker)
+After=network-online.target codexbot.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=4
+OnFailure=codexbot-alert-user@%n
+
+[Service]
+Type=simple
+WorkingDirectory=%h/codexbot/data/runtime_worktrees/current
+EnvironmentFile=%h/codexbot/codexbot.env
+Environment=ENV_FILE=%h/codexbot/codexbot.env
+Environment=CODEXBOT_PYTHON_BIN=%h/codexbot/.venv/bin/python
+Environment=BOT_CEO_PLANE_ONLY=1
+Environment=BOT_PROACTIVE_LANE_ENABLED=0
+Environment=BOT_PROACTIVE_ITERATION_ENABLED=0
+Environment=BOT_CEO_ORDER_AUTOPILOT_ENABLED=0
+Environment=BOT_ORCHESTRATOR_DB_PATH=%h/codexbot/data/ceo_jobs.sqlite
+Environment=BOT_ORCHESTRATOR_WORKERS=2
+Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=%h/codexbot/data/runtime_worktrees/current/orchestrator/agents.yaml
+Environment=BOT_RUNBOOKS_PATH=%h/codexbot/data/runtime_worktrees/current/orchestrator/runbooks.yaml
+Environment=BOT_STATE_FILE=%h/codexbot/ceo_state.json
+Environment=BOT_WORKTREE_ROOT=%h/codexbot/data/ceo_worktrees
+Environment=BOT_ARTIFACTS_ROOT=%h/codexbot/data/ceo_artifacts
+Environment=BOT_STATUS_HTTP_ENABLED=0
+Environment=BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS=0
+ExecStartPre=/home/aponce/codexbot/data/runtime_worktrees/current/run.sh --check-env
+ExecStart=/home/aponce/codexbot/.venv/bin/python /home/aponce/codexbot/data/runtime_worktrees/current/tools/ceo_plane_worker.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
