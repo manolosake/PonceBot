@@ -20,7 +20,7 @@ Environment=BOT_CEO_PLANE_ROUTE_ENABLED=1
 Environment=BOT_CEO_PLANE_DB_PATH=%h/codexbot/data/ceo_jobs.sqlite
 Environment=BOT_CEO_PLANE_WORKTREE_ROOT=%h/codexbot/data/ceo_worktrees
 Environment=BOT_CEO_PLANE_ARTIFACTS_ROOT=%h/codexbot/data/ceo_artifacts
-Environment=BOT_CEO_PLANE_STATE_FILE=%h/codexbot/ceo_state.json
+Environment=BOT_CEO_PLANE_STATE_FILE=%h/codexbot/data/ceo_state.json
 Environment=BOT_CEO_PLANE_SERVICE_NAME=poncebot-ceo.service
 Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=%h/codexbot/data/runtime_worktrees/current/orchestrator/agents.yaml
 Environment=BOT_RUNBOOKS_PATH=%h/codexbot/data/runtime_worktrees/current/orchestrator/runbooks.yaml

@@ -21,13 +21,21 @@ import bot
 
 
 def _set_ceo_plane_defaults() -> None:
-    os.environ.setdefault("BOT_CEO_PLANE_ONLY", "1")
-    os.environ.setdefault("BOT_PROACTIVE_LANE_ENABLED", "0")
-    os.environ.setdefault("BOT_PROACTIVE_ITERATION_ENABLED", "0")
-    os.environ.setdefault("BOT_CEO_ORDER_AUTOPILOT_ENABLED", "0")
-    os.environ.setdefault("BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS", "0")
-    os.environ.setdefault("BOT_STATUS_HTTP_ENABLED", "0")
-    os.environ.setdefault("BOT_NOTIFY_CHILD_WORKERS", "0")
+    base = Path(os.environ.get("HOME", "/home/aponce")).expanduser() / "codexbot"
+    os.environ["BOT_CEO_PLANE_ONLY"] = "1"
+    os.environ["BOT_PROACTIVE_LANE_ENABLED"] = "0"
+    os.environ["BOT_PROACTIVE_ITERATION_ENABLED"] = "0"
+    os.environ["BOT_CEO_ORDER_AUTOPILOT_ENABLED"] = "0"
+    os.environ["BOT_ORCHESTRATOR_DAILY_DIGEST_SECONDS"] = "0"
+    os.environ["BOT_STATUS_HTTP_ENABLED"] = "0"
+    os.environ["BOT_NOTIFY_CHILD_WORKERS"] = "0"
+    os.environ["BOT_ORCHESTRATOR_DB_PATH"] = os.environ.get(
+        "BOT_CEO_PLANE_DB_PATH",
+        str(base / "data" / "ceo_jobs.sqlite"),
+    )
+    os.environ["BOT_STATE_FILE"] = os.environ.get("BOT_CEO_PLANE_STATE_FILE", str(base / "data" / "ceo_state.json"))
+    os.environ["BOT_WORKTREE_ROOT"] = os.environ.get("BOT_CEO_PLANE_WORKTREE_ROOT", str(base / "data" / "ceo_worktrees"))
+    os.environ["BOT_ARTIFACTS_ROOT"] = os.environ.get("BOT_CEO_PLANE_ARTIFACTS_ROOT", str(base / "data" / "ceo_artifacts"))
 
 
 def main() -> int:
