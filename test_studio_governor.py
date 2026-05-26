@@ -37,6 +37,15 @@ def test_repo_deploy_policy_uses_static_product_page_for_readme_repo(tmp_path):
     assert "Static product page published" in policy["success_summary"]
 
 
+def test_studio_repo_display_name_prefers_remote_name_for_generic_incubator(monkeypatch, tmp_path):
+    repo = tmp_path / "20260511-studio-cycle-new-product-incubator-0f5a5cc0"
+    repo.mkdir()
+
+    monkeypatch.setattr(bot, "_studio_repo_origin_hint", lambda _repo: "git@github.com:manolosake/quotekit-studio.git")
+
+    assert bot._studio_repo_display_name({"path": str(repo), "metadata": {}}) == "quotekit-studio"
+
+
 def _delivery_failure_memory(now: float) -> dict:
     return {
         "recent_studio_negative_outcomes": [
@@ -588,6 +597,83 @@ def test_studio_build_opportunities_excludes_governor_avoided_incubator(monkeypa
     assert memory["studio_governor"]["mode"] == "incubator_quality_gate"
     assert all(item["key"] != "new-project-incubator" for item in opportunities)
     assert any(item["repo_id"] == "executivedashboard-9ab2eb91" for item in opportunities)
+
+
+def test_studio_governor_focus_gate_blocks_fresh_repos_when_portfolio_is_too_broad():
+    now = 1_700_000_000.0
+    memory = {
+        "recent_studio_negative_outcomes": [],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 4,
+        "studio_portfolio_recent_count_24h": 8,
+        "studio_active_portfolio_repo_count": 54,
+        "studio_active_portfolio_focus_cap": 18,
+        "studio_unpublished_portfolio_repo_count": 13,
+        "studio_unpublished_portfolio_focus_cap": 3,
+        "studio_unpublished_portfolio_names": ["focus-forge", "runproof-board"],
+    }
+
+    governor = bot._studio_governor_assessment(memory, now=now)
+
+    assert governor["mode"] == "portfolio_focus_gate"
+    assert governor["severity"] == "yellow"
+    assert "new-project-incubator" in governor["avoid_keys"]
+    assert governor["active_portfolio_repo_count"] == 54
+    assert governor["unpublished_portfolio_repo_count"] == 13
+    assert "Do not create another fresh repo" in governor["force_next_action"]
+
+
+def test_studio_build_opportunities_focus_gate_excludes_incubator(monkeypatch, tmp_path):
+    now = 1_700_000_000.0
+    dashboard_dir = tmp_path / "ExecutiveDashboard"
+    dashboard_dir.mkdir()
+    repos = [
+        {
+            "repo_id": "executivedashboard-9ab2eb91",
+            "path": str(dashboard_dir),
+            "priority": 1,
+            "status": "active",
+            "autonomy_enabled": True,
+            "metadata": {"repo_name": "ExecutiveDashboard"},
+        }
+    ]
+    for idx in range(20):
+        repo_dir = tmp_path / f"portfolio-{idx}"
+        repo_dir.mkdir()
+        repos.append(
+            {
+                "repo_id": f"portfolio-{idx}",
+                "path": str(repo_dir),
+                "priority": 3,
+                "status": "active",
+                "autonomy_enabled": True,
+                "metadata": {"repo_name": f"portfolio-{idx}"},
+            }
+        )
+    memory = {
+        "recent_studio_negative_outcomes": [],
+        "recent_studio_positive_outcomes": [],
+        "studio_portfolio_recent_count_6h": 0,
+        "studio_portfolio_recent_count_24h": 0,
+    }
+    cfg = SimpleNamespace(orchestrator_db_path=tmp_path / "jobs.sqlite")
+
+    monkeypatch.setattr(bot, "_project_incubator_enabled", lambda: True)
+    monkeypatch.setattr(bot, "_project_incubator_due", lambda cfg, occupied_keys: True)
+
+    opportunities = bot._studio_build_opportunities(
+        cfg=cfg,
+        orch_q=SimpleNamespace(),
+        repos=repos,
+        occupied_keys=set(),
+        occupied_repo_ids=set(),
+        now=now,
+        memory=memory,
+    )
+
+    assert memory["studio_governor"]["mode"] == "portfolio_focus_gate"
+    assert all(item["key"] != "new-project-incubator" for item in opportunities)
+    assert any(item["lane"] in {"dashboard", "portfolio"} for item in opportunities)
 
 
 def test_late_deploy_success_recovery_clears_deploy_failed_order(monkeypatch, tmp_path):

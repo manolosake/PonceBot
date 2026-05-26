@@ -16684,7 +16684,7 @@ def _operational_maturity_sweep_tick(
 _PROACTIVE_MARKER_RX = re.compile(r"\[proactive:([a-z0-9_-]+)\]", re.IGNORECASE)
 _FACTORY_REPO_MARKER_RX = re.compile(r"\[repo:([a-z0-9._:-]+)\]", re.IGNORECASE)
 _STUDIO_CYCLE_VERSION = 1
-_STUDIO_GOVERNOR_VERSION = 1
+_STUDIO_GOVERNOR_VERSION = 2
 _STUDIO_OUTCOME_TYPES = ("shipped_to_main", "published_project", "blocked_need_operator", "rejected_low_value", "failed_root_caused")
 _STUDIO_STALE_SELECTED_SECONDS = 30 * 60
 _STUDIO_DELIVERY_FAILURE_PATTERNS = (
@@ -16725,6 +16725,26 @@ _STUDIO_R530_RESOURCE_POLICY = (
     "use them when they improve product quality, validation depth, or shipping speed, while keeping core services "
     "responsive and avoiding waste, runaway jobs, destructive actions, public exposure, or external spend."
 )
+
+
+def _studio_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(str(os.environ.get(name, str(default)) or str(default)).strip())
+    except Exception:
+        value = int(default)
+    return max(int(min_value), min(int(max_value), int(value)))
+
+
+def _studio_active_portfolio_focus_cap() -> int:
+    return _studio_int_env("BOT_STUDIO_ACTIVE_PORTFOLIO_FOCUS_CAP", 18, min_value=4, max_value=200)
+
+
+def _studio_unpublished_portfolio_focus_cap() -> int:
+    return _studio_int_env("BOT_STUDIO_UNPUBLISHED_PORTFOLIO_FOCUS_CAP", 3, min_value=0, max_value=100)
+
+
+def _studio_recent_new_project_focus_cap_24h() -> int:
+    return _studio_int_env("BOT_STUDIO_NEW_PROJECT_FOCUS_CAP_24H", 3, min_value=0, max_value=50)
 
 
 def _studio_enabled() -> bool:
@@ -16864,9 +16884,29 @@ def _studio_short_path(path: str) -> str:
 
 
 def _studio_repo_display_name(repo: dict[str, Any]) -> str:
+    metadata = _studio_repo_metadata(repo)
+    for key in ("display_name", "title", "project_name", "repo_name", "name"):
+        value = str(metadata.get(key) or "").strip()
+        if value and not re.search(r"\d{8}-studio-cycle-new-product-incubator", value, flags=re.IGNORECASE):
+            return value
     path = str(repo.get("path") or "").strip()
     if path:
-        return Path(path).name or str(repo.get("repo_id") or "repo")
+        path_name = Path(path).name or str(repo.get("repo_id") or "repo")
+        if re.search(r"\d{8}-studio-cycle-new-product-incubator", path_name, flags=re.IGNORECASE):
+            try:
+                repo_dir = Path(path).expanduser()
+                for readme in sorted(repo_dir.glob("README*"))[:3]:
+                    for line in readme.read_text(errors="ignore").splitlines()[:20]:
+                        title = re.sub(r"^#+\s*", "", line.strip()).strip()
+                        if title:
+                            return title
+            except Exception:
+                pass
+            remote = _studio_repo_origin_hint(repo)
+            match = re.search(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?$", remote, flags=re.IGNORECASE)
+            if match:
+                return match.group(2).removesuffix(".git")
+        return path_name
     return str(repo.get("repo_id") or "repo").strip() or "repo"
 
 
@@ -16880,6 +16920,125 @@ def _studio_repo_kind(repo: dict[str, Any]) -> str:
     if "android" in name or "omnicrew" in name or "omnicrew" in path:
         return "Product app"
     return "Portfolio"
+
+
+def _studio_repo_metadata(repo: dict[str, Any]) -> dict[str, Any]:
+    metadata = repo.get("metadata") if isinstance(repo, dict) else {}
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str) and metadata.strip():
+        try:
+            parsed = json.loads(metadata)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _studio_repo_origin_hint(repo: dict[str, Any]) -> str:
+    metadata = _studio_repo_metadata(repo)
+    for key in ("github_full_name", "github_repo", "github_url", "remote", "remote_url", "origin_url"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    path = str((repo or {}).get("path") or "").strip()
+    if not path:
+        return ""
+    try:
+        repo_dir = Path(path).expanduser()
+        if not (repo_dir / ".git").exists():
+            return ""
+        proc = _run_git(repo_dir, ["remote", "get-url", "origin"], check=False)
+        if proc.returncode == 0:
+            return str(proc.stdout or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _studio_portfolio_focus_memory(repos: list[dict[str, Any]], *, now: float) -> dict[str, Any]:
+    active_repo_count = 0
+    active_portfolio_count = 0
+    active_core_count = 0
+    active_dashboard_count = 0
+    active_product_app_count = 0
+    unpublished_portfolio_count = 0
+    unpublished_names: list[str] = []
+    active_names: list[str] = []
+
+    for repo in repos or []:
+        if not isinstance(repo, dict):
+            continue
+        if str(repo.get("status") or "").strip().lower() != "active":
+            continue
+        if not bool(repo.get("autonomy_enabled", True)):
+            continue
+        active_repo_count += 1
+        kind = _studio_repo_kind(repo)
+        if kind == "Core":
+            active_core_count += 1
+            continue
+        if kind == "Dashboard":
+            active_dashboard_count += 1
+            continue
+        if kind == "Product app":
+            active_product_app_count += 1
+            continue
+        active_portfolio_count += 1
+        name = _studio_repo_display_name(repo)
+        active_names.append(name)
+        origin = _studio_repo_origin_hint(repo)
+        if not origin:
+            unpublished_portfolio_count += 1
+            unpublished_names.append(name)
+
+    focus_cap = _studio_active_portfolio_focus_cap()
+    unpublished_cap = _studio_unpublished_portfolio_focus_cap()
+    recent_cap_24h = _studio_recent_new_project_focus_cap_24h()
+    return {
+        "studio_active_repo_count": active_repo_count,
+        "studio_active_core_repo_count": active_core_count,
+        "studio_active_dashboard_repo_count": active_dashboard_count,
+        "studio_active_product_app_repo_count": active_product_app_count,
+        "studio_active_portfolio_repo_count": active_portfolio_count,
+        "studio_active_portfolio_focus_cap": focus_cap,
+        "studio_unpublished_portfolio_repo_count": unpublished_portfolio_count,
+        "studio_unpublished_portfolio_focus_cap": unpublished_cap,
+        "studio_unpublished_portfolio_names": list(dict.fromkeys(unpublished_names))[:8],
+        "studio_active_portfolio_names": list(dict.fromkeys(active_names))[:12],
+        "studio_recent_new_project_focus_cap_24h": recent_cap_24h,
+        "studio_portfolio_focus_collected_at": float(now),
+    }
+
+
+def _studio_portfolio_focus_gate_reasons(memory: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    try:
+        active_portfolio = int(memory.get("studio_active_portfolio_repo_count", 0) or 0)
+        active_cap = int(memory.get("studio_active_portfolio_focus_cap", _studio_active_portfolio_focus_cap()) or 0)
+    except Exception:
+        active_portfolio = 0
+        active_cap = _studio_active_portfolio_focus_cap()
+    try:
+        unpublished = int(memory.get("studio_unpublished_portfolio_repo_count", 0) or 0)
+        unpublished_cap = int(memory.get("studio_unpublished_portfolio_focus_cap", _studio_unpublished_portfolio_focus_cap()) or 0)
+    except Exception:
+        unpublished = 0
+        unpublished_cap = _studio_unpublished_portfolio_focus_cap()
+    try:
+        recent_24h = int(memory.get("studio_portfolio_recent_count_24h", 0) or 0)
+        recent_cap = int(memory.get("studio_recent_new_project_focus_cap_24h", _studio_recent_new_project_focus_cap_24h()) or 0)
+    except Exception:
+        recent_24h = 0
+        recent_cap = _studio_recent_new_project_focus_cap_24h()
+
+    if active_cap >= 0 and active_portfolio > active_cap:
+        reasons.append(f"{active_portfolio} active portfolio repos exceed focus cap {active_cap}")
+    if unpublished_cap >= 0 and unpublished > unpublished_cap:
+        reasons.append(f"{unpublished} active portfolio repos lack GitHub publication/remote, cap {unpublished_cap}")
+    if recent_cap >= 0 and recent_24h > recent_cap:
+        reasons.append(f"{recent_24h} portfolio/new-project shipments in 24h exceed focus cap {recent_cap}")
+    return reasons
 
 
 def _studio_recent_order_memory(orch_q: OrchestratorQueue, *, now: float) -> dict[str, Any]:
@@ -17410,6 +17569,8 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         if new_project_failure_ratio_24h is not None
         else f"quality debt {new_project_quality_debt_24h}; no new-project cycles in 24h"
     )
+    portfolio_focus_reasons = _studio_portfolio_focus_gate_reasons(memory)
+    portfolio_focus_summary = _studio_one_line("; ".join(portfolio_focus_reasons), max_chars=260, default="")
 
     mode = "normal"
     severity = "green"
@@ -17515,6 +17676,30 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         directives.append(
             f"Treat the incubator quality debt as selection evidence: {new_project_quality_summary}; fresh projects need stronger proof than portfolio compounding."
         )
+    elif portfolio_focus_reasons:
+        mode = "portfolio_focus_gate"
+        severity = "yellow"
+        trigger = portfolio_focus_summary
+        force_next_action = (
+            "Do not create another fresh repo right now. Select PonceBot, ExecutiveDashboard, or deepen one existing "
+            "published portfolio product toward a real product phase, validation, distribution, monetization, or archival decision."
+        )
+        avoid_keys = ["new-project-incubator", "project-incubator"]
+        prefer_lanes = ["dashboard", "core", "portfolio"]
+        unpublished_names = "; ".join(
+            str(x)
+            for x in (memory.get("studio_unpublished_portfolio_names") or [])[:4]
+            if str(x).strip()
+        )
+        directives.extend(
+            [
+                "Portfolio focus gate is active: stop multiplying shallow repos until existing assets are deeper, published, validated, monetized, or archived.",
+                "Prefer one substantial phase on an existing repo over another MVP folder; the phase must change product value, not just README copy.",
+                "If an existing portfolio asset is weak, close with rejected_low_value or archive/disable guidance instead of keeping it active forever.",
+            ]
+        )
+        if unpublished_names:
+            directives.append(f"Resolve unpublished active assets before creating more: {unpublished_names}.")
     elif readiness_status in {"red", "yellow"} and readiness_gaps:
         mode = "toolchain_readiness_gate"
         severity = "red" if readiness_status == "red" else "yellow"
@@ -17541,6 +17726,16 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         prefer_lanes = ["portfolio", "dashboard", "core"]
         directives.append("Compound an existing asset unless a new project is demonstrably more monetizable than the current portfolio.")
 
+    if portfolio_focus_reasons and mode != "portfolio_focus_gate":
+        for blocked_key in ("new-project-incubator", "project-incubator"):
+            if blocked_key not in avoid_keys:
+                avoid_keys.append(blocked_key)
+        if not prefer_lanes:
+            prefer_lanes = ["dashboard", "core", "portfolio"]
+        directives.append(
+            "Portfolio focus pressure is also active: "
+            f"{portfolio_focus_summary}. Do not create another repo unless the portfolio is pruned, published, or the new bet is clearly stronger than compounding."
+        )
     if write_policy_failures:
         directives.append("Controller roles must not edit code directly; Skynet/Jarvis should delegate implementation to specialists and only review/decide.")
     if readiness_gaps:
@@ -17569,6 +17764,11 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "new_project_failure_ratio_24h": new_project_failure_ratio_24h,
         "portfolio_recent_count_6h": recent_projects_6h,
         "portfolio_recent_count_24h": recent_projects_24h,
+        "portfolio_focus_reason_count": len(portfolio_focus_reasons),
+        "active_portfolio_repo_count": int(memory.get("studio_active_portfolio_repo_count", 0) or 0),
+        "active_portfolio_focus_cap": int(memory.get("studio_active_portfolio_focus_cap", _studio_active_portfolio_focus_cap()) or 0),
+        "unpublished_portfolio_repo_count": int(memory.get("studio_unpublished_portfolio_repo_count", 0) or 0),
+        "unpublished_portfolio_focus_cap": int(memory.get("studio_unpublished_portfolio_focus_cap", _studio_unpublished_portfolio_focus_cap()) or 0),
         "readiness_status": readiness_status,
         "readiness_gap_count": len(readiness_gaps),
     }
@@ -18033,7 +18233,7 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
     repo_id = str(repo.get("repo_id") or "").strip().lower()
     path = _studio_short_path(str(repo.get("path") or ""))
     priority = int(repo.get("priority") or 3)
-    metadata = dict(repo.get("metadata") or {})
+    metadata = _studio_repo_metadata(repo)
     last_blocker = str(metadata.get("last_autonomy_blocker") or "").strip()
     status = str(repo.get("status") or "").strip().lower()
 
@@ -18066,13 +18266,13 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score = 76
     else:
         work_type = "PRODUCT_WORKFLOW"
-        thesis = f"Advance {repo_name} only if it has a clear user-facing or operator-facing reason to exist now."
-        outcome = "A concrete milestone, README/demo, or feature that makes the repo more useful."
+        thesis = f"Deepen {repo_name} only if it can become a materially stronger product, not another shallow maintenance pass."
+        outcome = "One substantial product phase: runnable workflow, buyer-facing demo, validation pack, distribution step, monetization step, or archive decision."
         target_user = "operator or eventual project user"
-        business_model = "Portfolio option: preserve or grow a project only when it has a credible user, buyer, or operational payoff."
-        monetization_path = "Revenue optionality through a clearer product milestone, reusable asset, or automation that saves time/money."
-        commercial_evidence = "buyer/user hypothesis, useful milestone, README/demo evidence, or rationale for archiving/pausing low-value work"
-        score = 64
+        business_model = "Focused portfolio option: concentrate effort on fewer assets that can plausibly become paid tools, rentable automation, or reusable sales/demo engines."
+        monetization_path = "Revenue optionality only through a deeper buyer workflow, clearer offer/pricing, validation evidence, distribution artifact, or explicit archive/stop decision."
+        commercial_evidence = "target buyer, painful use case, deeper workflow/demo, validation proof, monetization/distribution step, or rationale for archiving low-value work"
+        score = 70
 
     if priority <= 1:
         score += 8
@@ -18157,6 +18357,20 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
         score -= 24
     elif governor_mode == "portfolio_compounding" and kind in {"Core", "Dashboard"}:
         score -= 6
+    elif governor_mode == "portfolio_focus_gate":
+        if kind in {"Core", "Dashboard"}:
+            score += 12
+        elif kind == "Portfolio":
+            score += 18
+            thesis = f"Turn {repo_name} into a deeper product phase or deliberately archive/disable it; do not create a sibling MVP."
+            outcome = (
+                "A materially deeper existing-asset milestone with validation, distribution/monetization evidence, "
+                "or an explicit low-value archive decision."
+            )
+            commercial_evidence = (
+                "before/after proof that this existing asset is more sellable, more validated, more distributable, "
+                "or correctly removed from the active portfolio"
+            )
 
     recent_risks: list[str] = []
     recent_wins: list[str] = []
@@ -18247,10 +18461,24 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
             "The Studio Governor detected validated controller snapshots waiting for autoship, so codexbot/core "
             "recovery work beats new incubator or portfolio churn right now."
         )
+    if governor_mode == "portfolio_focus_gate":
+        if kind in {"Core", "Dashboard"}:
+            why = (
+                "The portfolio is over-expanded, so core/dashboard work that improves selection, visibility, pruning, "
+                "or product focus beats creating another repo."
+            )
+        elif kind == "Portfolio":
+            why = (
+                "The portfolio is over-expanded, so deepening, validating, monetizing, or archiving this existing "
+                "asset beats creating another shallow MVP."
+            )
     if recent_risks:
         why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
     elif recent_saturation:
-        why += " A recent successful shipment on this same surface lowers priority now; prefer a new project, different repo, or materially fresh angle."
+        if governor_mode == "portfolio_focus_gate":
+            why += " A recent successful shipment on this same surface lowers priority now; prefer a materially deeper phase on another existing asset."
+        else:
+            why += " A recent successful shipment on this same surface lowers priority now; prefer a new project, different repo, or materially fresh angle."
     elif recent_wins:
         why += f" Recent Studio success adds modest confidence: {_studio_one_line('; '.join(recent_wins[:2]), max_chars=160)}."
 
@@ -18325,6 +18553,15 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         outcome = f"A published portfolio asset under {root} moves toward validation, distribution, monetization, or a clearer demo; avoid shallow new folders."
         why = "Recent new-project outcomes failed quality gates; compounding has better expected value than another shallow MVP."
         risk += "; new-project quality gate is active"
+    elif governor_mode == "portfolio_focus_gate":
+        score -= 95
+        thesis = "Fresh incubator is gated because the active portfolio is already too broad; deepen, validate, monetize, or archive existing assets first."
+        outcome = (
+            "No new folder should be created now. The next valuable move is a substantial phase on PonceBot, ExecutiveDashboard, "
+            "or one existing published product."
+        )
+        why = "Too many active portfolio assets reduce focus; compounding and pruning have higher expected value than another MVP."
+        risk += "; portfolio focus gate is active"
     elif governor_mode == "portfolio_compounding":
         score -= 18
         thesis = "Advance the strongest existing portfolio product toward validation, demo quality, distribution, or monetization."
@@ -18405,6 +18642,7 @@ def _studio_build_opportunities(
         memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
     readiness = _studio_operational_readiness(cfg=cfg, repos=repos, now=now)
     memory["studio_readiness"] = readiness
+    memory.update(_studio_portfolio_focus_memory(repos, now=now))
     memory["studio_governor"] = _studio_governor_assessment(memory, now=now)
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     _studio_record_maturity_snapshot(cfg=cfg, readiness=readiness, now=now)
@@ -18590,6 +18828,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
+            f"- Portfolio focus: active={memory.get('studio_active_portfolio_repo_count', 0)}/{memory.get('studio_active_portfolio_focus_cap', _studio_active_portfolio_focus_cap())}; unpublished={memory.get('studio_unpublished_portfolio_repo_count', 0)}/{memory.get('studio_unpublished_portfolio_focus_cap', _studio_unpublished_portfolio_focus_cap())}; new-project cap 24h={memory.get('studio_recent_new_project_focus_cap_24h', _studio_recent_new_project_focus_cap_24h())}",
             f"- Studio quality audit: avg24h={quality_avg_text}; low24h={memory.get('studio_quality_low_24h', 0)}; warnings={quality_warnings}; recent={quality_recent}",
             f"- Operational readiness: status={readiness.get('status', 'unknown')} score={readiness.get('score', 'n/a')}; missing={readiness_missing}; {readiness_summary}",
             "",
@@ -18761,6 +19000,7 @@ def _studio_governor_should_preempt_active_cycle(
         "repair_loop_breaker",
         "repair_loop_cooldown",
         "incubator_quality_gate",
+        "portfolio_focus_gate",
     }:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
@@ -18783,6 +19023,8 @@ def _studio_governor_should_preempt_active_cycle(
     if mode == "repair_loop_cooldown":
         return bool(key or lane or selected_type)
     if mode == "incubator_quality_gate":
+        return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
+    if mode == "portfolio_focus_gate":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     repo_tokens = {key}
     if repo_id:
@@ -18838,6 +19080,7 @@ def _studio_governor_preempt_active_orders(
         "repair_loop_breaker",
         "repair_loop_cooldown",
         "incubator_quality_gate",
+        "portfolio_focus_gate",
     }:
         return 0
 
@@ -18845,6 +19088,11 @@ def _studio_governor_preempt_active_orders(
         summary = (
             "Rejected low-value by Studio Governor: recent new-project outcomes failed quality gates, "
             "so another immediate incubator sprint is paused until the next bet has stronger buyer, demo, and validation evidence."
+        )
+    elif governor_mode == "portfolio_focus_gate":
+        summary = (
+            "Rejected low-value by Studio Governor: the active portfolio is already too broad or under-published, "
+            "so fresh incubator work is paused until existing products are deepened, validated, monetized, published, or archived."
         )
     elif governor_mode == "autoship_recovery_gate":
         summary = (
@@ -21464,7 +21712,7 @@ def _proactive_lane_tick(
         now=now,
     )
     if preempted:
-        if preempt_governor_mode in {"repair_loop_cooldown", "incubator_quality_gate"}:
+        if preempt_governor_mode in {"repair_loop_cooldown", "incubator_quality_gate", "portfolio_focus_gate"}:
             try:
                 orch_q.set_runbook_last_run(runbook_id=runbook_id, ts=float(now))
             except Exception:
@@ -21612,7 +21860,32 @@ def _proactive_lane_tick(
         return 0
 
     if _project_incubator_due(cfg, occupied_keys=occupied):
-        initiative = _project_incubator_initiative(cfg)
+        skip_legacy_incubator = False
+        if _studio_enabled():
+            try:
+                focus_memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
+                focus_memory.update(_studio_portfolio_focus_memory(repos, now=now))
+                focus_reasons = _studio_portfolio_focus_gate_reasons(focus_memory)
+            except Exception:
+                focus_reasons = []
+            if focus_reasons:
+                skip_legacy_incubator = True
+                try:
+                    orch_q.append_audit_event(
+                        event_type="order.project_incubator.skipped_focus_gate",
+                        actor="skynet",
+                        details={
+                            "reasons": focus_reasons[:5],
+                            "active_portfolio_repo_count": int(focus_memory.get("studio_active_portfolio_repo_count", 0) or 0),
+                            "unpublished_portfolio_repo_count": int(focus_memory.get("studio_unpublished_portfolio_repo_count", 0) or 0),
+                        },
+                    )
+                except Exception:
+                    pass
+        if skip_legacy_incubator:
+            initiative = None
+        else:
+            initiative = _project_incubator_initiative(cfg)
         if initiative is not None:
             ok = _spawn_proactive_order(
                 cfg=cfg,
