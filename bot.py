@@ -2597,6 +2597,152 @@ def _factory_repo_policy_priority(repo_path: Path, *, base_repo: Path | None = N
     return 3
 
 
+_FACTORY_DATED_STUDIO_INCUBATOR_RE = re.compile(
+    r"^20\d{6}-studio-cycle-new-product-incubator-[a-f0-9]{8}$",
+    flags=re.IGNORECASE,
+)
+
+
+def _factory_int_env(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except Exception:
+        value = int(default)
+    if minimum is not None:
+        value = max(int(minimum), value)
+    if maximum is not None:
+        value = min(int(maximum), value)
+    return int(value)
+
+
+def _factory_active_portfolio_focus_cap() -> int:
+    return _factory_int_env("BOT_FACTORY_ACTIVE_PORTFOLIO_FOCUS_CAP", 18, minimum=0, maximum=100)
+
+
+def _factory_repo_origin_url(repo_path: Path) -> str:
+    try:
+        repo = repo_path.expanduser().resolve()
+    except Exception:
+        repo = repo_path.expanduser()
+    if not (repo / ".git").exists():
+        return ""
+    try:
+        proc = _run_git(repo, ["remote", "get-url", "origin"], check=False)
+        if proc.returncode == 0:
+            return str(proc.stdout or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _factory_repo_last_commit_ts(repo_path: Path) -> float:
+    try:
+        repo = repo_path.expanduser().resolve()
+    except Exception:
+        repo = repo_path.expanduser()
+    try:
+        proc = _run_git(repo, ["log", "-1", "--format=%ct"], check=False)
+        if proc.returncode == 0:
+            return float(str(proc.stdout or "0").strip() or 0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _factory_is_dated_studio_incubator_container(repo_path: Path) -> bool:
+    name = str(repo_path.name or "").strip()
+    return bool(_FACTORY_DATED_STUDIO_INCUBATOR_RE.match(name))
+
+
+def _factory_is_inside_dated_studio_incubator(repo_path: Path) -> bool:
+    return any(_FACTORY_DATED_STUDIO_INCUBATOR_RE.match(str(part or "")) for part in repo_path.parts)
+
+
+def _factory_disable_discovered_repo(row: dict[str, Any], *, reason: str, now: float) -> None:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    metadata = dict(metadata or {})
+    metadata["portfolio_focus_disabled"] = True
+    metadata["portfolio_focus_disabled_at"] = float(now)
+    metadata["portfolio_focus_reason"] = str(reason)
+    metadata["last_autonomy_blocker"] = str(reason)
+    row["metadata"] = metadata
+    row["autonomy_enabled"] = False
+    row["status"] = "disabled"
+
+
+def _factory_apply_repo_focus_policy(discovered: list[dict[str, Any]], *, now: float) -> None:
+    cap = _factory_active_portfolio_focus_cap()
+    candidates: list[tuple[float, str, dict[str, Any]]] = []
+    for row in discovered:
+        path = Path(str(row.get("path") or "")).expanduser()
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        metadata = dict(metadata or {})
+        metadata["portfolio_focus_cap"] = int(cap)
+        row["metadata"] = metadata
+        try:
+            priority = int(row.get("priority") or 3)
+        except Exception:
+            priority = 3
+        path_name = str(path.name or "").strip().lower()
+        if path_name.endswith((".tmp", ".bak")) or path_name.startswith("tmp-"):
+            _factory_disable_discovered_repo(
+                row,
+                reason="portfolio focus gate: temporary checkout; keep autonomous work on canonical repos.",
+                now=now,
+            )
+            continue
+        if priority <= 2:
+            metadata["portfolio_focus_class"] = "core"
+            continue
+
+        origin = _factory_repo_origin_url(path)
+        if origin:
+            metadata["origin_url"] = origin
+        metadata["portfolio_remote_present"] = bool(origin)
+
+        if _factory_is_dated_studio_incubator_container(path):
+            _factory_disable_discovered_repo(
+                row,
+                reason="portfolio focus gate: dated Studio incubator container; work must happen in a named product repo or the core Studio curator.",
+                now=now,
+            )
+            continue
+        if _factory_is_inside_dated_studio_incubator(path) and not origin:
+            _factory_disable_discovered_repo(
+                row,
+                reason="portfolio focus gate: unpublished incubator product; publish, archive, or promote it before autonomous deep work.",
+                now=now,
+            )
+            continue
+
+        last_commit_ts = _factory_repo_last_commit_ts(path)
+        name = str(path.name or "").lower()
+        score = 0.0
+        score += 80.0 if origin else 0.0
+        score += 15.0 if not _factory_is_inside_dated_studio_incubator(path) else 0.0
+        score += 10.0 if (path / "README.md").exists() else 0.0
+        score += 5.0 if any(token in name for token in ("desk", "dashboard", "bridge", "app", "radar", "kit")) else 0.0
+        score += min(20.0, max(0.0, last_commit_ts / 100000000.0))
+        metadata["portfolio_focus_score"] = round(score, 3)
+        candidates.append((score, str(path), row))
+
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    for index, (_score, _path, row) in enumerate(candidates):
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        metadata = dict(metadata or {})
+        if index < cap:
+            metadata["portfolio_focus_class"] = "focused_portfolio"
+            metadata["portfolio_focus_rank"] = int(index + 1)
+            row["metadata"] = metadata
+            continue
+        _factory_disable_discovered_repo(
+            row,
+            reason=f"portfolio focus gate: outside active portfolio cap {cap}; concentrate on fewer deeper assets before widening scope.",
+            now=now,
+        )
+
+
 def _factory_repo_priority_for_sync(
     *,
     existing: dict[str, Any],
@@ -2804,7 +2950,10 @@ def _factory_repo_status_for_sync(
     existing_status = str(existing.get("status") or "").strip().lower()
     discovered_status = str(discovered.get("status") or "").strip().lower() or "active"
     if not autonomy_enabled:
-        return existing_status or "disabled"
+        reason = str(metadata.get("portfolio_focus_reason") or metadata.get("last_autonomy_blocker") or "").strip()
+        if reason:
+            metadata["last_autonomy_blocker"] = reason
+        return "disabled"
     if existing_status in {"disabled", "paused"}:
         return existing_status
 
@@ -2890,6 +3039,7 @@ def _discover_factory_repos(cfg: "BotConfig") -> list[dict[str, Any]]:
                 }
             )
             dirnames[:] = []
+    _factory_apply_repo_focus_policy(discovered, now=time.time())
     discovered.sort(key=lambda item: (int(item.get("priority") or 2), str(item.get("path") or "")))
     return discovered
 
@@ -20649,7 +20799,13 @@ def _factory_sync_repo_registry(
             metadata=metadata,
             now=float(now),
         )
-        autonomy_enabled = bool(existing.get("autonomy_enabled", row.get("autonomy_enabled", True)))
+        discovered_autonomy = bool(row.get("autonomy_enabled", True))
+        if bool(metadata.get("autonomy_pinned", False)):
+            autonomy_enabled = bool(existing.get("autonomy_enabled", discovered_autonomy))
+        elif not discovered_autonomy:
+            autonomy_enabled = False
+        else:
+            autonomy_enabled = bool(existing.get("autonomy_enabled", discovered_autonomy))
         priority = _factory_repo_priority_for_sync(
             existing=existing,
             discovered=row,

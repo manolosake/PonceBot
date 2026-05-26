@@ -251,6 +251,76 @@ class TestStateHandling(unittest.TestCase):
             self.assertIn(str(repo_b.resolve()), repo_paths)
             self.assertFalse(any("node_modules" in path for path in repo_paths))
 
+    def test_factory_focus_policy_disables_dated_incubator_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "20260525-studio-cycle-new-product-incubator-abcdef12"
+            repo.mkdir(parents=True)
+            row = {
+                "repo_id": "incubator-abcdef12",
+                "path": str(repo),
+                "autonomy_enabled": True,
+                "priority": 3,
+                "status": "active",
+                "metadata": {"repo_name": repo.name},
+            }
+
+            bot._factory_apply_repo_focus_policy([row], now=123.0)
+
+        self.assertFalse(bool(row["autonomy_enabled"]))
+        self.assertEqual(row["status"], "disabled")
+        self.assertIn("dated Studio incubator container", row["metadata"]["portfolio_focus_reason"])
+
+    def test_factory_focus_policy_disables_temporary_checkouts_even_if_primary_named(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "ExecutiveDashboard.tmp"
+            repo.mkdir(parents=True)
+            row = {
+                "repo_id": "executivedashboard-tmp",
+                "path": str(repo),
+                "autonomy_enabled": True,
+                "priority": 1,
+                "status": "active",
+                "metadata": {"repo_name": repo.name},
+            }
+
+            bot._factory_apply_repo_focus_policy([row], now=123.0)
+
+        self.assertFalse(bool(row["autonomy_enabled"]))
+        self.assertEqual(row["status"], "disabled")
+        self.assertIn("temporary checkout", row["metadata"]["portfolio_focus_reason"])
+
+    def test_factory_focus_policy_caps_active_portfolio_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = []
+            for name in ("alpha-desk", "beta-desk", "gamma-desk"):
+                repo = root / name
+                repo.mkdir(parents=True)
+                (repo / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+                rows.append(
+                    {
+                        "repo_id": name,
+                        "path": str(repo),
+                        "autonomy_enabled": True,
+                        "priority": 3,
+                        "status": "active",
+                        "metadata": {"repo_name": name},
+                    }
+                )
+
+            with patch.dict(os.environ, {"BOT_FACTORY_ACTIVE_PORTFOLIO_FOCUS_CAP": "2"}), patch.object(
+                bot, "_factory_repo_origin_url", side_effect=lambda path: f"git@github.com:manolosake/{Path(path).name}.git"
+            ), patch.object(bot, "_factory_repo_last_commit_ts", return_value=1.0):
+                bot._factory_apply_repo_focus_policy(rows, now=123.0)
+
+        enabled = [row["repo_id"] for row in rows if bool(row["autonomy_enabled"])]
+        disabled = [row["repo_id"] for row in rows if not bool(row["autonomy_enabled"])]
+        self.assertEqual(enabled, ["alpha-desk", "beta-desk"])
+        self.assertEqual(disabled, ["gamma-desk"])
+        self.assertIn("outside active portfolio cap 2", rows[2]["metadata"]["portfolio_focus_reason"])
+
     def test_factory_repo_default_branch_sync_reconciles_temporary_branch(self) -> None:
         metadata = {
             "repo_name": "ExecutiveDashboard",
@@ -290,6 +360,54 @@ class TestStateHandling(unittest.TestCase):
         self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/ExecutiveDashboard"), base_repo=base_repo), 1)
         self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/OmniCrewApp.android"), base_repo=base_repo), 2)
         self.assertEqual(bot._factory_repo_policy_priority(Path("/home/aponce/Documents/ReceiptJury"), base_repo=base_repo), 3)
+
+    def test_factory_sync_disables_focus_gated_repo_even_if_existing_was_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / "gamma-desk"
+            repo.mkdir()
+            cfg = self._cfg(root / "state.json")
+            repo_id = "gamma-desk"
+            discovered = {
+                "repo_id": repo_id,
+                "path": str(repo.resolve()),
+                "default_branch": "main",
+                "autonomy_enabled": False,
+                "priority": 3,
+                "runtime_mode": "ceo-bounded",
+                "daily_budget": 0.0,
+                "status": "disabled",
+                "metadata": {
+                    "repo_name": "gamma-desk",
+                    "portfolio_focus_reason": "portfolio focus gate: outside active portfolio cap 2",
+                },
+            }
+
+            class _FakeQueue:
+                def __init__(self) -> None:
+                    self.rows = {repo_id: {**discovered, "autonomy_enabled": True, "status": "active"}}
+                    self.events: list[dict[str, object]] = []
+
+                def list_repos(self, limit: int = 5000):
+                    return list(self.rows.values())[:limit]
+
+                def upsert_repo(self, **kwargs: object) -> None:
+                    self.rows[str(kwargs["repo_id"])] = dict(kwargs)
+
+                def set_repo_status(self, *, repo_id: str, status: str) -> None:
+                    self.rows[repo_id]["status"] = status
+
+                def append_audit_event(self, **kwargs: object) -> None:
+                    self.events.append(dict(kwargs))
+
+            q = _FakeQueue()
+            with patch.object(bot, "_discover_factory_repos", return_value=[discovered]):
+                rows = bot._factory_sync_repo_registry(cfg=cfg, orch_q=q, now=123.0, force=True)  # type: ignore[arg-type]
+
+        synced = {str(row.get("repo_id")): row for row in rows}[repo_id]
+        self.assertFalse(bool(synced["autonomy_enabled"]))
+        self.assertEqual(synced["status"], "disabled")
+        self.assertIn("portfolio focus gate", synced["metadata"]["last_autonomy_blocker"])
 
     def test_factory_sync_recovers_blocked_repo_when_preflight_clears(self) -> None:
         with tempfile.TemporaryDirectory() as td:
