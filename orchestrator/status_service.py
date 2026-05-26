@@ -1062,18 +1062,44 @@ def _has_patch_artifact_evidence(task: Task) -> bool:
     )
 
 
+def _is_positive_validation_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower().replace("-", "_")
+    return text in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "ok",
+        "pass",
+        "passed",
+        "go",
+        "accepted",
+        "ready",
+        "validated",
+        "verified",
+        "reviewed_ready",
+        "closed",
+    }
+
+
 def _has_validation_evidence(task: Task) -> bool:
     trace = task.trace or {}
     patch_info = trace.get("local_patch_info")
     if not isinstance(patch_info, dict):
         patch_info = trace.get("patch_info")
     return bool(
-        trace.get("slice_validation_ok")
-        or trace.get("review_ready")
-        or trace.get("improvement_verified")
-        or trace.get("quality_gate_status") in {"validated", "reviewed_ready", "closed"}
-        or trace.get("slice_status") in {"validated", "reviewed_ready", "closed"}
-        or (isinstance(patch_info, dict) and bool(patch_info.get("validation_ok")))
+        _is_positive_validation_value(trace.get("slice_validation_ok"))
+        or _is_positive_validation_value(trace.get("review_ready"))
+        or _is_positive_validation_value(trace.get("improvement_verified"))
+        or _is_positive_validation_value(trace.get("quality_gate_status"))
+        or _is_positive_validation_value(trace.get("slice_status"))
+        or (isinstance(patch_info, dict) and _is_positive_validation_value(patch_info.get("validation_ok")))
     )
 
 
@@ -2010,23 +2036,54 @@ def _selection_churn_risk_metadata(
         for role, count in children_by_role.items()
         if str(role or "").strip().lower() in _DELIVERY_ROLES
     )
+    validation_children_done = _coerce_int(order.get("validation_children_done"))
+    qa_children_done = _coerce_int(order.get("qa_children_done"))
+    reviewer_children_done = _coerce_int(order.get("reviewer_children_done"))
+    accepted_validation_children = _coerce_int(order.get("accepted_validation_children"))
+    terminal_closure_evidence = bool(
+        closed_count > 0
+        or order.get("merged_to_main")
+        or str(order.get("readiness_state") or "").strip().lower() in {"ready", "released"}
+        or str(order.get("readiness_verdict") or "").strip().lower() == "go"
+        or trace.get("proactive_improvement_closed")
+        or trace.get("merged_to_main")
+        or str(trace.get("deploy_status") or "").strip().lower() in {"ok", "scheduled"}
+    )
+    studio_terminal_outcome = str(trace.get("studio_terminal_outcome") or "").strip().lower()
+    studio_terminal_summary = str(
+        trace.get("studio_terminal_outcome_summary") or trace.get("outcome_summary") or trace.get("result_summary") or ""
+    ).strip()
+    if studio_terminal_outcome in set(_PROACTIVE_TERMINAL_OUTCOMES) and studio_terminal_summary:
+        terminal_closure_evidence = True
+    has_validation_child_closure_debt = bool(accepted_validation_children > 0 and not terminal_closure_evidence)
 
     churn_flags: list[str] = []
     if started_count >= 3 and started_count >= validated_or_closed + 2:
         churn_flags.append("started_slices_exceed_validated_or_closed")
-    if validated_count >= 2 and closed_count == 0:
+    if (validated_count >= 2 and not terminal_closure_evidence) or has_validation_child_closure_debt:
         churn_flags.append("validated_slices_without_terminal_closure")
     if delivery_children >= 2 and validated_or_closed == 0:
         churn_flags.append("repeated_delivery_children_without_validation")
     elif children_total >= 3 and validated_or_closed == 0:
         churn_flags.append("multiple_child_jobs_without_validation")
 
-    needs_review = bool(churn_flags and (started_count > 0 or applied_count > 0 or validated_count > 0 or children_total > 0))
+    needs_review = bool(
+        churn_flags
+        and (
+            started_count > 0
+            or applied_count > 0
+            or validated_count > 0
+            or children_total > 0
+            or accepted_validation_children > 0
+        )
+    )
     return {
         "status": "needs_review" if needs_review else "ok",
         "flags": churn_flags,
         "summary": (
-            "Implementation activity is outpacing validation or closure; review selection before more delivery delegation."
+            "Validated work has not reached terminal closure; route closure debt before more delivery delegation."
+            if has_validation_child_closure_debt or "validated_slices_without_terminal_closure" in churn_flags
+            else "Implementation activity is outpacing validation or closure; review selection before more delivery delegation."
             if needs_review
             else "No implementation churn risk detected."
         ),
@@ -2037,6 +2094,11 @@ def _selection_churn_risk_metadata(
             "proactive_slices_closed": closed_count,
             "children_total": children_total,
             "delivery_children": delivery_children,
+            "validation_children_done": validation_children_done,
+            "qa_children_done": qa_children_done,
+            "reviewer_children_done": reviewer_children_done,
+            "accepted_validation_children": accepted_validation_children,
+            "terminal_closure_evidence": terminal_closure_evidence,
         },
     }
 
@@ -2051,7 +2113,6 @@ def _selection_quality_metadata(
     readiness_state = str(order.get("readiness_state") or "").strip().lower()
     readiness_verdict = str(order.get("readiness_verdict") or "").strip().lower()
     primary_blocker = order.get("primary_blocker") if isinstance(order.get("primary_blocker"), dict) else None
-    merge_ready = bool(order.get("merge_ready"))
     merged_to_main = bool(order.get("merged_to_main"))
 
     flags: list[str] = []
@@ -2062,7 +2123,7 @@ def _selection_quality_metadata(
             "summary": "Selection-quality gate only reviews advance/not-ready proactive work.",
             "recommended_owner_role": None,
         }
-    if merge_ready or merged_to_main or readiness_state in {"ready", "released"} or readiness_verdict == "go":
+    if merged_to_main or readiness_state in {"ready", "released"} or readiness_verdict == "go":
         return {
             "status": "ok",
             "flags": ["release_ready_exempt"],
@@ -3137,9 +3198,24 @@ class StatusService:
             )
             children_by_state = _count_task_states(children)
             children_by_role: dict[str, int] = {}
+            validation_children_done = 0
+            qa_children_done = 0
+            reviewer_children_done = 0
+            accepted_validation_children = 0
             for child in children:
                 role = str(child.role or "").strip().lower() or "unknown"
                 children_by_role[role] = children_by_role.get(role, 0) + 1
+                if role not in {"qa", "reviewer_local"}:
+                    continue
+                child_done = str(child.state or "").strip().lower() == "done"
+                if child_done:
+                    validation_children_done += 1
+                    if role == "qa":
+                        qa_children_done += 1
+                    elif role == "reviewer_local":
+                        reviewer_children_done += 1
+                if _has_validation_evidence(child):
+                    accepted_validation_children += 1
 
             readiness_state = str(readiness.get("state") or "unknown")
             current_stage = str(workflow.get("current_stage") or readiness.get("current_stage") or "skynet_plan")
@@ -3202,6 +3278,10 @@ class StatusService:
                     "children_total": len(children),
                     "children_by_state": children_by_state,
                     "children_by_role": children_by_role,
+                    "validation_children_done": validation_children_done,
+                    "qa_children_done": qa_children_done,
+                    "reviewer_children_done": reviewer_children_done,
+                    "accepted_validation_children": accepted_validation_children,
                     "merge_ready": bool(workflow.get("merge_ready")),
                     "merged_to_main": bool(workflow.get("merged_to_main")),
                 }
@@ -4038,6 +4118,10 @@ class StatusService:
                 "merged_to_main": bool(order.get("merged_to_main")),
                 "children_total": int(order.get("children_total") or 0),
                 "children_by_role": order.get("children_by_role") if isinstance(order.get("children_by_role"), dict) else {},
+                "validation_children_done": int(order.get("validation_children_done") or 0),
+                "qa_children_done": int(order.get("qa_children_done") or 0),
+                "reviewer_children_done": int(order.get("reviewer_children_done") or 0),
+                "accepted_validation_children": int(order.get("accepted_validation_children") or 0),
                 "updated_at": updated_at,
             }
             factory_delta_contract = _factory_delta_contract_from_trace(root_task)
@@ -4146,6 +4230,10 @@ class StatusService:
             "merged_to_main",
             "children_total",
             "children_by_role",
+            "validation_children_done",
+            "qa_children_done",
+            "reviewer_children_done",
+            "accepted_validation_children",
             "selection_quality",
             "factory_delta_contract",
             "studio_decision_evidence_contract",

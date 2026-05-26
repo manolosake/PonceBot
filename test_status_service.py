@@ -1143,6 +1143,353 @@ class TestStatusService(unittest.TestCase):
                 top_packet["definition_of_done"],
             )
 
+    def test_proactive_action_plan_reroutes_validation_child_closure_debt_to_release_mgr(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "qa-reviewed-closure-debt-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="QA-reviewed proactive order",
+                body="QA reviewed the slice, but no terminal closure was recorded.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] QA-reviewed proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 1,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_validated": 0,
+                        "proactive_slices_closed": 0,
+                        "factory_value": {
+                            "score": 76,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence supports the reviewed improvement.",
+                        },
+                    },
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="qa",
+                    input_text="Validate the proactive slice.",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    parent_job_id=order_id,
+                    trace={
+                        "quality_gate_status": "reviewed_ready",
+                        "slice_validation_ok": True,
+                        "result_summary": "QA reviewed the implemented slice and marked it ready.",
+                    },
+                    job_id="qa-reviewed-child",
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            churn_risk = selection_quality["churn_risk"]
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["status"], "needs_review")
+            self.assertIn("validated_slices_without_terminal_closure", selection_quality["flags"])
+            self.assertIn("validated_slices_without_terminal_closure", churn_risk["flags"])
+            self.assertEqual(churn_risk["counters"]["proactive_slices_validated"], 0)
+            self.assertEqual(churn_risk["counters"]["proactive_slices_closed"], 0)
+            self.assertEqual(churn_risk["counters"]["validation_children_done"], 1)
+            self.assertEqual(churn_risk["counters"]["qa_children_done"], 1)
+            self.assertEqual(churn_risk["counters"]["reviewer_children_done"], 0)
+            self.assertEqual(churn_risk["counters"]["accepted_validation_children"], 1)
+            self.assertFalse(churn_risk["counters"]["terminal_closure_evidence"])
+            self.assertEqual(selection_quality["recommended_owner_role"], "release_mgr")
+            self.assertEqual(selection_quality["delegation_reason"], "validated_slices_without_terminal_closure")
+            self.assertEqual(selection_quality["delegation_focus"], "terminal_outcome_closure")
+
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(plan["summary"]["top_lane"], "selection_review")
+            self.assertEqual(top_packet["order_id"], order_id)
+            self.assertEqual(top_packet["owner_role"], "release_mgr")
+            self.assertEqual(top_packet["delegation_reason"], "validated_slices_without_terminal_closure")
+            self.assertIn("Closure debt review", top_packet["action"])
+            self.assertIn("terminal outcome evidence", top_packet["action"])
+            self.assertNotIn("kill/continue", top_packet["action"])
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
+
+    def test_proactive_action_plan_no_go_validation_child_does_not_count_as_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "qa-no-go-validation-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="QA no-go proactive order",
+                body="QA finished with no-go validation.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] QA no-go proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 1,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_validated": 0,
+                        "proactive_slices_closed": 0,
+                        "factory_value": {
+                            "score": 74,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence exists, but validation did not accept the slice.",
+                        },
+                    },
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="qa",
+                    input_text="Validate the proactive slice.",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    parent_job_id=order_id,
+                    trace={
+                        "quality_gate_status": "no_go",
+                        "slice_validation_ok": False,
+                        "result_summary": "QA completed validation with a no-go because checks failed.",
+                    },
+                    job_id="qa-no-go-child",
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 0)
+            self.assertEqual(lanes["advance"]["count"], 1)
+            order = lanes["advance"]["orders"][0]
+            churn_risk = order["selection_quality"]["churn_risk"]
+            self.assertEqual(churn_risk["counters"]["validation_children_done"], 1)
+            self.assertEqual(churn_risk["counters"]["qa_children_done"], 1)
+            self.assertEqual(churn_risk["counters"]["accepted_validation_children"], 0)
+            self.assertNotIn("validated_slices_without_terminal_closure", churn_risk["flags"])
+            self.assertNotEqual(order["selection_quality"].get("recommended_owner_role"), "release_mgr")
+
+    def test_proactive_action_plan_merge_ready_with_validation_child_still_routes_closure_debt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "merge-ready-reviewed-closure-debt-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Merge-ready reviewed proactive order",
+                body="QA accepted the slice and it is merge-ready, but nothing terminal happened.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Merge-ready reviewed proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 1,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_validated": 0,
+                        "proactive_slices_closed": 0,
+                        "merge_ready": True,
+                        "factory_value": {
+                            "score": 78,
+                            "dimensions": {"factory": {"ok": True}},
+                            "summary": "Factory-value evidence supports the accepted improvement.",
+                        },
+                    },
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="Review the proactive slice.",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    parent_job_id=order_id,
+                    trace={
+                        "review_ready": True,
+                        "result_summary": "Reviewer accepted the slice as ready.",
+                    },
+                    job_id="reviewer-merge-ready-child",
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 1)
+            self.assertEqual(lanes["advance"]["count"], 0)
+            order = lanes["selection_review"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            churn_risk = selection_quality["churn_risk"]
+            self.assertTrue(order["merge_ready"])
+            self.assertFalse(order["merged_to_main"])
+            self.assertEqual(order["readiness_state"], "not_ready")
+            self.assertEqual(order["readiness_verdict"], "wait")
+            self.assertEqual(churn_risk["counters"]["accepted_validation_children"], 1)
+            self.assertFalse(churn_risk["counters"]["terminal_closure_evidence"])
+            self.assertIn("validated_slices_without_terminal_closure", churn_risk["flags"])
+            self.assertEqual(order["decision"], "selection_review")
+            self.assertEqual(selection_quality["recommended_owner_role"], "release_mgr")
+            self.assertEqual(selection_quality["delegation_focus"], "terminal_outcome_closure")
+            self.assertEqual(plan["top_execution_packet"]["owner_role"], "release_mgr")
+            self.assertEqual(plan["top_execution_packet"]["delegation_focus"], "terminal_outcome_closure")
+
+    def test_proactive_action_plan_validation_child_closure_debt_exempts_merged_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            order_id = "merged-reviewed-order"
+            q.upsert_order(
+                order_id=order_id,
+                chat_id=7,
+                title="Merged reviewed proactive order",
+                body="Reviewer evidence exists and the order already merged.",
+                status="active",
+                priority=1,
+                phase="executing",
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="skynet",
+                    input_text="[proactive: test] Merged reviewed proactive order",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    trace={
+                        "proactive_lane": True,
+                        "proactive_slices_started": 1,
+                        "proactive_slices_applied": 1,
+                        "proactive_slices_closed": 0,
+                        "merged_to_main": True,
+                        "deploy_status": "ok",
+                        "result_summary": "The reviewed slice merged to main.",
+                    },
+                    job_id=order_id,
+                )
+            )
+            q.submit_task(
+                Task.new(
+                    source="telegram",
+                    role="reviewer_local",
+                    input_text="Review the proactive slice.",
+                    request_type="task",
+                    priority=1,
+                    model="gpt-5.2",
+                    effort="medium",
+                    mode_hint="rw",
+                    requires_approval=False,
+                    max_cost_window_usd=1.0,
+                    chat_id=7,
+                    state="done",
+                    parent_job_id=order_id,
+                    trace={
+                        "review_ready": True,
+                        "result_summary": "Reviewer accepted the slice before merge.",
+                    },
+                    job_id="reviewer-merged-child",
+                )
+            )
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            lanes = {lane["lane"]: lane for lane in plan["lanes"]}
+            self.assertEqual(lanes["selection_review"]["count"], 0)
+            self.assertEqual(lanes["monitor"]["count"], 1)
+            order = lanes["monitor"]["orders"][0]
+            selection_quality = order["selection_quality"]
+            self.assertEqual(order["decision"], "monitor")
+            self.assertEqual(selection_quality["status"], "ok")
+            self.assertNotIn("validated_slices_without_terminal_closure", selection_quality["flags"])
+            self.assertEqual(lanes["monitor"]["execution_packet"]["owner_role"], "release_mgr")
+
     def test_proactive_action_plan_allows_single_validated_slice_without_closure_to_advance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
