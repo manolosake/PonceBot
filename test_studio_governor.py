@@ -1826,7 +1826,7 @@ def test_auto_merge_tick_recovers_controller_snapshot_deploy_failure_from_main_d
     assert job.trace["deployed_commit"] == commit
     assert job.trace["controller_snapshot_autoship_done"] is True
     assert job.trace["controller_snapshot_autoship_commit"] == commit
-    assert job.trace["result_status"] == "merged"
+    assert job.trace["result_status"] == "shipped_to_main"
     assert "Recovered deploy success" in job.trace["result_summary"]
     with sqlite3.connect(db) as conn:
         row = conn.execute(

@@ -1397,6 +1397,29 @@ def _is_proactive_order(order_row: dict[str, Any], root_task: Task | None) -> bo
     return any(marker in haystack for marker in _PROACTIVE_MARKERS)
 
 
+def _is_controller_snapshot_order(order_row: dict[str, Any], root_task: Task | None) -> bool:
+    trace = dict((root_task.trace or {}) if root_task is not None else {})
+    structured = trace.get("structured_digest") if isinstance(trace.get("structured_digest"), dict) else {}
+    structured_snapshot = structured.get("controller_snapshot") if isinstance(structured.get("controller_snapshot"), dict) else {}
+    if (
+        trace.get("controller_snapshot_workdir")
+        or trace.get("controller_snapshot_autoship_done")
+        or trace.get("controller_snapshot_autoship_error")
+        or structured_snapshot.get("workdir")
+        or str(structured.get("workdir") or "").strip().endswith("controller_snapshot")
+    ):
+        return True
+
+    haystack = " ".join(
+        [
+            str((order_row or {}).get("title") or ""),
+            str((order_row or {}).get("body") or ""),
+            str(root_task.input_text if root_task is not None else ""),
+        ]
+    ).lower()
+    return "controller snapshot" in haystack or "controller_snapshot" in haystack
+
+
 def _primary_blocker(order: dict[str, Any]) -> dict[str, Any] | None:
     blockers = list(order.get("blockers") or [])
     for blocker in blockers:
@@ -1877,6 +1900,12 @@ def _selection_review_owner_role(selection_quality: dict[str, Any]) -> str:
 
 def _closure_debt_action(order: dict[str, Any]) -> str:
     oid = str(order.get("order_id_short") or order.get("order_id") or "this order").strip()
+    if bool(order.get("controller_snapshot")) or bool(order.get("merge_ready")):
+        return (
+            f"Closure debt review for order {oid}: route the validated merge-ready work to release_mgr for an "
+            "explicit terminal outcome; record merge/push/deploy evidence, or record rejected_low_value for a "
+            "verified no-delta snapshot, or failed_root_caused with the exact blocker."
+        )
     return (
         f"Closure debt review for order {oid}: close, release, or replan the already validated work before any more "
         "implementation; record terminal outcome evidence such as merge/release evidence, an explicit block, "
@@ -1917,6 +1946,16 @@ _PROACTIVE_SELECTION_OUTCOME_DOD = (
 )
 _PROACTIVE_SELECTION_OUTCOME_EVIDENCE = (
     "If ending the order, include terminal outcome evidence with outcome, evidence, and residual_risk."
+)
+_PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_DOD = (
+    "Validated controller snapshot closure records shipped_to_main/published_project, rejected_low_value no-delta, "
+    "or failed_root_caused with exact blocker evidence."
+)
+_PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_EVIDENCE = (
+    "merge/push/deploy result, or rejected_low_value no-delta repo evidence, or exact failed_root_caused blocker"
+)
+_PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_VALIDATION = (
+    "Verify merge_ready is cleared only after merge/push/deploy evidence, no-delta rejection evidence, or exact blocker evidence is recorded."
 )
 
 
@@ -2478,6 +2517,15 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
             "Re-read the inspect endpoint after the closure decision.",
             "Verify validated slices now have terminal closure evidence or an explicit replan/blocker.",
         ]
+        if bool(order.get("controller_snapshot")) or bool(order.get("merge_ready")):
+            _append_unique_text(
+                acceptance_criteria,
+                "Route validated merge-ready/controller-snapshot work to release_mgr for terminal outcome closure, not another implementation slice.",
+                "Record either merge/push/deploy evidence, rejected_low_value no-delta evidence, or the exact failed_root_caused blocker.",
+            )
+            _append_unique_text(definition_of_done, _PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_DOD)
+            _append_unique_text(evidence_required, _PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_EVIDENCE)
+            _append_unique_text(suggested_validation, _PROACTIVE_CONTROLLER_SNAPSHOT_CLOSURE_VALIDATION)
     elif selection_needs_review:
         acceptance_criteria = [
             f"Inspect {inspect_endpoint}.",
@@ -4122,6 +4170,7 @@ class StatusService:
                 "qa_children_done": int(order.get("qa_children_done") or 0),
                 "reviewer_children_done": int(order.get("reviewer_children_done") or 0),
                 "accepted_validation_children": int(order.get("accepted_validation_children") or 0),
+                "controller_snapshot": _is_controller_snapshot_order(order_row, root_task),
                 "updated_at": updated_at,
             }
             factory_delta_contract = _factory_delta_contract_from_trace(root_task)
@@ -4234,6 +4283,7 @@ class StatusService:
             "qa_children_done",
             "reviewer_children_done",
             "accepted_validation_children",
+            "controller_snapshot",
             "selection_quality",
             "factory_delta_contract",
             "studio_decision_evidence_contract",
