@@ -17063,7 +17063,12 @@ def _studio_repo_display_name(repo: dict[str, Any]) -> str:
 def _studio_repo_kind(repo: dict[str, Any]) -> str:
     name = _studio_repo_display_name(repo).strip().lower()
     path = str(repo.get("path") or "").strip().lower()
-    if "codexbot" in name or "codexbot" in path or name == "poncebot" or path.endswith("/poncebot"):
+    repo_id = str(repo.get("repo_id") or "").strip().lower()
+    path_name = Path(path).name.strip().lower() if path else ""
+    identity_values = {name, repo_id, path_name}
+    normalized_identities = {re.sub(r"[^a-z0-9]+", "-", value).strip("-") for value in identity_values if value}
+    core_identities = {"codexbot", "codexbot-core", "poncebot", "poncebot-core"}
+    if identity_values & core_identities or normalized_identities & core_identities:
         return "Core"
     if "executivedashboard" in name or "executivedashboard" in path:
         return "Dashboard"
