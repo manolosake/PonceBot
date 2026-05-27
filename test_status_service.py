@@ -1360,6 +1360,7 @@ class TestStatusService(unittest.TestCase):
                         "proactive_slices_validated": 0,
                         "proactive_slices_closed": 0,
                         "merge_ready": True,
+                        "controller_snapshot_workdir": "/tmp/artifacts/merge-ready-reviewed/controller_snapshot",
                         "factory_value": {
                             "score": 78,
                             "dimensions": {"factory": {"ok": True}},
@@ -1405,14 +1406,30 @@ class TestStatusService(unittest.TestCase):
             self.assertFalse(order["merged_to_main"])
             self.assertEqual(order["readiness_state"], "not_ready")
             self.assertEqual(order["readiness_verdict"], "wait")
+            self.assertTrue(order["controller_snapshot"])
             self.assertEqual(churn_risk["counters"]["accepted_validation_children"], 1)
             self.assertFalse(churn_risk["counters"]["terminal_closure_evidence"])
             self.assertIn("validated_slices_without_terminal_closure", churn_risk["flags"])
             self.assertEqual(order["decision"], "selection_review")
             self.assertEqual(selection_quality["recommended_owner_role"], "release_mgr")
             self.assertEqual(selection_quality["delegation_focus"], "terminal_outcome_closure")
-            self.assertEqual(plan["top_execution_packet"]["owner_role"], "release_mgr")
-            self.assertEqual(plan["top_execution_packet"]["delegation_focus"], "terminal_outcome_closure")
+            top_packet = plan["top_execution_packet"]
+            self.assertEqual(top_packet["owner_role"], "release_mgr")
+            self.assertEqual(top_packet["delegation_focus"], "terminal_outcome_closure")
+            packet_text = "\n".join(
+                [
+                    top_packet["action"],
+                    *top_packet["acceptance_criteria"],
+                    *top_packet["definition_of_done"],
+                    *top_packet["evidence_required"],
+                    *top_packet["suggested_validation"],
+                    top_packet["assignment_prompt"],
+                ]
+            )
+            self.assertIn("merge/push/deploy", packet_text)
+            self.assertIn("rejected_low_value", packet_text)
+            self.assertIn("failed_root_caused", packet_text)
+            self.assertIn("exact blocker", packet_text)
 
     def test_proactive_action_plan_validation_child_closure_debt_exempts_merged_orders(self) -> None:
         with tempfile.TemporaryDirectory() as td:
