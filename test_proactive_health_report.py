@@ -513,6 +513,94 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertEqual(stale_anomaly.get("count"), 1)
             self.assertEqual(payload.get("operational_status"), "WARN")
 
+    def test_factory_next_targets_include_active_order_quality_gate_not_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            self._create_factory_report_db(
+                db,
+                repos=[
+                    ("quality-repo", "active", 1),
+                ],
+                heartbeats=[
+                    ("quality-repo", now - 60),
+                ],
+            )
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "order-quality-open",
+                        "active",
+                        "planning",
+                        "Proactive Sprint: quality-repo",
+                        "[repo:quality-repo]",
+                        now,
+                    ),
+                )
+                con.execute(
+                    """
+                    INSERT INTO jobs(job_id, parent_job_id, state, role, labels, trace, updated_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "impl-quality-1",
+                        "order-quality-open",
+                        "done",
+                        "implementer_local",
+                        "{}",
+                        json.dumps(
+                            {
+                                "slice_id": "slice_quality",
+                                "slice_patch_applied": True,
+                                "slice_validation_ok": True,
+                                "result_summary": "Applied and locally validated the slice; awaiting controller quality closure.",
+                            }
+                        ),
+                        now,
+                        now - 5,
+                    ),
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("operational_status"), "OK")
+            self.assertEqual(payload["metrics"]["factory_stale_heartbeats"], 0)
+            self.assertEqual(payload["metrics"]["factory_uncovered_enabled_repos"], 0)
+            coverage = payload["factory"]["coverage_details"]
+            self.assertEqual(len(coverage), 1)
+            self.assertEqual(coverage[0]["coverage_state"], "covered_active")
+            self.assertEqual(coverage[0]["order_quality_gate_status"], "validated")
+            self.assertEqual(coverage[0]["order_slices_validated"], 1)
+            self.assertEqual(coverage[0]["order_slices_closed"], 0)
+            self.assertEqual(coverage[0]["order_quality_attention_reason"], "quality_gate_not_closed")
+            self.assertEqual(coverage[0]["order_quality_recommended_action"], "run_quality_gate")
+
+            targets = payload["factory"]["next_targets"]
+            self.assertEqual(len(targets), 1)
+            target = targets[0]
+            self.assertEqual(target["repo_id"], "quality-repo")
+            self.assertEqual(target["coverage_state"], "covered_active")
+            self.assertEqual(target["attention_reason"], "quality_gate_not_closed")
+            self.assertEqual(target["recommended_action"], "run_quality_gate")
+            self.assertEqual(target["order_quality_gate_status"], "validated")
+            self.assertEqual(target["order_slices_validated"], 1)
+            self.assertEqual(target["order_slices_closed"], 0)
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn("## Factory Next Targets", markdown)
+            self.assertIn("repo=quality-repo", markdown)
+            self.assertIn("reason=quality_gate_not_closed", markdown)
+            self.assertIn("action=run_quality_gate", markdown)
+            self.assertIn("order_gate=validated", markdown)
+
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -690,6 +778,7 @@ class TestProactiveHealthReport(unittest.TestCase):
             payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
             self.assertEqual(payload.get("status"), "OK")
             self.assertEqual(payload.get("recommended_actions"), [])
+            self.assertEqual(payload["factory"]["next_targets"], [])
             self.assertEqual(payload["metrics"]["outcome_quality_status"], "OK")
             self.assertFalse(any(item.get("type") == "low_outcome_quality" for item in payload.get("trend_flags") or []))
 

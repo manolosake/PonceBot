@@ -41,6 +41,18 @@ AUTONOMY_MINIMUM_SLO = {
 IMPLEMENTER_FAIL_RATE_TREND_MIN_ATTEMPTS = 5
 OUTCOME_QUALITY_TREND_MIN_STARTED = 3
 OUTCOME_QUALITY_CHURN_GAP_WARN = 3
+FACTORY_ORDER_QUALITY_ACTIONS = {
+    'ready_without_quality_gate': 'run_quality_gate',
+    'review_stalled_over_45m': 'finish_review_or_root_cause',
+    'idle_without_improvement': 'replan_or_close_churn',
+    'low_outcome_quality': 'replan_or_close_churn',
+    'quality_gate_not_closed': 'run_quality_gate',
+}
+FACTORY_ORDER_QUALITY_ANOMALY_RANK = {
+    'ready_without_quality_gate': 0,
+    'review_stalled_over_45m': 1,
+    'idle_without_improvement': 2,
+}
 
 
 def worst_status(*values: str) -> str:
@@ -748,11 +760,75 @@ def runtime_heartbeat_summary(repo_id: str, heartbeat_rows_by_repo: dict, *, now
     }
 
 
+def build_order_quality_summary(order_report: dict, anomalies_by_order_id: dict) -> dict:
+    if not order_report:
+        return {
+            'attention_reason': '',
+            'recommended_action': '',
+            'attention_source': '',
+        }
+
+    order_id = str((order_report or {}).get('order_id') or '').strip()
+    order_anomalies = list((anomalies_by_order_id or {}).get(order_id) or [])
+    order_anomalies.sort(key=lambda item: FACTORY_ORDER_QUALITY_ANOMALY_RANK.get(str((item or {}).get('type') or ''), 99))
+    for anomaly in order_anomalies:
+        reason = str((anomaly or {}).get('type') or '').strip()
+        action = FACTORY_ORDER_QUALITY_ACTIONS.get(reason)
+        if action:
+            return {
+                'attention_reason': reason,
+                'recommended_action': action,
+                'attention_source': 'order_anomaly',
+            }
+
+    funnel = (order_report or {}).get('autonomy_funnel') or {}
+    started = int(funnel.get('slices_started', 0) or 0)
+    applied = int(funnel.get('slices_applied', 0) or 0)
+    validated = int(funnel.get('slices_validated', 0) or 0)
+    closed = int(funnel.get('slices_closed', 0) or 0)
+    attempted = max(started, applied)
+    churn_gap = max(0, attempted - closed)
+    verified_outcome_rate = (float(closed) / float(started)) if started > 0 else 0.0
+    quality_gate_status = str(funnel.get('quality_gate_status') or (order_report or {}).get('quality_gate_status') or '').strip()
+    improvement_seen = bool((order_report or {}).get('meaningful_improvement_seen', False))
+
+    if (
+        not improvement_seen
+        and started >= OUTCOME_QUALITY_TREND_MIN_STARTED
+        and churn_gap >= OUTCOME_QUALITY_CHURN_GAP_WARN
+        and verified_outcome_rate < float(AUTONOMY_MINIMUM_SLO['closed_over_started_gte'])
+    ):
+        return {
+            'attention_reason': 'low_outcome_quality',
+            'recommended_action': FACTORY_ORDER_QUALITY_ACTIONS['low_outcome_quality'],
+            'attention_source': 'autonomy_funnel',
+        }
+
+    if (
+        not improvement_seen
+        and validated > closed
+        and quality_gate_status in {'validated', 'reviewed_ready'}
+    ):
+        return {
+            'attention_reason': 'quality_gate_not_closed',
+            'recommended_action': FACTORY_ORDER_QUALITY_ACTIONS['quality_gate_not_closed'],
+            'attention_source': 'autonomy_funnel',
+        }
+
+    return {
+        'attention_reason': '',
+        'recommended_action': '',
+        'attention_source': '',
+    }
+
+
 def build_factory_coverage_details(
     enabled_repos: list,
     proactive_orders: list,
     heartbeat_rows: list,
     order_activity_age_by_id: dict,
+    order_reports=None,
+    anomalies=None,
     *,
     now: float,
 ) -> list:
@@ -761,6 +837,17 @@ def build_factory_coverage_details(
         repo_id = str((hb or {}).get('repo_id') or '').strip()
         if repo_id and repo_id not in latest_heartbeat_by_repo:
             latest_heartbeat_by_repo[repo_id] = hb
+    order_report_by_id = {
+        str((report or {}).get('order_id') or '').strip(): report
+        for report in (order_reports or [])
+        if str((report or {}).get('order_id') or '').strip()
+    }
+    anomalies_by_order_id = {}
+    for anomaly in anomalies or []:
+        order_id = str((anomaly or {}).get('order_id') or '').strip()
+        reason = str((anomaly or {}).get('type') or '').strip()
+        if order_id and reason in FACTORY_ORDER_QUALITY_ACTIONS:
+            anomalies_by_order_id.setdefault(order_id, []).append(anomaly)
 
     rows = []
     for repo in enabled_repos:
@@ -790,6 +877,9 @@ def build_factory_coverage_details(
             updated_at = float_or_zero(selected_order.get('updated_at'))
             if updated_at > 0:
                 order_activity_age_s = max(0, int(now - updated_at))
+        order_report = order_report_by_id.get(order_id) or {}
+        order_funnel = (order_report or {}).get('autonomy_funnel') or {}
+        order_quality = build_order_quality_summary(order_report, anomalies_by_order_id)
         repo_path = str((repo or {}).get('path') or '')
         rows.append({
             'repo_id': repo_id,
@@ -802,6 +892,16 @@ def build_factory_coverage_details(
             'order_status': order_status,
             'order_phase': str((selected_order or {}).get('phase') or ''),
             'order_activity_age_s': order_activity_age_s,
+            'order_quality_gate_status': str(order_funnel.get('quality_gate_status') or (order_report or {}).get('quality_gate_status') or ''),
+            'order_slices_started': int(order_funnel.get('slices_started', 0) or 0),
+            'order_slices_applied': int(order_funnel.get('slices_applied', 0) or 0),
+            'order_slices_validated': int(order_funnel.get('slices_validated', 0) or 0),
+            'order_slices_closed': int(order_funnel.get('slices_closed', 0) or 0),
+            'order_churn_gap': max(0, max(int(order_funnel.get('slices_started', 0) or 0), int(order_funnel.get('slices_applied', 0) or 0)) - int(order_funnel.get('slices_closed', 0) or 0)),
+            'order_meaningful_improvement_seen': bool((order_report or {}).get('meaningful_improvement_seen', False)),
+            'order_quality_attention_reason': str(order_quality.get('attention_reason') or ''),
+            'order_quality_recommended_action': str(order_quality.get('recommended_action') or ''),
+            'order_quality_attention_source': str(order_quality.get('attention_source') or ''),
             'runtime_heartbeat': runtime_heartbeat_summary(repo_id, latest_heartbeat_by_repo, now=now),
         })
 
@@ -817,6 +917,7 @@ def build_factory_coverage_details(
 def build_factory_next_targets(coverage_details: list) -> list:
     target_rows = []
     group_rank = {'uncovered': 0, 'covered_paused': 1, 'covered_active': 2}
+    attention_rank = {'coverage': 0, 'order_quality': 0, 'heartbeat': 1}
     unhealthy_heartbeat_reasons = {'missing_runtime_state_row', 'missing', 'stale', 'stale_heartbeat'}
     for item in coverage_details:
         coverage_state = str((item or {}).get('coverage_state') or '').strip()
@@ -827,15 +928,21 @@ def build_factory_next_targets(coverage_details: list) -> list:
 
         attention_reason = ''
         recommended_action = ''
+        attention_type = 'coverage'
         if coverage_state == 'uncovered':
             attention_reason = 'uncovered'
             recommended_action = 'seed_proactive_order'
         elif coverage_state == 'covered_paused':
             attention_reason = 'covered_paused'
             recommended_action = 'resume_or_close_paused_order'
+        elif coverage_state == 'covered_active' and str((item or {}).get('order_quality_attention_reason') or '').strip():
+            attention_reason = str((item or {}).get('order_quality_attention_reason') or '').strip()
+            recommended_action = str((item or {}).get('order_quality_recommended_action') or '').strip()
+            attention_type = 'order_quality'
         elif coverage_state == 'covered_active' and normalized_heartbeat_reason in unhealthy_heartbeat_reasons:
             attention_reason = normalized_heartbeat_reason
             recommended_action = 'restart_or_inspect_agent'
+            attention_type = 'heartbeat'
         else:
             continue
 
@@ -850,21 +957,32 @@ def build_factory_next_targets(coverage_details: list) -> list:
             'order_status': (item or {}).get('order_status') or '',
             'order_phase': (item or {}).get('order_phase') or '',
             'order_activity_age_s': (item or {}).get('order_activity_age_s'),
+            'order_quality_gate_status': (item or {}).get('order_quality_gate_status') or '',
+            'order_slices_started': int((item or {}).get('order_slices_started', 0) or 0),
+            'order_slices_applied': int((item or {}).get('order_slices_applied', 0) or 0),
+            'order_slices_validated': int((item or {}).get('order_slices_validated', 0) or 0),
+            'order_slices_closed': int((item or {}).get('order_slices_closed', 0) or 0),
+            'order_churn_gap': int((item or {}).get('order_churn_gap', 0) or 0),
+            'order_meaningful_improvement_seen': bool((item or {}).get('order_meaningful_improvement_seen', False)),
+            'order_quality_attention_source': (item or {}).get('order_quality_attention_source') or '',
             'heartbeat_state': heartbeat_state,
             'heartbeat_age_s': heartbeat.get('heartbeat_age_s'),
             'agent_key': heartbeat.get('agent_key') or '',
             'role': heartbeat.get('role') or '',
             '_group_rank': group_rank.get(coverage_state, 99),
+            '_attention_rank': attention_rank.get(attention_type, 9),
         })
 
     target_rows.sort(key=lambda item: (
         int(item.get('_group_rank') or 99),
+        int(item.get('_attention_rank') or 9),
         sortable_priority(item.get('priority')),
         str(item.get('repo_id') or ''),
     ))
     for rank, item in enumerate(target_rows, start=1):
         item['rank'] = rank
         item.pop('_group_rank', None)
+        item.pop('_attention_rank', None)
     return target_rows
 
 
@@ -1086,6 +1204,8 @@ def main() -> int:
         proactive_orders,
         heartbeat_rows,
         order_activity_age_by_id,
+        order_reports,
+        anomalies,
         now=now,
     )
     coverage_count = len(coverage_details)
@@ -1393,6 +1513,9 @@ def main() -> int:
                 f"- rank={item.get('rank')} repo={item.get('repo_id')} reason={item.get('attention_reason')} "
                 f"action={item.get('recommended_action')} priority={priority_text} state={item.get('coverage_state')} "
                 f"order={order_text} phase={phase_text} order_activity_age_s={item.get('order_activity_age_s')} "
+                f"order_gate={item.get('order_quality_gate_status') or 'none'} "
+                f"order_slices={item.get('order_slices_started')}/{item.get('order_slices_applied')}/{item.get('order_slices_validated')}/{item.get('order_slices_closed')} "
+                f"order_churn_gap={item.get('order_churn_gap')} "
                 f"heartbeat={item.get('heartbeat_state') or 'none'} heartbeat_age_s={heartbeat_age_text} "
                 f"agent={item.get('agent_key') or 'none'} role={item.get('role') or 'none'}"
             )
@@ -1418,6 +1541,8 @@ def main() -> int:
                 f"- repo={item.get('repo_id')} state={item.get('coverage_state')} priority={priority_text} "
                 f"status={item.get('status')} order={order_text} order_status={item.get('order_status') or 'none'} "
                 f"phase={item.get('order_phase') or 'none'} order_activity_age_s={item.get('order_activity_age_s')} "
+                f"order_gate={item.get('order_quality_gate_status') or 'none'} "
+                f"order_quality_reason={item.get('order_quality_attention_reason') or 'none'} "
                 f"heartbeat={heartbeat.get('state')} heartbeat_age_s={heartbeat_age_text} "
                 f"agent={heartbeat.get('agent_key') or 'none'} role={heartbeat.get('role') or 'none'}"
             )
