@@ -1591,6 +1591,7 @@ def _has_structured_studio_decision_evidence(value: Any) -> bool:
         not selected_id
         or selected_id not in candidate_id_set
         or selected_id in killed_ids
+        or not _has_substantive_studio_decision_text(selected_bet.get("summary"))
         or not _studio_decision_has_keyed_text(selected_bet, _STUDIO_DECISION_REASON_KEYS)
     ):
         return False
@@ -1679,6 +1680,7 @@ def _structured_studio_decision_evidence_flags(value: Any) -> list[str]:
         or not selected_id
         or (candidate_id_set and selected_id not in candidate_id_set)
         or selected_id in killed_ids
+        or not _has_substantive_studio_decision_text(selected_bet.get("summary"))
         or not _studio_decision_has_keyed_text(selected_bet, _STUDIO_DECISION_REASON_KEYS)
     ):
         flags.append("studio_decision_evidence_selected_bet_missing_or_weak")
@@ -1984,23 +1986,24 @@ def _studio_decision_evidence_contract_from_trace(root_task: Task | None) -> dic
             "studio_decision_evidence.candidate_bets",
             "studio_decision_evidence.killed_bets",
             "studio_decision_evidence.selected_bet",
+            "studio_decision_evidence.selected_bet.summary",
             "studio_decision_evidence.critic_answers",
             "studio_decision_evidence.debate_summary",
         ],
         "candidate_bets": "Return structured studio_decision_evidence.candidate_bets for considered bets.",
         "killed_bets": "Return structured studio_decision_evidence.killed_bets with kill rationale.",
-        "selected_bet": "Return structured studio_decision_evidence.selected_bet for the chosen DEEP_IMPROVEMENT bet.",
+        "selected_bet": "Return structured studio_decision_evidence.selected_bet with id, summary, and rationale for the chosen DEEP_IMPROVEMENT bet.",
         "critic_answers": "Return structured studio_decision_evidence.critic_answers for objections and answers.",
         "debate_summary": "Return structured studio_decision_evidence.debate_summary summarizing the decision.",
         "definition": (
             "Final structured output must include studio_decision_evidence with candidate_bets, killed_bets, "
-            "selected_bet, critic_answers, and debate_summary; validate with "
+            "selected_bet including summary, critic_answers, and debate_summary; validate with "
             f"`{_STUDIO_DECISION_EVIDENCE_GUARD_COMMAND}`."
         ),
         "evidence_required": [
             "structured studio_decision_evidence.candidate_bets",
             "structured studio_decision_evidence.killed_bets",
-            "structured studio_decision_evidence.selected_bet",
+            "structured studio_decision_evidence.selected_bet with summary",
             "structured studio_decision_evidence.critic_answers",
             "structured studio_decision_evidence.debate_summary",
             (

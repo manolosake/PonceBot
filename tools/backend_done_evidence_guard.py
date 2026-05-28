@@ -478,6 +478,13 @@ def _studio_decision_evidence_error(
             "reason": "studio_decision_selected_bet_missing",
             "summary_path": str(summary_path),
         }
+    if not _substantive_studio_text(selected_bet.get("summary")):
+        return {
+            "ok": False,
+            "reason": "studio_decision_selected_bet_summary_missing",
+            "summary_path": str(summary_path),
+            "selected_bet_id": selected_id,
+        }
     if selected_id not in candidate_ids:
         return {
             "ok": False,

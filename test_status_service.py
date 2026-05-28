@@ -7,7 +7,7 @@ from unittest import mock
 
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.schemas.task import Task
-from orchestrator.status_service import StatusService
+from orchestrator.status_service import StatusService, _structured_studio_decision_evidence_flags
 from orchestrator.storage import SQLiteTaskStorage
 from tools.backend_done_evidence_guard import _studio_decision_evidence_error
 
@@ -41,6 +41,7 @@ class TestStatusService(unittest.TestCase):
             ],
             "selected_bet": {
                 "id": "bet-a",
+                "summary": "Tighten proactive selection evidence before delegating implementation slices.",
                 "reason": "Selected because it directly prevents weak narrative evidence from causing more implementation churn.",
             },
             "critic_answers": [
@@ -88,6 +89,7 @@ class TestStatusService(unittest.TestCase):
             ],
             "selected_bet": {
                 "id": "bet-a",
+                "summary": "Require structured Studio decision evidence before allowing proactive implementation to continue.",
                 "explanation": "Selected because it directly aligns the early selection gate with final guard-compatible evidence.",
             },
             "critic_answers": {
@@ -109,6 +111,14 @@ class TestStatusService(unittest.TestCase):
         evidence["candidate_bets"][0]["summary"] = {
             "text": "Nested candidate summary should not count because the final guard only accepts string values."
         }
+        return evidence
+
+    def _selected_bet_summary_studio_decision_evidence(self, summary: object = None) -> dict:
+        evidence = self._valid_studio_decision_evidence()
+        if summary is None:
+            evidence["selected_bet"].pop("summary")
+        else:
+            evidence["selected_bet"]["summary"] = summary
         return evidence
 
     def _valid_factory_delta(self) -> dict:
@@ -361,12 +371,14 @@ class TestStatusService(unittest.TestCase):
             studio_contract = packet.get("studio_decision_evidence_contract")
             self.assertIsInstance(studio_contract, dict)
             self.assertEqual(studio_contract.get("studio_cycle_id"), "cycle-123")
+            self.assertIn("summary", studio_contract.get("selected_bet") or "")
             self.assertEqual(
                 studio_contract.get("required_fields"),
                 [
                     "studio_decision_evidence.candidate_bets",
                     "studio_decision_evidence.killed_bets",
                     "studio_decision_evidence.selected_bet",
+                    "studio_decision_evidence.selected_bet.summary",
                     "studio_decision_evidence.critic_answers",
                     "studio_decision_evidence.debate_summary",
                 ],
@@ -375,7 +387,7 @@ class TestStatusService(unittest.TestCase):
             self.assertIn("--require-studio-decision-evidence", " ".join(packet.get("suggested_validation") or []))
             self.assertIn("structured studio_decision_evidence.candidate_bets", packet.get("evidence_required") or [])
             self.assertIn("structured studio_decision_evidence.killed_bets", packet.get("evidence_required") or [])
-            self.assertIn("structured studio_decision_evidence.selected_bet", packet.get("evidence_required") or [])
+            self.assertIn("structured studio_decision_evidence.selected_bet with summary", packet.get("evidence_required") or [])
             self.assertIn("structured studio_decision_evidence.critic_answers", packet.get("evidence_required") or [])
             self.assertIn("structured studio_decision_evidence.debate_summary", packet.get("evidence_required") or [])
             self.assertIn("Studio decision evidence contract:", packet.get("assignment_prompt") or "")
@@ -741,6 +753,24 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(selection_quality["flags"], ["selection_evidence_present"])
             self.assertEqual(selection_quality["evidence_sources"][0]["key"], "studio_decision_evidence")
             self.assertEqual(plan["top_execution_packet"]["lane"], "advance")
+
+    def test_studio_decision_flags_reject_selected_bet_without_substantive_summary(self) -> None:
+        cases = [
+            ("missing", self._selected_bet_summary_studio_decision_evidence()),
+            ("generic", self._selected_bet_summary_studio_decision_evidence("unknown")),
+        ]
+        for name, evidence in cases:
+            with self.subTest(name=name):
+                guard_error = _studio_decision_evidence_error(
+                    payload={"studio_decision_evidence": evidence},
+                    summary_path=Path("summary.json"),
+                )
+                self.assertIsNotNone(guard_error)
+                self.assertEqual(guard_error.get("reason"), "studio_decision_selected_bet_summary_missing")
+
+                flags = _structured_studio_decision_evidence_flags(evidence)
+
+                self.assertIn("studio_decision_evidence_selected_bet_missing_or_weak", flags)
 
     def test_proactive_action_plan_accepts_guard_compatible_dict_critic_studio_decision_evidence(self) -> None:
         guard_error = _studio_decision_evidence_error(

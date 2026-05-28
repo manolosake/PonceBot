@@ -89,6 +89,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             ],
             "selected_bet": {
                 "id": "tighten-final-guard",
+                "summary": "add validation gate that blocks weak backend completion evidence",
                 "reason": "highest leverage because it stops unsupported backend completions",
             },
             "critic_answers": [
@@ -243,13 +244,18 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
         cases = [
             (
                 "unknown",
-                {"id": "missing-bet", "reason": "stronger because it reduces churn fastest"},
+                {
+                    "id": "missing-bet",
+                    "summary": "select a stronger evidence gate that reduces churn fastest",
+                    "reason": "stronger because it reduces churn fastest",
+                },
                 "studio_decision_selected_bet_unknown",
             ),
             (
                 "killed",
                 {
                     "id": "expand-routing-signal",
+                    "summary": "select routing signal work to improve factory decision quality",
                     "reason": "stronger because it reduces churn fastest",
                 },
                 "studio_decision_selected_bet_killed",
@@ -326,6 +332,27 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                 "killed_reason",
                 {"killed_bets": [{"id": "expand-routing-signal", "reason": "done"}]},
                 "studio_decision_killed_bet_reason_missing",
+            ),
+            (
+                "selected_bet_summary_missing",
+                {
+                    "selected_bet": {
+                        "id": "tighten-final-guard",
+                        "reason": "highest leverage because it stops unsupported backend completions",
+                    }
+                },
+                "studio_decision_selected_bet_summary_missing",
+            ),
+            (
+                "selected_bet_summary_generic",
+                {
+                    "selected_bet": {
+                        "id": "tighten-final-guard",
+                        "summary": "done",
+                        "reason": "highest leverage because it stops unsupported backend completions",
+                    }
+                },
+                "studio_decision_selected_bet_summary_missing",
             ),
             (
                 "critic_answers",
