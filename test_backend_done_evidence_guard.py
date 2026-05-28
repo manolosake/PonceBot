@@ -32,6 +32,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             "outcome": "shipped_to_main",
             "delivery_contract": {
                 "branch": "main",
+                "commit": "0123456789abcdef0123456789abcdef01234567",
                 "diff_artifact": "changes.patch",
                 "validation_artifacts": ["tests.log"],
                 "ship_artifacts": ["release.txt"],
@@ -884,6 +885,46 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(payload["reason"], "branch_missing")
 
+    def test_validate_evidence_fails_when_shipped_outcome_missing_commit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_artifact(artifacts_dir, "proof.log")
+            self._write_evidence(
+                artifacts_dir,
+                {
+                    "summary": "verified improvement",
+                    "artifacts": ["proof.log"],
+                    "next_action": None,
+                    "outcome": "shipped_to_main",
+                    "delivery_contract": {
+                        "branch": "main",
+                        "diffstat": "1 file changed",
+                        "validation": "pytest PASS",
+                        "ship_evidence": "merged to main",
+                    },
+                },
+            )
+
+            ok, payload = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertFalse(ok)
+            self.assertEqual(payload["reason"], "commit_evidence_missing")
+
+    def test_validate_evidence_accepts_alternate_commit_evidence_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifacts_dir = Path(td)
+            self._write_shipped_artifacts(artifacts_dir)
+            payload = self._shipped_payload()
+            delivery_contract = payload["delivery_contract"]
+            delivery_contract.pop("commit")
+            delivery_contract["head_sha"] = "89abcde"
+            self._write_evidence(artifacts_dir, payload)
+
+            ok, result = validate_evidence(artifacts_dir=artifacts_dir)
+
+            self.assertTrue(ok)
+            self.assertTrue(result["ok"])
+
     def test_validate_evidence_fails_when_shipped_outcome_missing_diff_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             artifacts_dir = Path(td)
@@ -897,6 +938,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "validation": "pytest PASS",
                         "ship_evidence": "merged to main",
                     },
@@ -921,6 +963,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "diffstat": "1 file changed",
                         "ship_evidence": "merged to main",
                     },
@@ -945,6 +988,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "diffstat": "1 file changed",
                         "validation": "pytest PASS",
                     },
@@ -969,6 +1013,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "diff_artifact": "missing.patch",
                         "validation": "pytest PASS",
                         "ship_evidence": "merged to main",
@@ -997,6 +1042,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "diff_artifact": "missing.patch",
                         "validation": "pytest PASS",
                         "ship_evidence": "merged to main",
@@ -1021,6 +1067,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                 "validation_artifacts",
                 {
                     "branch": "main",
+                    "commit": "0123456789abcdef0123456789abcdef01234567",
                     "diffstat": "1 file changed",
                     "validation_artifacts": ["missing-tests.log"],
                     "ship_evidence": "merged to main",
@@ -1030,6 +1077,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                 "ship_artifacts",
                 {
                     "branch": "main",
+                    "commit": "0123456789abcdef0123456789abcdef01234567",
                     "diffstat": "1 file changed",
                     "validation": "pytest PASS",
                     "ship_artifacts": ["missing-release.json"],
@@ -1069,6 +1117,7 @@ class TestBackendDoneEvidenceGuard(unittest.TestCase):
                     "outcome": "shipped_to_main",
                     "delivery_contract": {
                         "branch": "main",
+                        "commit": "0123456789abcdef0123456789abcdef01234567",
                         "diff_artifact": "../escape.patch",
                         "validation": "pytest PASS",
                         "ship_evidence": "merged to main",

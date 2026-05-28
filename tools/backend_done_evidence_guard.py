@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 DELIVERED_OUTCOMES = {"shipped_to_main", "published_project"}
+COMMIT_EVIDENCE_KEYS = ("commit", "head", "head_sha", "commit_sha", "revision")
+GIT_SHA_LIKE_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,40}(?![0-9a-fA-F])")
 ROOT_CAUSED_TERMINAL_OUTCOMES = {
     "blocked_need_operator",
     "rejected_low_value",
@@ -200,6 +202,14 @@ def _has_diff_evidence(delivery_contract: dict[str, Any]) -> bool:
         or _has_text(delivery_contract.get("diffstat"))
         or _has_non_empty_text_list(delivery_contract.get("changed_files"))
     )
+
+
+def _has_commit_evidence(delivery_contract: dict[str, Any]) -> bool:
+    for key in COMMIT_EVIDENCE_KEYS:
+        value = delivery_contract.get(key)
+        if isinstance(value, str) and GIT_SHA_LIKE_RE.search(value.strip()):
+            return True
+    return False
 
 
 def _has_validation_evidence(delivery_contract: dict[str, Any]) -> bool:
@@ -766,6 +776,13 @@ def validate_evidence(
             return False, {
                 "ok": False,
                 "reason": "branch_missing",
+                "summary_path": str(summary_path),
+                "outcome": outcome,
+            }
+        if not _has_commit_evidence(delivery_contract):
+            return False, {
+                "ok": False,
+                "reason": "commit_evidence_missing",
                 "summary_path": str(summary_path),
                 "outcome": outcome,
             }
