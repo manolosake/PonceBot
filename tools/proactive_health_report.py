@@ -917,7 +917,7 @@ def build_factory_coverage_details(
 def build_factory_next_targets(coverage_details: list) -> list:
     target_rows = []
     group_rank = {'uncovered': 0, 'covered_paused': 1, 'covered_active': 2}
-    attention_rank = {'coverage': 0, 'order_quality': 0, 'heartbeat': 1}
+    attention_rank = {'order_quality': 0, 'coverage': 1, 'heartbeat': 2}
     unhealthy_heartbeat_reasons = {'missing_runtime_state_row', 'missing', 'stale', 'stale_heartbeat'}
     for item in coverage_details:
         coverage_state = str((item or {}).get('coverage_state') or '').strip()
@@ -974,8 +974,8 @@ def build_factory_next_targets(coverage_details: list) -> list:
         })
 
     target_rows.sort(key=lambda item: (
-        int(item.get('_group_rank') or 99),
-        int(item.get('_attention_rank') or 9),
+        int(item.get('_attention_rank', 9)),
+        int(item.get('_group_rank', 99)),
         sortable_priority(item.get('priority')),
         str(item.get('repo_id') or ''),
     ))

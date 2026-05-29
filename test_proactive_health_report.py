@@ -601,6 +601,78 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertIn("action=run_quality_gate", markdown)
             self.assertIn("order_gate=validated", markdown)
 
+    def test_factory_next_targets_prioritize_active_order_quality_before_uncovered(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            self._create_factory_report_db(
+                db,
+                repos=[
+                    ("uncovered-repo", "active", 1),
+                    ("quality-repo", "active", 1),
+                ],
+                heartbeats=[
+                    ("uncovered-repo", now - 60),
+                    ("quality-repo", now - 60),
+                ],
+            )
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    INSERT INTO ceo_orders(order_id, status, phase, title, body, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "order-quality-open",
+                        "active",
+                        "planning",
+                        "Proactive Sprint: quality-repo",
+                        "[repo:quality-repo]",
+                        now,
+                    ),
+                )
+                con.execute(
+                    """
+                    INSERT INTO jobs(job_id, parent_job_id, state, role, labels, trace, updated_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "impl-quality-1",
+                        "order-quality-open",
+                        "done",
+                        "implementer_local",
+                        "{}",
+                        json.dumps(
+                            {
+                                "slice_id": "slice_quality",
+                                "slice_patch_applied": True,
+                                "slice_validation_ok": True,
+                                "result_summary": "Applied and locally validated the slice; awaiting controller quality closure.",
+                            }
+                        ),
+                        now,
+                        now - 5,
+                    ),
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["factory_uncovered_enabled_repos"], 1)
+
+            targets = payload["factory"]["next_targets"]
+            self.assertEqual([item["repo_id"] for item in targets], ["quality-repo", "uncovered-repo"])
+            self.assertEqual([item["rank"] for item in targets], [1, 2])
+            self.assertEqual(targets[0]["coverage_state"], "covered_active")
+            self.assertEqual(targets[0]["attention_reason"], "quality_gate_not_closed")
+            self.assertEqual(targets[0]["recommended_action"], "run_quality_gate")
+            self.assertEqual(targets[1]["coverage_state"], "uncovered")
+            self.assertEqual(targets[1]["attention_reason"], "uncovered")
+            self.assertEqual(targets[1]["recommended_action"], "seed_proactive_order")
+
     def test_paused_idle_backlog_is_separate_from_active_idle_report_noise(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
