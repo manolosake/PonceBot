@@ -1,200 +1,310 @@
-# PonceBot (codexbot) - Jarvis CTO 24/7
+# PonceBot Autonomous Studio
 
-PonceBot turns a Linux server into a Telegram-first engineering org:
+PonceBot turns r530 into a Telegram-first, Codex-powered software factory.
 
-- You message the bot.
-- **Jarvis** (Chief of Staff / CTO) decides if it's a **query** (answer directly) or **work** (delegate in parallel).
-- You get a **single editable ticket card** (no spam) plus a final executive wrap-up with artifacts (patches, logs, PNGs).
+It has two isolated operating lanes:
 
-This repository prioritizes:
-- CEO-grade UX in Telegram
-- 24/7 operation (systemd)
-- Multi-agent orchestration (roles + worktrees + sessions)
-- Safety-by-default (secrets out of git; approvals for dangerous modes)
+- **CEO on-demand lane:** Alejandro messages PonceBot through Telegram. Jarvis answers directly for simple questions or delegates bounded work to delivery roles.
+- **Autonomous Studio lane:** Skynet periodically evaluates the workspace, chooses high-value software bets, delegates implementation, validates, ships, and learns.
 
-## Org Chart (Jarvis v1)
+The system is intentionally conservative with Codex usage. It should prefer fewer valuable outcomes over many low-signal jobs.
 
-```mermaid
-flowchart TB
-  CEO["CEO (Alejandro Ponce)"] --> J["Jarvis (Chief of Staff / CTO)"]
-  J --> FE["Frontend (UI + visual evidence)"]
-  J --> BE["Backend (services + data + tests)"]
-  J --> QA["QA (quality gates + regression)"]
-  J --> SRE["SRE (24/7 reliability + ops)"]
-  J --> PO["Product Ops (scope + acceptance criteria)"]
-  J --> SEC["Security (hardening + risk)"]
-  J --> RES["Research (SOTA + gap tracking)"]
-  J --> RM["Release Manager (branch -> QA -> merge)"]
-  FE --> J
-  BE --> J
-  QA --> J
-  SRE --> J
-  PO --> J
-  SEC --> J
-  RES --> J
-  RM --> J
-  J --> CEO
-```
+## Current Production Shape
 
-## Ground Truth vs Assumptions
+The r530 deployment runs from:
 
-Ground truth (implemented in this repo):
-- Telegram bot entrypoint in `bot.py`.
-- Orchestrator with persistent SQLite queue in `./data/jobs.sqlite`.
-- Multi-agent roster and prompts in `orchestrator/agents.yaml` (supports `{CEO_NAME}` placeholder).
-- Runbooks (scheduled autonomous checks) in `orchestrator/runbooks.yaml`.
-- Per-role worktrees (isolated workspaces) under `BOT_WORKTREE_ROOT` (default: `./data/worktrees`).
-- Per-role Codex sessions (`codex exec resume`) when `BOT_ORCH_SESSIONS_ENABLED=1`.
-- "No spam" policy: single editable **ticket card** per top-level request, plus `/watch` single live status message.
-- Voice-in transcription supports `whisper.cpp` (local) and OpenAI (paid) backends.
-- Screenshot pipeline can send PNG artifacts (Playwright optional; can be disabled).
+- repo: `/home/aponce/codexbot`
+- branch: `main`
+- runtime worktree: `/home/aponce/codexbot/data/runtime_worktrees/current`
+- queue DB: `/home/aponce/codexbot/data/jobs.sqlite`
+- service: `codexbot.service` as a **user** systemd service
+- isolated CEO worker: `poncebot-ceo.service`
+- deploy monitor: `codexbot-main-deploy-monitor.service`
 
-Assumptions (deployment-specific; validate on your server):
-- Outbound Internet access (Telegram polling to `api.telegram.org:443`, plus optional GitHub/Playwright).
-- `codex` CLI is installed and configured (`codex --version` works).
-- If voice-in is enabled: `ffmpeg` + `whisper-cli` + a GGML model are installed.
-- If screenshots are enabled: Playwright + Chromium are installed and runnable on the host.
+Source-of-truth files:
 
-## What You Notice in Telegram (CEO UX)
+- `bot.py`: Telegram bot, scheduler, orchestration, Studio memory, gates, and outcome logic.
+- `orchestrator/agents.yaml`: agent roster, models, effort, prompts, and role limits.
+- `orchestrator/runbooks.yaml`: scheduled runbooks and diagnostics.
+- `codexbot.env.example`: documented environment knobs.
+- `systemd/`: user/system service definitions.
+- `tools/`: deploy, diagnostics, reports, security, and production helpers.
 
-1. **Jarvis is the front door**
-- Any plain message routes to Jarvis.
-- Only explicit markers route to others: `@frontend`, `@backend`, `@qa`, `@sre`, etc.
+Production-specific secrets and overrides live outside git or in the private runtime env file. Do not commit real tokens, passwords, IDs, or private env files.
 
-2. **No spam**
-- One ticket card message is created per top-level request.
-- The bot edits that message as the ticket progresses.
-- Use `/watch` for a single live "company status" message (auto-updated).
+## Operating Model
 
-3. **Deterministic CEO queries (no Codex, no delegation)**
-- "Who am I?"
-- "How many employees/agents do we have?"
-- "What models do agents use?"
-- "What is SRE?"
+### CEO On-Demand Lane
 
-## Quick Start
+Jarvis is the front door for Telegram.
 
-1. Create a Telegram bot with `@BotFather`.
-2. Create config:
+- Pure questions should be answered directly and briefly.
+- Real work should become a traceable ticket/order.
+- Jarvis delegates to delivery roles only when useful.
+- The CEO gets a concise status card and an executive wrap-up, not a stream of noisy logs.
+- Manual CEO work is isolated from the autonomous factory lane through the CEO command plane.
 
-```bash
-cp codexbot.env.example codexbot.env
-```
+Useful Telegram commands:
 
-3. Store secrets outside the repo (recommended):
+- `/help`: command list
+- `/whoami`: show Telegram ids
+- `/agents`: agent queue and live status
+- `/ticket <id>`: ticket tree
+- `/job <id>`: job details
+- `/orders`: active orders
+- `/order show|pause|done <id>`: manage an order
+- `/watch` / `/unwatch`: single live status message
+- `/pause <role>` / `/resume <role>`: role control
+- `/emergency_stop` / `/emergency_resume`: global stop/resume
 
-```bash
-mkdir -p ~/.config/codexbot
-cat > ~/.config/codexbot/secrets.env <<'EOF'
-TELEGRAM_BOT_TOKEN=123456789:REPLACE_ME
-EOF
-chmod 600 ~/.config/codexbot/secrets.env
-```
+### Autonomous Studio Lane
 
-4. Set allow-lists (required). Message the bot once to see your ids, then set:
-- `TELEGRAM_ALLOWED_USER_IDS=...` and/or `TELEGRAM_ALLOWED_CHAT_IDS=...`
+Skynet owns proactive work. It should behave like a technical/product director, not like a cron job that creates work for its own sake.
 
-5. Run:
+Each Studio cycle follows this mental model:
 
-```bash
-ENV_LOCAL_FILE="$HOME/.config/codexbot/secrets.env" ./run.sh
-```
+1. **Sense:** inspect repos, GitHub state, jobs, deploys, logs, branches, runbooks, portfolio assets, and memory.
+2. **Understand:** infer what hurts, what has failed before, what is stale, and what has real opportunity.
+3. **Imagine:** generate possible bets: bug fix, product feature, PonceBot improvement, ExecutiveDashboard improvement, or new monetizable project.
+4. **Debate:** reject weak, repetitive, no-delta, cosmetic, non-shippable, or non-monetizable work before spending more credits.
+5. **Choose:** pick one bounded bet or do no work if all options are weak.
+6. **Build:** delegate implementation to the right delivery role. Skynet must not edit repository files directly.
+7. **Judge:** require QA/reviewer/release evidence: tests, diffs, logs, screenshots, deploy checks, or clear residual risks.
+8. **Ship:** merge/push/deploy to `main`, or publish a new private GitHub repo when the work is a new project.
+9. **Learn:** record the outcome and use it to improve future selection.
 
-For 24/7 operation with systemd, see `systemd/INSTALL.md`.
+Completion is outcome-based. A job being `done` is not enough.
 
-## CEO Commands (Cheat Sheet)
+Allowed final outcomes:
 
-- `/help` (full command list)
-- `/whoami` (show ids)
-- `/agents` (role backlog + running)
-- `/ticket <id>` (ticket tree: parent -> children)
-- `/job <id>` (job details + artifacts)
-- `/watch` / `/unwatch` (single live status message)
-- `/orders` (autopilot scope: active CEO orders)
-- `/order show|pause|done <id>` (manage orders)
-- `/snapshot <url|goal>` (frontend visual work)
-- `/approve <id>` (unblock blocked jobs)
-- `/pause <role>` / `/resume <role>` (role controls)
-- `/emergency_stop` / `/emergency_resume` (global stop/resume)
+- `shipped_to_main`: merged, pushed, and deployed when the repo has a deploy path.
+- `published_project`: new private GitHub repo exists with README/demo/validation evidence.
+- `blocked_need_operator`: one specific human decision is required.
+- `rejected_low_value`: the idea was killed before wasting more execution.
+- `failed_root_caused`: the work failed and the cause is recorded.
 
-## Autopilot (24/7 Within CEO Orders)
+## Cost Discipline
 
-Goal: keep employees busy only on active CEO orders.
+Codex credits are spent only when the system invokes Codex-backed agents.
 
-Grounded behavior:
-- Top-level Jarvis tickets are persisted as **orders** in SQLite (`ceo_orders`).
-- Autopilot ticks every 15 minutes and can enqueue Jarvis follow-up work when an order is idle.
-- Use `/orders` to see what autopilot considers in-scope.
+Typical cost profile by cycle stage:
 
-## Agent Roster (Source of Truth)
+- Low or no Codex: `Sense`, local DB reads, git status, logs, health checks, deploy checks, local gates, and simple persistence.
+- Medium Codex: `Understand`, `Imagine`, `Debate`, and `Choose` when Skynet or Critic reason over candidate bets.
+- Highest Codex: `Build` and `Judge`, because delivery and QA agents inspect code, write changes, and review results.
+- Usually low Codex: `Ship` and `Learn`, unless a merge conflict, release note, or root-cause summary needs agentic reasoning.
 
-Edit `orchestrator/agents.yaml`:
-- role profiles (model, effort, default mode, parallelism)
-- prompts and reporting rules
+The budget-first production profile is intentionally slow:
 
-If your Codex CLI does not support `gpt-5.2`, change the `model:` fields accordingly.
+- one orchestrator worker
+- one proactive order at a time
+- one active autonomous subtask at a time
+- one proactive iteration round
+- proactive lane interval measured in hours, not minutes
 
-## CEO Name (Prompts)
+This is expected behavior. If no high-value work is available, PonceBot should stay idle or reject the bet instead of burning credits.
 
-Set `BOT_CEO_NAME` (default: `"Alejandro Ponce"`).
+## Agent Roster
 
-In YAML prompts, use `{CEO_NAME}` and the bot will render it at runtime.
+The authoritative roster is `orchestrator/agents.yaml`.
 
-## Execution Model
+The current budget-controlled profile uses `gpt-5.4` with `medium` effort for the configured roles, including Jarvis and Skynet. Raise model or effort only when the value of the work justifies higher credit usage.
 
-- Manual CEO requests stay on the Codex CLI lane by default (`jarvis` -> frontend/backend/qa/sre/etc).
-- `skynet` owns the autonomous/proactive lane and uses `architect_local`, `implementer_local`, and `reviewer_local` there by default.
-- `BOT_CEO_INJECT_LOCAL_SPECIALISTS=1` is an experimental opt-in override for manual CEO work; keep it off unless you explicitly want mixed manual + local lanes.
+Current role model:
 
-## Safety Notes
+- `jarvis`: CEO front door and command routing.
+- `skynet`: Autonomous Studio controller, planning, review, and final judgement.
+- `critic`: adversarial product/engineering review before execution.
+- `product_ops`: acceptance criteria, scope, and product framing.
+- `research`: repo/opportunity investigation.
+- `backend`: services, data, APIs, tests, and most code changes.
+- `frontend`: UI changes with visual evidence.
+- `qa`: regression and acceptance validation.
+- `sre`: systemd, runtime, deploy, logs, health, and production reliability.
+- `security`: hardening and risk review.
+- `release_mgr`: merge, push, release, cleanup, and deploy readiness.
+- local specialist roles: advisory/recovery roles when explicitly routed.
 
-- Keep secrets out of git and out of `CODEX_WORKDIR` whenever possible.
-- Default execution should stay sandboxed (`CODEX_DEFAULT_MODE=ro` or `rw`).
-- `CODEX_DANGEROUS_BYPASS_SANDBOX=1` is breakglass-only and requires:
-  - `BOT_BREAKGLASS_REASON` at startup
-  - short `BOT_BREAKGLASS_TTL_SECONDS`
-  - admin-controlled activation/deactivation from Telegram (`/breakglass ...`)
-  - operator awareness that `access_mode=full` can remain selected while dangerous bypass is already OFF after breakglass expiry
-- Status HTTP API requires token auth (`Authorization: Bearer ...`) and strict CORS allowlist.
-- `GET /api/v1/orchestration/runbooks` returns authenticated, rate-limited scheduled runbook status, including due and overdue automation.
-- `GET /api/v1/orchestration/orders/evidence?order_id=<id>` returns an authenticated, rate-limited order evidence packet with workflow stage, child jobs, traces, decisions, delegations, and artifact references.
+Skynet should not use every profile by default. It should delegate only the roles needed for the selected slice.
 
-## Deliverability Checklist (Safe Defaults)
+## Branch, Merge, and Deploy Rules
 
-1. `TELEGRAM_ALLOWED_*` is configured (no open bot).
-2. `BOT_ADMIN_USER_IDS` and/or `BOT_ADMIN_CHAT_IDS` is configured.
-3. `BOT_STATUS_HTTP_ENABLED=1` implies:
-   - `BOT_STATUS_HTTP_TOKEN` is set
-   - `BOT_STATUS_HTTP_ALLOWED_ORIGINS` is explicit (no `*`)
-4. `CODEX_DANGEROUS_BYPASS_SANDBOX=0` for normal operation.
-5. Run verification before deploy:
+Normal operating rule:
+
+- `main` is the base branch and production truth for PonceBot.
+- Proactive branches should be short-lived and merge back to `main` only after validation.
+- Do not count branch-only work as success.
+- Runtime `current` should be deployed from `main`.
+- The deploy monitor keeps the runtime aligned with `origin/main`.
+
+Release evidence should include:
+
+- commit hash
+- branch merged to `main`
+- push confirmation
+- deploy/current runtime hash
+- relevant test or health output
+- cleanup notes for stale worktrees/branches when applicable
+
+## Memory and Portfolio
+
+Autonomous Studio uses persistent state beyond terminal logs:
+
+- `jobs`: work queue and role-level execution.
+- `ceo_orders`: operator and proactive orders.
+- `studio_cycles`: candidate bets, selected thesis, debate summary, and prompt packets.
+- `studio_memory`: durable facts and lessons.
+- `studio_portfolio_projects`: new or incubated products.
+- `repo_registry` / `projects_registry`: known repos and projects.
+- `audit_log`, `job_events`, and related tables: traceability and recovery evidence.
+
+The system should remember:
+
+- what repos exist and why they matter
+- what features already exist
+- repeated failures or no-delta patterns
+- what projects were created
+- what was rejected and why
+- what reached `main`
+- what deployed
+- what Alejandro prefers: visible, useful, creative, shippable, and low-noise work
+
+## New Projects
+
+New projects are valid only when they can become useful or monetizable.
+
+A new project should have:
+
+- folder under `/home/aponce/<project-name>`
+- clean git repo
+- private GitHub remote under the operator account
+- README with buyer/user, problem, offer, validation, and next milestone
+- runnable or demoable artifact when practical
+- registration in the dashboard/project registry
+- outcome `published_project`, not just local files
+
+The factory should not create many shallow MVPs if compounding an existing product is more valuable.
+
+## Self-Healing and Failure Handling
+
+PonceBot should repair or close operationally terminal states without waiting forever.
+
+Important recovery behavior:
+
+- stale or terminal blocked children should not keep a root proactive order alive forever
+- write-policy violations should be root-caused and closed or recovered through delegated implementation
+- no-delta work should become `rejected_low_value`, not success
+- weak incubator work can be preempted by the economic discipline gate
+- idle diagnostics should verify there are no hidden workers before declaring the factory idle
+
+This does not mean every failure auto-fixes itself. Destructive work, public launch decisions, external spending, credential changes, and data-loss risks still require the operator.
+
+## Dashboard Expectations
+
+ExecutiveDashboard should show operator signal, not raw noise.
+
+Agents view should make clear:
+
+- whether PonceBot is active or paused
+- current proactive thesis and objective
+- repo, branch, worktree, phase, and agents involved
+- why the work matters
+- evidence still missing
+- last shipped/published/rejected item
+- agent diagnostics with terminals still available for inspection
+
+Projects view should make clear:
+
+- GitHub remote
+- branch count
+- open PR/issues when available
+- latest `main` commits
+- last push/deploy status
+- next milestone
+- stale/blocked/active state
+
+The dashboard is not the source of truth. It should render the DB, git, runtime, and telemetry truth clearly.
+
+## Safety
+
+Default posture:
+
+- allow only configured Telegram users/chats
+- keep secrets out of git
+- prefer read-only or bounded write modes
+- use breakglass only with explicit reason and short TTL
+- require concrete evidence before claiming success
+- ask for approval before public publishing, destructive operations, external spending, billing, credentials, or data-loss risks
+
+Breakglass notes:
+
+- `CODEX_DANGEROUS_BYPASS_SANDBOX=1` is not normal mode.
+- `BOT_BREAKGLASS_REASON` and `BOT_BREAKGLASS_TTL_SECONDS` should be explicit.
+- Admin allowlists should be configured before relying on Telegram breakglass controls.
+
+## Verification
+
+Before shipping code changes:
 
 ```bash
 make verify
 ```
 
-## Verification Targets
+Common targeted checks:
 
-`make verify` runs:
-- syntax/lint-style checks (`py_compile`)
-- security guardrail checks (`tools/security_check.py --strict`)
-- unit tests (`python -m unittest -q`)
-- coverage gate for the transactional state layer baseline (`tools/coverage_gate.py --min 0.70`)
+```bash
+python3 -m py_compile bot.py test_bot.py
+python3 -m unittest test_bot.TestStudioOutcomeMemory
+python3 -m unittest test_bot.TestSkynetLocalOnlyProactivePolicy
+python3 -m unittest -q
+```
 
-`make pytest` runs deterministic pytest replay through `./scripts/bootstrap_pytest_python3.sh`.
+If `./scripts/jest_sharded_agg.sh` exists in the relevant workspace, run it for frontend/dashboard changes. If it does not exist, report that explicitly instead of pretending it ran.
 
-## Deployment Notes
+## Operations
 
-- Keep 24/7 operation under systemd (`systemd/INSTALL.md`).
-- Prefer user-level service with `Restart=always` and journal retention policies.
-- For emergency full-access incidents, use short-lived breakglass windows and review `security_audit` events in `state.json`.
+Service checks on r530:
 
+```bash
+systemctl --user status codexbot.service --no-pager -l
+systemctl --user status poncebot-ceo.service --no-pager -l
+systemctl --user status codexbot-main-deploy-monitor.service --no-pager -l
+journalctl --user -u codexbot.service -n 120 --no-pager
+```
 
+Queue checks:
 
-## Notification Scope (CEO UX)
+```bash
+cd /home/aponce/codexbot
+.venv/bin/python - <<'PY'
+import sqlite3
+con = sqlite3.connect("data/jobs.sqlite")
+con.row_factory = sqlite3.Row
+for row in con.execute("select state, role, count(*) c from jobs group by state, role order by c desc"):
+    print(dict(row))
+con.close()
+PY
+```
 
-- Use `/notify policy critical|state_change|digest_only` to control what reaches the CEO chat.
-- `critical`: failures/blocks/timeouts only.
-- `state_change` (default): critical + key workflow transitions and wrapups.
-- `digest_only`: periodic noise is suppressed; only digest/wrapup + critical signals.
-- Repeated identical updates are deduped by fingerprint using `BOT_NOTIFY_DEDUPE_COOLDOWN_SECONDS`.
+Deploy alignment check:
+
+```bash
+cd /home/aponce/codexbot
+git rev-parse --short HEAD
+git rev-parse --short origin/main
+git -C data/runtime_worktrees/current rev-parse --short HEAD
+```
+
+## What Good Looks Like
+
+In a healthy 48 to 72 hour window:
+
+- PonceBot stays active under systemd.
+- Proactive cycles either ship, publish, reject low-value work, or fail with a clear root cause.
+- There are no zombie orders.
+- Valuable work reaches `main`, deploy, or a private GitHub repo.
+- Local-only projects do not count as success.
+- The dashboard explains what Skynet is doing and why.
+- Credit usage remains bounded by low WIP, slow cadence, and aggressive rejection of weak work.
+
+PonceBot is successful only when it produces durable value: better products, better factory capability, fewer failures, deployable code, published private assets, and clearer decisions.
