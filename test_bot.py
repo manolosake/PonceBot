@@ -1672,6 +1672,86 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("incubator_quality_gate", debate_summary)
         self.assertIn("weaker than selected score 120", debate_summary)
 
+    def test_studio_governor_activates_economic_discipline_on_high_churn(self) -> None:
+        now = 500_000.0
+        negatives = [
+            {
+                "key": f"repo-churn-{idx}",
+                "repo_id": f"churn-{idx}",
+                "type": "FEATURE",
+                "lane": "dashboard",
+                "status": "rejected_low_value",
+                "summary": "Weak bet rejected as low value churn.",
+                "updated_at": now - (idx * 600.0),
+            }
+            for idx in range(7)
+        ]
+        positives = [
+            {
+                "key": f"repo-ship-{idx}",
+                "repo_id": f"ship-{idx}",
+                "type": "FEATURE",
+                "lane": "dashboard",
+                "status": "shipped_to_main",
+                "summary": "Shipped a visible feature to main.",
+                "updated_at": now - (idx * 900.0),
+            }
+            for idx in range(2)
+        ]
+
+        governor = bot._studio_governor_assessment(
+            {
+                "recent_studio_negative_outcomes": negatives,
+                "recent_studio_positive_outcomes": positives,
+            },
+            now=now,
+        )
+
+        self.assertEqual(governor["mode"], "economic_discipline_gate")
+        self.assertTrue(governor["economic_gate_active"])
+        self.assertEqual(governor["economic_recent_negative_count_72h"], 7)
+        self.assertEqual(governor["economic_recent_positive_count_72h"], 2)
+        self.assertGreater(governor["economic_recent_negative_ratio_72h"], 0.60)
+        self.assertIn("Spend Codex only", governor["force_next_action"])
+
+    def test_economic_discipline_filter_removes_weak_candidates_before_codex(self) -> None:
+        governor = {
+            "mode": "economic_discipline_gate",
+            "economic_gate_active": True,
+        }
+        strong = {
+            "key": "repo-codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "repo_name": "codexbot",
+            "score": 96,
+            "factory_value": {"score": 100, "shipability_score": 100},
+        }
+        low_score = {
+            "key": "repo-shallow",
+            "type": "PRODUCT_WORKFLOW",
+            "repo_name": "Shallow",
+            "score": 74,
+            "factory_value": {"score": 100, "shipability_score": 100},
+        }
+        incomplete_value = {
+            "key": "repo-no-ship",
+            "type": "FEATURE",
+            "repo_name": "No Ship",
+            "score": 90,
+            "factory_value": {"score": 75, "shipability_score": 50},
+        }
+
+        filtered = bot._studio_apply_economic_discipline_filter(
+            governor,
+            [strong, low_score, incomplete_value],
+        )
+
+        self.assertEqual(filtered, [strong])
+        self.assertIn("economic_discipline_gate rejected candidate", low_score["economic_gate_rejection_reason"])
+        self.assertIn("score 74<", low_score["economic_gate_rejection_reason"])
+        self.assertIn("factory_value 75<", incomplete_value["economic_gate_rejection_reason"])
+        self.assertIn("shipability 50<", incomplete_value["economic_gate_rejection_reason"])
+
     def test_published_project_outcome_records_portfolio_asset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"

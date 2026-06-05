@@ -16875,6 +16875,7 @@ _STUDIO_R530_RESOURCE_POLICY = (
     "use them when they improve product quality, validation depth, or shipping speed, while keeping core services "
     "responsive and avoiding waste, runaway jobs, destructive actions, public exposure, or external spend."
 )
+_STUDIO_ECONOMIC_GATE_VERSION = 1
 
 
 def _studio_int_env(name: str, default: int, *, min_value: int, max_value: int) -> int:
@@ -16895,6 +16896,26 @@ def _studio_unpublished_portfolio_focus_cap() -> int:
 
 def _studio_recent_new_project_focus_cap_24h() -> int:
     return _studio_int_env("BOT_STUDIO_NEW_PROJECT_FOCUS_CAP_24H", 3, min_value=0, max_value=50)
+
+
+def _studio_economic_gate_min_outcomes_72h() -> int:
+    return _studio_int_env("BOT_STUDIO_ECONOMIC_GATE_MIN_OUTCOMES_72H", 8, min_value=3, max_value=200)
+
+
+def _studio_economic_gate_negative_ratio_pct() -> int:
+    return _studio_int_env("BOT_STUDIO_ECONOMIC_GATE_NEGATIVE_RATIO_PCT", 60, min_value=10, max_value=100)
+
+
+def _studio_economic_gate_min_factory_value_score() -> int:
+    return _studio_int_env("BOT_STUDIO_ECONOMIC_GATE_MIN_FACTORY_VALUE_SCORE", 100, min_value=0, max_value=100)
+
+
+def _studio_economic_gate_min_shipability_score() -> int:
+    return _studio_int_env("BOT_STUDIO_ECONOMIC_GATE_MIN_SHIPABILITY_SCORE", 100, min_value=0, max_value=100)
+
+
+def _studio_economic_gate_min_selection_score() -> int:
+    return _studio_int_env("BOT_STUDIO_ECONOMIC_GATE_MIN_SELECTION_SCORE", 82, min_value=0, max_value=300)
 
 
 def _studio_enabled() -> bool:
@@ -17755,6 +17776,36 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         if new_project_failure_ratio_24h is not None
         else f"quality debt {new_project_quality_debt_24h}; no new-project cycles in 24h"
     )
+    recent_outcome_count_72h = len(recent_negative) + len(recent_positive)
+    recent_negative_ratio_72h = (
+        (len(recent_negative) / recent_outcome_count_72h)
+        if recent_outcome_count_72h
+        else None
+    )
+    recent_rejected_low_value_72h = sum(
+        1
+        for entry in recent_negative
+        if str(entry.get("status") or "").strip().lower() == "rejected_low_value"
+    )
+    recent_failed_root_caused_72h = sum(
+        1
+        for entry in recent_negative
+        if str(entry.get("status") or "").strip().lower() == "failed_root_caused"
+    )
+    economic_gate_min_outcomes = _studio_economic_gate_min_outcomes_72h()
+    economic_gate_negative_ratio_pct = _studio_economic_gate_negative_ratio_pct()
+    economic_gate_active = bool(
+        recent_outcome_count_72h >= economic_gate_min_outcomes
+        and recent_negative_ratio_72h is not None
+        and recent_negative_ratio_72h * 100.0 >= float(economic_gate_negative_ratio_pct)
+    )
+    economic_gate_summary = (
+        f"{len(recent_negative)} negative vs {len(recent_positive)} shipped/published Studio outcomes in 72h "
+        f"({recent_negative_ratio_72h:.0%} negative; {recent_rejected_low_value_72h} rejected_low_value; "
+        f"{recent_failed_root_caused_72h} failed_root_caused)"
+        if recent_negative_ratio_72h is not None
+        else "No recent Studio outcomes available for economic discipline."
+    )
     portfolio_focus_reasons = _studio_portfolio_focus_gate_reasons(memory)
     portfolio_focus_summary = _studio_one_line("; ".join(portfolio_focus_reasons), max_chars=260, default="")
 
@@ -17862,6 +17913,28 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         directives.append(
             f"Treat the incubator quality debt as selection evidence: {new_project_quality_summary}; fresh projects need stronger proof than portfolio compounding."
         )
+    elif economic_gate_active:
+        mode = "economic_discipline_gate"
+        severity = "red"
+        trigger = (
+            f"Economic discipline gate: {economic_gate_summary}; threshold is at least "
+            f"{economic_gate_min_outcomes} outcomes and {economic_gate_negative_ratio_pct}% negative."
+        )
+        force_next_action = (
+            "Spend Codex only on one bounded bet with complete factory value: measurable delta, money/savings path, "
+            "validation toolchain, and merge/push/deploy or publication path. If no candidate meets the gate, observe "
+            "instead of opening work."
+        )
+        avoid_keys = ["new-project-incubator", "project-incubator"]
+        prefer_lanes = ["dashboard", "core", "portfolio"]
+        directives.extend(
+            [
+                "Economic discipline is active: reject weak bets before spawning Codex; no work-for-work's-sake.",
+                "A selectable bet needs full factory-value evidence, shipability evidence, and a score above the economic threshold.",
+                "Prefer compounding PonceBot, ExecutiveDashboard, or a proven portfolio asset over speculative new folders.",
+                "Fresh incubator work is allowed only after it beats existing assets on buyer, pricing/rental, demo, validation, and publication evidence.",
+            ]
+        )
     elif portfolio_focus_reasons:
         mode = "portfolio_focus_gate"
         severity = "yellow"
@@ -17948,6 +18021,19 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "new_project_cycles_24h": new_project_cycles_24h,
         "new_project_quality_debt_24h": new_project_quality_debt_24h,
         "new_project_failure_ratio_24h": new_project_failure_ratio_24h,
+        "economic_gate_version": _STUDIO_ECONOMIC_GATE_VERSION,
+        "economic_recent_outcome_count_72h": recent_outcome_count_72h,
+        "economic_recent_negative_count_72h": len(recent_negative),
+        "economic_recent_positive_count_72h": len(recent_positive),
+        "economic_recent_negative_ratio_72h": recent_negative_ratio_72h,
+        "economic_recent_rejected_low_value_72h": recent_rejected_low_value_72h,
+        "economic_recent_failed_root_caused_72h": recent_failed_root_caused_72h,
+        "economic_gate_active": bool(economic_gate_active),
+        "economic_gate_min_outcomes_72h": economic_gate_min_outcomes,
+        "economic_gate_negative_ratio_pct": economic_gate_negative_ratio_pct,
+        "economic_gate_min_factory_value_score": _studio_economic_gate_min_factory_value_score(),
+        "economic_gate_min_shipability_score": _studio_economic_gate_min_shipability_score(),
+        "economic_gate_min_selection_score": _studio_economic_gate_min_selection_score(),
         "portfolio_recent_count_6h": recent_projects_6h,
         "portfolio_recent_count_24h": recent_projects_24h,
         "portfolio_focus_reason_count": len(portfolio_focus_reasons),
@@ -18557,6 +18643,34 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
                 "before/after proof that this existing asset is more sellable, more validated, more distributable, "
                 "or correctly removed from the active portfolio"
             )
+    elif governor_mode == "economic_discipline_gate":
+        if kind == "Core":
+            score += 16
+            thesis = "Make PonceBot spend fewer Codex cycles while increasing shipped, monetizable outcomes per sprint."
+            outcome = (
+                "A factory-control improvement with before/after evidence that weak bets are rejected before Codex "
+                "and strong bets still reach main/deploy or exact blocker status."
+            )
+            commercial_evidence = (
+                "factory metric evidence: fewer rejected/failed Studio cycles, fewer wasted Codex launches, or more "
+                "shipped/published outcomes per selected sprint"
+            )
+            monetization_path = (
+                "Increase profit potential by spending credits only where the factory can ship products, revenue "
+                "features, paid-tool capabilities, or clear cost-saving automation."
+            )
+        elif kind == "Dashboard":
+            score += 12
+            thesis = "Expose the factory's economic discipline so Alejandro can see what value is being built, rejected, or shipped."
+            outcome = "A dashboard view or signal that distinguishes valuable shipped work from rejected churn and shows the next money-relevant bet."
+            commercial_evidence = "operator-visible evidence that decisions, shipped value, rejected work, and money/savings rationale became clearer"
+        elif kind == "Portfolio":
+            score += 4
+            thesis = f"Advance {repo_name} only if it can become measurably more sellable, rentable, demoable, or revenue-relevant."
+            outcome = "A substantial existing-product phase with buyer, pricing/rental, demo, validation, and GitHub/main evidence."
+            commercial_evidence = "buyer pain, offer/pricing hypothesis, demo or validation proof, and why this asset deserves more factory cycles"
+        else:
+            score -= 8
 
     recent_risks: list[str] = []
     recent_wins: list[str] = []
@@ -18658,6 +18772,11 @@ def _studio_opportunity_for_repo(repo: dict[str, Any], *, now: float, memory: di
                 "The portfolio is over-expanded, so deepening, validating, monetizing, or archiving this existing "
                 "asset beats creating another shallow MVP."
             )
+    if governor_mode == "economic_discipline_gate":
+        why = (
+            "The Studio Governor detected too much negative/rejected work, so this bet must justify Codex spend with "
+            "money/savings relevance, validation evidence, and a main/deploy or publication path before delegation."
+        )
     if recent_risks:
         why += " Recent Studio outcomes lower confidence, so selection should require a clearer fresh angle or choose another repo."
     elif recent_saturation:
@@ -18748,6 +18867,18 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
         )
         why = "Too many active portfolio assets reduce focus; compounding and pruning have higher expected value than another MVP."
         risk += "; portfolio focus gate is active"
+    elif governor_mode == "economic_discipline_gate":
+        score -= 36
+        thesis = (
+            "Fresh incubator must be an economically justified bet, not another MVP: named buyer, painful problem, "
+            "pricing/rental hypothesis, demo, validation, and private GitHub publication."
+        )
+        outcome = (
+            f"A revenue-relevant project phase under {root} only if it beats compounding existing assets and can publish "
+            "with buyer/pricing/demo/validation evidence."
+        )
+        why = "Economic discipline says speculative new folders are lower priority than compounding existing assets unless the business case is unusually strong."
+        risk += "; economic discipline gate requires buyer, pricing/rental, demo, validation, and publication evidence"
     elif governor_mode == "portfolio_compounding":
         score -= 18
         thesis = "Advance the strongest existing portfolio product toward validation, demo quality, distribution, or monetization."
@@ -18814,6 +18945,68 @@ def _studio_governor_avoids_opportunity(governor: dict[str, Any] | None, opportu
     return bool({token for token in tokens if token} & avoid_keys)
 
 
+def _studio_economic_discipline_gate_applies(governor: dict[str, Any] | None) -> bool:
+    if not isinstance(governor, dict):
+        return False
+    mode = str(governor.get("mode") or "").strip().lower()
+    if mode in {"autoship_recovery_gate", "repair_delivery_contract"}:
+        return False
+    return bool(governor.get("economic_gate_active")) or mode == "economic_discipline_gate"
+
+
+def _studio_economic_gate_rejection_reason(governor: dict[str, Any] | None, opportunity: dict[str, Any]) -> str:
+    if not _studio_economic_discipline_gate_applies(governor):
+        return ""
+    factory_value = opportunity.get("factory_value") if isinstance(opportunity.get("factory_value"), dict) else {}
+    try:
+        factory_score = int(factory_value.get("score") or 0)
+    except Exception:
+        factory_score = 0
+    try:
+        shipability_score = int(factory_value.get("shipability_score") or 0)
+    except Exception:
+        shipability_score = 0
+    try:
+        selection_score = int(opportunity.get("score") or 0)
+    except Exception:
+        selection_score = 0
+    min_factory = _studio_economic_gate_min_factory_value_score()
+    min_shipability = _studio_economic_gate_min_shipability_score()
+    min_selection = _studio_economic_gate_min_selection_score()
+    reasons: list[str] = []
+    if factory_score < min_factory:
+        reasons.append(f"factory_value {factory_score}<{min_factory}")
+    if shipability_score < min_shipability:
+        reasons.append(f"shipability {shipability_score}<{min_shipability}")
+    if selection_score < min_selection:
+        reasons.append(f"score {selection_score}<{min_selection}")
+    if not reasons:
+        return ""
+    return "economic_discipline_gate rejected candidate: " + ", ".join(reasons)
+
+
+def _studio_apply_economic_discipline_filter(
+    governor: dict[str, Any] | None,
+    opportunities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not _studio_economic_discipline_gate_applies(governor):
+        return opportunities
+    filtered: list[dict[str, Any]] = []
+    for item in opportunities:
+        reason = _studio_economic_gate_rejection_reason(governor, item)
+        if reason:
+            item["economic_gate_rejection_reason"] = reason
+            LOG.info(
+                "Studio economic discipline rejected %s (%s): %s",
+                item.get("key") or item.get("repo_name") or "candidate",
+                item.get("type") or "unknown",
+                reason,
+            )
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def _studio_build_opportunities(
     *,
     cfg: BotConfig,
@@ -18850,6 +19043,7 @@ def _studio_build_opportunities(
     if _project_incubator_enabled() and "project-incubator" not in occupied_keys and "new-project-incubator" not in occupied_keys:
         incubator = _studio_incubator_opportunity(cfg=cfg, now=now, memory=memory)
         if _studio_governor_avoids_opportunity(governor, incubator):
+            opportunities = _studio_apply_economic_discipline_filter(governor, opportunities)
             opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
             return opportunities[:5]
         try:
@@ -18860,6 +19054,7 @@ def _studio_build_opportunities(
             pass
         opportunities.append(incubator)
 
+    opportunities = _studio_apply_economic_discipline_filter(governor, opportunities)
     opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
     return opportunities[:5]
 
@@ -19000,6 +19195,23 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
         if governor_failure_ratio >= 0.0
         else "new-project quality: no new-project cycles in 24h"
     )
+    try:
+        economic_negative_ratio = float(governor.get("economic_recent_negative_ratio_72h"))
+    except Exception:
+        economic_negative_ratio = -1.0
+    economic_line = (
+        "economic discipline: "
+        f"active={bool(governor.get('economic_gate_active'))}; "
+        f"outcomes72h={governor.get('economic_recent_outcome_count_72h', 0)}; "
+        f"negative={governor.get('economic_recent_negative_count_72h', 0)}; "
+        f"positive={governor.get('economic_recent_positive_count_72h', 0)}; "
+        f"negative_ratio={economic_negative_ratio:.0%}; "
+        f"min_factory={governor.get('economic_gate_min_factory_value_score', _studio_economic_gate_min_factory_value_score())}; "
+        f"min_shipability={governor.get('economic_gate_min_shipability_score', _studio_economic_gate_min_shipability_score())}; "
+        f"min_score={governor.get('economic_gate_min_selection_score', _studio_economic_gate_min_selection_score())}"
+        if economic_negative_ratio >= 0.0
+        else "economic discipline: no recent Studio outcomes in 72h"
+    )
     readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
     readiness_summary = _studio_one_line(readiness.get("summary"), max_chars=260, default="not collected")
     readiness_missing = ", ".join(str(x) for x in (readiness.get("missing_tools") or [])[:6]) or "none"
@@ -19021,6 +19233,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             "Studio governor:",
             f"- mode: {governor_mode}; severity: {governor.get('severity', 'green')}; trigger: {governor_trigger}",
             f"- {governor_quality_line}",
+            f"- {economic_line}",
             f"- force next action: {governor_force}",
             f"- directives: {governor_directives}",
             "",
