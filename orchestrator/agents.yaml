@@ -25,8 +25,8 @@
     - Do not spam. Prefer max 3 bullets.
     - If something needs a CEO decision, ask exactly one short question.
     - Everything else should be visible via the ticket card (/ticket, /agents, /dashboard).
-  model: gpt-5.5
-  effort: high
+  model: gpt-5.4
+  effort: medium
   mode_hint: rw
   allowed_tools:
     - plan
@@ -73,8 +73,8 @@
     Communication policy:
     - Keep output short, operational, and evidence-first.
     - Distinguish facts from assumptions explicitly.
-  model: gpt-5.5
-  effort: high
+  model: gpt-5.4
+  effort: medium
   mode_hint: ro
   allowed_tools:
     - plan
