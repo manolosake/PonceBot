@@ -2050,6 +2050,113 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(row["status"], "published_private")
         self.assertEqual(row["private"], 1)
 
+    def test_publication_contract_reconcile_keeps_confirmed_private_repo_when_head_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_000.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/winback-workbench",
+                        "Winback Workbench",
+                        "",
+                        "manolosake/winback-workbench",
+                        "https://github.com/manolosake/winback-workbench.git",
+                        "main",
+                        "",
+                        1,
+                        "published_private",
+                        "order-1",
+                        "order-1",
+                        "published_project",
+                        "Published private repo.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT status, latest_summary FROM studio_portfolio_projects").fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "published_private")
+        self.assertIn("Publication evidence incomplete", row["latest_summary"])
+
+    def test_orphaned_active_cycle_finalizer_skips_minimal_fixture_without_order_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 230_000.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-no-order-table",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "repo-codexbot",
+                        "DEEP_IMPROVEMENT",
+                        "codexbot",
+                        "",
+                        "core",
+                        "Improve factory.",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        "missing-order",
+                        now,
+                        now - 1000,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_finalize_orphaned_active_cycles(db, now=now)
+
+        self.assertEqual(changed, 0)
+
+    def test_economic_discipline_preempts_weak_incubator_active_cycle(self) -> None:
+        governor = {
+            "mode": "economic_discipline_gate",
+            "avoid_keys": ["new-project-incubator"],
+        }
+        cycle = {
+            "selected_key": "new-project-incubator",
+            "selected_type": "NEW_PROJECT",
+            "selected_lane": "incubator",
+        }
+
+        self.assertTrue(bot._studio_governor_should_preempt_active_cycle(governor, cycle))
+
     def test_incubator_opportunity_requires_monetization_evidence(self) -> None:
         item = bot._studio_incubator_opportunity(
             cfg=SimpleNamespace(),  # type: ignore[arg-type]
@@ -8113,6 +8220,109 @@ class TestSkynetLocalOnlyProactivePolicy(unittest.TestCase):
         self.assertTrue(any(update.get("merge_ready") is False for update in q.trace_updates))
         self.assertTrue(any(update.get("operational_gate_reason") == "root_job_still_blocked" for update in q.trace_updates))
         self.assertEqual(q.audit_events[-1]["event_type"], "order.operational_gate_blocked")
+
+    def test_sync_order_phase_closes_proactive_root_with_only_terminal_blocked_children(self) -> None:
+        root = SimpleNamespace(
+            job_id="root",
+            role="skynet",
+            state="blocked",
+            trace={"order_branch": "feature/order-root", "result_summary": "Write policy violation."},
+            labels={},
+            parent_job_id="",
+            chat_id=1,
+            created_at=90.0,
+            updated_at=100.0,
+        )
+        children = [
+            SimpleNamespace(
+                job_id="backend-recovery",
+                role="backend",
+                state="blocked",
+                labels={"key": "local_impl_recover"},
+                trace={
+                    "result_summary": (
+                        "Studio DEEP_IMPROVEMENT decision evidence gate not met. "
+                        "candidate_bets must list at least 3 options."
+                    )
+                },
+                parent_job_id="root",
+                chat_id=1,
+                created_at=110.0,
+                updated_at=120.0,
+            )
+        ]
+
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.phases: list[str] = []
+                self.statuses: list[str] = []
+                self.trace_updates: list[dict[str, object]] = []
+                self.state_updates: list[tuple[str, str, dict[str, object]]] = []
+                self.audit_events: list[dict[str, object]] = []
+
+            def get_order(self, order_id: str, chat_id: int = 0) -> dict[str, object]:
+                return {
+                    "order_id": order_id,
+                    "chat_id": chat_id,
+                    "status": "active",
+                    "phase": "review",
+                    "title": "Studio Cycle: codexbot",
+                    "body": "AUTONOMOUS PROACTIVE SPRINT",
+                }
+
+            def get_job(self, job_id: str):
+                return root
+
+            def jobs_by_parent(self, *, parent_job_id: str, limit: int = 600):
+                return children
+
+            def set_order_phase(self, order_id: str, chat_id: int, phase: str) -> None:
+                self.phases.append(phase)
+
+            def set_order_status(self, order_id: str, chat_id: int, status: str) -> None:
+                self.statuses.append(status)
+
+            def update_trace(self, job_id: str, **kwargs: object) -> None:
+                root.trace.update(kwargs)
+                self.trace_updates.append(dict(kwargs))
+
+            def update_state(self, job_id: str, state: str, **kwargs: object) -> None:
+                root.state = state
+                root.trace.update(kwargs)
+                self.state_updates.append((job_id, state, dict(kwargs)))
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        q = FakeQueue()
+        with patch.object(bot, "_repo_context_for_order", return_value=({}, Path("."), "main")), patch.object(
+            bot, "_order_trace_requires_merge", return_value=(True, "feature/order-root")
+        ), patch.object(bot, "_order_has_meaningful_improvement", return_value=False), patch.object(
+            bot,
+            "_collect_order_local_autonomy_funnel",
+            return_value={
+                "slices_started": 1,
+                "slices_applied": 0,
+                "slices_validated": 0,
+                "slices_closed": 0,
+                "implementer_fail_rate": 1.0,
+                "mean_time_to_validated_improvement": None,
+                "loop_breaker_count": 0,
+                "quality_gate_status": "blocked",
+                "improvement_verified": False,
+            },
+        ), patch.object(bot, "_order_has_verified_no_change_resolution", return_value=False), patch.object(
+            bot, "_studio_complete_cycle_for_order_from_queue"
+        ) as complete_cycle:
+            bot._sync_order_phase_from_runtime(orch_q=q, root_ticket="root", chat_id=1)
+
+        self.assertEqual(q.statuses[-1], "failed")
+        self.assertEqual(q.phases[-1], "failed")
+        self.assertEqual(root.state, "failed")
+        self.assertTrue(root.trace["proactive_terminal_blocked_children"])
+        self.assertEqual(root.trace["result_status"], "failed_root_caused")
+        complete_cycle.assert_called_once()
+        self.assertEqual(q.audit_events[-1]["event_type"], "order.proactive_terminal_blocked_children_closed")
 
     def test_sync_order_phase_promotes_cancelled_root_with_verified_local_delivery(self) -> None:
         root = SimpleNamespace(

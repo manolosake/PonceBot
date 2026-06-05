@@ -17526,6 +17526,12 @@ def _studio_finalize_orphaned_active_cycles(
             return 0
         _studio_ensure_schema(db)
         with sqlite3.connect(str(db), timeout=8.0) as conn:
+            tables = {
+                str(row[0] or "").strip().lower()
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if not {"ceo_orders", "jobs"}.issubset(tables):
+                return 0
             parent_done_cur = conn.execute(
                 """
                 UPDATE studio_cycles
@@ -18256,21 +18262,36 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 if not missing:
                     continue
                 current_summary = str(row["latest_summary"] or "").strip()
-                prefix = f"Publication incomplete: missing {', '.join(missing)}."
+                blocking_missing = [field for field in missing if field in {"github_repo", "github_url"}]
+                prefix = (
+                    f"Publication incomplete: missing {', '.join(blocking_missing)}."
+                    if blocking_missing
+                    else f"Publication evidence incomplete: missing {', '.join(missing)}."
+                )
                 summary = (
                     current_summary
-                    if current_summary.lower().startswith("publication incomplete:")
+                    if current_summary.lower().startswith(("publication incomplete:", "publication evidence incomplete:"))
                     else _studio_one_line(f"{prefix} {current_summary}", max_chars=500, default=prefix)
                 )
-                conn.execute(
-                    """
-                    UPDATE studio_portfolio_projects
-                    SET status = 'needs_publication',
-                        latest_summary = ?
-                    WHERE project_key = ?
-                    """,
-                    (summary, row["project_key"]),
-                )
+                if blocking_missing:
+                    conn.execute(
+                        """
+                        UPDATE studio_portfolio_projects
+                        SET status = 'needs_publication',
+                            latest_summary = ?
+                        WHERE project_key = ?
+                        """,
+                        (summary, row["project_key"]),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE studio_portfolio_projects
+                        SET latest_summary = ?
+                        WHERE project_key = ?
+                        """,
+                        (summary, row["project_key"]),
+                    )
                 changed += 1
             conn.commit()
             return changed
@@ -19400,6 +19421,7 @@ def _studio_governor_should_preempt_active_cycle(
         "repair_loop_cooldown",
         "incubator_quality_gate",
         "portfolio_focus_gate",
+        "economic_discipline_gate",
     }:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
@@ -19424,6 +19446,8 @@ def _studio_governor_should_preempt_active_cycle(
     if mode == "incubator_quality_gate":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     if mode == "portfolio_focus_gate":
+        return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
+    if mode == "economic_discipline_gate":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     repo_tokens = {key}
     if repo_id:
@@ -19480,6 +19504,7 @@ def _studio_governor_preempt_active_orders(
         "repair_loop_cooldown",
         "incubator_quality_gate",
         "portfolio_focus_gate",
+        "economic_discipline_gate",
     }:
         return 0
 
@@ -19507,6 +19532,11 @@ def _studio_governor_preempt_active_orders(
         summary = (
             "Rejected low-value by Studio Governor: repeated codexbot/PonceBot repair attempts recently failed "
             "or produced no material delta, so repeating the same core repair is now classified as churn."
+        )
+    elif governor_mode == "economic_discipline_gate":
+        summary = (
+            "Rejected low-value by Studio Governor: recent Studio outcomes are too negative, so active weak bets "
+            "must stop unless they have complete factory value, validation, and ship/publication evidence."
         )
     else:
         summary = (
@@ -20050,9 +20080,19 @@ def _studio_extract_portfolio_project_from_order(
     }
     publication_missing = _studio_publication_contract_missing(publication_probe)
     status = "published_private" if private else "published"
-    if publication_missing:
+    blocking_publication_missing = [
+        field for field in publication_missing if field in {"github_repo", "github_url"}
+    ]
+    if blocking_publication_missing:
         status = "needs_publication"
-        missing_line = f"Publication incomplete: missing {', '.join(publication_missing)}."
+        missing_line = f"Publication incomplete: missing {', '.join(blocking_publication_missing)}."
+        validation_summary = _studio_one_line(
+            f"{missing_line} {validation_summary or summary}",
+            max_chars=260,
+            default=missing_line,
+        )
+    elif publication_missing:
+        missing_line = f"Publication evidence incomplete: missing {', '.join(publication_missing)}."
         validation_summary = _studio_one_line(
             f"{missing_line} {validation_summary or summary}",
             max_chars=260,
@@ -25554,6 +25594,37 @@ def _summary_has_blocked_with_root_cause_signal(text: str) -> bool:
     return ("blocked_with_root_cause" in blob) or ("blocked with root cause" in blob)
 
 
+def _blocked_task_has_terminal_root_cause_signal(task: Any) -> bool:
+    trace = getattr(task, "trace", {}) or {}
+    if not isinstance(trace, dict):
+        trace = {}
+    parts = [
+        getattr(task, "blocked_reason", ""),
+        getattr(task, "input_text", ""),
+        trace.get("result_status"),
+        trace.get("result_summary"),
+        trace.get("result_next_action"),
+        trace.get("blocked_reason"),
+        trace.get("operational_gate_reason"),
+    ]
+    blob = " ".join(str(part or "") for part in parts).strip().lower()
+    if not blob:
+        return False
+    terminal_markers = (
+        "blocked_with_root_cause",
+        "blocked with root cause",
+        "failed_root_caused",
+        "decision evidence gate not met",
+        "factory_delta.",
+        "write policy violation",
+        "controller modified files directly",
+        "no material delta",
+        "no validated repo diff",
+        "branch has no diff",
+    )
+    return any(marker in blob for marker in terminal_markers)
+
+
 def _summary_has_verified_improvement_signal(text: str) -> bool:
     blob = str(text or "").strip().lower()
     if not blob:
@@ -28483,6 +28554,12 @@ def _sync_order_phase_from_runtime(
     wrapup_done = any(str(w.state or "").strip().lower() == "done" for w in wrapups)
     wrapup_active = any(str(w.state or "").strip().lower() in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for w in wrapups)
     any_live = any(s in ("queued", "waiting_deps", "blocked_approval", "running", "blocked") for s in states)
+    non_blocked_live = any(s in ("queued", "waiting_deps", "blocked_approval", "running", "ready") for s in states)
+    blocked_children = [
+        child
+        for child in phase_children
+        if str(getattr(child, "state", "") or "").strip().lower() == "blocked"
+    ]
 
     latest_controller_terminal_summary = str(root_trace.get("result_summary") or "").strip()
     latest_controller_terminal_ts = float(getattr(root_job, "updated_at", 0.0) or getattr(root_job, "created_at", 0.0) or 0.0)
@@ -28528,6 +28605,78 @@ def _sync_order_phase_from_runtime(
         and (not any_live)
         and (proactive_verified_no_change or proactive_improvement_verified)
     )
+    root_has_only_terminal_blocked_children = bool(
+        proactive_order
+        and root_state == "blocked"
+        and blocked_children
+        and not non_blocked_live
+        and all(_blocked_task_has_terminal_root_cause_signal(child) for child in blocked_children)
+    )
+    if root_has_only_terminal_blocked_children:
+        blocked_summaries: list[str] = []
+        for child in blocked_children[:3]:
+            trace = getattr(child, "trace", {}) or {}
+            if not isinstance(trace, dict):
+                trace = {}
+            blocked_summaries.append(
+                _studio_one_line(
+                    trace.get("result_summary") or trace.get("blocked_reason") or getattr(child, "blocked_reason", ""),
+                    max_chars=140,
+                    default=str(getattr(child, "job_id", "") or "blocked child"),
+                )
+            )
+        summary = (
+            "Failed root-caused: proactive order had only terminal blocked recovery children, so keeping it active "
+            "would block the factory from selecting the next higher-value bet. "
+            f"children={len(blocked_children)}; evidence={_studio_one_line('; '.join(blocked_summaries), max_chars=320)}"
+        )
+        now_ts = time.time()
+        try:
+            orch_q.set_order_status(rid, chat_id=int(chat_id), status="failed")
+            orch_q.set_order_phase(rid, chat_id=int(chat_id), phase="failed")
+            orch_q.update_trace(
+                rid,
+                merge_ready=False,
+                proactive_blocked_with_root_cause=True,
+                proactive_terminal_blocked_children=True,
+                proactive_terminal_blocked_children_count=len(blocked_children),
+                proactive_improvement_missing=True,
+                result_status="failed_root_caused",
+                result_summary=summary,
+                result_next_action="Open a fresh Studio bet after the economic/value gate; do not keep this blocked recovery alive.",
+                operational_gate_status="failed",
+                operational_gate_reason="terminal_blocked_children_root_caused",
+                live_at=now_ts,
+            )
+            orch_q.update_state(
+                rid,
+                "failed",
+                blocked_reason=None,
+                merge_ready=False,
+                proactive_blocked_with_root_cause=True,
+                result_status="failed_root_caused",
+                result_summary=summary,
+                result_next_action="Open a fresh Studio bet after the economic/value gate.",
+            )
+            _studio_complete_cycle_for_order_from_queue(
+                orch_q=orch_q,
+                order_id=rid,
+                outcome_status="failed_root_caused",
+                outcome_summary=summary,
+                now=now_ts,
+            )
+            orch_q.append_audit_event(
+                event_type="order.proactive_terminal_blocked_children_closed",
+                actor="skynet",
+                details={
+                    "order_id": rid,
+                    "blocked_children": len(blocked_children),
+                    "reason": "terminal_blocked_children_root_caused",
+                },
+            )
+        except Exception:
+            pass
+        return
     if _operational_gate_is_live_state(root_state) and not root_blocked_with_root_cause and not root_has_recovered_delivery:
         try:
             next_phase = "executing" if root_state == "running" else "delegated" if root_state in ("queued", "waiting_deps") else "review"
