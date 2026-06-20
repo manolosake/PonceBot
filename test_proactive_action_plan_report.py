@@ -121,11 +121,29 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "readiness_verdict": "wait",
                 "decision": "advance",
                 "next_action": "Implement the bounded slice.",
+                "selection_quality": {
+                    "status": "needs_review",
+                    "summary": "Advance work needs a selection review before delivery continues.",
+                    "flags": ["weak_selection_evidence"],
+                    "evidence_sources": [
+                        {
+                            "kind": "trace",
+                            "key": "factory_value",
+                            "summary": "Factory-value evidence was too weak to continue.",
+                        }
+                    ],
+                    "recommended_owner_role": "architect_local",
+                    "delegation_reason": "weak_selection_evidence",
+                    "delegation_focus": "deep_improvement_selection_quality",
+                },
                 "handoff": {
                     "suggested_role": "implementer_local",
                     "suggested_endpoint": "/handoff/advance-order",
                     "inspect_path": "/inspect/advance-order",
                     "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
+                    "evidence_expectations": ["pytest output"],
+                    "suggested_validation": ["Run focused tests."],
+                    "definition_of_done": ["Tests pass."],
                 },
             },
             "receipt": {
@@ -269,8 +287,21 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- Rank: 1", rendered)
         self.assertIn("## Selected Order", rendered)
         self.assertIn("- title: Advance order", rendered)
+        self.assertIn("### Selection Context", rendered)
+        self.assertIn("- status: needs_review", rendered)
+        self.assertIn("- recommended_owner_role: architect_local", rendered)
+        self.assertIn("- delegation_reason: weak_selection_evidence", rendered)
+        self.assertIn("- delegation_focus: deep_improvement_selection_quality", rendered)
+        self.assertIn("  - weak_selection_evidence", rendered)
+        self.assertIn("  - trace/factory_value: Factory-value evidence was too weak to continue.", rendered)
         self.assertIn("### Delegation", rendered)
         self.assertIn("- suggested_role: implementer_local", rendered)
+        self.assertIn("- evidence_expectations:", rendered)
+        self.assertIn("  - pytest output", rendered)
+        self.assertIn("- suggested_validation:", rendered)
+        self.assertIn("  - Run focused tests.", rendered)
+        self.assertIn("- definition_of_done:", rendered)
+        self.assertIn("  - Tests pass.", rendered)
         self.assertIn("## Receipt", rendered)
         self.assertIn("- event_type: proactive_action_plan_receipt", rendered)
         self.assertIn("- persisted: True", rendered)
@@ -281,6 +312,21 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- acknowledged: 1", rendered)
         self.assertIn("## Receipt History", rendered)
         self.assertIn("| 1 | acknowledged | implementer_local | 200.0 | Delegated the bounded slice. | Track implementation receipt. |", rendered)
+
+    def test_render_receipt_markdown_remains_compatible_when_context_fields_absent(self) -> None:
+        receipt_report = self._base_receipt_report()
+        receipt_report["order_identity"].pop("selection_quality", None)
+        receipt_report["order_identity"]["handoff"] = {
+            "suggested_role": "implementer_local",
+            "suggested_endpoint": "/handoff/advance-order",
+        }
+
+        rendered = report_tool.render_receipt_markdown(receipt_report)
+
+        self.assertNotIn("### Selection Context", rendered)
+        self.assertIn("### Delegation", rendered)
+        self.assertIn("- suggested_role: implementer_local", rendered)
+        self.assertIn("- suggested_endpoint: /handoff/advance-order", rendered)
 
     def test_main_receipt_mode_renders_json_payload(self) -> None:
         receipt_report = self._base_receipt_report()

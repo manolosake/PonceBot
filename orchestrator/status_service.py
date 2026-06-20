@@ -4438,11 +4438,34 @@ class StatusService:
             "next_action",
         )
         identity = {key: order.get(key) for key in keys if order.get(key) is not None}
+        selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+        if selection_quality:
+            identity["selection_quality"] = {
+                key: selection_quality.get(key)
+                for key in (
+                    "status",
+                    "summary",
+                    "flags",
+                    "evidence_sources",
+                    "recommended_owner_role",
+                    "delegation_reason",
+                    "delegation_focus",
+                )
+                if selection_quality.get(key) is not None
+            }
         handoff = order.get("handoff") if isinstance(order.get("handoff"), dict) else {}
         if handoff:
             identity["handoff"] = {
                 key: handoff.get(key)
-                for key in ("suggested_role", "suggested_endpoint", "inspect_path", "assignment_prompt")
+                for key in (
+                    "suggested_role",
+                    "suggested_endpoint",
+                    "inspect_path",
+                    "assignment_prompt",
+                    "evidence_expectations",
+                    "suggested_validation",
+                    "definition_of_done",
+                )
                 if handoff.get(key) is not None
             }
         return identity

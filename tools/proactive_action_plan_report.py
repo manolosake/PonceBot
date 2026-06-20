@@ -334,6 +334,26 @@ def render_receipt_markdown(receipt_report: dict[str, Any]) -> str:
         ):
             if key in order_identity:
                 lines.append(f"- {key}: {_one_line(order_identity.get(key))}")
+        selection_quality = (
+            order_identity.get("selection_quality")
+            if isinstance(order_identity.get("selection_quality"), dict)
+            else {}
+        )
+        if selection_quality:
+            lines.extend(["", "### Selection Context", ""])
+            for key in ("status", "recommended_owner_role", "delegation_reason", "delegation_focus", "summary"):
+                if key in selection_quality:
+                    lines.append(f"- {key}: {_one_line(selection_quality.get(key))}")
+            if "flags" in selection_quality:
+                _append_list(lines, "flags", selection_quality.get("flags"))
+            if "evidence_sources" in selection_quality:
+                lines.append("- evidence_sources:")
+                sources = [_source_line(source) for source in _as_list(selection_quality.get("evidence_sources"))]
+                if sources:
+                    for source in sources:
+                        lines.append(f"  - {source}")
+                else:
+                    lines.append("  - -")
         handoff = order_identity.get("handoff") if isinstance(order_identity.get("handoff"), dict) else {}
         if handoff:
             lines.extend(
@@ -347,6 +367,13 @@ def render_receipt_markdown(receipt_report: dict[str, Any]) -> str:
                     f"- assignment_prompt: {_one_line(handoff.get('assignment_prompt'))}",
                 ]
             )
+            for key, title in (
+                ("evidence_expectations", "evidence_expectations"),
+                ("suggested_validation", "suggested_validation"),
+                ("definition_of_done", "definition_of_done"),
+            ):
+                if key in handoff:
+                    _append_list(lines, title, handoff.get(key))
         lines.append("")
     else:
         lines.extend(["No proactive order matched the requested selector.", ""])

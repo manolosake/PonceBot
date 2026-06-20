@@ -1863,11 +1863,29 @@ class TestStatusService(unittest.TestCase):
                                 "readiness_verdict": "wait",
                                 "decision": "advance",
                                 "next_action": "Implement the bounded slice.",
+                                "selection_quality": {
+                                    "status": "needs_review",
+                                    "summary": "Advance work needs a selection review before delivery continues.",
+                                    "flags": ["weak_selection_evidence"],
+                                    "evidence_sources": [
+                                        {
+                                            "kind": "trace",
+                                            "key": "factory_value",
+                                            "summary": "Factory-value evidence was too weak to continue.",
+                                        }
+                                    ],
+                                    "recommended_owner_role": "architect_local",
+                                    "delegation_reason": "weak_selection_evidence",
+                                    "delegation_focus": "deep_improvement_selection_quality",
+                                },
                                 "handoff": {
                                     "suggested_role": "implementer_local",
                                     "suggested_endpoint": "/handoff/advance-order",
                                     "inspect_path": "/inspect/advance-order",
                                     "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
+                                    "evidence_expectations": ["pytest output"],
+                                    "suggested_validation": ["Run focused tests."],
+                                    "definition_of_done": ["Tests pass."],
                                 },
                             }
                         ],
@@ -1886,7 +1904,14 @@ class TestStatusService(unittest.TestCase):
                     "details": {
                         "actor": "implementer_local",
                         "selection": {"rank": 1, "matched_by": "rank"},
-                        "order_identity": {"order_id": "advance-order", "title": "Advance order"},
+                        "order_identity": {
+                            "order_id": "advance-order",
+                            "title": "Advance order",
+                            "selection_quality": {
+                                "status": "needs_review",
+                                "delegation_reason": "weak_selection_evidence",
+                            },
+                        },
                         "proactive_action_plan_details": {"note": "delegate now"},
                     },
                 }
@@ -1913,13 +1938,31 @@ class TestStatusService(unittest.TestCase):
             persisted_details = append_decision_log.call_args.kwargs["details"]
             self.assertEqual(persisted_details["selection"]["rank"], 1)
             self.assertEqual(persisted_details["order_identity"]["order_id"], "advance-order")
+            self.assertEqual(
+                persisted_details["order_identity"]["selection_quality"]["delegation_reason"],
+                "weak_selection_evidence",
+            )
+            self.assertEqual(
+                persisted_details["order_identity"]["selection_quality"]["recommended_owner_role"],
+                "architect_local",
+            )
+            self.assertEqual(
+                persisted_details["order_identity"]["handoff"]["suggested_validation"],
+                ["Run focused tests."],
+            )
             self.assertEqual(persisted_details["proactive_action_plan_details"], {"note": "delegate now"})
 
             self.assertEqual(payload.get("selection"), {"order_id": None, "rank": 1, "matched_by": "rank"})
             order_identity = payload.get("order_identity") or {}
             self.assertEqual(order_identity.get("order_id"), "advance-order")
             self.assertEqual(order_identity.get("title"), "Advance order")
+            self.assertEqual((order_identity.get("selection_quality") or {}).get("status"), "needs_review")
+            self.assertEqual(
+                (order_identity.get("selection_quality") or {}).get("delegation_focus"),
+                "deep_improvement_selection_quality",
+            )
             self.assertEqual((order_identity.get("handoff") or {}).get("suggested_role"), "implementer_local")
+            self.assertEqual((order_identity.get("handoff") or {}).get("definition_of_done"), ["Tests pass."])
             receipt = payload.get("receipt") or {}
             self.assertTrue(receipt.get("persisted"))
             self.assertEqual(receipt.get("persistence_reason"), "decision_log_appended")
@@ -1928,6 +1971,10 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(persisted_receipt.get("actor"), "implementer_local")
             self.assertEqual(persisted_receipt.get("recorded_at"), 200.0)
             self.assertEqual((persisted_receipt.get("details") or {}).get("note"), "delegate now")
+            self.assertEqual(
+                ((persisted_receipt.get("order_identity") or {}).get("selection_quality") or {}).get("status"),
+                "needs_review",
+            )
             self.assertEqual(payload.get("receipt_count"), 1)
             self.assertEqual(payload.get("receipt_counts_by_state"), {"acknowledged": 1})
             self.assertEqual(len(payload.get("receipt_history") or []), 1)
