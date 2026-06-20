@@ -1826,6 +1826,170 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(lanes["unblock"]["orders"][0]["selection_quality"]["status"], "ok")
             self.assertNotIn("Selection review", unblock_packet["action"])
 
+    def test_proactive_action_plan_receipt_persists_selected_order_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {
+                    "active_proactive_orders": 1,
+                    "returned": 1,
+                    "lanes": {"advance": 1},
+                    "selection_quality": {"ok": 1},
+                    "top_lane": "advance",
+                    "top_action": "Implement the bounded slice.",
+                },
+                "lanes": [
+                    {
+                        "lane": "advance",
+                        "label": "Advance",
+                        "count": 1,
+                        "recommended_next_action": "Implement the bounded slice.",
+                        "orders": [
+                            {
+                                "rank": 1,
+                                "order_id": "advance-order",
+                                "order_id_short": "advance",
+                                "title": "Advance order",
+                                "priority": 1,
+                                "phase": "executing",
+                                "current_stage": "delivery",
+                                "readiness_state": "not_ready",
+                                "readiness_verdict": "wait",
+                                "decision": "advance",
+                                "next_action": "Implement the bounded slice.",
+                                "handoff": {
+                                    "suggested_role": "implementer_local",
+                                    "suggested_endpoint": "/handoff/advance-order",
+                                    "inspect_path": "/inspect/advance-order",
+                                    "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+            receipt_rows = [
+                {
+                    "kind": "proactive_action_plan_receipt",
+                    "state": "acknowledged",
+                    "summary": "Delegated the bounded slice.",
+                    "next_action": "Track implementation receipt.",
+                    "order_id": "advance-order",
+                    "job_id": "advance-order",
+                    "ts": 200.0,
+                    "details": {
+                        "actor": "implementer_local",
+                        "selection": {"rank": 1, "matched_by": "rank"},
+                        "order_identity": {"order_id": "advance-order", "title": "Advance order"},
+                        "proactive_action_plan_details": {"note": "delegate now"},
+                    },
+                }
+            ]
+
+            with mock.patch.object(svc, "proactive_action_plan", return_value=report), \
+                 mock.patch.object(q, "append_decision_log") as append_decision_log, \
+                 mock.patch.object(q, "list_decision_log", return_value=receipt_rows):
+                payload = svc.proactive_action_plan_receipt(
+                    chat_id=7,
+                    rank=1,
+                    state="acknowledged",
+                    summary="Delegated the bounded slice.",
+                    next_action="Track implementation receipt.",
+                    actor="implementer_local",
+                    details={"note": "delegate now"},
+                )
+
+            append_decision_log.assert_called_once()
+            self.assertEqual(append_decision_log.call_args.kwargs["order_id"], "advance-order")
+            self.assertEqual(append_decision_log.call_args.kwargs["job_id"], "advance-order")
+            self.assertEqual(append_decision_log.call_args.kwargs["kind"], "proactive_action_plan_receipt")
+            self.assertEqual(append_decision_log.call_args.kwargs["state"], "acknowledged")
+            persisted_details = append_decision_log.call_args.kwargs["details"]
+            self.assertEqual(persisted_details["selection"]["rank"], 1)
+            self.assertEqual(persisted_details["order_identity"]["order_id"], "advance-order")
+            self.assertEqual(persisted_details["proactive_action_plan_details"], {"note": "delegate now"})
+
+            self.assertEqual(payload.get("selection"), {"order_id": None, "rank": 1, "matched_by": "rank"})
+            order_identity = payload.get("order_identity") or {}
+            self.assertEqual(order_identity.get("order_id"), "advance-order")
+            self.assertEqual(order_identity.get("title"), "Advance order")
+            self.assertEqual((order_identity.get("handoff") or {}).get("suggested_role"), "implementer_local")
+            receipt = payload.get("receipt") or {}
+            self.assertTrue(receipt.get("persisted"))
+            self.assertEqual(receipt.get("persistence_reason"), "decision_log_appended")
+            self.assertEqual(receipt.get("order_id"), "advance-order")
+            persisted_receipt = payload.get("persisted_receipt") or {}
+            self.assertEqual(persisted_receipt.get("actor"), "implementer_local")
+            self.assertEqual(persisted_receipt.get("recorded_at"), 200.0)
+            self.assertEqual((persisted_receipt.get("details") or {}).get("note"), "delegate now")
+            self.assertEqual(payload.get("receipt_count"), 1)
+            self.assertEqual(payload.get("receipt_counts_by_state"), {"acknowledged": 1})
+            self.assertEqual(len(payload.get("receipt_history") or []), 1)
+
+    def test_proactive_action_plan_receipt_returns_missing_selection_without_persisting(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            report = {
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {
+                    "active_proactive_orders": 1,
+                    "returned": 1,
+                    "top_lane": "advance",
+                    "top_action": "Implement the bounded slice.",
+                },
+                "lanes": [
+                    {
+                        "lane": "advance",
+                        "label": "Advance",
+                        "count": 1,
+                        "recommended_next_action": "Implement the bounded slice.",
+                        "orders": [{"rank": 1, "order_id": "advance-order", "title": "Advance order", "decision": "advance"}],
+                    }
+                ],
+            }
+
+            with mock.patch.object(svc, "proactive_action_plan", return_value=report), \
+                 mock.patch.object(q, "append_decision_log") as append_decision_log, \
+                 mock.patch.object(q, "list_decision_log") as list_decision_log:
+                payload = svc.proactive_action_plan_receipt(
+                    chat_id=7,
+                    order_id="missing-order",
+                    state="completed",
+                    summary="Nothing matched.",
+                )
+
+            append_decision_log.assert_not_called()
+            list_decision_log.assert_not_called()
+            self.assertEqual(payload.get("selection"), {"order_id": "missing-order", "rank": None, "matched_by": None})
+            self.assertIsNone(payload.get("order_identity"))
+            receipt = payload.get("receipt") or {}
+            self.assertFalse(receipt.get("persisted"))
+            self.assertEqual(receipt.get("persistence_reason"), "order_not_selected")
+            self.assertIsNone(payload.get("persisted_receipt"))
+            self.assertEqual(payload.get("receipt_count"), 0)
+            self.assertEqual(payload.get("receipt_counts_by_state"), {})
+            self.assertEqual(payload.get("receipt_history"), [])
+
+    def test_proactive_action_plan_receipt_rejects_invalid_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            q = OrchestratorQueue(storage=storage, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}})
+            svc = StatusService(orch_q=q, role_profiles={"backend": {"role": "backend", "max_parallel_jobs": 1}}, cache_ttl_seconds=0)
+
+            with self.assertRaisesRegex(ValueError, "invalid_proactive_action_plan_receipt_state"):
+                svc.proactive_action_plan_receipt(chat_id=7, rank=1, state="delegated")
+
     def test_operator_focus_delegate_contract_is_populated(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

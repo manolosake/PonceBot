@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import io
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from tools import proactive_action_plan_report as report_tool
 
@@ -90,6 +94,71 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                             },
                         }
                     ],
+                }
+            ],
+        }
+
+    def _base_receipt_report(self) -> dict:
+        return {
+            "generated_at": 123.0,
+            "chat_id": 7,
+            "selection": {"order_id": "advance-order", "rank": 1, "matched_by": "order_id"},
+            "summary": {
+                "active_proactive_orders": 1,
+                "returned": 1,
+                "top_lane": "advance",
+                "top_action": "Implement the bounded slice.",
+            },
+            "order_identity": {
+                "rank": 1,
+                "order_id": "advance-order",
+                "order_id_short": "advance",
+                "title": "Advance order",
+                "priority": 1,
+                "phase": "executing",
+                "current_stage": "delivery",
+                "readiness_state": "not_ready",
+                "readiness_verdict": "wait",
+                "decision": "advance",
+                "next_action": "Implement the bounded slice.",
+                "handoff": {
+                    "suggested_role": "implementer_local",
+                    "suggested_endpoint": "/handoff/advance-order",
+                    "inspect_path": "/inspect/advance-order",
+                    "assignment_prompt": "ROLE: implementer_local.\nAction: Implement the bounded slice.",
+                },
+            },
+            "receipt": {
+                "event_type": "proactive_action_plan_receipt",
+                "state": "acknowledged",
+                "summary": "Delegated the bounded slice.",
+                "next_action": "Track implementation receipt.",
+                "actor": "implementer_local",
+                "details": {"note": "delegate now"},
+                "persisted": True,
+                "persistence_reason": "decision_log_appended",
+                "order_id": "advance-order",
+                "job_id": "advance-order",
+            },
+            "persisted_receipt": {
+                "state": "acknowledged",
+                "summary": "Delegated the bounded slice.",
+                "next_action": "Track implementation receipt.",
+                "actor": "implementer_local",
+                "recorded_at": 200.0,
+                "order_id": "advance-order",
+                "job_id": "advance-order",
+                "details": {"note": "delegate now"},
+            },
+            "receipt_count": 1,
+            "receipt_counts_by_state": {"acknowledged": 1},
+            "receipt_history": [
+                {
+                    "state": "acknowledged",
+                    "summary": "Delegated the bounded slice.",
+                    "next_action": "Track implementation receipt.",
+                    "actor": "implementer_local",
+                    "recorded_at": 200.0,
                 }
             ],
         }
@@ -190,6 +259,61 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- churn_risk: needs_review", rendered)
         self.assertIn("  - started_slices_exceed_validated_or_closed", rendered)
         self.assertIn("proactive_slices_started=4", rendered)
+
+    def test_render_receipt_markdown_includes_selection_order_and_persisted_sections(self) -> None:
+        rendered = report_tool.render_receipt_markdown(self._base_receipt_report())
+
+        self.assertIn("# Proactive Action Plan Receipt", rendered)
+        self.assertIn("## Selection", rendered)
+        self.assertIn("- Order id: advance-order", rendered)
+        self.assertIn("- Rank: 1", rendered)
+        self.assertIn("## Selected Order", rendered)
+        self.assertIn("- title: Advance order", rendered)
+        self.assertIn("### Delegation", rendered)
+        self.assertIn("- suggested_role: implementer_local", rendered)
+        self.assertIn("## Receipt", rendered)
+        self.assertIn("- event_type: proactive_action_plan_receipt", rendered)
+        self.assertIn("- persisted: True", rendered)
+        self.assertIn("## Persisted Receipt", rendered)
+        self.assertIn("- recorded_at: 200.0", rendered)
+        self.assertIn("## Receipt Counts", rendered)
+        self.assertIn("- Total receipts: 1", rendered)
+        self.assertIn("- acknowledged: 1", rendered)
+        self.assertIn("## Receipt History", rendered)
+        self.assertIn("| 1 | acknowledged | implementer_local | 200.0 | Delegated the bounded slice. | Track implementation receipt. |", rendered)
+
+    def test_main_receipt_mode_renders_json_payload(self) -> None:
+        receipt_report = self._base_receipt_report()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "jobs.sqlite"
+            db_path.write_text("", encoding="utf-8")
+
+            with mock.patch.object(report_tool, "build_receipt", return_value=receipt_report):
+                exit_code = report_tool.main(
+                    [
+                        "--db",
+                        str(db_path),
+                        "--receipt",
+                        "--order-id",
+                        "advance-order",
+                        "--state",
+                        "acknowledged",
+                        "--format",
+                        "json",
+                    ],
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        rendered = stdout.getvalue()
+        self.assertIn('"event_type": "proactive_action_plan_receipt"', rendered)
+        self.assertIn('"order_id": "advance-order"', rendered)
+        self.assertIn('"persisted": true', rendered)
 
 
 if __name__ == "__main__":

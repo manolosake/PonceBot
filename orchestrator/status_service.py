@@ -239,6 +239,8 @@ _TERMINAL_TASK_STATES = {"done", "failed", "cancelled"}
 _OPERATOR_FOCUS_RECEIPT_EVENT_TYPE = "operator_focus_receipt"
 _OPERATOR_FOCUS_RECEIPT_HISTORY_LIMIT = 5
 _OPERATOR_FOCUS_RECEIPT_STATUSES = {"acknowledged", "in_progress", "completed"}
+_PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE = "proactive_action_plan_receipt"
+_PROACTIVE_ACTION_PLAN_RECEIPT_STATUSES = {"acknowledged", "in_progress", "completed"}
 _OPERATOR_FOCUS_RECEIPT_STALE_AFTER_SECONDS = {
     "acknowledged": 30 * 60,
     "in_progress": 60 * 60,
@@ -4368,6 +4370,276 @@ class StatusService:
             },
             "lanes": lanes,
             "top_execution_packet": top_execution_packet,
+        }
+
+    def _select_proactive_action_plan_order(
+        self,
+        report: dict[str, Any],
+        *,
+        order_id: str | None = None,
+        rank: int | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        lanes = [lane for lane in list(report.get("lanes") or []) if isinstance(lane, dict)]
+        orders: list[dict[str, Any]] = []
+        for lane in lanes:
+            lane_key = str(lane.get("lane") or "").strip() or None
+            for order in list(lane.get("orders") or []):
+                if not isinstance(order, dict):
+                    continue
+                compact = dict(order)
+                if lane_key and not compact.get("decision"):
+                    compact["decision"] = lane_key
+                orders.append(compact)
+
+        normalized_order_id = str(order_id or "").strip()
+        selected: dict[str, Any] | None = None
+        matched_by = "top"
+
+        if normalized_order_id:
+            selected = next(
+                (order for order in orders if str(order.get("order_id") or "").strip() == normalized_order_id),
+                None,
+            )
+            matched_by = "order_id"
+        elif rank is not None:
+            selected = next(
+                (
+                    order
+                    for order in orders
+                    if isinstance(order.get("rank"), int) and int(order.get("rank")) == int(rank)
+                ),
+                None,
+            )
+            matched_by = "rank"
+        elif orders:
+            selected = orders[0]
+
+        selection = {
+            "order_id": normalized_order_id or None,
+            "rank": int(rank) if rank is not None else None,
+            "matched_by": matched_by if selected else None,
+        }
+        return selected, selection
+
+    def _proactive_action_plan_order_identity(self, order: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not order:
+            return None
+        keys = (
+            "rank",
+            "order_id",
+            "order_id_short",
+            "title",
+            "priority",
+            "phase",
+            "current_stage",
+            "readiness_state",
+            "readiness_verdict",
+            "decision",
+            "next_action",
+        )
+        identity = {key: order.get(key) for key in keys if order.get(key) is not None}
+        handoff = order.get("handoff") if isinstance(order.get("handoff"), dict) else {}
+        if handoff:
+            identity["handoff"] = {
+                key: handoff.get(key)
+                for key in ("suggested_role", "suggested_endpoint", "inspect_path", "assignment_prompt")
+                if handoff.get(key) is not None
+            }
+        return identity
+
+    def _compact_proactive_action_plan_receipt(self, receipt: dict[str, Any]) -> dict[str, Any]:
+        details = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
+        persisted_details = details.get("proactive_action_plan_details")
+        compact = {
+            "state": receipt.get("state"),
+            "summary": receipt.get("summary"),
+            "next_action": receipt.get("next_action"),
+            "actor": details.get("actor"),
+            "recorded_at": receipt.get("ts"),
+            "ts": receipt.get("ts"),
+            "order_id": receipt.get("order_id"),
+            "job_id": receipt.get("job_id"),
+        }
+        if isinstance(persisted_details, dict) and persisted_details:
+            compact["details"] = dict(persisted_details)
+        selection = details.get("selection")
+        if isinstance(selection, dict) and selection:
+            compact["selection"] = dict(selection)
+        order_identity = details.get("order_identity")
+        if isinstance(order_identity, dict) and order_identity:
+            compact["order_identity"] = dict(order_identity)
+        return {key: value for key, value in compact.items() if value is not None}
+
+    def _proactive_action_plan_receipt_rollup_from_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        order_id: str,
+        history_limit: int = 5,
+    ) -> dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return {
+                "receipt_count": 0,
+                "receipt_counts_by_state": {},
+                "receipt_history": [],
+                "latest_receipt": None,
+            }
+
+        receipts: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("kind") or "").strip() != _PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE:
+                continue
+            if str(row.get("order_id") or "").strip() != oid:
+                continue
+            try:
+                ts = float(row.get("ts") or 0.0)
+            except Exception:
+                ts = 0.0
+            receipts.append((ts, row))
+
+        receipts.sort(key=lambda item: item[0], reverse=True)
+        counts_by_state: dict[str, int] = {}
+        for _, receipt in receipts:
+            state = str(receipt.get("state") or "").strip().lower() or "unknown"
+            counts_by_state[state] = int(counts_by_state.get(state, 0)) + 1
+
+        history = [
+            self._compact_proactive_action_plan_receipt(receipt)
+            for _, receipt in receipts[: max(1, int(history_limit))]
+        ]
+        latest = history[0] if history else None
+        return {
+            "receipt_count": len(receipts),
+            "receipt_counts_by_state": counts_by_state,
+            "receipt_history": history,
+            "latest_receipt": latest,
+        }
+
+    def _latest_proactive_action_plan_receipt(self, *, order_id: str) -> dict[str, Any] | None:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        try:
+            rows = self.orch_q.list_decision_log(order_id=oid, limit=50)
+        except Exception:
+            return None
+
+        receipts = [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("kind") or "").strip() == _PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE
+            and str(row.get("order_id") or "").strip() == oid
+        ]
+        if not receipts:
+            return None
+        latest = max(receipts, key=lambda row: float(row.get("ts") or 0.0))
+        return self._compact_proactive_action_plan_receipt(latest)
+
+    def proactive_action_plan_receipt(
+        self,
+        *,
+        chat_id: int | None = None,
+        state: str,
+        summary: str | None = None,
+        next_action: str | None = None,
+        actor: str | None = None,
+        details: dict[str, Any] | None = None,
+        order_id: str | None = None,
+        rank: int | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in _PROACTIVE_ACTION_PLAN_RECEIPT_STATUSES:
+            raise ValueError("invalid_proactive_action_plan_receipt_state")
+
+        def _text(value: Any, default: str = "") -> str:
+            text = str(value or "").strip()
+            return text if text else default
+
+        report = self.proactive_action_plan(chat_id=chat_id, limit=limit)
+        selected, selection = self._select_proactive_action_plan_order(report, order_id=order_id, rank=rank)
+        order_identity = self._proactive_action_plan_order_identity(selected)
+
+        receipt_summary = _text(summary)
+        if not receipt_summary and selected:
+            receipt_summary = (
+                f"Proactive action-plan order {normalized_state}: "
+                f"{_text(selected.get('title'), _text(selected.get('order_id'), 'selected order'))}"
+            )
+        receipt_next_action = _text(next_action) or None
+        receipt_details = dict(details) if isinstance(details, dict) else {}
+        actor_name = _text(actor) or None
+
+        persisted = False
+        persistence_reason = "order_not_selected"
+        persisted_receipt = None
+        receipt_count = 0
+        receipt_counts_by_state: dict[str, int] = {}
+        receipt_history: list[dict[str, Any]] = []
+        selected_order_id = _text(selected.get("order_id")) if selected else ""
+        selected_job_id = selected_order_id
+
+        if selected and selected_order_id:
+            persistence_details = {
+                "event_type": _PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE,
+                "actor": actor_name,
+                "selection": dict(selection),
+                "order_identity": order_identity or {},
+                "proactive_action_plan_details": receipt_details,
+            }
+            self.orch_q.append_decision_log(
+                order_id=selected_order_id,
+                job_id=selected_job_id,
+                kind=_PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE,
+                state=normalized_state,
+                summary=receipt_summary,
+                next_action=receipt_next_action,
+                details=persistence_details,
+            )
+            persisted = True
+            persistence_reason = "decision_log_appended"
+            try:
+                rows = self.orch_q.list_decision_log(order_id=selected_order_id, limit=100)
+            except Exception:
+                rows = []
+            rollup = self._proactive_action_plan_receipt_rollup_from_rows(
+                rows,
+                order_id=selected_order_id,
+                history_limit=5,
+            )
+            receipt_count = int(rollup.get("receipt_count") or 0)
+            receipt_counts_by_state = dict(rollup.get("receipt_counts_by_state") or {})
+            receipt_history = list(rollup.get("receipt_history") or [])
+            persisted_receipt = rollup.get("latest_receipt")
+
+        return {
+            "api_version": "v1",
+            "schema_version": 1,
+            "generated_at": report.get("generated_at"),
+            "chat_id": report.get("chat_id"),
+            "selection": selection,
+            "summary": report.get("summary") if isinstance(report.get("summary"), dict) else {},
+            "order_identity": order_identity,
+            "receipt": {
+                "event_type": _PROACTIVE_ACTION_PLAN_RECEIPT_EVENT_TYPE,
+                "state": normalized_state,
+                "summary": receipt_summary,
+                "next_action": receipt_next_action,
+                "actor": actor_name,
+                "details": receipt_details,
+                "persisted": persisted,
+                "persistence_reason": persistence_reason,
+                "order_id": selected_order_id or None,
+                "job_id": selected_job_id or None,
+            },
+            "persisted_receipt": persisted_receipt,
+            "receipt_count": receipt_count,
+            "receipt_counts_by_state": receipt_counts_by_state,
+            "receipt_history": receipt_history,
         }
 
     def order_evidence_packet(

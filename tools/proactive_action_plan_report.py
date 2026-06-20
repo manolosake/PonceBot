@@ -109,6 +109,35 @@ def build_report(*, db_path: Path, chat_id: int | None, limit: int) -> dict[str,
     return svc.proactive_action_plan(chat_id=chat_id, limit=limit)
 
 
+def build_receipt(
+    *,
+    db_path: Path,
+    chat_id: int | None,
+    state: str,
+    summary: str | None = None,
+    next_action: str | None = None,
+    actor: str | None = None,
+    details: dict[str, Any] | None = None,
+    order_id: str | None = None,
+    rank: int | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    storage = SQLiteTaskStorage(db_path)
+    orch_q = OrchestratorQueue(storage=storage, role_profiles=None)
+    svc = StatusService(orch_q=orch_q, role_profiles=None, cache_ttl_seconds=0)
+    return svc.proactive_action_plan_receipt(
+        chat_id=chat_id,
+        state=state,
+        summary=summary,
+        next_action=next_action,
+        actor=actor,
+        details=details,
+        order_id=order_id,
+        rank=rank,
+        limit=limit,
+    )
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     lane_counts = summary.get("lanes") if isinstance(summary.get("lanes"), dict) else {}
@@ -246,12 +275,172 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_receipt_markdown(receipt_report: dict[str, Any]) -> str:
+    selection = receipt_report.get("selection") if isinstance(receipt_report.get("selection"), dict) else {}
+    summary = receipt_report.get("summary") if isinstance(receipt_report.get("summary"), dict) else {}
+    order_identity = receipt_report.get("order_identity") if isinstance(receipt_report.get("order_identity"), dict) else None
+    receipt = receipt_report.get("receipt") if isinstance(receipt_report.get("receipt"), dict) else {}
+    persisted_receipt = (
+        receipt_report.get("persisted_receipt")
+        if isinstance(receipt_report.get("persisted_receipt"), dict)
+        else None
+    )
+    details = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
+    receipt_counts = (
+        receipt_report.get("receipt_counts_by_state")
+        if isinstance(receipt_report.get("receipt_counts_by_state"), dict)
+        else {}
+    )
+    receipt_history = [
+        item for item in list(receipt_report.get("receipt_history") or []) if isinstance(item, dict)
+    ]
+
+    lines = [
+        "# Proactive Action Plan Receipt",
+        "",
+        f"- Generated: {_one_line(receipt_report.get('generated_at'))}",
+        f"- Chat: {_one_line(receipt_report.get('chat_id'), default='all')}",
+        "",
+        "## Selection",
+        "",
+        f"- Order id: {_one_line(selection.get('order_id'))}",
+        f"- Rank: {_one_line(selection.get('rank'))}",
+        f"- Matched by: {_one_line(selection.get('matched_by'))}",
+        "",
+        "## Summary",
+        "",
+        f"- Active proactive orders: {_one_line(summary.get('active_proactive_orders'), default='0')}",
+        f"- Returned: {_one_line(summary.get('returned'), default='0')}",
+        f"- Top lane: {_one_line(summary.get('top_lane'))}",
+        f"- Top action: {_one_line(summary.get('top_action'))}",
+        "",
+        "## Selected Order",
+        "",
+    ]
+
+    if order_identity:
+        for key in (
+            "rank",
+            "order_id",
+            "order_id_short",
+            "title",
+            "priority",
+            "phase",
+            "current_stage",
+            "readiness_state",
+            "readiness_verdict",
+            "decision",
+            "next_action",
+        ):
+            if key in order_identity:
+                lines.append(f"- {key}: {_one_line(order_identity.get(key))}")
+        handoff = order_identity.get("handoff") if isinstance(order_identity.get("handoff"), dict) else {}
+        if handoff:
+            lines.extend(
+                [
+                    "",
+                    "### Delegation",
+                    "",
+                    f"- suggested_role: {_one_line(handoff.get('suggested_role'))}",
+                    f"- suggested_endpoint: {_one_line(handoff.get('suggested_endpoint'))}",
+                    f"- inspect_path: {_one_line(handoff.get('inspect_path'))}",
+                    f"- assignment_prompt: {_one_line(handoff.get('assignment_prompt'))}",
+                ]
+            )
+        lines.append("")
+    else:
+        lines.extend(["No proactive order matched the requested selector.", ""])
+
+    lines.extend(
+        [
+            "## Receipt",
+            "",
+            f"- event_type: {_one_line(receipt.get('event_type'))}",
+            f"- state: {_one_line(receipt.get('state'))}",
+            f"- summary: {_one_line(receipt.get('summary'))}",
+            f"- next_action: {_one_line(receipt.get('next_action'))}",
+            f"- actor: {_one_line(receipt.get('actor'))}",
+            f"- persisted: {_one_line(receipt.get('persisted'))}",
+            f"- persistence_reason: {_one_line(receipt.get('persistence_reason'))}",
+            f"- order_id: {_one_line(receipt.get('order_id'))}",
+            f"- job_id: {_one_line(receipt.get('job_id'))}",
+            "",
+            "### Details",
+            "",
+            "```json",
+            json.dumps(details, sort_keys=True, ensure_ascii=True, indent=2),
+            "```",
+            "",
+            "## Persisted Receipt",
+            "",
+        ]
+    )
+
+    if persisted_receipt:
+        for key in ("state", "summary", "next_action", "actor", "recorded_at", "order_id", "job_id"):
+            lines.append(f"- {key}: {_one_line(persisted_receipt.get(key))}")
+        lines.append("")
+    else:
+        lines.extend(["No persisted receipt is available for this selection.", ""])
+
+    lines.extend(
+        [
+            "## Receipt Counts",
+            "",
+            f"- Total receipts: {_one_line(receipt_report.get('receipt_count'), default='0')}",
+        ]
+    )
+    if receipt_counts:
+        for state in sorted(receipt_counts):
+            lines.append(f"- {state}: {_one_line(receipt_counts.get(state), default='0')}")
+    else:
+        lines.append("- By state: none")
+    lines.append("")
+
+    lines.extend(
+        [
+            "## Receipt History",
+            "",
+            "| # | State | Actor | Recorded at | Summary | Next action |",
+            "| ---: | --- | --- | --- | --- | --- |",
+        ]
+    )
+    if receipt_history:
+        for index, history_item in enumerate(receipt_history, start=1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        _one_line(index),
+                        _one_line(history_item.get("state")),
+                        _one_line(history_item.get("actor")),
+                        _one_line(history_item.get("recorded_at")),
+                        _one_line(history_item.get("summary")),
+                        _one_line(history_item.get("next_action")),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.append("| - | - | - | - | No receipt history. | - |")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render an offline proactive action-plan report from the orchestrator SQLite database.")
     parser.add_argument("--db", required=True, type=Path, help="Path to the orchestrator SQLite database.")
     parser.add_argument("--format", choices=("json", "md", "markdown"), default="json", help="Output format.")
+    parser.add_argument("--receipt", action="store_true", help="Record and render a proactive action-plan receipt payload.")
     parser.add_argument("--limit", type=_positive_int, default=20, help="Maximum proactive orders to return.")
+    parser.add_argument("--rank", type=_positive_int, help="Select a proactive order by rank for receipt mode.")
+    parser.add_argument("--order-id", help="Select a proactive order by order id for receipt mode. Takes precedence over --rank.")
     parser.add_argument("--chat-id", type=int, help="Optional chat id scope.")
+    parser.add_argument("--state", choices=("acknowledged", "in_progress", "completed"), help="Receipt state.")
+    parser.add_argument("--summary", help="Receipt summary.")
+    parser.add_argument("--next-action", help="Receipt next action.")
+    parser.add_argument("--actor", help="Receipt actor.")
+    parser.add_argument("--details-json", help="Receipt details as a JSON object.")
     parser.add_argument("--output", type=Path, help="Optional output file path.")
     return parser.parse_args(argv)
 
@@ -266,8 +455,41 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
         print(f"database not found: {db_path}", file=err)
         return 2
 
+    details: dict[str, Any] | None = None
+    if args.receipt:
+        if not args.state:
+            print("receipt mode requires --state (acknowledged, in_progress, or completed)", file=err)
+            return 2
+        if not args.order_id and args.rank is None:
+            print("receipt mode requires either --order-id or --rank", file=err)
+            return 2
+        if args.details_json:
+            try:
+                parsed_details = json.loads(args.details_json)
+            except json.JSONDecodeError as exc:
+                print(f"--details-json must be a valid JSON object: {exc.msg}", file=err)
+                return 2
+            if not isinstance(parsed_details, dict):
+                print("--details-json must be a JSON object", file=err)
+                return 2
+            details = parsed_details
+
     try:
-        report = build_report(db_path=db_path, chat_id=args.chat_id, limit=args.limit)
+        if args.receipt:
+            report = build_receipt(
+                db_path=db_path,
+                chat_id=args.chat_id,
+                state=args.state,
+                summary=args.summary,
+                next_action=args.next_action,
+                actor=args.actor,
+                details=details,
+                order_id=args.order_id,
+                rank=args.rank,
+                limit=args.limit,
+            )
+        else:
+            report = build_report(db_path=db_path, chat_id=args.chat_id, limit=args.limit)
     except Exception as exc:
         print(f"failed to render proactive action-plan report: {exc}", file=err)
         return 2
@@ -275,7 +497,7 @@ def main(argv: list[str] | None = None, *, stdout: TextIO | None = None, stderr:
     if args.format == "json":
         rendered = json.dumps(report, sort_keys=True, ensure_ascii=True, indent=2) + "\n"
     else:
-        rendered = render_markdown(report)
+        rendered = render_receipt_markdown(report) if args.receipt else render_markdown(report)
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
