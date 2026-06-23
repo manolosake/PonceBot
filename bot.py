@@ -15442,10 +15442,42 @@ def _controller_snapshot_patch_has_meaningful_diff(patch_path: Path) -> bool:
     return False
 
 
+def _controller_snapshot_preserves_publication_blocker(trace: dict[str, Any]) -> bool:
+    if str(trace.get("result_status") or "").strip().lower() != "blocked_need_operator":
+        return False
+    publication_recovery = str(trace.get("studio_selected_type") or "").strip().upper() == "PUBLICATION_RECOVERY"
+    if not publication_recovery:
+        publication_recovery = any(
+            str(trace.get(key) or "").strip()
+            for key in (
+                "studio_recovery_id",
+                "studio_recovery_project_key",
+                "studio_recovery_project_path",
+                "studio_recovery_source_order_id",
+            )
+        )
+    if not publication_recovery:
+        return False
+    blocker_text = " ".join(
+        str(trace.get(key) or "").strip().lower()
+        for key in ("result_summary", "result_next_action")
+    )
+    if not blocker_text:
+        return False
+    if "publication incomplete:" in blocker_text or "publication evidence incomplete:" in blocker_text:
+        return True
+    return (
+        "private github publication" in blocker_text
+        and any(token in blocker_text for token in ("blocked", "missing", "push", "create"))
+    )
+
+
 def _controller_snapshot_no_delta_outcome_status(trace: dict[str, Any]) -> str:
     # A controller snapshot without a material repo delta is never a shipped
     # product outcome. Publication claims still need a real committed project
     # artifact or repo-state change; otherwise Studio learns to count chatter.
+    if _controller_snapshot_preserves_publication_blocker(trace):
+        return "blocked_need_operator"
     return "rejected_low_value"
 
 
@@ -15510,13 +15542,25 @@ def _auto_ship_controller_snapshot_order(
                 ok = deploy_status != "failed"
                 outcome_status = _controller_snapshot_no_delta_outcome_status(trace)
                 delivered = outcome_status in {"published_project", "shipped_to_main"}
-                summary = (
-                    f"Controller snapshot had no new delta; not counted as shipped without a material patch"
-                    + (f" commit={commit_sha}" if commit_sha else "")
-                    + (f". {deploy_summary}" if deploy_summary else ".")
-                )
+                blocked_publication = outcome_status == "blocked_need_operator"
+                if blocked_publication:
+                    blocker_summary = str(trace.get("result_summary") or "").strip()
+                    summary = (
+                        "Controller snapshot had no new delta; preserving the validated publication blocker"
+                        + (f": {blocker_summary}" if blocker_summary else ".")
+                    )
+                    if deploy_summary:
+                        summary = f"{summary} {deploy_summary}"
+                else:
+                    summary = (
+                        f"Controller snapshot had no new delta; not counted as shipped without a material patch"
+                        + (f" commit={commit_sha}" if commit_sha else "")
+                        + (f". {deploy_summary}" if deploy_summary else ".")
+                    )
                 if ok and outcome_status == "published_project":
                     original_reason = "snapshot_no_delta_already_published"
+                elif ok and blocked_publication:
+                    original_reason = "snapshot_no_delta_publication_blocked"
                 elif ok:
                     original_reason = "snapshot_no_delta_rejected_low_value"
                 else:
@@ -15548,9 +15592,16 @@ def _auto_ship_controller_snapshot_order(
                             "Factory ready for next order."
                             if ok and delivered
                             else (
-                                "Reject this no-delta work and choose a stronger candidate."
-                                if ok
-                                else "Inspect deployment failure and complete rollout."
+                                (
+                                    str(trace.get("result_next_action") or "").strip()
+                                    or "Live checkout/GitHub verification is still required; complete the exact publication recovery step before retrying autoship."
+                                )
+                                if ok and blocked_publication
+                                else (
+                                    "Reject this no-delta work and choose a stronger candidate."
+                                    if ok
+                                    else "Inspect deployment failure and complete rollout."
+                                )
                             )
                         ),
                     )

@@ -1281,7 +1281,7 @@ def test_controller_snapshot_autoship_closes_empty_published_project_patch_as_no
     assert queue.audit_events[-1][1]["event_type"] == "order.controller_snapshot_autoship_no_delta"
 
 
-def test_controller_snapshot_autoship_rejects_empty_non_published_patch_as_low_value(tmp_path, monkeypatch):
+def test_controller_snapshot_autoship_preserves_publication_recovery_blocker_for_no_delta(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".git").mkdir()
@@ -1330,8 +1330,86 @@ def test_controller_snapshot_autoship_rejects_empty_non_published_patch_as_low_v
         trace={
             "controller_snapshot_workdir": str(snapshot),
             "result_artifacts": [str(patch)],
-            "result_status": "done",
-            "result_summary": "PASS validation. Ready to commit, push and deploy, but no material repo change was produced.",
+            "result_status": "blocked_need_operator",
+            "result_summary": (
+                "Publication incomplete: missing private GitHub publication evidence. "
+                "Outcome: blocked_need_operator. PASS validated controller snapshot."
+            ),
+            "result_next_action": "Create the private GitHub remote and push main with the validated publication evidence.",
+            "studio_selected_type": "PUBLICATION_RECOVERY",
+            "studio_recovery_id": str(repo).lower(),
+            "studio_recovery_project_path": str(repo),
+        },
+        repo_record=None,
+        repo_dir=repo,
+        default_branch="main",
+        now=2_000.0,
+    )
+
+    assert result["status"] == "ok"
+    assert result["reason"] == "snapshot_no_delta_publication_blocked"
+    assert queue.state_call[1]["result_status"] == "blocked_need_operator"
+    assert queue.state_call[1]["merged_to_main"] is False
+    assert queue.state_call[1]["controller_snapshot_autoship_commit"] is None
+    assert "Publication incomplete: missing private GitHub publication evidence." in queue.state_call[1]["result_summary"]
+    assert queue.state_call[1]["result_next_action"] == (
+        "Create the private GitHub remote and push main with the validated publication evidence."
+    )
+    assert completed["outcome_status"] == "blocked_need_operator"
+
+
+def test_controller_snapshot_autoship_rejects_generic_blocked_no_delta_as_low_value(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    patch = tmp_path / "changes.patch"
+    patch.write_text("", encoding="utf-8")
+    completed = {}
+
+    class RecordingQueue:
+        def __init__(self):
+            self.state_call = None
+
+        def set_order_status(self, *args, **kwargs):
+            return None
+
+        def set_order_phase(self, *args, **kwargs):
+            return None
+
+        def update_state(self, *args, **kwargs):
+            self.state_call = (args, kwargs)
+
+        def append_audit_event(self, *args, **kwargs):
+            return None
+
+    def fake_run_git(_repo, args, **kwargs):
+        if args[:2] == ["apply", "--check"]:
+            return SimpleNamespace(returncode=128, stdout="", stderr="error: No valid patches in input")
+        if args[:2] == ["rev-parse", "--short"]:
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        raise AssertionError(f"unexpected git command: {args}")
+
+    monkeypatch.setattr(bot, "_sync_repo_checkout_to_default_branch", lambda **kwargs: (True, "", None, None))
+    monkeypatch.setattr(bot, "_git_status_porcelain", lambda _repo: "")
+    monkeypatch.setattr(bot, "_run_git", fake_run_git)
+    monkeypatch.setattr(bot, "_controller_snapshot_copy_safe_untracked_files", lambda **kwargs: [])
+    monkeypatch.setattr(bot, "_deploy_after_order_merge", lambda **kwargs: {"status": "skipped", "reason": "no_policy", "summary": "Deploy skipped."})
+    monkeypatch.setattr(bot, "_studio_complete_cycle_for_order", lambda **kwargs: completed.update(kwargs))
+
+    queue = RecordingQueue()
+    result = bot._auto_ship_controller_snapshot_order(
+        cfg=SimpleNamespace(),
+        orch_q=queue,
+        order_id="snapshot-order",
+        chat_id=123,
+        trace={
+            "controller_snapshot_workdir": str(snapshot),
+            "result_artifacts": [str(patch)],
+            "result_status": "blocked_need_operator",
+            "result_summary": "Outcome: blocked_need_operator. PASS validated controller snapshot waiting for autoship recovery.",
+            "result_next_action": "Apply the validated changes into the real repository checkout, commit, push, and deploy.",
         },
         repo_record=None,
         repo_dir=repo,
