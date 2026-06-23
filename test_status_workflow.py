@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from bot import _studio_reconcile_portfolio_publication_contract
 from orchestrator.queue import OrchestratorQueue
 from orchestrator.schemas.task import Task
 from orchestrator.status_service import StatusService
@@ -994,6 +995,314 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 checks["release_target_evidence"]["evidence"][0]["value"],
                 "manolosake/signaldeck",
             )
+
+    def test_publication_reconciliation_uses_persisted_private_evidence_from_open_recovery_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "signaldeck",
+                        "SignalDeck",
+                        "/tmp/nonexistent-signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "main",
+                        "2efec0a",
+                        0,
+                        "needs_publication",
+                        "47414141-5252-6363-7474-858585858585",
+                        "47414141-5252-6363-7474-858585858585",
+                        "published_project",
+                        "Portfolio row is missing only persisted private visibility evidence.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-open-private",
+                        "signaldeck",
+                        "SignalDeck",
+                        "/tmp/nonexistent-signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "2efec0a",
+                        1,
+                        "[]",
+                        "resolve_publication_contract",
+                        "open",
+                        "SQLite already has the complete private publication evidence.",
+                        "47414141-5252-6363-7474-858585858585",
+                        11.0,
+                        21.0,
+                    ),
+                )
+                conn.commit()
+
+            changed = _studio_reconcile_portfolio_publication_contract(storage.path, now=42.0)
+
+            self.assertEqual(changed, 1)
+            with sqlite3.connect(storage.path) as conn:
+                portfolio_row = conn.execute(
+                    """
+                    SELECT status, private, github_repo, github_url, latest_head
+                    FROM studio_portfolio_projects
+                    WHERE project_key = ?
+                    """,
+                    ("signaldeck",),
+                ).fetchone()
+                recovery_row = conn.execute(
+                    """
+                    SELECT status, private
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    ("recovery-open-private",),
+                ).fetchone()
+
+            self.assertIsNotNone(portfolio_row)
+            self.assertIsNotNone(recovery_row)
+            self.assertEqual(portfolio_row[0], "published_private")
+            self.assertEqual(portfolio_row[1], 1)
+            self.assertEqual(portfolio_row[2], "manolosake/signaldeck")
+            self.assertEqual(portfolio_row[3], "https://github.com/manolosake/signaldeck.git")
+            self.assertEqual(portfolio_row[4], "2efec0a")
+            self.assertEqual(recovery_row[0], "resolved")
+            self.assertEqual(recovery_row[1], 1)
+
+    def test_publication_reconciliation_only_resolves_exact_matching_same_key_recovery_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "signaldeck",
+                        "SignalDeck",
+                        "/tmp/nonexistent-signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "main",
+                        "2efec0a",
+                        0,
+                        "needs_publication",
+                        "47414141-5252-6363-7474-858585858585",
+                        "47414141-5252-6363-7474-858585858585",
+                        "published_project",
+                        "Portfolio row is missing only persisted private visibility evidence.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-open-private",
+                        "signaldeck",
+                        "SignalDeck",
+                        "/tmp/nonexistent-signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "2efec0a",
+                        1,
+                        "[]",
+                        "resolve_publication_contract",
+                        "open",
+                        "SQLite already has the complete private publication evidence.",
+                        "47414141-5252-6363-7474-858585858585",
+                        11.0,
+                        21.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-conflict",
+                        "signaldeck",
+                        "SignalDeck Fork",
+                        "/tmp/nonexistent-signaldeck-fork",
+                        "manolosake/signaldeck-fork",
+                        "",
+                        "",
+                        0,
+                        "[\"github_url\", \"latest_head\", \"private\"]",
+                        "resolve_publication_contract",
+                        "open",
+                        "Same key, but conflicting identity should stay open.",
+                        "99999999-aaaa-bbbb-cccc-dddddddddddd",
+                        12.0,
+                        22.0,
+                    ),
+                )
+                conn.commit()
+
+            changed = _studio_reconcile_portfolio_publication_contract(storage.path, now=42.0)
+
+            self.assertEqual(changed, 1)
+            with sqlite3.connect(storage.path) as conn:
+                portfolio_row = conn.execute(
+                    """
+                    SELECT status, private
+                    FROM studio_portfolio_projects
+                    WHERE project_key = ?
+                    """,
+                    ("signaldeck",),
+                ).fetchone()
+                matching_recovery_row = conn.execute(
+                    """
+                    SELECT status, private
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    ("recovery-open-private",),
+                ).fetchone()
+                conflicting_recovery_row = conn.execute(
+                    """
+                    SELECT status, private, reason
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    ("recovery-conflict",),
+                ).fetchone()
+
+            self.assertIsNotNone(portfolio_row)
+            self.assertIsNotNone(matching_recovery_row)
+            self.assertIsNotNone(conflicting_recovery_row)
+            self.assertEqual(portfolio_row[0], "published_private")
+            self.assertEqual(portfolio_row[1], 1)
+            self.assertEqual(matching_recovery_row[0], "resolved")
+            self.assertEqual(matching_recovery_row[1], 1)
+            self.assertEqual(conflicting_recovery_row[0], "open")
+            self.assertEqual(conflicting_recovery_row[1], 0)
+            self.assertEqual(conflicting_recovery_row[2], "Same key, but conflicting identity should stay open.")
 
     def test_release_readiness_rejects_persisted_publication_recovery_without_valid_github_url(self) -> None:
         with tempfile.TemporaryDirectory() as td:

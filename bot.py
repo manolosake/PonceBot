@@ -18478,6 +18478,7 @@ def _studio_complete_publication_sibling(
 
 def _studio_publication_recovery_row_project(row: Mapping[str, Any]) -> dict[str, Any]:
     recovery = dict(row)
+    private_raw = recovery.get("private")
     return {
         "project_key": str(recovery.get("project_key") or recovery.get("recovery_id") or "").strip(),
         "project_name": str(recovery.get("project_name") or "").strip(),
@@ -18485,11 +18486,50 @@ def _studio_publication_recovery_row_project(row: Mapping[str, Any]) -> dict[str
         "github_repo": str(recovery.get("github_repo") or "").strip(),
         "github_url": str(recovery.get("github_url") or "").strip(),
         "latest_head": str(recovery.get("latest_head") or "").strip(),
-        "private": 0,
-        "status": "needs_publication",
+        "private": 1 if _studio_github_publication_private_confirmed(private_raw) else 0,
+        "status": str(recovery.get("status") or "").strip() or "needs_publication",
         "source_order_id": str(recovery.get("source_order_id") or "").strip(),
         "latest_order_id": str(recovery.get("source_order_id") or "").strip(),
     }
+
+
+def _studio_publication_recovery_matches_project(
+    project: Mapping[str, Any],
+    recovery_project: Mapping[str, Any],
+) -> bool:
+    project_key = str(project.get("project_key") or "").strip().lower()
+    recovery_key = str(recovery_project.get("project_key") or "").strip().lower()
+    if project_key and recovery_key and project_key != recovery_key:
+        return False
+
+    project_order_ids = {
+        str(raw_order_id or "").strip().lower()
+        for raw_order_id in (project.get("source_order_id"), project.get("latest_order_id"))
+        if str(raw_order_id or "").strip()
+    }
+    recovery_order_id = str(recovery_project.get("source_order_id") or recovery_project.get("latest_order_id") or "").strip().lower()
+    if recovery_order_id and project_order_ids and recovery_order_id not in project_order_ids:
+        return False
+
+    project_path = str(project.get("project_path") or "").strip().lower()
+    recovery_path = str(recovery_project.get("project_path") or "").strip().lower()
+    if project_path and recovery_path and project_path != recovery_path:
+        return False
+
+    project_repo = str(project.get("github_repo") or _github_repo_full_name_from_remote_url(str(project.get("github_url") or "")) or "").strip().lower()
+    recovery_repo = str(
+        recovery_project.get("github_repo")
+        or _github_repo_full_name_from_remote_url(str(recovery_project.get("github_url") or ""))
+        or ""
+    ).strip().lower()
+    if project_repo and recovery_repo and project_repo != recovery_repo:
+        return False
+
+    return bool(
+        (recovery_order_id and recovery_order_id in project_order_ids)
+        or (project_path and recovery_path and project_path == recovery_path)
+        or (project_repo and recovery_repo and project_repo == recovery_repo)
+    )
 
 
 def _studio_upsert_publication_recovery_conn(
@@ -18790,6 +18830,10 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 str(row["name"] or "").strip().lower()
                 for row in conn.execute("PRAGMA table_info(studio_portfolio_projects)").fetchall()
             }
+            recovery_columns = {
+                str(row["name"] or "").strip().lower()
+                for row in conn.execute("PRAGMA table_info(studio_publication_recovery)").fetchall()
+            }
             required = {
                 "project_key",
                 "project_name",
@@ -18814,20 +18858,37 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 WHERE status LIKE 'published%' OR status = 'needs_publication'
                 """
             ).fetchall()
+            recovery_private_select = ", private" if "private" in recovery_columns else ", 0 AS private"
             open_recovery_rows = conn.execute(
-                """
+                f"""
                 SELECT recovery_id, project_key, project_name, project_path, github_repo, github_url,
-                       latest_head, source_order_id, status, required_action, reason
+                       latest_head{recovery_private_select}, source_order_id, status, required_action, reason
                 FROM studio_publication_recovery
                 WHERE status = 'open'
+                ORDER BY updated_at DESC, first_seen_at DESC, recovery_id ASC
                 """
             ).fetchall()
-            reconciled_rows: list[tuple[sqlite3.Row, dict[str, Any], list[str]]] = []
+            open_recovery_rows_by_key: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for recovery_row in open_recovery_rows or []:
+                recovery_project = _studio_publication_recovery_row_project(recovery_row)
+                recovery_key = str(recovery_project.get("project_key") or "").strip().lower()
+                recovery_id = str(recovery_row["recovery_id"] or "").strip().lower()
+                if recovery_key and recovery_id:
+                    open_recovery_rows_by_key.setdefault(recovery_key, []).append((recovery_id, recovery_project))
+            reconciled_rows: list[tuple[sqlite3.Row, dict[str, Any], list[str], set[str]]] = []
             reconciled_projects: list[dict[str, Any]] = []
             touched_recovery_ids: set[str] = set()
             for row in rows or []:
+                project_key = str(row["project_key"] or "").strip().lower()
+                project = dict(row)
+                matching_recovery_ids: set[str] = set()
+                for recovery_id, recovery_project in open_recovery_rows_by_key.get(project_key, []):
+                    if not _studio_publication_recovery_matches_project(project, recovery_project):
+                        continue
+                    project = _studio_merge_publication_evidence(project, recovery_project)
+                    matching_recovery_ids.add(recovery_id)
                 project = _studio_merge_publication_evidence(
-                    dict(row),
+                    project,
                     _studio_publication_trace_evidence_conn(
                         conn,
                         order_ids=(row["source_order_id"], row["latest_order_id"]),
@@ -18835,9 +18896,9 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 )
                 project = _studio_project_git_publication_probe(project)
                 reconciled_projects.append(project)
-                reconciled_rows.append((row, project, _studio_publication_contract_missing(project)))
+                reconciled_rows.append((row, project, _studio_publication_contract_missing(project), matching_recovery_ids))
             changed = 0
-            for row, project, missing in reconciled_rows:
+            for row, project, missing, matching_recovery_ids in reconciled_rows:
                 if missing and "github_identity" not in missing:
                     sibling = _studio_complete_publication_sibling(project, reconciled_projects)
                     if sibling:
@@ -18847,6 +18908,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         )
                         missing = _studio_publication_contract_missing(project)
                 if not missing:
+                    resolved_reason = "Publication contract is complete after local Git evidence backfill."
                     github_repo = str(project.get("github_repo") or "")
                     github_url = str(project.get("github_url") or "")
                     default_branch = str(project.get("default_branch") or "")
@@ -18906,13 +18968,24 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         missing=[],
                         now=now,
                         status="resolved",
-                        reason="Publication contract is complete after local Git evidence backfill.",
+                        reason=resolved_reason,
                     )
-                    touched_recovery_ids.add(
-                        str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "")
-                        .strip()
-                        .lower()
-                    )
+                    for recovery_id in matching_recovery_ids:
+                        conn.execute(
+                            """
+                            UPDATE studio_publication_recovery
+                            SET status = 'resolved',
+                                reason = ?,
+                                updated_at = ?
+                            WHERE recovery_id = ?
+                            """,
+                            (
+                                resolved_reason,
+                                float(now),
+                                recovery_id,
+                            ),
+                        )
+                    touched_recovery_ids.update(matching_recovery_ids)
                     if row_changed:
                         changed += 1
                     continue
@@ -18976,11 +19049,6 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     now=now,
                     status="open",
                     reason=summary,
-                )
-                touched_recovery_ids.add(
-                    str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "")
-                    .strip()
-                    .lower()
                 )
                 if row_changed:
                     changed += 1
