@@ -3017,6 +3017,414 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(project_row["status"], "needs_publication")
         self.assertIn("archive_or_reject_missing_path", project_row["latest_summary"])
 
+    def test_publication_contract_reconcile_recovers_missing_fields_from_source_order_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_260.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/signaldeck",
+                                    "github_url": "https://github.com/manolosake/signaldeck.git",
+                                    "remote_url": "https://github.com/manolosake/signaldeck.git",
+                                    "default_branch": "main",
+                                    "branch": "main",
+                                    "latest_head": "abc1234",
+                                    "head": "abc1234",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-latest", json.dumps({"seed": "latest"}), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/signaldeck",
+                        "SignalDeck",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source",
+                        "order-latest",
+                        "published_project",
+                        "Publication evidence needs recovery.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/signaldeck",),
+                ).fetchone()
+                latest_job = conn.execute(
+                    "SELECT trace, updated_at FROM jobs WHERE job_id = ?",
+                    ("order-latest",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/signaldeck")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/signaldeck.git")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], "abc1234")
+        self.assertEqual(project_row["private"], 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertIn("Publication contract is complete", recovery_row["reason"])
+        self.assertIsNotNone(latest_job)
+        latest_trace = json.loads(str(latest_job["trace"] or "{}"))
+        publication = latest_trace.get("github_publication")
+        self.assertIsInstance(publication, dict)
+        self.assertEqual(publication["github_repo"], "manolosake/signaldeck")
+        self.assertEqual(publication["github_url"], "https://github.com/manolosake/signaldeck.git")
+        self.assertEqual(publication["latest_head"], "abc1234")
+        self.assertTrue(publication["private"])
+
+    def test_publication_contract_reconcile_prefers_latest_trace_over_conflicting_source_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_265.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source-conflict",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/source-repo",
+                                    "github_url": "https://github.com/manolosake/source-repo.git",
+                                    "default_branch": "main",
+                                    "latest_head": "source123",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-latest-conflict",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/latest-repo",
+                                    "github_url": "https://github.com/manolosake/latest-repo.git",
+                                    "default_branch": "main",
+                                    "latest_head": "latest456",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/latest-repo",
+                        "Latest Repo",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-conflict",
+                        "order-latest-conflict",
+                        "published_project",
+                        "Conflicting trace evidence needs recovery.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/latest-repo",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/latest-repo")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/latest-repo.git")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], "latest456")
+        self.assertEqual(project_row["private"], 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+
+    def test_publication_contract_reconcile_ignores_partial_trace_publication_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_268.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source-weak",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "private": True,
+                                    "latest_head": "weak1234",
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-latest-weak", json.dumps({"seed": "latest"}), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "weak-trace-project",
+                        "Weak Trace Project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-weak",
+                        "order-latest-weak",
+                        "published_project",
+                        "Publication evidence needs recovery.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private, latest_summary "
+                    "FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("weak-trace-project",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_repo"], "")
+        self.assertEqual(project_row["github_url"], "")
+        self.assertEqual(project_row["default_branch"], "")
+        self.assertEqual(project_row["latest_head"], "")
+        self.assertEqual(project_row["private"], 0)
+        self.assertIn("Publication incomplete:", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "archive_or_reject_missing_path")
+        self.assertIn("github_repo", recovery_row["missing_json"])
+        self.assertIn("github_url", recovery_row["missing_json"])
+        self.assertIn("latest_head", recovery_row["missing_json"])
+        self.assertIn("private", recovery_row["missing_json"])
+
+    def test_publication_contract_reconcile_recovers_missing_fields_from_latest_order_trace_when_path_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_project = root / "gone-project"
+            db = root / "jobs.sqlite"
+            now = 229_270.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-source-gone", json.dumps({"seed": "source"}), now),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-latest-gone",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/recovery-desk",
+                                    "github_url": "https://github.com/manolosake/recovery-desk.git",
+                                    "default_branch": "main",
+                                    "latest_head": "def5678",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/recovery-desk",
+                        "Recovery Desk",
+                        str(missing_project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-gone",
+                        "order-latest-gone",
+                        "published_project",
+                        "Local project path is gone but evidence may exist.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private, latest_summary "
+                    "FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/recovery-desk",),
+                ).fetchone()
+                source_job = conn.execute(
+                    "SELECT trace FROM jobs WHERE job_id = ?",
+                    ("order-source-gone",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/recovery-desk")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/recovery-desk.git")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], "def5678")
+        self.assertEqual(project_row["private"], 1)
+        self.assertEqual(project_row["latest_summary"], "Local project path is gone but evidence may exist.")
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertNotIn("archive_or_reject_missing_path", str(recovery_row["required_action"] or ""))
+        self.assertIsNotNone(source_job)
+        source_trace = json.loads(str(source_job["trace"] or "{}"))
+        publication = source_trace.get("github_publication")
+        self.assertIsInstance(publication, dict)
+        self.assertEqual(publication["github_repo"], "manolosake/recovery-desk")
+        self.assertEqual(publication["github_url"], "https://github.com/manolosake/recovery-desk.git")
+        self.assertEqual(publication["latest_head"], "def5678")
+        self.assertTrue(publication["private"])
+
     def test_publication_recovery_gate_creates_priority_opportunity(self) -> None:
         memory = {
             "studio_publication_recovery_count": 2,

@@ -18393,7 +18393,7 @@ def _studio_upsert_publication_recovery_conn(
     key = str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "").strip().lower()
     if not key:
         return
-    action = _studio_publication_recovery_action(project, missing)
+    action = "resolve_publication_contract" if not missing else _studio_publication_recovery_action(project, missing)
     project_name = str(project.get("project_name") or "")
     project_path = str(project.get("project_path") or "")
     github_repo = str(project.get("github_repo") or "")
@@ -18468,6 +18468,88 @@ def _studio_upsert_publication_recovery_conn(
             float(now),
         ),
     )
+
+
+def _studio_publication_trace_evidence_conn(
+    conn: sqlite3.Connection,
+    *,
+    order_ids: Iterable[Any],
+) -> dict[str, Any]:
+    columns = {
+        str(row["name"] or "").strip().lower()
+        for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "job_id" not in columns or "trace" not in columns:
+        return {}
+    seen: set[str] = set()
+    ordered_ids = [str(raw_order_id or "").strip() for raw_order_id in order_ids]
+    for order_id in reversed(ordered_ids):
+        if not order_id or order_id in seen:
+            continue
+        seen.add(order_id)
+        row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (order_id,)).fetchone()
+        if row is None:
+            continue
+        raw_trace = row["trace"] if isinstance(row, sqlite3.Row) else row[0]
+        trace: dict[str, Any] = {}
+        if isinstance(raw_trace, str) and raw_trace.strip():
+            try:
+                parsed = json.loads(raw_trace)
+                if isinstance(parsed, dict):
+                    trace = parsed
+            except Exception:
+                trace = {}
+        elif isinstance(raw_trace, dict):
+            trace = dict(raw_trace)
+        publication = trace.get("github_publication")
+        if not isinstance(publication, dict):
+            continue
+        github_repo = str(publication.get("github_repo") or "").strip()
+        github_url = str(publication.get("github_url") or publication.get("remote_url") or "").strip()
+        remote_repo = _github_repo_full_name_from_remote_url(github_url)
+        if github_url and not remote_repo:
+            github_url = ""
+        if not github_repo and remote_repo:
+            github_repo = remote_repo
+        if github_repo and remote_repo and github_repo != remote_repo:
+            github_repo = ""
+            github_url = ""
+        default_branch = str(publication.get("default_branch") or publication.get("branch") or "").strip()
+        latest_head = str(publication.get("latest_head") or publication.get("head") or "").strip()
+        private_raw = publication.get("private")
+        private_confirmed = private_raw is True or private_raw == 1
+        if isinstance(private_raw, str):
+            private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+        if not (github_repo and github_url and latest_head and private_confirmed):
+            continue
+        evidence: dict[str, Any] = {}
+        evidence["github_repo"] = github_repo
+        evidence["github_url"] = github_url
+        if default_branch:
+            evidence["default_branch"] = default_branch
+        evidence["latest_head"] = latest_head
+        evidence["private"] = 1
+        return evidence
+    return {}
+
+
+def _studio_merge_publication_evidence(
+    project: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = dict(project)
+    if not evidence:
+        return result
+    for field in ("github_repo", "github_url", "default_branch", "latest_head"):
+        if not str(result.get(field) or "").strip() and str(evidence.get(field) or "").strip():
+            result[field] = str(evidence.get(field) or "").strip()
+    private_raw = result.get("private")
+    private_confirmed = private_raw is True or private_raw == 1
+    if isinstance(private_raw, str):
+        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    if not private_confirmed and "private" in evidence:
+        result["private"] = int(evidence.get("private") or 0)
+    return result
 
 
 def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, Any]:
@@ -18584,7 +18666,14 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
             ).fetchall()
             changed = 0
             for row in rows or []:
-                project = _studio_project_git_publication_probe(dict(row))
+                project = _studio_merge_publication_evidence(
+                    dict(row),
+                    _studio_publication_trace_evidence_conn(
+                        conn,
+                        order_ids=(row["source_order_id"], row["latest_order_id"]),
+                    ),
+                )
+                project = _studio_project_git_publication_probe(project)
                 missing = _studio_publication_contract_missing(project)
                 if not missing:
                     github_repo = str(project.get("github_repo") or "")
