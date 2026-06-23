@@ -15445,18 +15445,8 @@ def _controller_snapshot_patch_has_meaningful_diff(patch_path: Path) -> bool:
 def _controller_snapshot_preserves_publication_blocker(trace: dict[str, Any]) -> bool:
     if str(trace.get("result_status") or "").strip().lower() != "blocked_need_operator":
         return False
-    publication_recovery = str(trace.get("studio_selected_type") or "").strip().upper() == "PUBLICATION_RECOVERY"
-    if not publication_recovery:
-        publication_recovery = any(
-            str(trace.get(key) or "").strip()
-            for key in (
-                "studio_recovery_id",
-                "studio_recovery_project_key",
-                "studio_recovery_project_path",
-                "studio_recovery_source_order_id",
-            )
-        )
-    if not publication_recovery:
+    recovery_id = str(trace.get("studio_recovery_id") or "").strip().lower()
+    if not recovery_id:
         return False
     blocker_text = " ".join(
         str(trace.get(key) or "").strip().lower()
@@ -20871,71 +20861,18 @@ def _studio_close_negative_publication_recovery_for_order_conn(
         trace = {}
 
     recovery_id = str(trace.get("studio_recovery_id") or "").strip().lower()
-    project_key = str(trace.get("studio_recovery_project_key") or "").strip().lower()
-    github_repo = str(trace.get("studio_recovery_github_repo") or "").strip().lower()
-    project_path = str(trace.get("studio_recovery_project_path") or "").strip()
-    source_order_id = str(trace.get("studio_recovery_source_order_id") or "").strip()
-
-    target_row = None
-    if recovery_id:
-        target_row = conn.execute(
-            """
-            SELECT recovery_id
-            FROM studio_publication_recovery
-            WHERE recovery_id = ?
-              AND status = 'open'
-            LIMIT 1
-            """,
-            (recovery_id,),
-        ).fetchone()
-    if target_row is None and project_key:
-        target_row = conn.execute(
-            """
-            SELECT recovery_id
-            FROM studio_publication_recovery
-            WHERE project_key = ?
-              AND status = 'open'
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (project_key,),
-        ).fetchone()
-    if target_row is None and github_repo:
-        target_row = conn.execute(
-            """
-            SELECT recovery_id
-            FROM studio_publication_recovery
-            WHERE LOWER(COALESCE(github_repo, '')) = ?
-              AND status = 'open'
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (github_repo,),
-        ).fetchone()
-    if target_row is None and project_path:
-        target_row = conn.execute(
-            """
-            SELECT recovery_id
-            FROM studio_publication_recovery
-            WHERE project_path = ?
-              AND status = 'open'
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (project_path,),
-        ).fetchone()
-    if target_row is None and source_order_id:
-        target_row = conn.execute(
-            """
-            SELECT recovery_id
-            FROM studio_publication_recovery
-            WHERE source_order_id = ?
-              AND status = 'open'
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (source_order_id,),
-        ).fetchone()
+    if not recovery_id:
+        return
+    target_row = conn.execute(
+        """
+        SELECT recovery_id
+        FROM studio_publication_recovery
+        WHERE recovery_id = ?
+          AND status = 'open'
+        LIMIT 1
+        """,
+        (recovery_id,),
+    ).fetchone()
     if target_row is None:
         return
 
