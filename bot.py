@@ -20564,9 +20564,23 @@ def _studio_extract_portfolio_project_from_order(
     github_repo = str(publication.get("github_repo") or "").strip()
     remote_url = str(publication.get("remote_url") or delivery.get("github_remote_url") or "").strip()
     if not remote_url and project_git_path is not None:
-        remote = _run_git(project_git_path, ["remote", "get-url", "origin"], check=False)
-        if remote.returncode == 0:
-            remote_url = str(remote.stdout or "").strip()
+        def _preferred_remote_url() -> str:
+            def _remote_url(name: str) -> str:
+                remote = _run_git(project_git_path, ["remote", "get-url", name], check=False)
+                if remote.returncode != 0:
+                    return ""
+                return str(remote.stdout or "").strip()
+
+            origin_url = _remote_url("origin")
+            if _github_repo_full_name_from_remote_url(origin_url):
+                return origin_url
+
+            github_url = _remote_url("github")
+            if _github_repo_full_name_from_remote_url(github_url):
+                return github_url
+            return origin_url
+
+        remote_url = _preferred_remote_url()
     if not github_repo and remote_url:
         github_repo = _github_repo_full_name_from_remote_url(remote_url)
     if not github_repo:

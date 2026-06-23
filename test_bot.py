@@ -1909,6 +1909,9 @@ class TestStudioOutcomeMemory(unittest.TestCase):
 
     def test_portfolio_parser_reads_git_remote_and_head_from_project_path(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
             return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
 
         with tempfile.TemporaryDirectory() as td:
@@ -1985,6 +1988,95 @@ class TestStudioOutcomeMemory(unittest.TestCase):
 
         self.assertIsNotNone(row)
         self.assertEqual(row["github_repo"], "manolosake/winback-workbench")
+        self.assertEqual(row["latest_head"], head)
+
+    def test_portfolio_parser_prefers_github_remote_when_origin_is_not_github(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "signaldeck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@example.com:team/signaldeck.git"], cwd=project)
+            run(["git", "remote", "add", "github", "git@github.com:manolosake/signaldeck.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 227_050.0
+            order_id = "order-portfolio-github-remote"
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace) VALUES (?, ?)",
+                    (
+                        order_id,
+                        json.dumps({"project_incubator_delivery": {"project_path": str(project)}}),
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-github-remote-parser",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "new-project-incubator",
+                        "NEW_PROJECT",
+                        "",
+                        "",
+                        "incubator",
+                        "Create a sellable project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        order_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility", return_value=True):
+                bot._studio_complete_cycle_for_order_db(
+                    db_path=db,
+                    order_id=order_id,
+                    outcome_status="published_project",
+                    outcome_summary="PASS. Built SignalDeck and published it privately.",
+                    now=now + 60,
+                )
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT status, github_repo, github_url, latest_head FROM studio_portfolio_projects"
+                ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "published_private")
+        self.assertEqual(row["github_repo"], "manolosake/signaldeck")
+        self.assertEqual(row["github_url"], "https://github.com/manolosake/signaldeck.git")
         self.assertEqual(row["latest_head"], head)
 
     def test_portfolio_parser_confirms_private_visibility_from_github_api(self) -> None:
