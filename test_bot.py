@@ -3228,6 +3228,96 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
         self.assertEqual(recovery_row["missing_json"], "[]")
 
+    def test_publication_contract_reconcile_prefers_complete_latest_trace_over_stale_row_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_266.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-source-stale-row", json.dumps({"seed": "source"}), now),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-latest-stale-row",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/correct-repo",
+                                    "github_url": "https://github.com/manolosake/correct-repo.git",
+                                    "default_branch": "main",
+                                    "latest_head": "correct123",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/correct-repo",
+                        "Correct Repo",
+                        "",
+                        "manolosake/wrong-repo",
+                        "https://github.com/manolosake/wrong-repo.git",
+                        "main",
+                        "wrong999",
+                        1,
+                        "published_private",
+                        "order-source-stale-row",
+                        "order-latest-stale-row",
+                        "published_project",
+                        "Stored publication fields are stale.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/correct-repo",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/correct-repo")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/correct-repo.git")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], "correct123")
+        self.assertEqual(project_row["private"], 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+
     def test_publication_contract_reconcile_ignores_partial_trace_publication_payload(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"

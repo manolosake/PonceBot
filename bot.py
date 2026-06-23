@@ -18540,8 +18540,19 @@ def _studio_merge_publication_evidence(
     result = dict(project)
     if not evidence:
         return result
+    evidence_private_raw = evidence.get("private")
+    evidence_private_confirmed = evidence_private_raw is True or evidence_private_raw == 1
+    if isinstance(evidence_private_raw, str):
+        evidence_private_confirmed = evidence_private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    evidence_is_authoritative = (
+        evidence_private_confirmed
+        and all(str(evidence.get(field) or "").strip() for field in ("github_repo", "github_url", "latest_head"))
+    )
     for field in ("github_repo", "github_url", "default_branch", "latest_head"):
-        if not str(result.get(field) or "").strip() and str(evidence.get(field) or "").strip():
+        evidence_value = str(evidence.get(field) or "").strip()
+        if not evidence_value:
+            continue
+        if evidence_is_authoritative or not str(result.get(field) or "").strip():
             result[field] = str(evidence.get(field) or "").strip()
     private_raw = result.get("private")
     private_confirmed = private_raw is True or private_raw == 1
