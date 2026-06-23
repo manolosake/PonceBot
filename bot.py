@@ -18481,6 +18481,33 @@ def _studio_publication_trace_evidence_conn(
     *,
     order_ids: Iterable[Any],
 ) -> dict[str, Any]:
+    def _trace_has_negative_publication_outcome(trace: Mapping[str, Any]) -> bool:
+        negative_outcomes = {
+            "blocked_need_operator",
+            "rejected_low_value",
+            "failed_root_caused",
+            "failed",
+            "error",
+            "deploy_failed",
+            "blocked",
+            "cancelled",
+        }
+        status_fields = (
+            "studio_terminal_outcome",
+            "outcome_status",
+            "result_status",
+            "operational_gate_reason",
+        )
+        for field in status_fields:
+            value = str(trace.get(field) or "").strip().lower()
+            if not value:
+                continue
+            if value.startswith("studio_outcome_"):
+                value = value.removeprefix("studio_outcome_")
+            if value in negative_outcomes:
+                return True
+        return False
+
     columns = {
         str(row["name"] or "").strip().lower()
         for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
@@ -18507,6 +18534,8 @@ def _studio_publication_trace_evidence_conn(
                 trace = {}
         elif isinstance(raw_trace, dict):
             trace = dict(raw_trace)
+        if _trace_has_negative_publication_outcome(trace):
+            continue
         publication = trace.get("github_publication")
         if not isinstance(publication, dict):
             continue

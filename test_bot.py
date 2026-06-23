@@ -3159,6 +3159,203 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(publication["latest_head"], "abc1234")
         self.assertTrue(publication["private"])
 
+    def test_publication_contract_reconcile_recovers_from_legacy_complete_trace_without_status_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_260.25
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source-legacy",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/legacy-backfill",
+                                    "github_url": "https://github.com/manolosake/legacy-backfill.git",
+                                    "remote_url": "https://github.com/manolosake/legacy-backfill.git",
+                                    "default_branch": "main",
+                                    "branch": "main",
+                                    "latest_head": "legacy12",
+                                    "head": "legacy12",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-latest-legacy", json.dumps({"seed": "latest"}), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/legacy-backfill",
+                        "Legacy Backfill",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-legacy",
+                        "order-latest-legacy",
+                        "published_project",
+                        "Legacy successful publication trace should still recover.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/legacy-backfill",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/legacy-backfill")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/legacy-backfill.git")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], "legacy12")
+        self.assertEqual(project_row["private"], 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+
+    def test_publication_contract_reconcile_ignores_complete_trace_payload_from_blocked_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_260.5
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source-blocked",
+                        json.dumps(
+                            {
+                                "studio_terminal_outcome": "blocked_need_operator",
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/blocked-repo",
+                                    "github_url": "https://github.com/manolosake/blocked-repo.git",
+                                    "remote_url": "https://github.com/manolosake/blocked-repo.git",
+                                    "default_branch": "main",
+                                    "branch": "main",
+                                    "latest_head": "block123",
+                                    "head": "block123",
+                                    "private": True,
+                                },
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-latest-blocked", json.dumps({"seed": "latest"}), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/blocked-repo",
+                        "Blocked Repo",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-blocked",
+                        "order-latest-blocked",
+                        "blocked_need_operator",
+                        "Blocked publication trace should not clear recovery.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private, latest_summary "
+                    "FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/blocked-repo",),
+                ).fetchone()
+                latest_job = conn.execute(
+                    "SELECT trace FROM jobs WHERE job_id = ?",
+                    ("order-latest-blocked",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_repo"], "")
+        self.assertEqual(project_row["github_url"], "")
+        self.assertEqual(project_row["default_branch"], "")
+        self.assertEqual(project_row["latest_head"], "")
+        self.assertEqual(project_row["private"], 0)
+        self.assertIn("Publication incomplete:", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertIn("github_repo", recovery_row["missing_json"])
+        self.assertIn("github_url", recovery_row["missing_json"])
+        self.assertIn("latest_head", recovery_row["missing_json"])
+        self.assertIn("private", recovery_row["missing_json"])
+        self.assertIsNotNone(latest_job)
+        self.assertEqual(json.loads(str(latest_job["trace"] or "{}")), {"seed": "latest"})
+
     def test_publication_contract_reconcile_does_not_recover_private_false_string_from_source_order_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
