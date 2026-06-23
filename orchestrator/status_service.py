@@ -1012,6 +1012,19 @@ def _release_target_evidence_from_github_publication(
     return None
 
 
+def _publication_recovery_status_is_resolved(status_raw: Any) -> bool:
+    status = str(status_raw or "").strip().lower()
+    return status in {
+        "resolved",
+        "complete",
+        "completed",
+        "published",
+        "published_private",
+        "published_public",
+        "closed",
+    }
+
+
 def _release_target_evidence(
     root_trace: dict[str, Any],
     *,
@@ -4688,9 +4701,9 @@ class StatusService:
 
         def _recovery_row_rank(row: sqlite3.Row) -> tuple[int, int, int, float]:
             status = str(row["status"] or "").strip().lower()
-            resolved_score = 1 if status in {"resolved", "complete", "completed", "published", "closed"} else 0
+            resolved_score = 1 if _publication_recovery_status_is_resolved(status) else 0
             completeness_score = 0
-            for field in ("github_repo", "github_url", "latest_head"):
+            for field in ("github_repo", "github_url", "latest_head", "private"):
                 if str(row[field] or "").strip():
                     completeness_score += 1
             github_identity_score = 1 if completeness_score >= 2 else 0
@@ -4708,6 +4721,7 @@ class StatusService:
                 }
 
                 portfolio_rows: list[sqlite3.Row] = []
+                direct_recovery_rows: list[sqlite3.Row] = []
                 recovery_rows_by_key: dict[str, sqlite3.Row] = {}
                 matched_project_keys: set[str] = set()
 
@@ -4759,15 +4773,26 @@ class StatusService:
                         "github_repo",
                         "github_url",
                         "latest_head",
+                        "private",
                         "status",
+                        "source_order_id",
                         "updated_at",
                     ]
                     recovery_select = [
                         field if field in recovery_columns else f"NULL AS {field}"
                         for field in recovery_fields
                     ]
-                    recovery_queries: list[tuple[str, tuple[Any, ...]]] = []
-                    recovery_queries.append(
+                    direct_recovery_rows = conn.execute(
+                        f"""
+                        SELECT {", ".join(recovery_select)}
+                        FROM studio_publication_recovery
+                        WHERE source_order_id = ?
+                        ORDER BY updated_at DESC
+                        LIMIT 20
+                        """,
+                        (oid,),
+                    ).fetchall()
+                    recovery_queries: list[tuple[str, tuple[Any, ...]]] = [
                         (
                             f"""
                             SELECT {", ".join(recovery_select)}
@@ -4778,7 +4803,7 @@ class StatusService:
                             """,
                             (oid,),
                         )
-                    )
+                    ]
                     if matched_project_keys:
                         placeholders = ", ".join("?" for _ in matched_project_keys)
                         recovery_queries.append(
@@ -4828,6 +4853,24 @@ class StatusService:
                             or (str(recovery_row["latest_head"] or "").strip() if recovery_row is not None else "")
                         ),
                         "private": private_raw,
+                    }
+                    evidence = _release_target_evidence_from_github_publication(
+                        publication,
+                        key="persisted_github_publication",
+                        kind="sqlite",
+                    )
+                    if evidence is not None:
+                        candidates.append(evidence)
+
+                for row in direct_recovery_rows:
+                    if not _publication_recovery_status_is_resolved(row["status"]):
+                        continue
+                    publication = {
+                        "ok": True,
+                        "github_repo": str(row["github_repo"] or "").strip(),
+                        "github_url": str(row["github_url"] or "").strip(),
+                        "latest_head": str(row["latest_head"] or "").strip(),
+                        "private": row["private"],
                     }
                     evidence = _release_target_evidence_from_github_publication(
                         publication,

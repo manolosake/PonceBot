@@ -477,30 +477,6 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             with sqlite3.connect(storage.path) as conn:
                 conn.execute(
                     """
-                    CREATE TABLE studio_portfolio_projects (
-                        project_key TEXT PRIMARY KEY,
-                        project_name TEXT NOT NULL,
-                        project_path TEXT,
-                        github_repo TEXT,
-                        github_url TEXT,
-                        default_branch TEXT,
-                        latest_head TEXT,
-                        private INTEGER,
-                        status TEXT NOT NULL,
-                        source_order_id TEXT,
-                        latest_order_id TEXT,
-                        latest_outcome_status TEXT,
-                        latest_summary TEXT,
-                        validation_summary TEXT,
-                        monetization_summary TEXT,
-                        next_milestone TEXT,
-                        first_seen_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    """
                     CREATE TABLE studio_publication_recovery (
                         recovery_id TEXT PRIMARY KEY,
                         project_key TEXT NOT NULL,
@@ -509,6 +485,7 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                         github_repo TEXT,
                         github_url TEXT,
                         latest_head TEXT,
+                        private INTEGER,
                         missing_json TEXT NOT NULL DEFAULT '[]',
                         required_action TEXT NOT NULL,
                         status TEXT NOT NULL,
@@ -521,51 +498,23 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 )
                 conn.execute(
                     """
-                    INSERT INTO studio_portfolio_projects(
-                        project_key, project_name, project_path, github_repo, github_url, default_branch,
-                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
-                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        "signaldeck",
-                        "SignalDeck",
-                        "/home/aponce/signaldeck",
-                        "manolosake/signaldeck",
-                        "",
-                        "main",
-                        "",
-                        1,
-                        "published_private",
-                        order_id,
-                        order_id,
-                        "published_project",
-                        "Recovered private publication evidence.",
-                        None,
-                        None,
-                        None,
-                        10.0,
-                        20.0,
-                    ),
-                )
-                conn.execute(
-                    """
                     INSERT INTO studio_publication_recovery(
                         recovery_id, project_key, project_name, project_path, github_repo, github_url,
-                        latest_head, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "recovery-1",
                         "signaldeck",
                         "SignalDeck",
                         "/home/aponce/signaldeck",
-                        "",
+                        "manolosake/signaldeck",
                         "https://github.com/manolosake/signaldeck.git",
                         "2efec0a",
+                        1,
                         "[]",
                         "resolve_publication_contract",
-                        "resolved",
+                        "published_private",
                         "Recovered GitHub target evidence from SQLite.",
                         order_id,
                         11.0,
@@ -587,6 +536,73 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 checks["release_target_evidence"]["evidence"][0]["value"],
                 "manolosake/signaldeck",
             )
+
+    def test_release_readiness_rejects_recovery_only_publication_without_private_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "45969696-7070-8181-9292-030303030303"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-missing-private",
+                        "signaldeck",
+                        "SignalDeck",
+                        "/home/aponce/signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "2efec0a",
+                        None,
+                        "[\"private\"]",
+                        "resolve_publication_contract",
+                        "published_private",
+                        "Missing explicit private visibility evidence should keep readiness pending.",
+                        order_id,
+                        11.0,
+                        21.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
 
     def test_release_readiness_merges_portfolio_latest_order_match_with_older_recovery_source_order(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -710,6 +726,127 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 checks["release_target_evidence"]["evidence"][0]["value"],
                 "manolosake/signaldeck",
             )
+
+    def test_release_readiness_does_not_inherit_recovery_only_evidence_from_older_order_via_project_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            older_order_id = "47191919-0303-1414-2525-363636363636"
+            current_order_id = "47202020-1414-2525-3636-474747474747"
+            self._make_ready_proactive_order(q, order_id=current_order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "signaldeck",
+                        "SignalDeck",
+                        "/home/aponce/signaldeck",
+                        "manolosake/signaldeck",
+                        "",
+                        "main",
+                        "",
+                        0,
+                        "draft",
+                        current_order_id,
+                        current_order_id,
+                        "work_in_progress",
+                        "Current order portfolio row is not yet published/private.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        30.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, private, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-older-order",
+                        "signaldeck",
+                        "SignalDeck",
+                        "/home/aponce/signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "2efec0a",
+                        1,
+                        "[]",
+                        "resolve_publication_contract",
+                        "published_private",
+                        "Older order has complete recovery evidence, but the current order should not inherit it.",
+                        older_order_id,
+                        11.0,
+                        21.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(current_order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
 
     def test_release_readiness_prefers_resolved_recovery_row_over_newer_incomplete_row_for_same_project(self) -> None:
         with tempfile.TemporaryDirectory() as td:
