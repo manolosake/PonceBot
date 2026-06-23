@@ -637,13 +637,15 @@ def main() -> None:
         gateway_cfg=gateway_cfg,
     )
     path = gateway_cfg.endpoint_path.rstrip("/") or "/alexa"
+    log_path = path
     if gateway_cfg.path_secret:
         path = path.rstrip("/") + "/" + urllib.parse.quote(gateway_cfg.path_secret, safe="")
+        log_path = log_path.rstrip("/") + "/<secret>"
     LOG.info(
         "PonceBot Alexa gateway listening on http://%s:%s%s verify_signature=%s skill_id=%s",
         gateway_cfg.host,
         gateway_cfg.port,
-        path,
+        log_path,
         gateway_cfg.verify_signature,
         gateway_cfg.skill_id or "(not pinned)",
     )

@@ -12,7 +12,6 @@
             }
           ],
           "samples": [
-            "{query}",
             "pregunta {query}",
             "pregunta a ponce bot {query}",
             "preguntale {query}",
