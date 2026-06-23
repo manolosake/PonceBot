@@ -10,6 +10,8 @@ requests into the isolated PonceBot on-demand command plane.
 - `skill-package/interactionModels/custom/es-MX.json`: Spanish Mexico model.
 - `skill-package/interactionModels/custom/es-US.json`: Spanish US model.
 - `skill-package/interactionModels/custom/es-ES.json`: Spanish Spain model.
+- `assets/poncebot-icon-108.png`: small Alexa store icon.
+- `assets/poncebot-icon-512.png`: large Alexa store icon.
 
 ## Manual Amazon step
 
