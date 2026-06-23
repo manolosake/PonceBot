@@ -9296,6 +9296,19 @@ def _github_repo_full_name_from_remote_url(remote_url: str) -> str:
     return ""
 
 
+def _github_repo_private_visibility(repo_full_name: str) -> bool | None:
+    repo = str(repo_full_name or "").strip()
+    if not repo:
+        return None
+    token, _token_source = _github_token_from_env_or_git_credentials()
+    if not token:
+        return None
+    ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{repo}")
+    if not ok_repo:
+        return None
+    return bool(repo_payload.get("private", False))
+
+
 def _publish_project_incubator_private_github(project_path: Path, *, description: str = "") -> dict[str, Any]:
     try:
         path = project_path.expanduser().resolve()
@@ -9330,12 +9343,8 @@ def _publish_project_incubator_private_github(project_path: Path, *, description
                 "head": head,
             }
         repo_full_name = _github_repo_full_name_from_remote_url(existing_url)
-        private: bool | None = None
         token, token_source = _github_token_from_env_or_git_credentials()
-        if token and repo_full_name:
-            ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{repo_full_name}")
-            if ok_repo:
-                private = bool(repo_payload.get("private", False))
+        private = _github_repo_private_visibility(repo_full_name) if repo_full_name else None
         return {
             "ok": True,
             "reason": "github_remote_verified_and_pushed",
@@ -18479,6 +18488,24 @@ def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, 
                 result["default_branch"] = head_ref.rsplit("/", 1)[-1].strip()
         except Exception:
             pass
+    private_raw = result.get("private")
+    private_confirmed = private_raw is True or private_raw == 1
+    if isinstance(private_raw, str):
+        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    github_repo = str(result.get("github_repo") or "").strip()
+    github_url = str(result.get("github_url") or "").strip()
+    remote_repo = _github_repo_full_name_from_remote_url(github_url)
+    if (
+        not private_confirmed
+        and github_repo
+        and github_url
+        and remote_repo
+        and github_repo == remote_repo
+        and str(result.get("latest_head") or "").strip()
+    ):
+        private = _github_repo_private_visibility(github_repo)
+        if private is not None:
+            result["private"] = int(private)
     return result
 
 
@@ -18531,6 +18558,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             github_url = COALESCE(NULLIF(?, ''), github_url),
                             default_branch = COALESCE(NULLIF(?, ''), default_branch),
                             latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                            private = ?,
                             updated_at = ?
                         WHERE project_key = ?
                         """,
@@ -18540,6 +18568,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             str(project.get("github_url") or ""),
                             str(project.get("default_branch") or ""),
                             str(project.get("latest_head") or ""),
+                            int(project.get("private") or 0),
                             float(now),
                             row["project_key"],
                         ),
@@ -18576,6 +18605,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         github_url = COALESCE(NULLIF(?, ''), github_url),
                         default_branch = COALESCE(NULLIF(?, ''), default_branch),
                         latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                        private = ?,
                         latest_summary = ?,
                         updated_at = ?
                     WHERE project_key = ?
@@ -18585,6 +18615,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         str(project.get("github_url") or ""),
                         str(project.get("default_branch") or ""),
                         str(project.get("latest_head") or ""),
+                        int(project.get("private") or 0),
                         summary,
                         float(now),
                         row["project_key"],
@@ -20485,11 +20516,7 @@ def _studio_extract_portfolio_project_from_order(
             branch = branch_text
     private_raw = publication.get("private")
     if private_raw is None and github_repo:
-        token, _token_source = _github_token_from_env_or_git_credentials()
-        if token:
-            ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{github_repo}")
-            if ok_repo:
-                private_raw = bool(repo_payload.get("private", False))
+        private_raw = _github_repo_private_visibility(github_repo)
     private = 1 if bool(private_raw) else 0
     project_key = (github_repo or project_path).strip().lower()
     if not project_key:
