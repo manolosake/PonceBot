@@ -9,6 +9,7 @@ requests into the isolated PonceBot on-demand command plane.
   after the HTTPS tunnel URL and route secret are known.
 - `skill-package/interactionModels/custom/es-MX.json`: Spanish Mexico model.
 - `skill-package/interactionModels/custom/es-US.json`: Spanish US model.
+- `skill-package/interactionModels/custom/es-ES.json`: Spanish Spain model.
 
 ## Manual Amazon step
 

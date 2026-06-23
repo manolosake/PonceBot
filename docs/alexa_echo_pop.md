@@ -72,29 +72,36 @@ sudo journalctl -u poncebot-alexa -f
 
 ## Exponer a Alexa
 
-Alexa necesita HTTPS publico. Opciones:
+Alexa necesita HTTPS publico. El despliegue actual usa Tailscale Funnel, sin
+Cloudflare, ngrok, AWS Lambda ni dominios pagados.
 
-- Cloudflare Tunnel hacia `http://127.0.0.1:8095` (recomendado)
-- ngrok hacia `http://127.0.0.1:8095` (util para pruebas)
-- reverse proxy propio con TLS
+Estado esperado:
+
+```text
+https://r530.tail3525c1.ts.net -> http://127.0.0.1:8095
+```
 
 La URL final del endpoint debe incluir el secreto de ruta:
 
 ```text
-https://tu-dominio.example/alexa/pon-un-secreto-largo-aqui
+https://r530.tail3525c1.ts.net/alexa/pon-un-secreto-largo-aqui
 ```
 
 ## Alexa Developer Console
 
 1. Crear una Custom Skill.
-2. Locale recomendado: `es-MX` o `es-US`, segun el idioma configurado en el Echo.
+2. Locales configurados: `es-MX`, `es-US` y `es-ES`.
 3. Invocation name: `ponce bot`.
 4. Importar o copiar el skill package desde `alexa/skill-package`.
 5. Si se configura manualmente, copiar el interaction model desde:
    - `alexa/skill-package/interactionModels/custom/es-MX.json`
    - `alexa/skill-package/interactionModels/custom/es-US.json`
+   - `alexa/skill-package/interactionModels/custom/es-ES.json`
 6. Endpoint: HTTPS, usando la URL publica del gateway.
 7. Copiar el Skill ID a `PONCEBOT_ALEXA_SKILL_ID`.
+8. En Test, habilitar `Development`; los Echo registrados con la misma cuenta
+   Amazon developer pueden probar la skill si su locale coincide con uno de los
+   locales configurados.
 
 ## Paso que requiere al operador
 

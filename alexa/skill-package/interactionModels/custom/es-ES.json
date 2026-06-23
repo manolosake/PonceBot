@@ -1,0 +1,52 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "ponce bot",
+      "intents": [
+        {
+          "name": "AskPonceIntent",
+          "slots": [
+            {
+              "name": "query",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "pregunta {query}",
+            "pregunta a ponce bot {query}",
+            "preguntale {query}",
+            "preguntale a ponce bot {query}",
+            "dile {query}",
+            "dile a ponce bot {query}",
+            "necesito {query}",
+            "quiero {query}",
+            "revisa {query}",
+            "revisa con ponce bot {query}",
+            "consulta {query}",
+            "consulta con ponce bot {query}",
+            "que {query}",
+            "cual es {query}",
+            "como va {query}"
+          ]
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        }
+      ],
+      "types": []
+    }
+  }
+}

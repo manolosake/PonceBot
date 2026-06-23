@@ -5,6 +5,7 @@
       "category": "PRODUCTIVITY",
       "isAvailableWorldwide": false,
       "distributionCountries": [
+        "ES",
         "MX",
         "US"
       ],
@@ -39,6 +40,21 @@
             "productivity",
             "assistant"
           ]
+        },
+        "es-ES": {
+          "name": "Ponce Bot",
+          "summary": "Canal de voz privado para hablar con PonceBot desde un Echo Pop.",
+          "description": "Ponce Bot conecta Alexa con el plano on-demand de PonceBot en r530. Permite dictar preguntas o instrucciones cortas y escuchar la respuesta cuando el trabajo termina rapido; si tarda mas, deja un ticket en PonceBot.",
+          "examplePhrases": [
+            "Alexa, abre Ponce Bot",
+            "Alexa, pregunta a Ponce Bot que esta haciendo",
+            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+          ],
+          "keywords": [
+            "poncebot",
+            "productividad",
+            "asistente"
+          ]
         }
       }
     },
@@ -56,6 +72,7 @@
       "isExportCompliant": true,
       "containsAds": false,
       "locales": {
+        "es-ES": {},
         "es-MX": {},
         "es-US": {}
       }
