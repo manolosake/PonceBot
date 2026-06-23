@@ -18435,6 +18435,22 @@ def _studio_complete_publication_sibling(
     return {}
 
 
+def _studio_publication_recovery_row_project(row: Mapping[str, Any]) -> dict[str, Any]:
+    recovery = dict(row)
+    return {
+        "project_key": str(recovery.get("project_key") or recovery.get("recovery_id") or "").strip(),
+        "project_name": str(recovery.get("project_name") or "").strip(),
+        "project_path": str(recovery.get("project_path") or "").strip(),
+        "github_repo": str(recovery.get("github_repo") or "").strip(),
+        "github_url": str(recovery.get("github_url") or "").strip(),
+        "latest_head": str(recovery.get("latest_head") or "").strip(),
+        "private": 0,
+        "status": "needs_publication",
+        "source_order_id": str(recovery.get("source_order_id") or "").strip(),
+        "latest_order_id": str(recovery.get("source_order_id") or "").strip(),
+    }
+
+
 def _studio_upsert_publication_recovery_conn(
     *,
     conn: sqlite3.Connection,
@@ -18757,8 +18773,17 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 WHERE status LIKE 'published%' OR status = 'needs_publication'
                 """
             ).fetchall()
+            open_recovery_rows = conn.execute(
+                """
+                SELECT recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                       latest_head, source_order_id, status, required_action, reason
+                FROM studio_publication_recovery
+                WHERE status = 'open'
+                """
+            ).fetchall()
             reconciled_rows: list[tuple[sqlite3.Row, dict[str, Any], list[str]]] = []
             reconciled_projects: list[dict[str, Any]] = []
+            touched_recovery_ids: set[str] = set()
             for row in rows or []:
                 project = _studio_merge_publication_evidence(
                     dict(row),
@@ -18842,6 +18867,11 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         status="resolved",
                         reason="Publication contract is complete after local Git evidence backfill.",
                     )
+                    touched_recovery_ids.add(
+                        str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "")
+                        .strip()
+                        .lower()
+                    )
                     if row_changed:
                         changed += 1
                     continue
@@ -18906,8 +18936,51 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     status="open",
                     reason=summary,
                 )
+                touched_recovery_ids.add(
+                    str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "")
+                    .strip()
+                    .lower()
+                )
                 if row_changed:
                     changed += 1
+            for recovery_row in open_recovery_rows or []:
+                recovery_id = str(recovery_row["recovery_id"] or "").strip().lower()
+                if recovery_id and recovery_id in touched_recovery_ids:
+                    continue
+                recovery_project = _studio_merge_publication_evidence(
+                    _studio_publication_recovery_row_project(recovery_row),
+                    _studio_publication_trace_evidence_conn(
+                        conn,
+                        order_ids=(recovery_row["source_order_id"],),
+                    ),
+                )
+                recovery_project = _studio_project_git_publication_probe(recovery_project)
+                missing = _studio_publication_contract_missing(recovery_project)
+                if missing and "github_identity" not in missing:
+                    sibling = _studio_complete_publication_sibling(recovery_project, reconciled_projects)
+                    if sibling:
+                        recovery_project = _studio_merge_publication_evidence(
+                            recovery_project,
+                            _studio_normalize_github_publication(sibling),
+                        )
+                        missing = _studio_publication_contract_missing(recovery_project)
+                if missing:
+                    continue
+                _studio_backfill_publication_trace_evidence_conn(
+                    conn=conn,
+                    order_ids=(recovery_row["source_order_id"],),
+                    project=recovery_project,
+                    now=now,
+                )
+                _studio_upsert_publication_recovery_conn(
+                    conn=conn,
+                    project=recovery_project,
+                    missing=[],
+                    now=now,
+                    status="resolved",
+                    reason="Publication contract is complete after authoritative evidence reconciliation.",
+                )
+                changed += 1
             conn.commit()
             return changed
     except Exception:

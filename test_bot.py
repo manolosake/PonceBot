@@ -4224,6 +4224,273 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIsNotNone(open_count)
         self.assertEqual(int(open_count["c"]), 0)
 
+    def test_publication_contract_reconcile_resolves_recovery_only_row_from_complete_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_project = root / "trace-only-project"
+            db = root / "jobs.sqlite"
+            now = 229_269.5
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-trace-only",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/trace-only-project",
+                                    "github_url": "https://github.com/manolosake/trace-only-project.git",
+                                    "default_branch": "main",
+                                    "latest_head": "trace123",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(missing_project).lower(),
+                        str(missing_project).lower(),
+                        "Trace Only Project",
+                        str(missing_project),
+                        "",
+                        "",
+                        "",
+                        '["github_repo", "github_url", "latest_head", "private"]',
+                        "archive_or_reject_missing_path",
+                        "open",
+                        "Recovery row is waiting on publication evidence.",
+                        "order-trace-only",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                recovery_row = conn.execute(
+                    """
+                    SELECT status, required_action, missing_json, github_repo, github_url, latest_head
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    (str(missing_project).lower(),),
+                ).fetchone()
+                trace_row = conn.execute(
+                    "SELECT trace FROM jobs WHERE job_id = ?",
+                    ("order-trace-only",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertEqual(recovery_row["github_repo"], "manolosake/trace-only-project")
+        self.assertEqual(recovery_row["github_url"], "https://github.com/manolosake/trace-only-project.git")
+        self.assertEqual(recovery_row["latest_head"], "trace123")
+        self.assertIsNotNone(trace_row)
+        self.assertEqual(
+            json.loads(str(trace_row["trace"] or "{}")).get("github_publication", {}).get("github_repo"),
+            "manolosake/trace-only-project",
+        )
+
+    def test_publication_contract_reconcile_resolves_recovery_only_row_from_complete_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project_dir = root / "orphan-recovery-project"
+            project_dir.mkdir()
+            db = root / "jobs.sqlite"
+            now = 229_269.75
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/orphan-recovery-project",
+                        "Orphan Recovery Project",
+                        str(project_dir),
+                        "manolosake/orphan-recovery-project",
+                        "https://github.com/manolosake/orphan-recovery-project.git",
+                        "main",
+                        "repo123",
+                        1,
+                        "published_private",
+                        "order-sibling-published",
+                        "order-sibling-published",
+                        "published_project",
+                        "Published private repo.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project_dir).lower(),
+                        str(project_dir).lower(),
+                        "Orphan Recovery Project",
+                        str(project_dir),
+                        "",
+                        "",
+                        "",
+                        '["github_repo", "github_url", "latest_head", "private"]',
+                        "archive_or_reject_missing_path",
+                        "open",
+                        "Recovery row persisted before repo-keyed row existed.",
+                        "order-stale-recovery",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                recovery_row = conn.execute(
+                    """
+                    SELECT status, required_action, missing_json, github_repo, github_url, latest_head
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    (str(project_dir).lower(),),
+                ).fetchone()
+                open_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM studio_publication_recovery WHERE status = 'open'"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertEqual(recovery_row["github_repo"], "manolosake/orphan-recovery-project")
+        self.assertEqual(recovery_row["github_url"], "https://github.com/manolosake/orphan-recovery-project.git")
+        self.assertEqual(recovery_row["latest_head"], "repo123")
+        self.assertIsNotNone(open_count)
+        self.assertEqual(int(open_count["c"]), 0)
+
+    def test_publication_contract_reconcile_resolves_recovery_only_row_from_local_git_probe(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project_dir = root / "local-git-recovery-project"
+            project_dir.mkdir()
+            db = root / "jobs.sqlite"
+            now = 229_269.9
+            bot._studio_ensure_schema(db)
+            run(["git", "init", "-b", "main"], cwd=project_dir)
+            run(["git", "config", "user.name", "Codex Bot"], cwd=project_dir)
+            run(["git", "config", "user.email", "codex@example.com"], cwd=project_dir)
+            (project_dir / "README.md").write_text("# Local Git Recovery Project\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project_dir)
+            run(["git", "commit", "-m", "Initial commit"], cwd=project_dir)
+            run(
+                ["git", "remote", "add", "origin", "https://github.com/manolosake/local-git-recovery-project.git"],
+                cwd=project_dir,
+            )
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project_dir)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project_dir).lower(),
+                        str(project_dir).lower(),
+                        "Local Git Recovery Project",
+                        str(project_dir),
+                        "",
+                        "",
+                        "",
+                        '["github_repo", "github_url", "latest_head", "private"]',
+                        "archive_or_reject_missing_path",
+                        "open",
+                        "Recovery row should resolve from local Git evidence.",
+                        "order-local-git-recovery",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility", return_value=True) as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_called_once_with("manolosake/local-git-recovery-project")
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                recovery_row = conn.execute(
+                    """
+                    SELECT status, required_action, missing_json, github_repo, github_url, latest_head
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    (str(project_dir).lower(),),
+                ).fetchone()
+                open_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM studio_publication_recovery WHERE status = 'open'"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertEqual(recovery_row["github_repo"], "manolosake/local-git-recovery-project")
+        self.assertEqual(
+            bot._github_repo_full_name_from_remote_url(str(recovery_row["github_url"] or "")),
+            "manolosake/local-git-recovery-project",
+        )
+        self.assertEqual(recovery_row["latest_head"], head)
+        self.assertIsNotNone(open_count)
+        self.assertEqual(int(open_count["c"]), 0)
+
     def test_publication_contract_reconcile_recovers_missing_fields_from_latest_order_trace_when_path_gone(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
