@@ -18387,6 +18387,30 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
     return "resolve_publication_contract"
 
 
+def _studio_complete_publication_sibling(
+    project: Mapping[str, Any],
+    sibling_projects: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    project_key = str(project.get("project_key") or "").strip().lower()
+    project_path = str(project.get("project_path") or "").strip().lower()
+    github_repo = str(project.get("github_repo") or "").strip().lower()
+    for sibling in sibling_projects:
+        sibling_key = str(sibling.get("project_key") or "").strip().lower()
+        if not sibling_key or sibling_key == project_key:
+            continue
+        sibling_repo = str(sibling.get("github_repo") or "").strip().lower()
+        sibling_path = str(sibling.get("project_path") or "").strip().lower()
+        if not sibling_repo:
+            continue
+        if _studio_publication_contract_missing(dict(sibling)):
+            continue
+        if project_path and sibling_path and project_path == sibling_path:
+            return dict(sibling)
+        if github_repo and sibling_repo == github_repo:
+            return dict(sibling)
+    return {}
+
+
 def _studio_upsert_publication_recovery_conn(
     *,
     conn: sqlite3.Connection,
@@ -18702,7 +18726,8 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 WHERE status LIKE 'published%' OR status = 'needs_publication'
                 """
             ).fetchall()
-            changed = 0
+            reconciled_rows: list[tuple[sqlite3.Row, dict[str, Any], list[str]]] = []
+            reconciled_projects: list[dict[str, Any]] = []
             for row in rows or []:
                 project = _studio_merge_publication_evidence(
                     dict(row),
@@ -18712,7 +18737,18 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     ),
                 )
                 project = _studio_project_git_publication_probe(project)
-                missing = _studio_publication_contract_missing(project)
+                reconciled_projects.append(project)
+                reconciled_rows.append((row, project, _studio_publication_contract_missing(project)))
+            changed = 0
+            for row, project, missing in reconciled_rows:
+                if missing:
+                    sibling = _studio_complete_publication_sibling(project, reconciled_projects)
+                    if sibling:
+                        project = _studio_merge_publication_evidence(
+                            project,
+                            _studio_normalize_github_publication(sibling),
+                        )
+                        missing = _studio_publication_contract_missing(project)
                 if not missing:
                     github_repo = str(project.get("github_repo") or "")
                     github_url = str(project.get("github_url") or "")

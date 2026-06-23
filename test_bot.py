@@ -3748,6 +3748,145 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("latest_head", recovery_row["missing_json"])
         self.assertIn("private", recovery_row["missing_json"])
 
+    def test_publication_contract_reconcile_resolves_stale_path_keyed_row_from_complete_repo_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project_dir = root / "focus-flow"
+            project_dir.mkdir()
+            db = root / "jobs.sqlite"
+            now = 229_269.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project_dir).lower(),
+                        "Focus Flow",
+                        str(project_dir),
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-stale-path",
+                        "order-stale-path",
+                        "published_project",
+                        "Publication evidence incomplete: stale path-keyed row.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/focus-flow",
+                        "Focus Flow",
+                        str(project_dir),
+                        "manolosake/focus-flow",
+                        "https://github.com/manolosake/focus-flow.git",
+                        "main",
+                        "fresh123",
+                        1,
+                        "published_private",
+                        "order-repo",
+                        "order-repo",
+                        "published_project",
+                        "Published private repo.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project_dir).lower(),
+                        str(project_dir).lower(),
+                        "Focus Flow",
+                        str(project_dir),
+                        "",
+                        "",
+                        "",
+                        '["github_repo", "github_url", "latest_head", "private"]',
+                        "create_private_remote_and_push_or_archive",
+                        "open",
+                        "Publication evidence incomplete: stale path-keyed row.",
+                        "order-stale-path",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                stale_row = conn.execute(
+                    """
+                    SELECT status, github_repo, github_url, default_branch, latest_head, private
+                    FROM studio_portfolio_projects
+                    WHERE project_key = ?
+                    """,
+                    (str(project_dir).lower(),),
+                ).fetchone()
+                recovery_row = conn.execute(
+                    """
+                    SELECT status, required_action, missing_json, github_repo, github_url, latest_head
+                    FROM studio_publication_recovery
+                    WHERE recovery_id = ?
+                    """,
+                    (str(project_dir).lower(),),
+                ).fetchone()
+                open_count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM studio_publication_recovery WHERE status = 'open'"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(stale_row)
+        self.assertEqual(stale_row["status"], "published_private")
+        self.assertEqual(stale_row["github_repo"], "manolosake/focus-flow")
+        self.assertEqual(stale_row["github_url"], "https://github.com/manolosake/focus-flow.git")
+        self.assertEqual(stale_row["default_branch"], "main")
+        self.assertEqual(stale_row["latest_head"], "fresh123")
+        self.assertEqual(stale_row["private"], 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["missing_json"], "[]")
+        self.assertEqual(recovery_row["github_repo"], "manolosake/focus-flow")
+        self.assertEqual(recovery_row["github_url"], "https://github.com/manolosake/focus-flow.git")
+        self.assertEqual(recovery_row["latest_head"], "fresh123")
+        self.assertIsNotNone(open_count)
+        self.assertEqual(int(open_count["c"]), 0)
+
     def test_publication_contract_reconcile_recovers_missing_fields_from_latest_order_trace_when_path_gone(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
