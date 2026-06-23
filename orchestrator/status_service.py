@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 import hashlib
 import json
+import sqlite3
 import time
 import urllib.parse
 
@@ -444,6 +445,15 @@ def _compact_jsonable_list(value: Any, *, max_items: int = 20) -> list[Any]:
         elif isinstance(item, (str, int, float, bool)) or item is None:
             out.append(item)
     return out
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 def _compact_factory_focus(proactive_health: dict[str, Any], *, limit: int) -> dict[str, Any]:
@@ -4240,10 +4250,77 @@ class StatusService:
             "orders": orders,
         }
 
+    def _publication_recovery_summary(self, *, item_limit: int = 5) -> dict[str, Any] | None:
+        storage = getattr(self.orch_q, "_storage", None)
+        db_path = getattr(storage, "path", None)
+        if not isinstance(db_path, Path):
+            return None
+
+        rows: list[sqlite3.Row] = []
+        open_count = 0
+        try:
+            with sqlite3.connect(str(db_path), timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                table_row = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_publication_recovery'"
+                ).fetchone()
+                if not table_row:
+                    return None
+                rows = conn.execute(
+                    """
+                    SELECT project_name, project_path, github_repo, required_action, reason, missing_json, status, updated_at
+                    FROM studio_publication_recovery
+                    WHERE status = 'open'
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (max(1, int(item_limit)),),
+                ).fetchall()
+                total_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM studio_publication_recovery WHERE status = 'open'"
+                ).fetchone()
+                open_count = int(total_row["c"] if total_row else 0)
+        except Exception:
+            return None
+
+        if open_count <= 0:
+            return None
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            missing_json = str(row["missing_json"] or "").strip()
+            missing_fields: list[str] = []
+            if missing_json:
+                try:
+                    parsed_missing = json.loads(missing_json)
+                except Exception:
+                    parsed_missing = None
+                if isinstance(parsed_missing, list):
+                    missing_fields = [str(item).strip() for item in parsed_missing if str(item).strip()]
+            item = {
+                "project_name": str(row["project_name"] or "").strip() or None,
+                "project_path": str(row["project_path"] or "").strip() or None,
+                "github_repo": str(row["github_repo"] or "").strip() or None,
+                "required_action": str(row["required_action"] or "").strip() or None,
+                "reason": str(row["reason"] or "").strip() or None,
+                "missing_json": missing_json or "[]",
+                "missing_fields": missing_fields,
+                "status": str(row["status"] or "").strip() or "open",
+                "updated_at": _safe_float(row["updated_at"]),
+            }
+            items.append({key: value for key, value in item.items() if value is not None})
+
+        return {
+            "count": open_count,
+            "items": items,
+            "truncated": open_count > len(items),
+        }
+
     def proactive_action_plan(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
         priorities = self.proactive_priorities(chat_id=chat_id, limit=limit)
         generated_at = float(priorities.get("generated_at") or time.time())
         lim = int(priorities.get("limit") or max(1, min(200, int(limit))))
+        publication_recovery = self._publication_recovery_summary(item_limit=min(5, lim))
         lane_defs = [
             ("release", "Release"),
             ("unblock", "Unblock"),
@@ -4391,7 +4468,7 @@ class StatusService:
                 selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
                 status = str(selection_quality.get("status") or "unknown")
                 selection_quality_counts[status] = selection_quality_counts.get(status, 0) + 1
-        return {
+        report = {
             "api_version": "v1",
             "schema_version": 1,
             "generated_at": generated_at,
@@ -4409,6 +4486,9 @@ class StatusService:
             "lanes": lanes,
             "top_execution_packet": top_execution_packet,
         }
+        if isinstance(publication_recovery, dict):
+            report["publication_recovery"] = publication_recovery
+        return report
 
     def _select_proactive_action_plan_order(
         self,

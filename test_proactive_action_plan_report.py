@@ -278,6 +278,65 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("  - started_slices_exceed_validated_or_closed", rendered)
         self.assertIn("proactive_slices_started=4", rendered)
 
+    def test_render_markdown_includes_publication_recovery_section(self) -> None:
+        report = self._base_report()
+        report["publication_recovery"] = {
+            "count": 2,
+            "truncated": True,
+            "items": [
+                {
+                    "project_name": "SignalDeck",
+                    "project_path": "/home/aponce/signaldeck",
+                    "github_repo": "manolosake/signaldeck",
+                    "required_action": "resolve_publication_contract",
+                    "reason": "Private visibility confirmation is still missing.",
+                    "missing_json": '["private"]',
+                    "missing_fields": ["private"],
+                    "status": "open",
+                },
+                {
+                    "project_name": "Local Only Project",
+                    "project_path": "/home/aponce/local-only-project",
+                    "required_action": "archive_or_reject_missing_path",
+                    "reason": "No GitHub publication target was found.",
+                    "missing_json": '["github_repo", "github_url"]',
+                    "missing_fields": ["github_repo", "github_url"],
+                    "status": "open",
+                },
+            ],
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn("## Publication Recovery", rendered)
+        self.assertIn("- Open items: 2", rendered)
+        self.assertIn("- Truncated: True", rendered)
+        self.assertIn("| Project | Target | Required action | Missing | Status | Reason |", rendered)
+        self.assertIn("| SignalDeck | manolosake/signaldeck | resolve_publication_contract | private | open | Private visibility confirmation is still missing. |", rendered)
+        self.assertIn("| Local Only Project | /home/aponce/local-only-project | archive_or_reject_missing_path | github_repo, github_url | open | No GitHub publication target was found. |", rendered)
+
+    def test_render_markdown_escapes_publication_recovery_pipe_characters(self) -> None:
+        report = self._base_report()
+        report["publication_recovery"] = {
+            "count": 1,
+            "truncated": False,
+            "items": [
+                {
+                    "project_name": "Signal|Deck",
+                    "project_path": "/home/aponce/signal|deck",
+                    "required_action": "resolve|publication_contract",
+                    "reason": "Confirm private|visibility before publish.",
+                    "missing_json": '["github_repo|github_url"]',
+                    "missing_fields": ["github_repo|github_url"],
+                    "status": "open|queued",
+                }
+            ],
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn("| Signal\\|Deck | /home/aponce/signal\\|deck | resolve\\|publication_contract | github_repo\\|github_url | open\\|queued | Confirm private\\|visibility before publish. |", rendered)
+
     def test_render_receipt_markdown_includes_selection_order_and_persisted_sections(self) -> None:
         rendered = report_tool.render_receipt_markdown(self._base_receipt_report())
 

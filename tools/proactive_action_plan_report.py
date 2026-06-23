@@ -36,6 +36,10 @@ def _one_line(value: Any, *, default: str = "-") -> str:
     return text or default
 
 
+def _markdown_table_cell(value: Any, *, default: str = "-") -> str:
+    return _one_line(value, default=default).replace("|", "\\|")
+
+
 def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
@@ -142,6 +146,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
     lane_counts = summary.get("lanes") if isinstance(summary.get("lanes"), dict) else {}
     selection_quality = summary.get("selection_quality") if isinstance(summary.get("selection_quality"), dict) else {}
+    publication_recovery = (
+        report.get("publication_recovery") if isinstance(report.get("publication_recovery"), dict) else None
+    )
     lanes = [lane for lane in list(report.get("lanes") or []) if isinstance(lane, dict)]
 
     lines = [
@@ -171,6 +178,47 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.append(f"- {label}: {_one_line(count, default='0')}")
     else:
         lines.append("- No lanes returned.")
+
+    if publication_recovery is not None:
+        lines.extend(
+            [
+                "",
+                "## Publication Recovery",
+                "",
+                f"- Open items: {_one_line(publication_recovery.get('count'), default='0')}",
+                f"- Truncated: {_one_line(publication_recovery.get('truncated'), default='False')}",
+            ]
+        )
+        items = [item for item in list(publication_recovery.get("items") or []) if isinstance(item, dict)]
+        if items:
+            lines.extend(
+                [
+                    "",
+                    "| Project | Target | Required action | Missing | Status | Reason |",
+                    "| --- | --- | --- | --- | --- | --- |",
+                ]
+            )
+            for item in items:
+                target = item.get("github_repo") or item.get("project_path")
+                missing = ", ".join(_one_line(entry, default="") for entry in _as_list(item.get("missing_fields")))
+                if not missing.strip():
+                    missing = _one_line(item.get("missing_json"))
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            _markdown_table_cell(item.get("project_name")),
+                            _markdown_table_cell(target),
+                            _markdown_table_cell(item.get("required_action")),
+                            _markdown_table_cell(missing),
+                            _markdown_table_cell(item.get("status")),
+                            _markdown_table_cell(item.get("reason")),
+                        ]
+                    )
+                    + " |"
+                )
+        else:
+            lines.append("- No open publication recovery items.")
 
     top_execution_packet = report.get("top_execution_packet") if isinstance(report.get("top_execution_packet"), dict) else None
     if top_execution_packet is not None:

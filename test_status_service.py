@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -279,7 +280,6 @@ class TestStatusService(unittest.TestCase):
             self.assertIn("Release completion includes merge or release evidence, not branch-only or done-only status.", release_packet["definition_of_done"])
             self.assertIn("terminal outcome evidence with outcome, evidence, and residual_risk", release_packet["evidence_required"])
             self.assertIn("merge or release evidence for the terminal outcome", release_packet["evidence_required"])
-
             self.assertEqual(
                 plan["summary"]["next_delegate"],
                 {
@@ -297,6 +297,191 @@ class TestStatusService(unittest.TestCase):
                     "outcome_contract": expected_outcome_contract,
                 },
             )
+
+    def test_proactive_action_plan_includes_publication_recovery_summary_when_open_items_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-1",
+                        "signaldesk",
+                        "SignalDeck",
+                        "/tmp/signaldeck",
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "abc1234",
+                        '["github_url", "private"]',
+                        "resolve_publication_contract",
+                        "open",
+                        "Remote is present but private visibility evidence is missing.",
+                        "order-1",
+                        100.0,
+                        200.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-2",
+                        "closed-project",
+                        "Closed Project",
+                        "/tmp/closed",
+                        "manolosake/closed-project",
+                        "https://github.com/manolosake/closed-project.git",
+                        "def5678",
+                        "[]",
+                        "resolve_publication_contract",
+                        "resolved",
+                        "Already fixed.",
+                        "order-2",
+                        50.0,
+                        150.0,
+                    ),
+                )
+                conn.commit()
+
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            svc = StatusService(orch_q=q, role_profiles=None, cache_ttl_seconds=0)
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 0},
+                "orders": [],
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            publication_recovery = plan.get("publication_recovery")
+            self.assertIsInstance(publication_recovery, dict)
+            assert isinstance(publication_recovery, dict)
+            self.assertEqual(publication_recovery["count"], 1)
+            self.assertFalse(publication_recovery["truncated"])
+            self.assertEqual(len(publication_recovery["items"]), 1)
+            item = publication_recovery["items"][0]
+            self.assertEqual(item["project_name"], "SignalDeck")
+            self.assertEqual(item["project_path"], "/tmp/signaldeck")
+            self.assertEqual(item["github_repo"], "manolosake/signaldeck")
+            self.assertEqual(item["required_action"], "resolve_publication_contract")
+            self.assertEqual(item["reason"], "Remote is present but private visibility evidence is missing.")
+            self.assertEqual(item["missing_json"], '["github_url", "private"]')
+            self.assertEqual(item["missing_fields"], ["github_url", "private"])
+            self.assertEqual(item["status"], "open")
+
+    def test_proactive_action_plan_tolerates_malformed_publication_recovery_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-bad",
+                        "broken-project",
+                        "Broken Project",
+                        "/tmp/broken",
+                        "",
+                        "",
+                        "",
+                        "{not-json",
+                        "archive_or_reject_missing_path",
+                        "open",
+                        "Malformed metadata should not break the report.",
+                        "order-bad",
+                        10.0,
+                        "not-a-number",
+                    ),
+                )
+                conn.commit()
+
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            svc = StatusService(orch_q=q, role_profiles=None, cache_ttl_seconds=0)
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 0},
+                "orders": [],
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+            publication_recovery = plan.get("publication_recovery")
+            self.assertIsInstance(publication_recovery, dict)
+            assert isinstance(publication_recovery, dict)
+            self.assertEqual(publication_recovery["count"], 1)
+            item = publication_recovery["items"][0]
+            self.assertEqual(item["project_name"], "Broken Project")
+            self.assertEqual(item["required_action"], "archive_or_reject_missing_path")
+            self.assertEqual(item["missing_json"], "{not-json")
+            self.assertEqual(item["missing_fields"], [])
+            self.assertEqual(item["status"], "open")
+            self.assertNotIn("updated_at", item)
 
     def test_proactive_action_plan_surfaces_deep_improvement_factory_delta_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:
