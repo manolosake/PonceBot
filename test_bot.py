@@ -1489,6 +1489,42 @@ class TestStudioOutcomeMemory(unittest.TestCase):
             )
             conn.commit()
 
+    def _extract_published_project(
+        self,
+        *,
+        publication_private,
+        summary: str = "Published project summary.",
+    ) -> dict[str, object] | None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace) VALUES (?, ?)",
+                    (
+                        "order-private-check",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "github_repo": "manolosake/private-check",
+                                    "remote_url": "https://github.com/manolosake/private-check.git",
+                                    "github_url": "https://github.com/manolosake/private-check.git",
+                                    "head": "abc1234",
+                                    "latest_head": "abc1234",
+                                    "private": publication_private,
+                                }
+                            }
+                        ),
+                    ),
+                )
+                conn.commit()
+                return bot._studio_extract_portfolio_project_from_order(
+                    conn=conn,
+                    order_id="order-private-check",
+                    outcome_status="published_project",
+                    outcome_summary=summary,
+                )
+
     def test_recent_negative_studio_outcome_penalizes_matching_core_opportunity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -3123,6 +3159,108 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(publication["latest_head"], "abc1234")
         self.assertTrue(publication["private"])
 
+    def test_publication_contract_reconcile_does_not_recover_private_false_string_from_source_order_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 229_261.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-source-false-private",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/signaldeck",
+                                    "github_url": "https://github.com/manolosake/signaldeck.git",
+                                    "remote_url": "https://github.com/manolosake/signaldeck.git",
+                                    "default_branch": "main",
+                                    "branch": "main",
+                                    "latest_head": "abc1234",
+                                    "head": "abc1234",
+                                    "private": "false",
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    ("order-latest-false-private", json.dumps({"seed": "latest"}), now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/signaldeck",
+                        "SignalDeck",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        0,
+                        "needs_publication",
+                        "order-source-false-private",
+                        "order-latest-false-private",
+                        "published_project",
+                        "Publication evidence needs recovery.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head, private, latest_summary "
+                    "FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+                    ("manolosake/signaldeck",),
+                ).fetchone()
+                latest_job = conn.execute(
+                    "SELECT trace FROM jobs WHERE job_id = ?",
+                    ("order-latest-false-private",),
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_repo"], "")
+        self.assertEqual(project_row["github_url"], "")
+        self.assertEqual(project_row["default_branch"], "")
+        self.assertEqual(project_row["latest_head"], "")
+        self.assertEqual(project_row["private"], 0)
+        self.assertIn("private GitHub visibility unconfirmed", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "archive_or_reject_missing_path")
+        self.assertIn('"private"', recovery_row["missing_json"])
+        self.assertIn("private GitHub visibility unconfirmed", recovery_row["reason"])
+        self.assertIsNotNone(latest_job)
+        self.assertEqual(json.loads(str(latest_job["trace"] or "{}")), {"seed": "latest"})
+
     def test_publication_contract_reconcile_prefers_latest_trace_over_conflicting_source_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
@@ -3514,6 +3652,35 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(publication["github_url"], "https://github.com/manolosake/recovery-desk.git")
         self.assertEqual(publication["latest_head"], "def5678")
         self.assertTrue(publication["private"])
+
+    def test_extract_portfolio_project_treats_string_false_values_as_not_private(self) -> None:
+        for private_raw in ("false", "0", "no"):
+            with self.subTest(private_raw=private_raw):
+                project = self._extract_published_project(publication_private=private_raw)
+
+                self.assertIsNotNone(project)
+                assert project is not None
+                self.assertEqual(project["private"], 0)
+                self.assertEqual(project["status"], "needs_publication")
+
+    def test_extract_portfolio_project_accepts_truthy_strings_and_none_fallback(self) -> None:
+        for private_raw in ("true", "1"):
+            with self.subTest(private_raw=private_raw):
+                project = self._extract_published_project(publication_private=private_raw)
+
+                self.assertIsNotNone(project)
+                assert project is not None
+                self.assertEqual(project["private"], 1)
+                self.assertEqual(project["status"], "published_private")
+
+        with patch.object(bot, "_github_repo_private_visibility", return_value=True) as private_visibility:
+            project = self._extract_published_project(publication_private=None)
+
+        private_visibility.assert_called_once_with("manolosake/private-check")
+        self.assertIsNotNone(project)
+        assert project is not None
+        self.assertEqual(project["private"], 1)
+        self.assertEqual(project["status"], "published_private")
 
     def test_publication_recovery_gate_creates_priority_opportunity(self) -> None:
         memory = {

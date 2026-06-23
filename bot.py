@@ -18315,15 +18315,21 @@ def _studio_record_maturity_snapshot(*, cfg: BotConfig, readiness: dict[str, Any
         LOG.exception("Failed to record Studio maturity snapshot")
 
 
+def _studio_github_publication_private_confirmed(private_raw: Any) -> bool:
+    if private_raw is True or private_raw == 1:
+        return True
+    if isinstance(private_raw, str):
+        return private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    return False
+
+
 def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
     missing: list[str] = []
     github_repo = str(project.get("github_repo") or "").strip()
     github_url = str(project.get("github_url") or "").strip()
     latest_head = str(project.get("latest_head") or "").strip()
     private_raw = project.get("private")
-    private_confirmed = private_raw is True or private_raw == 1
-    if isinstance(private_raw, str):
-        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    private_confirmed = _studio_github_publication_private_confirmed(private_raw)
     github_remote_verified = bool(github_url and _github_repo_full_name_from_remote_url(github_url))
     if not github_repo:
         missing.append("github_repo")
@@ -18517,9 +18523,7 @@ def _studio_publication_trace_evidence_conn(
         default_branch = str(publication.get("default_branch") or publication.get("branch") or "").strip()
         latest_head = str(publication.get("latest_head") or publication.get("head") or "").strip()
         private_raw = publication.get("private")
-        private_confirmed = private_raw is True or private_raw == 1
-        if isinstance(private_raw, str):
-            private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+        private_confirmed = _studio_github_publication_private_confirmed(private_raw)
         if not (github_repo and github_url and latest_head and private_confirmed):
             continue
         evidence: dict[str, Any] = {}
@@ -18541,9 +18545,7 @@ def _studio_merge_publication_evidence(
     if not evidence:
         return result
     evidence_private_raw = evidence.get("private")
-    evidence_private_confirmed = evidence_private_raw is True or evidence_private_raw == 1
-    if isinstance(evidence_private_raw, str):
-        evidence_private_confirmed = evidence_private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    evidence_private_confirmed = _studio_github_publication_private_confirmed(evidence_private_raw)
     evidence_is_authoritative = (
         evidence_private_confirmed
         and all(str(evidence.get(field) or "").strip() for field in ("github_repo", "github_url", "latest_head"))
@@ -18555,9 +18557,7 @@ def _studio_merge_publication_evidence(
         if evidence_is_authoritative or not str(result.get(field) or "").strip():
             result[field] = str(evidence.get(field) or "").strip()
     private_raw = result.get("private")
-    private_confirmed = private_raw is True or private_raw == 1
-    if isinstance(private_raw, str):
-        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    private_confirmed = _studio_github_publication_private_confirmed(private_raw)
     if not private_confirmed and "private" in evidence:
         result["private"] = int(evidence.get("private") or 0)
     return result
@@ -18619,9 +18619,7 @@ def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, 
         except Exception:
             pass
     private_raw = result.get("private")
-    private_confirmed = private_raw is True or private_raw == 1
-    if isinstance(private_raw, str):
-        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    private_confirmed = _studio_github_publication_private_confirmed(private_raw)
     github_repo = str(result.get("github_repo") or "").strip()
     github_url = str(result.get("github_url") or "").strip()
     remote_repo = _github_repo_full_name_from_remote_url(github_url)
@@ -20719,7 +20717,7 @@ def _studio_extract_portfolio_project_from_order(
     private_raw = publication.get("private")
     if private_raw is None and github_repo:
         private_raw = _github_repo_private_visibility(github_repo)
-    private = 1 if bool(private_raw) else 0
+    private = 1 if _studio_github_publication_private_confirmed(private_raw) else 0
     project_key = (github_repo or project_path).strip().lower()
     if not project_key:
         return None
