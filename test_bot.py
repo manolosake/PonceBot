@@ -2050,7 +2050,7 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(row["status"], "published_private")
         self.assertEqual(row["private"], 1)
 
-    def test_publication_contract_reconcile_keeps_confirmed_private_repo_when_head_missing(self) -> None:
+    def test_publication_contract_reconcile_marks_confirmed_private_repo_when_head_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
             now = 229_000.0
@@ -2095,8 +2095,160 @@ class TestStudioOutcomeMemory(unittest.TestCase):
 
         self.assertEqual(changed, 1)
         self.assertIsNotNone(row)
-        self.assertEqual(row["status"], "published_private")
-        self.assertIn("Publication evidence incomplete", row["latest_summary"])
+        self.assertEqual(row["status"], "needs_publication")
+        self.assertIn("Publication incomplete", row["latest_summary"])
+
+    def test_publication_contract_reconcile_backfills_git_remote_and_head(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "signal-deck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/signaldeck.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_100.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project).lower(),
+                        "SignalDeck",
+                        str(project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-1",
+                        "order-1",
+                        "published_project",
+                        "Local project needs evidence.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, latest_head FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/signaldeck")
+        self.assertIn("github.com", project_row["github_url"])
+        self.assertIn("manolosake/signaldeck", project_row["github_url"])
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+
+    def test_publication_contract_reconcile_opens_recovery_for_uncommitted_project(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "submittal-chase-desk"
+            project.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(project), check=True, capture_output=True, text=True)
+            (project / "README.md").write_text("# Submittal Chase Desk\n", encoding="utf-8")
+            db = root / "jobs.sqlite"
+            now = 229_200.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project).lower(),
+                        "Submittal Chase Desk",
+                        str(project),
+                        "",
+                        "",
+                        "main",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-2",
+                        "order-2",
+                        "published_project",
+                        "Local scaffold needs publication.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+                project_row = conn.execute("SELECT status, latest_summary FROM studio_portfolio_projects").fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "commit_initial_and_publish_or_archive")
+        self.assertIn("latest_head", recovery_row["missing_json"])
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertIn("Required recovery", project_row["latest_summary"])
+
+    def test_publication_recovery_gate_creates_priority_opportunity(self) -> None:
+        memory = {
+            "studio_publication_recovery_count": 2,
+            "studio_publication_recovery_items": [
+                "SignalDeck · create_private_remote_and_push_or_archive",
+                "Submittal Chase Desk · commit_initial_and_publish_or_archive",
+            ],
+            "recent_studio_negative_outcomes": [],
+            "recent_studio_positive_outcomes": [],
+        }
+        governor = bot._studio_governor_assessment(memory, now=229_300.0)
+        memory["studio_governor"] = governor
+        opportunity = bot._studio_publication_recovery_opportunity(memory)
+
+        self.assertEqual(governor["mode"], "publication_recovery_gate")
+        self.assertIn("new-project-incubator", governor["avoid_keys"])
+        self.assertIsNotNone(opportunity)
+        self.assertEqual(opportunity["key"], "publication-recovery")
+        self.assertEqual(opportunity["type"], "PUBLICATION_RECOVERY")
+        self.assertGreaterEqual(int(opportunity["score"]), 100)
 
     def test_orphaned_active_cycle_finalizer_skips_minimal_fixture_without_order_tables(self) -> None:
         with tempfile.TemporaryDirectory() as td:

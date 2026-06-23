@@ -17019,12 +17019,33 @@ def _studio_ensure_schema(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS studio_publication_recovery (
+                recovery_id TEXT PRIMARY KEY,
+                project_key TEXT NOT NULL,
+                project_name TEXT,
+                project_path TEXT,
+                github_repo TEXT,
+                github_url TEXT,
+                latest_head TEXT,
+                missing_json TEXT NOT NULL DEFAULT '[]',
+                required_action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                source_order_id TEXT,
+                first_seen_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_ts ON studio_cycles(ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_cycles_status ON studio_cycles(status, updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_updated ON studio_portfolio_projects(updated_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_portfolio_github ON studio_portfolio_projects(github_repo)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_maturity_ts ON studio_maturity_snapshots(ts DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_quality_created ON studio_quality_audits(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_studio_publication_recovery_status ON studio_publication_recovery(status, updated_at DESC)")
         conn.commit()
 
 
@@ -17278,6 +17299,8 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         "studio_quality_warnings": [],
         "studio_quality_avg_24h": None,
         "studio_quality_low_24h": 0,
+        "studio_publication_recovery_count": 0,
+        "studio_publication_recovery_items": [],
     }
     cutoff = float(now) - 72.0 * 3600.0
     try:
@@ -17450,6 +17473,47 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
     memory["studio_quality_warnings"] = list(dict.fromkeys(quality_warnings))[:8]
     if scores_24h:
         memory["studio_quality_avg_24h"] = int(round(sum(scores_24h) / max(1, len(scores_24h))))
+    try:
+        with sqlite3.connect(str(db), timeout=8.0) as conn:
+            conn.row_factory = sqlite3.Row
+            recovery_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_publication_recovery'"
+            ).fetchone()
+            recovery_rows = []
+            if recovery_table:
+                recovery_rows = conn.execute(
+                    """
+                    SELECT project_key, project_name, project_path, github_repo, required_action, reason, updated_at
+                    FROM studio_publication_recovery
+                    WHERE status = 'open'
+                    ORDER BY updated_at DESC
+                    LIMIT 12
+                    """
+                ).fetchall()
+                total_open = conn.execute(
+                    "SELECT COUNT(*) AS c FROM studio_publication_recovery WHERE status = 'open'"
+                ).fetchone()
+                memory["studio_publication_recovery_count"] = int(total_open["c"] if total_open else 0)
+    except Exception:
+        recovery_rows = []
+    recovery_items: list[str] = []
+    for row in recovery_rows or []:
+        name = str(row["project_name"] or row["project_key"] or "portfolio project").strip()
+        action = str(row["required_action"] or "").strip()
+        path = str(row["project_path"] or "").strip()
+        repo = str(row["github_repo"] or "").strip()
+        reason = _studio_one_line(row["reason"], max_chars=90, default="")
+        bits = [name]
+        if action:
+            bits.append(action)
+        if repo:
+            bits.append(repo)
+        elif path:
+            bits.append(path)
+        if reason:
+            bits.append(reason)
+        recovery_items.append(_studio_one_line(" · ".join(bits), max_chars=180))
+    memory["studio_publication_recovery_items"] = list(dict.fromkeys(recovery_items))[:8]
     return memory
 
 
@@ -17705,6 +17769,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
     positives = [entry for entry in memory.get("recent_studio_positive_outcomes", []) or [] if isinstance(entry, dict)]
     recent_projects_6h = int(memory.get("studio_portfolio_recent_count_6h", 0) or 0)
     recent_projects_24h = int(memory.get("studio_portfolio_recent_count_24h", 0) or 0)
+    publication_recovery_count = int(memory.get("studio_publication_recovery_count", 0) or 0)
     readiness = memory.get("studio_readiness") if isinstance(memory.get("studio_readiness"), dict) else {}
     readiness_status = str(readiness.get("status") or "green").strip().lower()
     readiness_gaps = [
@@ -17867,6 +17932,28 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
                 "Cooldown after a successful alternative shipment: do not open another immediate incubator sprint.",
                 "Keep repeated codexbot repairs gated until fresh root-cause evidence appears.",
                 "Prefer observation or compounding existing portfolio/dashboard value on the next normal interval.",
+            ]
+        )
+    elif publication_recovery_count > 0:
+        mode = "publication_recovery_gate"
+        severity = "red"
+        recovery_preview = "; ".join(str(x) for x in (memory.get("studio_publication_recovery_items") or [])[:3])
+        trigger = (
+            f"{publication_recovery_count} portfolio assets have incomplete publication evidence"
+            + (f": {recovery_preview}" if recovery_preview else ".")
+        )
+        force_next_action = (
+            "Run publication recovery before fresh incubator work: backfill remote/head from local Git, publish a private "
+            "GitHub remote and push main when safe, or archive/reject the asset with an explicit low-value reason."
+        )
+        avoid_keys = ["new-project-incubator", "project-incubator"]
+        prefer_lanes = ["portfolio", "core"]
+        directives.extend(
+            [
+                "Publication recovery is mandatory: no project counts as published until github_repo, github_url, and latest_head are present.",
+                "Resolve each open recovery item by publishing/private-pushing main, backfilling evidence from local Git, or closing it as rejected_low_value/archive with reason.",
+                "Do not create another fresh repo while publication recovery is open unless the CEO explicitly asks.",
+                "If GitHub creation or push is blocked, close with blocked_need_operator and exact command/error evidence.",
             ]
         )
     elif delivery_failures and len(core_repair_loop_failures) >= 2:
@@ -18042,6 +18129,7 @@ def _studio_governor_assessment(memory: dict[str, Any], *, now: float | None = N
         "economic_gate_min_selection_score": _studio_economic_gate_min_selection_score(),
         "portfolio_recent_count_6h": recent_projects_6h,
         "portfolio_recent_count_24h": recent_projects_24h,
+        "publication_recovery_count": publication_recovery_count,
         "portfolio_focus_reason_count": len(portfolio_focus_reasons),
         "active_portfolio_repo_count": int(memory.get("studio_active_portfolio_repo_count", 0) or 0),
         "active_portfolio_focus_cap": int(memory.get("studio_active_portfolio_focus_cap", _studio_active_portfolio_focus_cap()) or 0),
@@ -18229,6 +18317,113 @@ def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
     return missing
 
 
+def _studio_publication_recovery_action(project: dict[str, Any], missing: list[str]) -> str:
+    path = str(project.get("project_path") or "").strip()
+    has_git = bool(project.get("_has_git"))
+    has_commit = bool(project.get("_has_commit"))
+    has_remote = bool(str(project.get("github_url") or "").strip())
+    if not path:
+        return "archive_or_reject_missing_path"
+    if not has_git:
+        return "initialize_git_or_archive"
+    if not has_commit:
+        return "commit_initial_and_publish_or_archive"
+    if not has_remote or "github_repo" in missing or "github_url" in missing:
+        return "create_private_remote_and_push_or_archive"
+    if "latest_head" in missing:
+        return "backfill_latest_head_or_validate_remote"
+    return "resolve_publication_contract"
+
+
+def _studio_upsert_publication_recovery_conn(
+    *,
+    conn: sqlite3.Connection,
+    project: dict[str, Any],
+    missing: list[str],
+    now: float,
+    status: str,
+    reason: str,
+) -> None:
+    key = str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "").strip().lower()
+    if not key:
+        return
+    action = _studio_publication_recovery_action(project, missing)
+    conn.execute(
+        """
+        INSERT INTO studio_publication_recovery(
+            recovery_id, project_key, project_name, project_path, github_repo, github_url,
+            latest_head, missing_json, required_action, status, reason, source_order_id,
+            first_seen_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(recovery_id) DO UPDATE SET
+            project_name = excluded.project_name,
+            project_path = COALESCE(NULLIF(excluded.project_path, ''), studio_publication_recovery.project_path),
+            github_repo = COALESCE(NULLIF(excluded.github_repo, ''), studio_publication_recovery.github_repo),
+            github_url = COALESCE(NULLIF(excluded.github_url, ''), studio_publication_recovery.github_url),
+            latest_head = COALESCE(NULLIF(excluded.latest_head, ''), studio_publication_recovery.latest_head),
+            missing_json = excluded.missing_json,
+            required_action = excluded.required_action,
+            status = excluded.status,
+            reason = excluded.reason,
+            source_order_id = COALESCE(NULLIF(excluded.source_order_id, ''), studio_publication_recovery.source_order_id),
+            updated_at = excluded.updated_at
+        """,
+        (
+            key,
+            key,
+            str(project.get("project_name") or ""),
+            str(project.get("project_path") or ""),
+            str(project.get("github_repo") or ""),
+            str(project.get("github_url") or ""),
+            str(project.get("latest_head") or ""),
+            _studio_json(list(dict.fromkeys(missing))),
+            action,
+            str(status or "open"),
+            _studio_one_line(reason, max_chars=500, default=action),
+            str(project.get("source_order_id") or project.get("latest_order_id") or ""),
+            float(now),
+            float(now),
+        ),
+    )
+
+
+def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, Any]:
+    result = dict(project)
+    project_path = str(result.get("project_path") or "").strip()
+    if not project_path:
+        result["_path_exists"] = False
+        result["_has_git"] = False
+        result["_has_commit"] = False
+        return result
+    try:
+        project_dir = Path(project_path).expanduser()
+    except Exception:
+        result["_path_exists"] = False
+        result["_has_git"] = False
+        result["_has_commit"] = False
+        return result
+    result["_path_exists"] = project_dir.exists()
+    result["_has_git"] = bool(project_dir.exists() and (project_dir / ".git").exists())
+    result["_has_commit"] = False
+    if not result["_has_git"]:
+        return result
+    if not str(result.get("github_url") or "").strip():
+        remote = _run_git(project_dir, ["remote", "get-url", "origin"], check=False)
+        if remote.returncode == 0:
+            result["github_url"] = str(remote.stdout or "").strip()
+    if not str(result.get("github_repo") or "").strip() and str(result.get("github_url") or "").strip():
+        result["github_repo"] = _github_repo_full_name_from_remote_url(str(result.get("github_url") or ""))
+    head = _run_git(project_dir, ["rev-parse", "--short", "HEAD"], check=False)
+    if head.returncode == 0 and str(head.stdout or "").strip():
+        result["_has_commit"] = True
+        if not str(result.get("latest_head") or "").strip():
+            result["latest_head"] = str(head.stdout or "").strip()
+    branch = _run_git(project_dir, ["branch", "--show-current"], check=False)
+    if branch.returncode == 0 and str(branch.stdout or "").strip() and not str(result.get("default_branch") or "").strip():
+        result["default_branch"] = str(branch.stdout or "").strip()
+    return result
+
+
 def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: float) -> int:
     try:
         db = Path(db_path).expanduser()
@@ -18241,57 +18436,111 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 str(row["name"] or "").strip().lower()
                 for row in conn.execute("PRAGMA table_info(studio_portfolio_projects)").fetchall()
             }
-            required = {"project_key", "status", "github_repo", "github_url", "latest_head", "latest_summary"}
+            required = {
+                "project_key",
+                "project_name",
+                "project_path",
+                "status",
+                "github_repo",
+                "github_url",
+                "default_branch",
+                "latest_head",
+                "latest_summary",
+                "source_order_id",
+                "latest_order_id",
+            }
             if not required.issubset(columns):
                 return 0
             rows = conn.execute(
                 """
-                SELECT project_key, github_repo, github_url, latest_head, latest_summary
+                SELECT project_key, project_name, project_path, status, github_repo, github_url,
+                       default_branch, latest_head, latest_summary, source_order_id, latest_order_id,
+                       private
                 FROM studio_portfolio_projects
-                WHERE status LIKE 'published%'
+                WHERE (status LIKE 'published%' OR status = 'needs_publication')
                   AND (
                     github_repo IS NULL OR TRIM(github_repo) = ''
                     OR github_url IS NULL OR TRIM(github_url) = ''
                     OR latest_head IS NULL OR TRIM(latest_head) = ''
+                    OR status = 'needs_publication'
                   )
                 """
             ).fetchall()
             changed = 0
             for row in rows or []:
-                missing = _studio_publication_contract_missing(dict(row))
+                project = _studio_project_git_publication_probe(dict(row))
+                missing = _studio_publication_contract_missing(project)
                 if not missing:
+                    status = "published_private" if bool(project.get("private")) else "published"
+                    conn.execute(
+                        """
+                        UPDATE studio_portfolio_projects
+                        SET status = ?,
+                            github_repo = COALESCE(NULLIF(?, ''), github_repo),
+                            github_url = COALESCE(NULLIF(?, ''), github_url),
+                            default_branch = COALESCE(NULLIF(?, ''), default_branch),
+                            latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                            updated_at = ?
+                        WHERE project_key = ?
+                        """,
+                        (
+                            status,
+                            str(project.get("github_repo") or ""),
+                            str(project.get("github_url") or ""),
+                            str(project.get("default_branch") or ""),
+                            str(project.get("latest_head") or ""),
+                            float(now),
+                            row["project_key"],
+                        ),
+                    )
+                    _studio_upsert_publication_recovery_conn(
+                        conn=conn,
+                        project=project,
+                        missing=[],
+                        now=now,
+                        status="resolved",
+                        reason="Publication contract is complete after local Git evidence backfill.",
+                    )
+                    changed += 1
                     continue
                 current_summary = str(row["latest_summary"] or "").strip()
-                blocking_missing = [field for field in missing if field in {"github_repo", "github_url"}]
-                prefix = (
-                    f"Publication incomplete: missing {', '.join(blocking_missing)}."
-                    if blocking_missing
-                    else f"Publication evidence incomplete: missing {', '.join(missing)}."
-                )
+                prefix = f"Publication incomplete: missing {', '.join(missing)}."
+                action = _studio_publication_recovery_action(project, missing)
                 summary = (
                     current_summary
                     if current_summary.lower().startswith(("publication incomplete:", "publication evidence incomplete:"))
-                    else _studio_one_line(f"{prefix} {current_summary}", max_chars=500, default=prefix)
+                    else _studio_one_line(f"{prefix} Required recovery: {action}. {current_summary}", max_chars=500, default=prefix)
                 )
-                if blocking_missing:
-                    conn.execute(
-                        """
-                        UPDATE studio_portfolio_projects
-                        SET status = 'needs_publication',
-                            latest_summary = ?
-                        WHERE project_key = ?
-                        """,
-                        (summary, row["project_key"]),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        UPDATE studio_portfolio_projects
-                        SET latest_summary = ?
-                        WHERE project_key = ?
-                        """,
-                        (summary, row["project_key"]),
-                    )
+                conn.execute(
+                    """
+                    UPDATE studio_portfolio_projects
+                    SET status = 'needs_publication',
+                        github_repo = COALESCE(NULLIF(?, ''), github_repo),
+                        github_url = COALESCE(NULLIF(?, ''), github_url),
+                        default_branch = COALESCE(NULLIF(?, ''), default_branch),
+                        latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                        latest_summary = ?,
+                        updated_at = ?
+                    WHERE project_key = ?
+                    """,
+                    (
+                        str(project.get("github_repo") or ""),
+                        str(project.get("github_url") or ""),
+                        str(project.get("default_branch") or ""),
+                        str(project.get("latest_head") or ""),
+                        summary,
+                        float(now),
+                        row["project_key"],
+                    ),
+                )
+                _studio_upsert_publication_recovery_conn(
+                    conn=conn,
+                    project=project,
+                    missing=missing,
+                    now=now,
+                    status="open",
+                    reason=summary,
+                )
                 changed += 1
             conn.commit()
             return changed
@@ -18945,6 +19194,60 @@ def _studio_incubator_opportunity(*, cfg: BotConfig, now: float, memory: dict[st
     return _studio_apply_factory_value_assessment(opportunity)
 
 
+def _studio_publication_recovery_opportunity(memory: dict[str, Any]) -> dict[str, Any] | None:
+    count = int(memory.get("studio_publication_recovery_count", 0) or 0)
+    if count <= 0:
+        return None
+    items = [
+        str(item)
+        for item in (memory.get("studio_publication_recovery_items") or [])[:5]
+        if str(item).strip()
+    ]
+    item_text = "; ".join(items) or "publication recovery queue has open items"
+    opportunity = {
+        "key": "publication-recovery",
+        "lane": "portfolio",
+        "type": "PUBLICATION_RECOVERY",
+        "repo_id": "",
+        "repo_path": "",
+        "repo_name": "Publication Recovery",
+        "repo_kind": "Portfolio",
+        "score": 175,
+        "problem": f"{count} portfolio assets have incomplete publication evidence; local-only work cannot count as factory output.",
+        "target_user": "Alejandro reviewing whether PonceBot's work actually shipped",
+        "thesis": (
+            "Close the publication debt queue before new incubator work: recover remote/head evidence, publish private "
+            "GitHub repos when safe, or archive/reject weak assets explicitly."
+        ),
+        "operator_visible_outcome": (
+            "Every selected recovery item ends as published_private with github_repo/github_url/latest_head, "
+            "or as rejected_low_value/archived/blocked_need_operator with exact evidence."
+        ),
+        "evidence_target": (
+            "SQLite recovery rows, git status, git log head, remote URL, push evidence, GitHub repo visibility, "
+            "or explicit archive/reject/blocker reason."
+        ),
+        "business_model": (
+            "Factory reliability: only published and auditable assets can become sellable, rentable, demoable, or reusable products."
+        ),
+        "monetization_path": (
+            "Protect revenue potential by converting local prototypes into private GitHub assets or pruning weak ones so cycles compound real products."
+        ),
+        "commercial_evidence_target": (
+            "portfolio assets with clean main, private GitHub publication, latest_head evidence, and next milestone; "
+            "or explicit rejection of low-value prototypes"
+        ),
+        "risk_summary": (
+            "do not publish publicly, spend money, delete data, or rewrite valuable history; private GitHub push is allowed when repo identity is clear"
+        ),
+        "why_better_than_alternatives": (
+            f"Publication debt blocks trustworthy factory outcomes. Open items: {_studio_one_line(item_text, max_chars=240)}"
+        ),
+        "publication_recovery_items": items,
+    }
+    return _studio_apply_factory_value_assessment(opportunity)
+
+
 def _studio_governor_avoids_opportunity(governor: dict[str, Any] | None, opportunity: dict[str, Any]) -> bool:
     if not isinstance(governor, dict) or not isinstance(opportunity, dict):
         return False
@@ -19047,6 +19350,9 @@ def _studio_build_opportunities(
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     _studio_record_maturity_snapshot(cfg=cfg, readiness=readiness, now=now)
     opportunities: list[dict[str, Any]] = []
+    recovery = _studio_publication_recovery_opportunity(memory)
+    if recovery is not None and str(recovery.get("key") or "").strip().lower() not in occupied_keys:
+        opportunities.append(recovery)
     for repo in repos:
         status = str(repo.get("status") or "").strip().lower()
         if status != "active" or not bool(repo.get("autonomy_enabled", True)):
@@ -19193,6 +19499,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
     failures = "; ".join(str(x) for x in memory.get("recent_failures", [])[:4]) or "none"
     studio_outcomes = "; ".join(str(x) for x in memory.get("recent_studio_outcomes", [])[:5]) or "none"
     portfolio_projects = "; ".join(str(x) for x in memory.get("studio_portfolio_recent_projects", [])[:6]) or "none"
+    publication_recovery = "; ".join(str(x) for x in memory.get("studio_publication_recovery_items", [])[:5]) or "none"
     quality_recent = "; ".join(str(x) for x in memory.get("studio_quality_recent", [])[:4]) or "none"
     quality_warnings = "; ".join(str(x) for x in memory.get("studio_quality_warnings", [])[:4]) or "none"
     quality_avg = memory.get("studio_quality_avg_24h")
@@ -19247,6 +19554,7 @@ def _studio_cycle_prompt_packet(*, selected: dict[str, Any], opportunities: list
             f"- recent failures: {failures}",
             f"- Recent Studio outcomes: {studio_outcomes}",
             f"- Portfolio assets: total={memory.get('studio_portfolio_total', 0)}; shipped 6h={memory.get('studio_portfolio_recent_count_6h', 0)}; shipped 24h={memory.get('studio_portfolio_recent_count_24h', 0)}; recent={portfolio_projects}",
+            f"- Publication recovery: open={memory.get('studio_publication_recovery_count', 0)}; items={publication_recovery}",
             f"- Portfolio focus: active={memory.get('studio_active_portfolio_repo_count', 0)}/{memory.get('studio_active_portfolio_focus_cap', _studio_active_portfolio_focus_cap())}; unpublished={memory.get('studio_unpublished_portfolio_repo_count', 0)}/{memory.get('studio_unpublished_portfolio_focus_cap', _studio_unpublished_portfolio_focus_cap())}; new-project cap 24h={memory.get('studio_recent_new_project_focus_cap_24h', _studio_recent_new_project_focus_cap_24h())}",
             f"- Studio quality audit: avg24h={quality_avg_text}; low24h={memory.get('studio_quality_low_24h', 0)}; warnings={quality_warnings}; recent={quality_recent}",
             f"- Operational readiness: status={readiness.get('status', 'unknown')} score={readiness.get('score', 'n/a')}; missing={readiness_missing}; {readiness_summary}",
@@ -19422,6 +19730,7 @@ def _studio_governor_should_preempt_active_cycle(
         "incubator_quality_gate",
         "portfolio_focus_gate",
         "economic_discipline_gate",
+        "publication_recovery_gate",
     }:
         return False
     key = str((cycle or {}).get("selected_key") or "").strip().lower()
@@ -19448,6 +19757,8 @@ def _studio_governor_should_preempt_active_cycle(
     if mode == "portfolio_focus_gate":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     if mode == "economic_discipline_gate":
+        return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
+    if mode == "publication_recovery_gate":
         return bool(key in avoid_keys or _studio_is_incubator_new_project_work(cycle))
     repo_tokens = {key}
     if repo_id:
@@ -20260,7 +20571,11 @@ def _studio_next_bet(
 
     lane = str(selected.get("lane") or "studio").strip().lower()
     key = str(selected.get("key") or cycle_id).strip().lower()
-    if lane == "incubator" or str(selected.get("type") or "").upper() == "NEW_PROJECT":
+    selected_type = str(selected.get("type") or "").upper()
+    if selected_type == "PUBLICATION_RECOVERY":
+        initiative_key = "publication-recovery"
+        title = "Studio Cycle: Publication Recovery"
+    elif lane == "incubator" or selected_type == "NEW_PROJECT":
         initiative_key = "project-incubator"
         title = "Studio Cycle: New Product Incubator"
     else:
@@ -21729,6 +22044,7 @@ def _spawn_proactive_order(
     ).strip()
     lane = str(initiative.get("lane") or "general").strip().lower()
     is_incubator_lane = lane == "incubator" or key == "project-incubator"
+    is_publication_recovery_lane = key == "publication-recovery"
     project_hint = str(initiative.get("project_hint") or "").strip()
     sprint_day = 1 + int((int(now) // (24 * 60 * 60)) % 5)
     repo = dict(repo_record or {})
@@ -21839,6 +22155,12 @@ def _spawn_proactive_order(
     requires_approval = bool(base_profile.get("approval_required", False))
     if repo_path:
         scope_policy = "- Scope decisions to the registered repo root above; do not create new repos or touch sibling repos. Controller access is read-only."
+    elif is_publication_recovery_lane:
+        scope_policy = (
+            "- Publication recovery is allowed to inspect registered portfolio project folders under /home/aponce, "
+            "backfill Git evidence, publish private GitHub remotes when safe, or close weak assets as rejected_low_value/archive. "
+            "Do not create unrelated new product repos."
+        )
     elif is_incubator_lane:
         scope_policy = (
             f"- Project incubation is allowed under {_project_incubator_root_dir()}. "
@@ -21855,6 +22177,18 @@ def _spawn_proactive_order(
             "- Because the factory scans /home/aponce, a new project must be discoverable as a git checkout after the next registry sync.",
         ]
         if is_incubator_lane
+        else []
+    )
+    publication_recovery_policy_lines = (
+        [
+            "- PUBLICATION_RECOVERY is not a new-product sprint. Its purpose is to close local-only or half-published portfolio work.",
+            "- For each selected recovery item, inspect Git status, commits, branch, origin remote, latest head, and GitHub publication evidence.",
+            "- If the asset is valuable and safe: ensure clean main, create/configure a private GitHub remote when needed, push main, and record github_repo/github_url/latest_head evidence.",
+            "- If the asset is weak, duplicated, or not worth more tokens: close it as rejected_low_value or archived with a concrete reason.",
+            "- If credentials, GitHub creation, or push is blocked: close with blocked_need_operator and exact command/error evidence.",
+            "- Do not count local-only folders, uncommitted scaffolds, or missing latest_head as published_project.",
+        ]
+        if is_publication_recovery_lane
         else []
     )
 
@@ -21904,6 +22238,7 @@ def _spawn_proactive_order(
         scope_policy,
         "- Skynet/Jarvis/controller lanes must not edit files, change branches, commit, push, merge, or deploy directly; implementation must be delegated to write-enabled local specialists.",
         *incubator_policy_lines,
+        *publication_recovery_policy_lines,
         f"- Factory business objective: {_STUDIO_OPERATOR_BUSINESS_GOAL}",
         f"- Self-improvement bar: {_STUDIO_SELF_IMPROVEMENT_GOAL}",
         f"- r530 resource policy: {_STUDIO_R530_RESOURCE_POLICY}",
@@ -22202,6 +22537,7 @@ def _proactive_lane_tick(
                 "repair_delivery_contract",
                 "autoship_recovery_gate",
                 "repair_loop_breaker",
+                "publication_recovery_gate",
             }
         except Exception:
             urgent_studio_repair = False
