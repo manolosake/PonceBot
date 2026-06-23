@@ -2044,11 +2044,83 @@ class TestStudioOutcomeMemory(unittest.TestCase):
                 )
             with sqlite3.connect(db) as conn:
                 conn.row_factory = sqlite3.Row
-                row = conn.execute("SELECT status, private FROM studio_portfolio_projects").fetchone()
+                row = conn.execute("SELECT status, private, validation_summary FROM studio_portfolio_projects").fetchone()
 
         self.assertIsNotNone(row)
-        self.assertEqual(row["status"], "published_private")
+        self.assertEqual(row["status"], "needs_publication")
         self.assertEqual(row["private"], 1)
+        self.assertIn("latest_head missing", row["validation_summary"])
+
+    def test_portfolio_parser_keeps_summary_only_private_claim_unconfirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "jobs.sqlite"
+            now = 228_050.0
+            order_id = "order-summary-private-claim"
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                conn.execute("INSERT INTO jobs(job_id, trace) VALUES (?, ?)", (order_id, "{}"))
+                conn.execute(
+                    """
+                    INSERT INTO studio_cycles(
+                        cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                        selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                        operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                        opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "cycle-summary-private-claim",
+                        bot._STUDIO_CYCLE_VERSION,
+                        now,
+                        "active",
+                        "new-project-incubator",
+                        "NEW_PROJECT",
+                        "",
+                        "",
+                        "incubator",
+                        "Create a sellable project",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "[]",
+                        "",
+                        "",
+                        order_id,
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_token_from_env_or_git_credentials", return_value=("", "")):
+                bot._studio_complete_cycle_for_order_db(
+                    db_path=db,
+                    order_id=order_id,
+                    outcome_status="published_project",
+                    outcome_summary=(
+                        "Published private repo manolosake/winback-workbench with "
+                        "head 1a2b3c4 and tests passed."
+                    ),
+                    now=now + 60,
+                )
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT status, github_repo, github_url, latest_head, private, validation_summary "
+                    "FROM studio_portfolio_projects"
+                ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "needs_publication")
+        self.assertEqual(row["github_repo"], "manolosake/winback-workbench")
+        self.assertEqual(row["github_url"], "https://github.com/manolosake/winback-workbench.git")
+        self.assertEqual(row["latest_head"], "1a2b3c4")
+        self.assertEqual(row["private"], 0)
+        self.assertIn("private GitHub visibility unconfirmed", row["validation_summary"])
 
     def test_publication_contract_reconcile_marks_confirmed_private_repo_when_head_missing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2196,6 +2268,159 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertTrue(publication["private"])
         self.assertEqual(trace["seed"], "value")
         self.assertEqual(job_row["updated_at"], now + 60)
+
+    def test_publication_contract_reconcile_keeps_non_github_remote_open(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "field-ops-desk"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Field Ops Desk\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@example.com:team/field-ops-desk.git"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_150.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project).lower(),
+                        "Field Ops Desk",
+                        str(project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-remote",
+                        "order-remote",
+                        "published_project",
+                        "Local project needs publication evidence.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_url, latest_summary FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, reason, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_url"], "git@example.com:team/field-ops-desk.git")
+        self.assertIn("origin remote is not GitHub", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "replace_non_github_remote_with_private_github_or_archive")
+        self.assertIn("origin remote is not GitHub", recovery_row["reason"])
+        self.assertIn('"github_url"', recovery_row["missing_json"])
+
+    def test_publication_contract_reconcile_keeps_unconfirmed_private_github_open(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "permit-sprint"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Permit Sprint\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/permit-sprint.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_175.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/permit-sprint",
+                        "Permit Sprint",
+                        str(project),
+                        "manolosake/permit-sprint",
+                        "https://github.com/manolosake/permit-sprint.git",
+                        "main",
+                        head,
+                        0,
+                        "published",
+                        "order-private",
+                        "order-private",
+                        "published_project",
+                        "Published repo needs verification.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, latest_head, latest_summary FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, reason, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_repo"], "manolosake/permit-sprint")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/permit-sprint.git")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertIn("private GitHub visibility unconfirmed", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "confirm_private_github_repo_or_archive")
+        self.assertIn("private GitHub visibility unconfirmed", recovery_row["reason"])
+        self.assertIn('"private"', recovery_row["missing_json"])
 
     def test_publication_contract_reconcile_opens_recovery_for_uncommitted_project(self) -> None:
         with tempfile.TemporaryDirectory() as td:

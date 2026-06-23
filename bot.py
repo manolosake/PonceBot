@@ -18308,13 +18308,42 @@ def _studio_record_maturity_snapshot(*, cfg: BotConfig, readiness: dict[str, Any
 
 def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
     missing: list[str] = []
-    if not str(project.get("github_repo") or "").strip():
+    github_repo = str(project.get("github_repo") or "").strip()
+    github_url = str(project.get("github_url") or "").strip()
+    latest_head = str(project.get("latest_head") or "").strip()
+    private_raw = project.get("private")
+    private_confirmed = private_raw is True or private_raw == 1
+    if isinstance(private_raw, str):
+        private_confirmed = private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    github_remote_verified = bool(github_url and _github_repo_full_name_from_remote_url(github_url))
+    if not github_repo:
         missing.append("github_repo")
-    if not str(project.get("github_url") or "").strip():
+    if not github_remote_verified:
         missing.append("github_url")
-    if not str(project.get("latest_head") or "").strip():
+    if not latest_head:
         missing.append("latest_head")
+    if not private_confirmed:
+        missing.append("private")
     return missing
+
+
+def _studio_publication_contract_reason(project: Mapping[str, Any], missing: Sequence[str]) -> str:
+    reasons: list[str] = []
+    github_url = str(project.get("github_url") or "").strip()
+    if github_url and not _github_repo_full_name_from_remote_url(github_url):
+        reasons.append("origin remote is not GitHub")
+    for field in missing:
+        if field == "github_repo":
+            reasons.append("github_repo missing")
+        elif field == "github_url" and not (github_url and not _github_repo_full_name_from_remote_url(github_url)):
+            reasons.append("github_url missing")
+        elif field == "latest_head":
+            reasons.append("latest_head missing")
+        elif field == "private":
+            reasons.append("private GitHub visibility unconfirmed")
+    if not reasons:
+        reasons.append("publication contract incomplete")
+    return f"Publication incomplete: {'; '.join(dict.fromkeys(reasons))}."
 
 
 def _studio_publication_recovery_action(project: dict[str, Any], missing: list[str]) -> str:
@@ -18323,6 +18352,7 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
     has_git = bool(project.get("_has_git"))
     has_commit = bool(project.get("_has_commit"))
     has_remote = bool(str(project.get("github_url") or "").strip())
+    github_remote_verified = bool(str(project.get("github_url") or "").strip() and _github_repo_full_name_from_remote_url(str(project.get("github_url") or "").strip()))
     if not path:
         return "archive_or_reject_missing_path"
     if path_exists is False:
@@ -18331,10 +18361,14 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
         return "initialize_git_or_archive"
     if not has_commit:
         return "commit_initial_and_publish_or_archive"
+    if has_remote and not github_remote_verified:
+        return "replace_non_github_remote_with_private_github_or_archive"
     if not has_remote or "github_repo" in missing or "github_url" in missing:
         return "create_private_remote_and_push_or_archive"
+    if "private" in missing:
+        return "confirm_private_github_repo_or_archive"
     if "latest_head" in missing:
-        return "backfill_latest_head_or_validate_remote"
+        return "backfill_latest_head_or_validate_private_github"
     return "resolve_publication_contract"
 
 
@@ -18467,13 +18501,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                        default_branch, latest_head, latest_summary, source_order_id, latest_order_id,
                        private
                 FROM studio_portfolio_projects
-                WHERE (status LIKE 'published%' OR status = 'needs_publication')
-                  AND (
-                    github_repo IS NULL OR TRIM(github_repo) = ''
-                    OR github_url IS NULL OR TRIM(github_url) = ''
-                    OR latest_head IS NULL OR TRIM(latest_head) = ''
-                    OR status = 'needs_publication'
-                  )
+                WHERE status LIKE 'published%' OR status = 'needs_publication'
                 """
             ).fetchall()
             changed = 0
@@ -18481,7 +18509,6 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 project = _studio_project_git_publication_probe(dict(row))
                 missing = _studio_publication_contract_missing(project)
                 if not missing:
-                    status = "published_private" if bool(project.get("private")) else "published"
                     conn.execute(
                         """
                         UPDATE studio_portfolio_projects
@@ -18494,7 +18521,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         WHERE project_key = ?
                         """,
                         (
-                            status,
+                            "published_private",
                             str(project.get("github_repo") or ""),
                             str(project.get("github_url") or ""),
                             str(project.get("default_branch") or ""),
@@ -18520,7 +18547,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     changed += 1
                     continue
                 current_summary = str(row["latest_summary"] or "").strip()
-                prefix = f"Publication incomplete: missing {', '.join(missing)}."
+                prefix = _studio_publication_contract_reason(project, missing)
                 action = _studio_publication_recovery_action(project, missing)
                 summary = (
                     current_summary
@@ -18581,7 +18608,7 @@ def _studio_normalize_github_publication(project: Mapping[str, Any]) -> dict[str
         "head": latest_head,
         "latest_head": latest_head,
         "project_path": project_path,
-        "private": bool(project.get("private")),
+        "private": "private" not in _studio_publication_contract_missing(dict(project)),
     }
     return {key: value for key, value in publication.items() if value not in ("", None)}
 
@@ -20449,8 +20476,6 @@ def _studio_extract_portfolio_project_from_order(
             ok_repo, repo_payload = _github_api_json(token=token, method="GET", path=f"/repos/{github_repo}")
             if ok_repo:
                 private_raw = bool(repo_payload.get("private", False))
-    if private_raw is None:
-        private_raw = "private" in summary.lower()
     private = 1 if bool(private_raw) else 0
     project_key = (github_repo or project_path).strip().lower()
     if not project_key:
@@ -20474,22 +20499,13 @@ def _studio_extract_portfolio_project_from_order(
         "github_repo": github_repo,
         "github_url": remote_url,
         "latest_head": latest_head,
+        "private": private,
     }
     publication_missing = _studio_publication_contract_missing(publication_probe)
-    status = "published_private" if private else "published"
-    blocking_publication_missing = [
-        field for field in publication_missing if field in {"github_repo", "github_url"}
-    ]
-    if blocking_publication_missing:
+    status = "published_private"
+    if publication_missing:
         status = "needs_publication"
-        missing_line = f"Publication incomplete: missing {', '.join(blocking_publication_missing)}."
-        validation_summary = _studio_one_line(
-            f"{missing_line} {validation_summary or summary}",
-            max_chars=260,
-            default=missing_line,
-        )
-    elif publication_missing:
-        missing_line = f"Publication evidence incomplete: missing {', '.join(publication_missing)}."
+        missing_line = _studio_publication_contract_reason(publication_probe, publication_missing)
         validation_summary = _studio_one_line(
             f"{missing_line} {validation_summary or summary}",
             max_chars=260,
