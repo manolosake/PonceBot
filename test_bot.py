@@ -1494,25 +1494,29 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         *,
         publication_private,
         summary: str = "Published project summary.",
+        publication_overrides: dict[str, object] | None = None,
     ) -> dict[str, object] | None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
             with sqlite3.connect(db) as conn:
                 conn.execute("CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}')")
+                publication = {
+                    "github_repo": "manolosake/private-check",
+                    "remote_url": "https://github.com/manolosake/private-check.git",
+                    "github_url": "https://github.com/manolosake/private-check.git",
+                    "head": "abc1234",
+                    "latest_head": "abc1234",
+                    "private": publication_private,
+                }
+                if publication_overrides:
+                    publication.update(publication_overrides)
                 conn.execute(
                     "INSERT INTO jobs(job_id, trace) VALUES (?, ?)",
                     (
                         "order-private-check",
                         json.dumps(
                             {
-                                "github_publication": {
-                                    "github_repo": "manolosake/private-check",
-                                    "remote_url": "https://github.com/manolosake/private-check.git",
-                                    "github_url": "https://github.com/manolosake/private-check.git",
-                                    "head": "abc1234",
-                                    "latest_head": "abc1234",
-                                    "private": publication_private,
-                                }
+                                "github_publication": publication
                             }
                         ),
                     ),
@@ -3876,6 +3880,28 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         private_visibility.assert_called_once_with("manolosake/private-check")
         self.assertIsNotNone(project)
         assert project is not None
+        self.assertEqual(project["private"], 1)
+        self.assertEqual(project["status"], "published_private")
+
+    def test_extract_portfolio_project_recovers_latest_head_default_branch_and_github_url(self) -> None:
+        project = self._extract_published_project(
+            publication_private=True,
+            publication_overrides={
+                "remote_url": "",
+                "github_url": "https://github.com/manolosake/private-check.git",
+                "head": "",
+                "latest_head": "def5678",
+                "branch": "",
+                "default_branch": "develop",
+            },
+        )
+
+        self.assertIsNotNone(project)
+        assert project is not None
+        self.assertEqual(project["github_repo"], "manolosake/private-check")
+        self.assertEqual(project["github_url"], "https://github.com/manolosake/private-check.git")
+        self.assertEqual(project["latest_head"], "def5678")
+        self.assertEqual(project["default_branch"], "develop")
         self.assertEqual(project["private"], 1)
         self.assertEqual(project["status"], "published_private")
 

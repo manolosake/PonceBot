@@ -20689,7 +20689,12 @@ def _studio_extract_portfolio_project_from_order(
         except Exception:
             project_git_path = None
     github_repo = str(publication.get("github_repo") or "").strip()
-    remote_url = str(publication.get("remote_url") or delivery.get("github_remote_url") or "").strip()
+    remote_url = str(
+        publication.get("remote_url")
+        or publication.get("github_url")
+        or delivery.get("github_remote_url")
+        or ""
+    ).strip()
     if not remote_url and project_git_path is not None:
         def _preferred_remote_url() -> str:
             def _remote_url(name: str) -> str:
@@ -20728,7 +20733,12 @@ def _studio_extract_portfolio_project_from_order(
             github_repo = owner_match.group(1).rstrip("`.,;:)").lower()
     if not remote_url and github_repo:
         remote_url = f"https://github.com/{github_repo}.git"
-    latest_head = str(publication.get("head") or delivery.get("project_head") or "").strip()
+    latest_head = str(
+        publication.get("head")
+        or publication.get("latest_head")
+        or delivery.get("project_head")
+        or ""
+    ).strip()
     if not latest_head and project_git_path is not None:
         head = _run_git(project_git_path, ["rev-parse", "--short", "HEAD"], check=False)
         if head.returncode == 0:
@@ -20737,7 +20747,7 @@ def _studio_extract_portfolio_project_from_order(
         head_match = re.search(r"\bhead\s+([0-9a-f]{7,40})\b", summary, flags=re.IGNORECASE)
         if head_match:
             latest_head = head_match.group(1)
-    branch = str(publication.get("branch") or "main").strip() or "main"
+    branch = str(publication.get("branch") or publication.get("default_branch") or "main").strip() or "main"
     if project_git_path is not None:
         branch_proc = _run_git(project_git_path, ["branch", "--show-current"], check=False)
         branch_text = str(branch_proc.stdout or "").strip() if branch_proc.returncode == 0 else ""
