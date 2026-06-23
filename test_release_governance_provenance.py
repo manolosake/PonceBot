@@ -1,5 +1,6 @@
 import unittest
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -260,14 +261,17 @@ class TestReleaseGovernanceProvenance(unittest.TestCase):
         )
 
     def test_collect_status_capture_uses_branch_style_output_for_clean_repo(self) -> None:
-        with TemporaryDirectory() as td:
+        git_safe_tmp_root = Path(__file__).resolve().parent / ".codexbot_tmp"
+        git_safe_tmp_root.mkdir(exist_ok=True)
+        with TemporaryDirectory(dir=git_safe_tmp_root, prefix="tmp") as td:
             repo = Path(td)
-            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            subprocess.run(["git", "config", "user.name", "QA"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            git_env = dict(os.environ, PYTEST_CURRENT_TEST=self.id())
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=git_env)
+            subprocess.run(["git", "config", "user.email", "qa@example.com"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=git_env)
+            subprocess.run(["git", "config", "user.name", "QA"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=git_env)
             (repo / "README.md").write_text("x\n", encoding="utf-8")
-            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=git_env)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=git_env)
             status = rg._collect_status_capture(repo)
             self.assertTrue(status.startswith("## "))
 
