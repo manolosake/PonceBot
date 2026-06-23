@@ -2229,6 +2229,62 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(project_row["status"], "needs_publication")
         self.assertIn("Required recovery", project_row["latest_summary"])
 
+    def test_publication_contract_reconcile_marks_missing_project_path_for_archive_or_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_project = root / "missing-project"
+            db = root / "jobs.sqlite"
+            now = 229_250.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(missing_project).lower(),
+                        "Missing Project",
+                        str(missing_project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-3",
+                        "order-3",
+                        "published_project",
+                        "Local project path was recorded but is gone.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+                project_row = conn.execute("SELECT status, latest_summary FROM studio_portfolio_projects").fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "archive_or_reject_missing_path")
+        self.assertIn("github_repo", recovery_row["missing_json"])
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertIn("archive_or_reject_missing_path", project_row["latest_summary"])
+
     def test_publication_recovery_gate_creates_priority_opportunity(self) -> None:
         memory = {
             "studio_publication_recovery_count": 2,

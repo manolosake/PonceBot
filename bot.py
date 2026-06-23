@@ -18319,10 +18319,13 @@ def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
 
 def _studio_publication_recovery_action(project: dict[str, Any], missing: list[str]) -> str:
     path = str(project.get("project_path") or "").strip()
+    path_exists = project.get("_path_exists")
     has_git = bool(project.get("_has_git"))
     has_commit = bool(project.get("_has_commit"))
     has_remote = bool(str(project.get("github_url") or "").strip())
     if not path:
+        return "archive_or_reject_missing_path"
+    if path_exists is False:
         return "archive_or_reject_missing_path"
     if not has_git:
         return "initialize_git_or_archive"
