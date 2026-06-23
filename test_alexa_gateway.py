@@ -94,6 +94,7 @@ def test_gateway_submits_query_and_returns_ticket(monkeypatch) -> None:
             path_secret="",
             verify_signature=False,
             skill_id="",
+            allowed_skill_ids=(),
             timestamp_tolerance_seconds=150,
             chat_id=123,
             user_id=456,
@@ -107,6 +108,44 @@ def test_gateway_submits_query_and_returns_ticket(monkeypatch) -> None:
     assert calls["submit"]["user_id"] == 456
     assert calls["trace_job_id"] == "abcdef123456"
     assert "Ticket abcdef12" in out["response"]["outputSpeech"]["ssml"]
+
+
+def test_parse_skill_ids_deduplicates_legacy_and_allowed() -> None:
+    assert alexa_gateway._parse_skill_ids(
+        "amzn1.ask.skill.one",
+        "amzn1.ask.skill.two, amzn1.ask.skill.one",
+        "amzn1.ask.skill.three;amzn1.ask.skill.two",
+    ) == (
+        "amzn1.ask.skill.one",
+        "amzn1.ask.skill.two",
+        "amzn1.ask.skill.three",
+    )
+
+
+def test_application_id_accepts_configured_allowed_id() -> None:
+    class FakeServer:
+        gateway_cfg = alexa_gateway.AlexaGatewayConfig(
+            host="127.0.0.1",
+            port=0,
+            endpoint_path="/alexa",
+            path_secret="",
+            verify_signature=False,
+            skill_id="amzn1.ask.skill.primary",
+            allowed_skill_ids=("amzn1.ask.skill.primary", "amzn1.ask.skill.secondary"),
+            timestamp_tolerance_seconds=150,
+            chat_id=123,
+            user_id=456,
+            wait_seconds=0,
+            max_speech_chars=500,
+        )
+
+    handler = object.__new__(alexa_gateway.AlexaHandler)
+    handler.server = FakeServer()
+    req = _ask_request("hola")
+    req["session"]["application"]["applicationId"] = "amzn1.ask.skill.secondary"
+    req["context"]["System"]["application"]["applicationId"] = "amzn1.ask.skill.secondary"
+
+    handler._check_application_id(req)
 
 
 def test_alexa_skill_package_has_manifest_and_locales() -> None:

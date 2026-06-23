@@ -27,6 +27,8 @@ PONCEBOT_ALEXA_LISTEN=127.0.0.1:8095
 PONCEBOT_ALEXA_ENDPOINT_PATH=/alexa
 PONCEBOT_ALEXA_PATH_SECRET=pon-un-secreto-largo-aqui
 PONCEBOT_ALEXA_SKILL_ID=amzn1.ask.skill.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+# Optional: comma-separated extra IDs if Amazon creates/dev-tests a duplicate skill.
+PONCEBOT_ALEXA_ALLOWED_SKILL_IDS=
 PONCEBOT_ALEXA_VERIFY_SIGNATURE=1
 PONCEBOT_ALEXA_CHAT_ID=8355547734
 PONCEBOT_ALEXA_USER_ID=8355547734
@@ -67,7 +69,7 @@ curl http://127.0.0.1:8095/health
 Logs:
 
 ```bash
-sudo journalctl -u poncebot-alexa -f
+journalctl --user -u poncebot-alexa.service -f
 ```
 
 ## Exponer a Alexa
@@ -98,7 +100,10 @@ https://r530.tail3525c1.ts.net/alexa/pon-un-secreto-largo-aqui
    - `alexa/skill-package/interactionModels/custom/es-US.json`
    - `alexa/skill-package/interactionModels/custom/es-ES.json`
 6. Endpoint: HTTPS, usando la URL publica del gateway.
-7. Copiar el Skill ID a `PONCEBOT_ALEXA_SKILL_ID`.
+7. Copiar el Skill ID a `PONCEBOT_ALEXA_SKILL_ID`. Si certificacion reporta
+   `invalid skill id`, revisar `journalctl --user -u poncebot-alexa.service`
+   y agregar cualquier ID legitimo de Amazon a
+   `PONCEBOT_ALEXA_ALLOWED_SKILL_IDS`.
 8. En Test, habilitar `Development`; los Echo registrados con la misma cuenta
    Amazon developer pueden probar la skill si su locale coincide con uno de los
    locales configurados.

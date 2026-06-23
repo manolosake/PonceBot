@@ -50,6 +50,7 @@ class AlexaGatewayConfig:
     path_secret: str
     verify_signature: bool
     skill_id: str
+    allowed_skill_ids: tuple[str, ...]
     timestamp_tolerance_seconds: int
     chat_id: int
     user_id: int
@@ -316,11 +317,21 @@ class AlexaHandler(BaseHTTPRequestHandler):
             raise AlexaRequestError(404, "not found")
 
     def _check_application_id(self, envelope: dict[str, Any]) -> None:
-        expected = self.server.gateway_cfg.skill_id.strip()
-        if not expected:
+        allowed = tuple(
+            sid.strip()
+            for sid in self.server.gateway_cfg.allowed_skill_ids
+            if str(sid or "").strip()
+        )
+        if not allowed:
             return
         actual = _application_id(envelope)
-        if actual != expected:
+        if actual not in allowed:
+            LOG.warning(
+                "Alexa request applicationId mismatch actual=%s actual_sha=%s allowed=%s",
+                actual or "(missing)",
+                _short_sha(actual),
+                ",".join(allowed),
+            )
             raise AlexaRequestError(403, "invalid skill id")
 
     def _send_json(self, code: int, payload: dict[str, Any]) -> None:
@@ -570,6 +581,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_skill_ids(*values: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        for part in re.split(r"[\s,;]+", str(value or "").strip()):
+            sid = part.strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            out.append(sid)
+    return tuple(out)
+
+
+def _short_sha(value: str) -> str:
+    if not value:
+        return "missing"
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
 def _first_int(values: set[int]) -> int | None:
     if not values:
         return None
@@ -593,13 +623,20 @@ def _gateway_config(cfg: poncebot.BotConfig) -> AlexaGatewayConfig:
     wait_seconds = float(os.environ.get("PONCEBOT_ALEXA_WAIT_SECONDS", "5.5"))
     max_speech_chars = int(os.environ.get("PONCEBOT_ALEXA_MAX_SPEECH_CHARS", "900"))
     tolerance = int(os.environ.get("PONCEBOT_ALEXA_TIMESTAMP_TOLERANCE_SECONDS", "150"))
+    primary_skill_id = os.environ.get("PONCEBOT_ALEXA_SKILL_ID", "").strip()
+    allowed_skill_ids = _parse_skill_ids(
+        primary_skill_id,
+        os.environ.get("PONCEBOT_ALEXA_ALLOWED_SKILL_IDS", ""),
+        os.environ.get("PONCEBOT_ALEXA_SKILL_IDS", ""),
+    )
     return AlexaGatewayConfig(
         host=host,
         port=port,
         endpoint_path=endpoint_path,
         path_secret=os.environ.get("PONCEBOT_ALEXA_PATH_SECRET", "").strip(),
         verify_signature=_env_bool("PONCEBOT_ALEXA_VERIFY_SIGNATURE", True),
-        skill_id=os.environ.get("PONCEBOT_ALEXA_SKILL_ID", "").strip(),
+        skill_id=primary_skill_id,
+        allowed_skill_ids=allowed_skill_ids,
         timestamp_tolerance_seconds=tolerance,
         chat_id=int(chat_id),
         user_id=int(user_id),
@@ -642,12 +679,12 @@ def main() -> None:
         path = path.rstrip("/") + "/" + urllib.parse.quote(gateway_cfg.path_secret, safe="")
         log_path = log_path.rstrip("/") + "/<secret>"
     LOG.info(
-        "PonceBot Alexa gateway listening on http://%s:%s%s verify_signature=%s skill_id=%s",
+        "PonceBot Alexa gateway listening on http://%s:%s%s verify_signature=%s skill_ids=%s",
         gateway_cfg.host,
         gateway_cfg.port,
         log_path,
         gateway_cfg.verify_signature,
-        gateway_cfg.skill_id or "(not pinned)",
+        ",".join(gateway_cfg.allowed_skill_ids) or "(not pinned)",
     )
     httpd.serve_forever()
 
