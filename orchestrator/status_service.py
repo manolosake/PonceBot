@@ -2791,6 +2791,59 @@ def _publication_recovery_action(item: dict[str, Any]) -> str:
     return f"Resolve the open publication recovery item for {project_name}."
 
 
+def _publication_recovery_outcome_contract(item: dict[str, Any]) -> dict[str, Any]:
+    common_required_fields = ["recovery_status", "reason", "evidence"]
+    resolved_required_fields = list(common_required_fields)
+    missing_fields = [entry for entry in _proactive_packet_list(item.get("missing_fields")) if entry]
+    for field in missing_fields:
+        if field not in resolved_required_fields:
+            resolved_required_fields.append(field)
+    for field in ("github_repo", "github_url", "latest_head"):
+        if _proactive_packet_text(item.get(field)) and field not in resolved_required_fields:
+            resolved_required_fields.append(field)
+
+    suggested_validation = [
+        "Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up.",
+        "Verify the recovery row now records the current publication target facts or an explicit terminal blocker.",
+    ]
+    if "latest_head" in missing_fields:
+        suggested_validation.append(
+            "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
+        )
+        suggested_validation.append(
+            "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
+        )
+    if "private" in missing_fields:
+        suggested_validation.append(
+            "Confirm the recovery row records private GitHub visibility evidence or an explicit privacy blocker."
+        )
+    if "github_repo" in missing_fields or "github_url" in missing_fields:
+        suggested_validation.append(
+            "Confirm the recovery row records the recovered GitHub repo/remote target or an explicit archive/reject decision."
+        )
+
+    return {
+        "allowed_outcomes": [
+            "resolved",
+            "archived",
+            "rejected_low_value",
+            "blocked_need_operator",
+        ],
+        "required_fields_by_outcome": {
+            "resolved": resolved_required_fields,
+            "archived": list(common_required_fields),
+            "rejected_low_value": list(common_required_fields),
+            "blocked_need_operator": list(common_required_fields),
+        },
+        "definition": (
+            "For outcome=resolved, include the recovered publication facts required to prove the target. "
+            "For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; "
+            "do not leave the row ambiguously open after the handoff."
+        ),
+        "suggested_validation": suggested_validation,
+    }
+
+
 def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | None:
     items = [item for item in list(summary.get("items") or []) if isinstance(item, dict)]
     if not items:
@@ -2911,6 +2964,7 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         suggested_validation.append(
             "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
         )
+    outcome_contract = _publication_recovery_outcome_contract(item)
 
     prompt_lines = [
         f"ROLE: {owner_role}.",
@@ -2932,6 +2986,18 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         "",
         "Suggested validation:",
         *(f"- {criterion}" for criterion in suggested_validation),
+        "",
+        "Outcome contract:",
+        *(f"- allowed_outcome: {outcome}" for outcome in _proactive_packet_list(outcome_contract.get("allowed_outcomes"))),
+        *(
+            f"- required_fields[{outcome}]: {', '.join(_proactive_packet_list(fields))}"
+            for outcome, fields in (
+                outcome_contract.get("required_fields_by_outcome", {}).items()
+                if isinstance(outcome_contract.get("required_fields_by_outcome"), dict)
+                else []
+            )
+        ),
+        f"- definition: {_proactive_packet_text(outcome_contract.get('definition'))}",
     ]
 
     packet = {
@@ -2952,6 +3018,7 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         "definition_of_done": definition_of_done,
         "evidence_required": evidence_required,
         "suggested_validation": suggested_validation,
+        "outcome_contract": outcome_contract,
         "assignment_prompt": "\n".join(prompt_lines),
         "order_id": source_order_id or f"publication-recovery:{project_name.lower().replace(' ', '-')}",
         "lane": "publication_recovery",

@@ -460,6 +460,43 @@ class TestStatusService(unittest.TestCase):
                 delegation_packet["definition_of_done"],
             )
             self.assertIn("ROLE: release_mgr.", delegation_packet["assignment_prompt"])
+            self.assertIn("Outcome contract:", delegation_packet["assignment_prompt"])
+            self.assertEqual(
+                delegation_packet["outcome_contract"],
+                {
+                    "allowed_outcomes": [
+                        "resolved",
+                        "archived",
+                        "rejected_low_value",
+                        "blocked_need_operator",
+                    ],
+                    "required_fields_by_outcome": {
+                        "resolved": [
+                            "recovery_status",
+                            "reason",
+                            "evidence",
+                            "github_url",
+                            "private",
+                            "github_repo",
+                            "latest_head",
+                        ],
+                        "archived": ["recovery_status", "reason", "evidence"],
+                        "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                        "blocked_need_operator": ["recovery_status", "reason", "evidence"],
+                    },
+                    "definition": (
+                        "For outcome=resolved, include the recovered publication facts required to prove the target. "
+                        "For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; "
+                        "do not leave the row ambiguously open after the handoff."
+                    ),
+                    "suggested_validation": [
+                        "Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up.",
+                        "Verify the recovery row now records the current publication target facts or an explicit terminal blocker.",
+                        "Confirm the recovery row records private GitHub visibility evidence or an explicit privacy blocker.",
+                        "Confirm the recovery row records the recovered GitHub repo/remote target or an explicit archive/reject decision.",
+                    ],
+                },
+            )
 
             self.assertEqual(plan["summary"]["active_proactive_orders"], 0)
             self.assertEqual(plan["summary"]["top_lane"], "publication_recovery")
@@ -761,9 +798,118 @@ class TestStatusService(unittest.TestCase):
                         )
                         self.assertIn(contract_line, combined_lines)
                     self.assertEqual(plan["summary"]["top_action"], expected_action)
-                    self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], expected_owner_role)
-                    self.assertIn(f"ROLE: {expected_owner_role}.", delegation_packet["assignment_prompt"])
-                    self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], expected_owner_role)
+            self.assertIn(f"ROLE: {expected_owner_role}.", delegation_packet["assignment_prompt"])
+            self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
+            self.assertIn("Outcome contract:", delegation_packet["assignment_prompt"])
+            outcome_contract = delegation_packet["outcome_contract"]
+            self.assertEqual(
+                outcome_contract["allowed_outcomes"],
+                ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+            )
+            self.assertEqual(
+                outcome_contract["required_fields_by_outcome"]["archived"],
+                ["recovery_status", "reason", "evidence"],
+            )
+            self.assertEqual(
+                outcome_contract["required_fields_by_outcome"]["rejected_low_value"],
+                ["recovery_status", "reason", "evidence"],
+            )
+            self.assertEqual(
+                outcome_contract["required_fields_by_outcome"]["blocked_need_operator"],
+                ["recovery_status", "reason", "evidence"],
+            )
+            self.assertIn("recovery_status", outcome_contract["required_fields_by_outcome"]["resolved"])
+            self.assertIn("reason", outcome_contract["required_fields_by_outcome"]["resolved"])
+            self.assertIn("evidence", outcome_contract["required_fields_by_outcome"]["resolved"])
+            self.assertEqual(
+                outcome_contract["definition"],
+                "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+            )
+            for contract_line in expected_contract:
+                combined_contract_lines = outcome_contract["suggested_validation"] + [outcome_contract["definition"]]
+                self.assertIn(contract_line, combined_contract_lines)
+
+    def test_publication_recovery_outcome_contract_distinguishes_negative_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-negative",
+                        "missing-project",
+                        "Missing Project",
+                        "/tmp/missing-project",
+                        "",
+                        "",
+                        "",
+                        '["github_repo", "github_url", "latest_head"]',
+                        "archive_or_reject_missing_path",
+                        "open",
+                        "No valid publication target remains.",
+                        "order-negative",
+                        100.0,
+                        200.0,
+                    ),
+                )
+                conn.commit()
+
+            q = OrchestratorQueue(storage=storage, role_profiles=None)
+            svc = StatusService(orch_q=q, role_profiles=None, cache_ttl_seconds=0)
+            priorities = {
+                "api_version": "v1",
+                "schema_version": 1,
+                "generated_at": 123.0,
+                "chat_id": 7,
+                "limit": 10,
+                "summary": {"active_proactive_orders": 0},
+                "orders": [],
+            }
+
+            with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+        packet = plan["publication_recovery"]["delegation_packet"]
+        contract = packet["outcome_contract"]
+        self.assertEqual(
+            contract["required_fields_by_outcome"]["archived"],
+            ["recovery_status", "reason", "evidence"],
+        )
+        self.assertNotIn("github_url", contract["required_fields_by_outcome"]["archived"])
+        self.assertNotIn("latest_head", contract["required_fields_by_outcome"]["archived"])
+        self.assertIn("github_url", contract["required_fields_by_outcome"]["resolved"])
+        self.assertIn("latest_head", contract["required_fields_by_outcome"]["resolved"])
+        self.assertIn(
+            "required_fields[archived]: recovery_status, reason, evidence",
+            packet["assignment_prompt"],
+        )
 
     def test_proactive_action_plan_tolerates_publication_recovery_tables_without_new_columns(self) -> None:
         with tempfile.TemporaryDirectory() as td:

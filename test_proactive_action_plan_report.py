@@ -337,10 +337,28 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
                     "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                     "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "current_target_facts": {
+                        "project_path": "/home/aponce/signaldeck",
+                        "github_repo": "manolosake/signaldeck",
+                        "github_url": "https://github.com/manolosake/signaldeck",
+                        "latest_head": "abc1234def5678",
+                    },
+                    "missing_fields": ["github_url", "private"],
                     "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
                     "evidence_required": ["publication recovery decision summary", "github_url", "private"],
                     "suggested_validation": ["Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up."],
                     "definition_of_done": ["The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale."],
+                    "outcome_contract": {
+                        "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+                        "required_fields_by_outcome": {
+                            "resolved": ["recovery_status", "reason", "evidence", "github_url", "private"],
+                            "archived": ["recovery_status", "reason", "evidence"],
+                            "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                            "blocked_need_operator": ["recovery_status", "reason", "evidence"]
+                        },
+                        "definition": "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+                        "suggested_validation": ["Verify the recovery row now records the current publication target facts or an explicit terminal blocker."],
+                    },
                     "assignment_prompt": "ROLE: release_mgr.\nAction: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
                 },
             },
@@ -351,10 +369,28 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
                 "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                 "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "current_target_facts": {
+                    "project_path": "/home/aponce/signaldeck",
+                    "github_repo": "manolosake/signaldeck",
+                    "github_url": "https://github.com/manolosake/signaldeck",
+                    "latest_head": "abc1234def5678",
+                },
+                "missing_fields": ["github_url", "private"],
                 "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
                 "evidence_required": ["publication recovery decision summary", "github_url", "private"],
                 "suggested_validation": ["Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up."],
                 "definition_of_done": ["The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale."],
+                "outcome_contract": {
+                    "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+                    "required_fields_by_outcome": {
+                        "resolved": ["recovery_status", "reason", "evidence", "github_url", "private"],
+                        "archived": ["recovery_status", "reason", "evidence"],
+                        "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                        "blocked_need_operator": ["recovery_status", "reason", "evidence"]
+                    },
+                    "definition": "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+                    "suggested_validation": ["Verify the recovery row now records the current publication target facts or an explicit terminal blocker."],
+                },
                 "assignment_prompt": "ROLE: release_mgr.\nAction: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
             },
             "lanes": [
@@ -410,6 +446,18 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- owner_role: release_mgr", rendered)
         self.assertIn("- lane: publication_recovery", rendered)
         self.assertIn("- order_id: order-17", rendered)
+        self.assertIn("- current_target_facts:", rendered)
+        self.assertIn("  - github_repo=manolosake/signaldeck", rendered)
+        self.assertIn("  - latest_head=abc1234def5678", rendered)
+        self.assertIn("- missing_fields:", rendered)
+        self.assertIn("  - github_url", rendered)
+        self.assertIn("  - private", rendered)
+        self.assertIn("- outcome_contract:", rendered)
+        self.assertIn("  - allowed_outcomes:", rendered)
+        self.assertIn("    - resolved", rendered)
+        self.assertIn("  - required_fields_by_outcome:", rendered)
+        self.assertIn("    - resolved: recovery_status, reason, evidence, github_url, private", rendered)
+        self.assertIn("    - archived: recovery_status, reason, evidence", rendered)
         self.assertIn("## Next Delegate", rendered)
         self.assertIn("- action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
         self.assertIn("## Publication Recovery", rendered)
@@ -435,6 +483,12 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
                     "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                     "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "current_target_facts": {
+                        "project_path": "/home/aponce/signaldeck",
+                        "github_repo": "manolosake/signaldeck",
+                        "github_url": "https://github.com/manolosake/signaldeck",
+                    },
+                    "missing_fields": ["latest_head"],
                     "acceptance_criteria": [
                         "Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."
                     ],
@@ -448,6 +502,17 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "definition_of_done": [
                         "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
                     ],
+                    "outcome_contract": {
+                        "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+                        "required_fields_by_outcome": {
+                            "resolved": ["recovery_status", "reason", "evidence", "latest_head", "github_repo", "github_url"],
+                            "archived": ["recovery_status", "reason", "evidence"],
+                            "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                            "blocked_need_operator": ["recovery_status", "reason", "evidence"]
+                        },
+                        "definition": "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+                        "suggested_validation": ["Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."],
+                    },
                     "assignment_prompt": "ROLE: release_mgr.\nAction: Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
                 },
             },
@@ -458,6 +523,12 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
                 "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                 "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "current_target_facts": {
+                    "project_path": "/home/aponce/signaldeck",
+                    "github_repo": "manolosake/signaldeck",
+                    "github_url": "https://github.com/manolosake/signaldeck",
+                },
+                "missing_fields": ["latest_head"],
                 "acceptance_criteria": [
                     "Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."
                 ],
@@ -471,6 +542,17 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "definition_of_done": [
                     "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
                 ],
+                "outcome_contract": {
+                    "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+                    "required_fields_by_outcome": {
+                        "resolved": ["recovery_status", "reason", "evidence", "latest_head", "github_repo", "github_url"],
+                        "archived": ["recovery_status", "reason", "evidence"],
+                        "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                        "blocked_need_operator": ["recovery_status", "reason", "evidence"]
+                    },
+                    "definition": "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+                    "suggested_validation": ["Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."],
+                },
                 "assignment_prompt": "ROLE: release_mgr.\nAction: Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
             },
             "lanes": [
@@ -531,10 +613,43 @@ class TestProactiveActionPlanReport(unittest.TestCase):
             "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker.",
             rendered,
         )
+        self.assertIn("    - resolved: recovery_status, reason, evidence, latest_head, github_repo, github_url", rendered)
         self.assertIn(
             "| SignalDeck | manolosake/signaldeck | url=https://github.com/manolosake/signaldeck; order=order-head | backfill_latest_head_or_validate_private_github | latest_head | open: Private GitHub target is known but latest_head evidence is missing. |",
             rendered,
         )
+
+    def test_render_markdown_publication_recovery_contract_distinguishes_negative_closure(self) -> None:
+        report = self._base_report()
+        report["summary"]["next_delegate"] = {
+            "owner_role": "product_ops",
+            "order_id": "order-negative",
+            "lane": "publication_recovery",
+            "action": "Decide whether to archive or reject Missing Project because no publication target is currently valid.",
+            "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
+            "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+            "current_target_facts": {"project_path": "/home/aponce/missing-project"},
+            "missing_fields": ["github_repo", "github_url", "latest_head"],
+            "acceptance_criteria": ["Inspect the open publication recovery entry for Missing Project."],
+            "evidence_required": ["archive/reject decision with rationale tied to the missing or invalid target"],
+            "suggested_validation": ["Verify the recovery row now records the current publication target facts or an explicit terminal blocker."],
+            "definition_of_done": ["A keep/archive/reject decision is recorded before fresh publication work continues."],
+            "outcome_contract": {
+                "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
+                "required_fields_by_outcome": {
+                    "resolved": ["recovery_status", "reason", "evidence", "github_repo", "github_url", "latest_head"],
+                    "archived": ["recovery_status", "reason", "evidence"],
+                    "rejected_low_value": ["recovery_status", "reason", "evidence"],
+                    "blocked_need_operator": ["recovery_status", "reason", "evidence"]
+                },
+                "definition": "For outcome=resolved, include the recovered publication facts required to prove the target. For archived/rejected_low_value/blocked_need_operator, record only closure evidence and the exact reason; do not leave the row ambiguously open after the handoff.",
+                "suggested_validation": ["Verify the recovery row now records the current publication target facts or an explicit terminal blocker."],
+            },
+            "assignment_prompt": "ROLE: product_ops.\nAction: Decide whether to archive or reject Missing Project because no publication target is currently valid.\n\nOutcome contract:\n- required_fields[archived]: recovery_status, reason, evidence",
+        }
+        rendered = report_tool.render_markdown(report)
+        self.assertIn("    - archived: recovery_status, reason, evidence", rendered)
+        self.assertNotIn("    - archived: recovery_status, reason, evidence, github_url", rendered)
 
     def test_render_markdown_escapes_publication_recovery_pipe_characters(self) -> None:
         report = self._base_report()

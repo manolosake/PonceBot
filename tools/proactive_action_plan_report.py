@@ -109,16 +109,49 @@ def _append_contract(lines: list[str], title: str, contract: Any) -> None:
     if not isinstance(contract, dict):
         return
     lines.append(f"- {title}:")
-    fields = [_one_line(item) for item in _as_list(contract.get("required_fields"))]
-    if fields:
-        lines.append("  - required_fields:")
-        for field in fields:
-            lines.append(f"    - {field}")
+    allowed_outcomes = [_one_line(item) for item in _as_list(contract.get("allowed_outcomes"))]
+    if allowed_outcomes:
+        lines.append("  - allowed_outcomes:")
+        for item in allowed_outcomes:
+            lines.append(f"    - {item}")
+    by_outcome = contract.get("required_fields_by_outcome")
+    if isinstance(by_outcome, dict):
+        lines.append("  - required_fields_by_outcome:")
+        for outcome, raw_fields in by_outcome.items():
+            fields = [_one_line(item) for item in _as_list(raw_fields)]
+            if fields:
+                lines.append(f"    - {_one_line(outcome)}: {', '.join(fields)}")
+            else:
+                lines.append(f"    - {_one_line(outcome)}: -")
+    else:
+        fields = [_one_line(item) for item in _as_list(contract.get("required_fields"))]
+        if fields:
+            lines.append("  - required_fields:")
+            for field in fields:
+                lines.append(f"    - {field}")
+    definition = _one_line(contract.get("definition"), default="")
+    if definition and definition != "-":
+        lines.append(f"  - definition: {definition}")
     validation = [_one_line(item) for item in _as_list(contract.get("suggested_validation"))]
     if validation:
         lines.append("  - suggested_validation:")
         for item in validation:
             lines.append(f"    - {item}")
+
+
+def _append_mapping(lines: list[str], title: str, mapping: Any) -> None:
+    if not isinstance(mapping, dict):
+        return
+    items = [
+        f"{_one_line(key, default='-')}={_one_line(value, default='-')}"
+        for key, value in mapping.items()
+        if _one_line(value, default="") not in {"", "-"}
+    ]
+    if not items:
+        return
+    lines.append(f"- {title}:")
+    for item in items:
+        lines.append(f"  - {item}")
 
 
 def _find_top_order(report: dict[str, Any], order_id: Any) -> dict[str, Any]:
@@ -253,10 +286,17 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Top Execution Packet", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(top_execution_packet.get(key))}")
+        _append_mapping(lines, "current_target_facts", top_execution_packet.get("current_target_facts"))
+        _append_list(lines, "missing_fields", top_execution_packet.get("missing_fields"))
         _append_list(lines, "acceptance_criteria", top_execution_packet.get("acceptance_criteria"))
         _append_list(lines, "evidence_required", top_execution_packet.get("evidence_required"))
         _append_list(lines, "suggested_validation", top_execution_packet.get("suggested_validation"))
         _append_list(lines, "definition_of_done", top_execution_packet.get("definition_of_done"))
+        _append_contract(
+            lines,
+            "outcome_contract",
+            top_execution_packet.get("outcome_contract"),
+        )
         _append_contract(
             lines,
             "studio_decision_evidence_contract",
@@ -292,6 +332,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Next Delegate", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(next_delegate.get(key))}")
+        _append_mapping(lines, "current_target_facts", next_delegate.get("current_target_facts"))
+        _append_list(lines, "missing_fields", next_delegate.get("missing_fields"))
         _append_list(lines, "acceptance_criteria", next_delegate.get("acceptance_criteria"))
         _append_list(lines, "evidence_required", next_delegate.get("evidence_required"))
         _append_list(lines, "suggested_validation", next_delegate.get("suggested_validation"))
