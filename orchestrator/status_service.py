@@ -2741,13 +2741,38 @@ def _publication_recovery_owner_role(required_action: str) -> str:
 def _publication_recovery_action(item: dict[str, Any]) -> str:
     required_action = str(item.get("required_action") or "").strip().lower()
     project_name = str(item.get("project_name") or item.get("github_repo") or item.get("project_path") or "project").strip()
-    if required_action == "archive_or_reject_missing_path":
-        return f"Decide whether to archive or reject {project_name} because no publication target is currently valid."
-    if required_action == "resolve_publication_contract":
-        return (
-            f"Recover publication evidence for {project_name} by confirming the GitHub target, head, "
-            "and publication visibility proof."
-        )
+    action_templates = {
+        "initialize_git_or_archive": (
+            "Initialize a local Git repository for {project_name}, or archive the project if it should not be published."
+        ),
+        "commit_initial_and_publish_or_archive": (
+            "Create the initial Git commit for {project_name} and publish it to a private GitHub repo, or archive it."
+        ),
+        "replace_non_github_remote_with_private_github_or_archive": (
+            "Replace the current non-GitHub remote for {project_name} with a private GitHub repo, or archive it."
+        ),
+        "repair_github_repo_identity_or_archive": (
+            "Repair the GitHub repo identity for {project_name} so the recorded repo matches the remote, or archive it."
+        ),
+        "create_private_remote_and_push_or_archive": (
+            "Create a private GitHub remote for {project_name} and push the latest local state, or archive it."
+        ),
+        "confirm_private_github_repo_or_archive": (
+            "Confirm that {project_name} is published to a private GitHub repo, or archive it if privacy requirements cannot be met."
+        ),
+        "backfill_latest_head_or_validate_private_github": (
+            "Backfill the latest published head for {project_name} or validate the private GitHub target if the head cannot be confirmed."
+        ),
+        "archive_or_reject_missing_path": (
+            "Decide whether to archive or reject {project_name} because no publication target is currently valid."
+        ),
+        "resolve_publication_contract": (
+            "Recover publication evidence for {project_name} by confirming the GitHub target, head, and publication visibility proof."
+        ),
+    }
+    template = action_templates.get(required_action)
+    if template:
+        return template.format(project_name=project_name)
     return f"Resolve the open publication recovery item for {project_name}."
 
 

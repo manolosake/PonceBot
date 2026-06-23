@@ -528,6 +528,97 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(delegation_packet["order_id"], "order-bad")
             self.assertIn("archive or reject Broken Project", delegation_packet["action"])
 
+    def test_proactive_action_plan_surfaces_specific_publication_recovery_actions(self) -> None:
+        cases = [
+            (
+                "commit_initial_and_publish_or_archive",
+                "Create the initial Git commit for Submittal Chase Desk and publish it to a private GitHub repo, or archive it.",
+                "order-commit",
+            ),
+            (
+                "create_private_remote_and_push_or_archive",
+                "Create a private GitHub remote for SignalDeck and push the latest local state, or archive it.",
+                "order-remote",
+            ),
+        ]
+
+        for required_action, expected_action, source_order_id in cases:
+            with self.subTest(required_action=required_action):
+                with tempfile.TemporaryDirectory() as td:
+                    storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+                    with sqlite3.connect(storage.path) as conn:
+                        conn.execute(
+                            """
+                            CREATE TABLE studio_publication_recovery (
+                                recovery_id TEXT PRIMARY KEY,
+                                project_key TEXT NOT NULL,
+                                project_name TEXT,
+                                project_path TEXT,
+                                github_repo TEXT,
+                                github_url TEXT,
+                                latest_head TEXT,
+                                missing_json TEXT NOT NULL DEFAULT '[]',
+                                required_action TEXT NOT NULL,
+                                status TEXT NOT NULL,
+                                reason TEXT NOT NULL,
+                                source_order_id TEXT,
+                                first_seen_at REAL NOT NULL,
+                                updated_at REAL NOT NULL
+                            )
+                            """
+                        )
+                        conn.execute(
+                            """
+                            INSERT INTO studio_publication_recovery(
+                                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                                latest_head, missing_json, required_action, status, reason, source_order_id,
+                                first_seen_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                f"recovery-{required_action}",
+                                required_action,
+                                "Submittal Chase Desk" if required_action.startswith("commit_") else "SignalDeck",
+                                "/tmp/submittal-chase-desk" if required_action.startswith("commit_") else "/tmp/signaldeck",
+                                "",
+                                "",
+                                "",
+                                '["github_repo", "github_url", "latest_head"]',
+                                required_action,
+                                "open",
+                                "Open publication recovery item requires specific operator instructions.",
+                                source_order_id,
+                                100.0,
+                                200.0,
+                            ),
+                        )
+                        conn.commit()
+
+                    q = OrchestratorQueue(storage=storage, role_profiles=None)
+                    svc = StatusService(orch_q=q, role_profiles=None, cache_ttl_seconds=0)
+                    priorities = {
+                        "api_version": "v1",
+                        "schema_version": 1,
+                        "generated_at": 123.0,
+                        "chat_id": 7,
+                        "limit": 10,
+                        "summary": {"active_proactive_orders": 0},
+                        "orders": [],
+                    }
+
+                    with mock.patch.object(svc, "proactive_priorities", return_value=priorities):
+                        plan = svc.proactive_action_plan(chat_id=7, limit=10)
+
+                    publication_recovery = plan.get("publication_recovery")
+                    self.assertIsInstance(publication_recovery, dict)
+                    assert isinstance(publication_recovery, dict)
+                    delegation_packet = publication_recovery.get("delegation_packet")
+                    self.assertIsInstance(delegation_packet, dict)
+                    assert isinstance(delegation_packet, dict)
+                    self.assertEqual(delegation_packet["action"], expected_action)
+                    self.assertEqual(plan["summary"]["top_action"], expected_action)
+                    self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
+
     def test_proactive_action_plan_tolerates_publication_recovery_tables_without_new_columns(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
