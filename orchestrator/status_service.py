@@ -2782,6 +2782,8 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         return None
 
     item = items[0]
+    recovery_id = str(item.get("recovery_id") or "").strip()
+    project_key = str(item.get("project_key") or "").strip()
     required_action = str(item.get("required_action") or "").strip()
     owner_role = _publication_recovery_owner_role(required_action)
     action = _publication_recovery_action(item)
@@ -2790,6 +2792,7 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
     github_repo = str(item.get("github_repo") or "").strip()
     github_url = str(item.get("github_url") or "").strip()
     latest_head = str(item.get("latest_head") or "").strip()
+    reason = str(item.get("reason") or "").strip()
     source_order_id = str(item.get("source_order_id") or "").strip()
     missing_fields = [entry for entry in _proactive_packet_list(item.get("missing_fields")) if entry]
 
@@ -2797,28 +2800,73 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
     handoff_endpoint = inspect_endpoint
 
     target_label = github_repo or project_path or project_name
+    current_target_facts = {
+        "project_path": project_path,
+        "github_repo": github_repo,
+        "github_url": github_url,
+        "latest_head": latest_head,
+    }
     acceptance_criteria = [
         f"Inspect the open publication recovery entry for {project_name} in {inspect_endpoint}.",
         action,
         f"Work only on the publication recovery item for {target_label}.",
     ]
+    if recovery_id:
+        acceptance_criteria.append(f"Use recovery_id={recovery_id} as the exact recovery row identifier.")
+    if project_key:
+        acceptance_criteria.append(f"Confirm the recovery row project_key matches {project_key}.")
+    if project_path:
+        acceptance_criteria.append(f"Use local target path {project_path} when validating or updating publication evidence.")
+    if required_action:
+        acceptance_criteria.append(f"Close the recovery row using required_action={required_action}.")
+    if reason:
+        acceptance_criteria.append(f"Address the recorded recovery reason: {reason}")
     if missing_fields:
         acceptance_criteria.append("Close the documented publication evidence gaps: " + ", ".join(missing_fields) + ".")
     if source_order_id:
         acceptance_criteria.append(f"Preserve traceability back to source order {source_order_id}.")
 
     evidence_required = [
-        "publication recovery decision summary",
+        "publication recovery decision summary referencing the exact recovery row and chosen outcome",
         "updated publication evidence or explicit archive/reject rationale",
     ]
+    if recovery_id:
+        evidence_required.append(f"recovery_id={recovery_id}")
+    if project_key:
+        evidence_required.append(f"project_key={project_key}")
+    if required_action:
+        evidence_required.append(f"required_action={required_action}")
     if github_repo:
         evidence_required.append(f"github_repo={github_repo}")
     if github_url:
         evidence_required.append(f"github_url={github_url}")
     if latest_head:
         evidence_required.append(f"latest_head={latest_head}")
+    if required_action.lower() == "create_private_remote_and_push_or_archive":
+        evidence_required.extend(
+            [
+                "private remote creation or verification evidence",
+                "push result for the recovered publication target or archive rationale",
+            ]
+        )
+    elif required_action.lower() == "archive_or_reject_missing_path":
+        evidence_required.extend(
+            [
+                "local path verification summary",
+                "archive/reject decision with rationale tied to the missing or invalid target",
+            ]
+        )
+    elif required_action.lower() == "commit_initial_and_publish_or_archive":
+        evidence_required.extend(
+            [
+                "initial commit evidence or archive rationale",
+                "private GitHub publication evidence for the initial publish attempt",
+            ]
+        )
+    else:
+        evidence_required.append("publication target facts confirmed against the current local repo or GitHub target")
     for field in missing_fields:
-        evidence_required.append(field)
+        evidence_required.append(f"missing_field={field}")
 
     definition_of_done = [
         "The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale.",
@@ -2861,6 +2909,15 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         "action": action,
         "inspect_endpoint": inspect_endpoint,
         "handoff_endpoint": handoff_endpoint,
+        "recovery_id": recovery_id or None,
+        "project_key": project_key or None,
+        "project_name": project_name,
+        "project_path": project_path or None,
+        "required_action": required_action or None,
+        "reason": reason or None,
+        "target_label": target_label,
+        "current_target_facts": {key: value for key, value in current_target_facts.items() if value},
+        "missing_fields": missing_fields,
         "acceptance_criteria": acceptance_criteria,
         "definition_of_done": definition_of_done,
         "evidence_required": evidence_required,
@@ -4449,6 +4506,8 @@ class StatusService:
                     if str(column["name"]).strip()
                 }
                 recovery_fields = [
+                    "recovery_id",
+                    "project_key",
                     "project_name",
                     "project_path",
                     "github_repo",
@@ -4497,6 +4556,8 @@ class StatusService:
                 if isinstance(parsed_missing, list):
                     missing_fields = [str(item).strip() for item in parsed_missing if str(item).strip()]
             item = {
+                "recovery_id": str(row["recovery_id"] or "").strip() or None,
+                "project_key": str(row["project_key"] or "").strip() or None,
                 "project_name": str(row["project_name"] or "").strip() or None,
                 "project_path": str(row["project_path"] or "").strip() or None,
                 "github_repo": str(row["github_repo"] or "").strip() or None,
@@ -4880,6 +4941,21 @@ class StatusService:
                 next_delegate["studio_decision_evidence_contract"] = top_execution_packet.get(
                     "studio_decision_evidence_contract"
                 )
+            for field in (
+                "recovery_id",
+                "project_key",
+                "project_name",
+                "project_path",
+                "required_action",
+                "reason",
+                "target_label",
+            ):
+                if top_execution_packet.get(field):
+                    next_delegate[field] = top_execution_packet.get(field)
+            if isinstance(top_execution_packet.get("current_target_facts"), dict):
+                next_delegate["current_target_facts"] = top_execution_packet.get("current_target_facts")
+            if isinstance(top_execution_packet.get("missing_fields"), list):
+                next_delegate["missing_fields"] = top_execution_packet.get("missing_fields")
 
         lane_counts = {str(lane.get("lane") or ""): int(lane.get("count") or 0) for lane in lanes}
         returned = sum(lane_counts.values())

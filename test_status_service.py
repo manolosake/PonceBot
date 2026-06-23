@@ -397,6 +397,8 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(len(publication_recovery["items"]), 1)
             item = publication_recovery["items"][0]
             self.assertEqual(item["project_name"], "SignalDeck")
+            self.assertEqual(item["recovery_id"], "recovery-1")
+            self.assertEqual(item["project_key"], "signaldesk")
             self.assertEqual(item["project_path"], "/tmp/signaldeck")
             self.assertEqual(item["github_repo"], "manolosake/signaldeck")
             self.assertEqual(item["github_url"], "https://github.com/manolosake/signaldeck.git")
@@ -413,12 +415,46 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(delegation_packet["owner_role"], "release_mgr")
             self.assertEqual(delegation_packet["lane"], "publication_recovery")
             self.assertEqual(delegation_packet["order_id"], "order-1")
+            self.assertEqual(delegation_packet["recovery_id"], "recovery-1")
+            self.assertEqual(delegation_packet["project_key"], "signaldesk")
+            self.assertEqual(delegation_packet["project_path"], "/tmp/signaldeck")
+            self.assertEqual(delegation_packet["required_action"], "resolve_publication_contract")
+            self.assertEqual(
+                delegation_packet["reason"],
+                "Remote is present but private visibility evidence is missing.",
+            )
+            self.assertEqual(
+                delegation_packet["current_target_facts"],
+                {
+                    "project_path": "/tmp/signaldeck",
+                    "github_repo": "manolosake/signaldeck",
+                    "github_url": "https://github.com/manolosake/signaldeck.git",
+                    "latest_head": "abc1234",
+                },
+            )
+            self.assertEqual(delegation_packet["missing_fields"], ["github_url", "private"])
             self.assertEqual(
                 delegation_packet["action"],
                 "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
             )
-            self.assertIn("github_url", delegation_packet["evidence_required"])
-            self.assertIn("private", delegation_packet["evidence_required"])
+            self.assertIn("recovery_id=recovery-1", delegation_packet["evidence_required"])
+            self.assertIn("project_key=signaldesk", delegation_packet["evidence_required"])
+            self.assertIn("required_action=resolve_publication_contract", delegation_packet["evidence_required"])
+            self.assertIn("github_url=https://github.com/manolosake/signaldeck.git", delegation_packet["evidence_required"])
+            self.assertIn("missing_field=github_url", delegation_packet["evidence_required"])
+            self.assertIn("missing_field=private", delegation_packet["evidence_required"])
+            self.assertIn(
+                "publication target facts confirmed against the current local repo or GitHub target",
+                delegation_packet["evidence_required"],
+            )
+            self.assertIn(
+                "Use recovery_id=recovery-1 as the exact recovery row identifier.",
+                delegation_packet["acceptance_criteria"],
+            )
+            self.assertIn(
+                "Use local target path /tmp/signaldeck when validating or updating publication evidence.",
+                delegation_packet["acceptance_criteria"],
+            )
             self.assertIn(
                 "GitHub repo, URL, head, and visibility evidence are recorded or an explicit blocker is attached.",
                 delegation_packet["definition_of_done"],
@@ -432,9 +468,25 @@ class TestStatusService(unittest.TestCase):
                 "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
             )
             self.assertEqual(plan["top_execution_packet"], delegation_packet)
-            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
-            self.assertEqual(plan["summary"]["next_delegate"]["lane"], "publication_recovery")
-            self.assertEqual(plan["summary"]["next_delegate"]["action"], delegation_packet["action"])
+            next_delegate = plan["summary"]["next_delegate"]
+            self.assertEqual(next_delegate["owner_role"], "release_mgr")
+            self.assertEqual(next_delegate["lane"], "publication_recovery")
+            self.assertEqual(next_delegate["action"], delegation_packet["action"])
+            self.assertEqual(next_delegate["recovery_id"], "recovery-1")
+            self.assertEqual(next_delegate["project_key"], "signaldesk")
+            self.assertEqual(next_delegate["project_name"], "SignalDeck")
+            self.assertEqual(next_delegate["project_path"], "/tmp/signaldeck")
+            self.assertEqual(next_delegate["required_action"], "resolve_publication_contract")
+            self.assertEqual(
+                next_delegate["reason"],
+                "Remote is present but private visibility evidence is missing.",
+            )
+            self.assertEqual(next_delegate["target_label"], "manolosake/signaldeck")
+            self.assertEqual(
+                next_delegate["current_target_facts"],
+                delegation_packet["current_target_facts"],
+            )
+            self.assertEqual(next_delegate["missing_fields"], ["github_url", "private"])
             lane = next(lane for lane in plan["lanes"] if lane["lane"] == "publication_recovery")
             self.assertEqual(lane["count"], 1)
             self.assertEqual(lane["execution_packet"], delegation_packet)
@@ -513,6 +565,8 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(publication_recovery["count"], 1)
             item = publication_recovery["items"][0]
             self.assertEqual(item["project_name"], "Broken Project")
+            self.assertEqual(item["recovery_id"], "recovery-bad")
+            self.assertEqual(item["project_key"], "broken-project")
             self.assertEqual(item["required_action"], "archive_or_reject_missing_path")
             self.assertEqual(item["missing_json"], "{not-json")
             self.assertEqual(item["missing_fields"], [])
@@ -526,7 +580,23 @@ class TestStatusService(unittest.TestCase):
             assert isinstance(delegation_packet, dict)
             self.assertEqual(delegation_packet["owner_role"], "product_ops")
             self.assertEqual(delegation_packet["order_id"], "order-bad")
+            self.assertEqual(delegation_packet["recovery_id"], "recovery-bad")
+            self.assertEqual(delegation_packet["project_key"], "broken-project")
+            self.assertEqual(
+                delegation_packet["current_target_facts"],
+                {"project_path": "/tmp/broken"},
+            )
             self.assertIn("archive or reject Broken Project", delegation_packet["action"])
+            self.assertIn("recovery_id=recovery-bad", delegation_packet["evidence_required"])
+            self.assertIn("project_key=broken-project", delegation_packet["evidence_required"])
+            self.assertIn(
+                "local path verification summary",
+                delegation_packet["evidence_required"],
+            )
+            self.assertIn(
+                "archive/reject decision with rationale tied to the missing or invalid target",
+                delegation_packet["evidence_required"],
+            )
 
     def test_proactive_action_plan_surfaces_specific_publication_recovery_actions(self) -> None:
         cases = [
@@ -534,15 +604,23 @@ class TestStatusService(unittest.TestCase):
                 "commit_initial_and_publish_or_archive",
                 "Create the initial Git commit for Submittal Chase Desk and publish it to a private GitHub repo, or archive it.",
                 "order-commit",
+                [
+                    "initial commit evidence or archive rationale",
+                    "private GitHub publication evidence for the initial publish attempt",
+                ],
             ),
             (
                 "create_private_remote_and_push_or_archive",
                 "Create a private GitHub remote for SignalDeck and push the latest local state, or archive it.",
                 "order-remote",
+                [
+                    "private remote creation or verification evidence",
+                    "push result for the recovered publication target or archive rationale",
+                ],
             ),
         ]
 
-        for required_action, expected_action, source_order_id in cases:
+        for required_action, expected_action, source_order_id, expected_evidence in cases:
             with self.subTest(required_action=required_action):
                 with tempfile.TemporaryDirectory() as td:
                     storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -616,6 +694,8 @@ class TestStatusService(unittest.TestCase):
                     self.assertIsInstance(delegation_packet, dict)
                     assert isinstance(delegation_packet, dict)
                     self.assertEqual(delegation_packet["action"], expected_action)
+                    for evidence in expected_evidence:
+                        self.assertIn(evidence, delegation_packet["evidence_required"])
                     self.assertEqual(plan["summary"]["top_action"], expected_action)
                     self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
 
@@ -684,10 +764,18 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(publication_recovery["count"], 1)
             item = publication_recovery["items"][0]
             self.assertEqual(item["project_name"], "Legacy Project")
+            self.assertEqual(item["recovery_id"], "recovery-legacy")
+            self.assertEqual(item["project_key"], "legacy-project")
             self.assertEqual(item["github_repo"], "manolosake/legacy-project")
             self.assertNotIn("github_url", item)
             self.assertNotIn("latest_head", item)
             self.assertNotIn("source_order_id", item)
+            delegation_packet = publication_recovery.get("delegation_packet")
+            self.assertIsInstance(delegation_packet, dict)
+            assert isinstance(delegation_packet, dict)
+            self.assertEqual(delegation_packet["recovery_id"], "recovery-legacy")
+            self.assertEqual(delegation_packet["project_key"], "legacy-project")
+            self.assertIn("missing_field=private", delegation_packet["evidence_required"])
 
     def test_proactive_action_plan_surfaces_deep_improvement_factory_delta_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:
