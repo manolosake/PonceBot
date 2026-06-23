@@ -41,7 +41,7 @@ import dataclasses
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Mapping
 
 from state_store import StateStore
 
@@ -18424,6 +18424,13 @@ def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, 
     branch = _run_git(project_dir, ["branch", "--show-current"], check=False)
     if branch.returncode == 0 and str(branch.stdout or "").strip() and not str(result.get("default_branch") or "").strip():
         result["default_branch"] = str(branch.stdout or "").strip()
+    if not str(result.get("default_branch") or "").strip():
+        try:
+            head_ref = (project_dir / ".git" / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
+            if head_ref.startswith("ref: refs/heads/"):
+                result["default_branch"] = head_ref.rsplit("/", 1)[-1].strip()
+        except Exception:
+            pass
     return result
 
 
@@ -18496,6 +18503,12 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             row["project_key"],
                         ),
                     )
+                    _studio_backfill_publication_trace_evidence_conn(
+                        conn=conn,
+                        order_ids=(row["source_order_id"], row["latest_order_id"]),
+                        project=project,
+                        now=now,
+                    )
                     _studio_upsert_publication_recovery_conn(
                         conn=conn,
                         project=project,
@@ -18550,6 +18563,75 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
     except Exception:
         LOG.exception("Failed to reconcile Studio portfolio publication contract")
         return 0
+
+
+def _studio_normalize_github_publication(project: Mapping[str, Any]) -> dict[str, Any]:
+    github_repo = str(project.get("github_repo") or "").strip()
+    github_url = str(project.get("github_url") or "").strip()
+    default_branch = str(project.get("default_branch") or "").strip()
+    latest_head = str(project.get("latest_head") or "").strip()
+    project_path = str(project.get("project_path") or "").strip()
+    publication: dict[str, Any] = {
+        "ok": True,
+        "github_repo": github_repo,
+        "remote_url": github_url,
+        "github_url": github_url,
+        "branch": default_branch,
+        "default_branch": default_branch,
+        "head": latest_head,
+        "latest_head": latest_head,
+        "project_path": project_path,
+        "private": bool(project.get("private")),
+    }
+    return {key: value for key, value in publication.items() if value not in ("", None)}
+
+
+def _studio_backfill_publication_trace_evidence_conn(
+    *,
+    conn: sqlite3.Connection,
+    order_ids: Iterable[Any],
+    project: Mapping[str, Any],
+    now: float,
+) -> None:
+    columns = {
+        str(row["name"] or "").strip().lower()
+        for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+    }
+    if "job_id" not in columns or "trace" not in columns:
+        return
+    publication = _studio_normalize_github_publication(project)
+    if not publication.get("ok"):
+        return
+    seen: set[str] = set()
+    update_updated_at = "updated_at" in columns
+    for raw_order_id in order_ids:
+        order_id = str(raw_order_id or "").strip()
+        if not order_id or order_id in seen:
+            continue
+        seen.add(order_id)
+        row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (order_id,)).fetchone()
+        if row is None:
+            continue
+        current_trace: dict[str, Any] = {}
+        raw_trace = row["trace"] if isinstance(row, sqlite3.Row) else row[0]
+        if isinstance(raw_trace, str) and raw_trace.strip():
+            try:
+                parsed = json.loads(raw_trace)
+                if isinstance(parsed, dict):
+                    current_trace = parsed
+            except Exception:
+                current_trace = {}
+        elif isinstance(raw_trace, dict):
+            current_trace = dict(raw_trace)
+        current_trace["github_publication"] = publication
+        trace_blob = json.dumps(current_trace, sort_keys=True)
+        if update_updated_at:
+            conn.execute(
+                "UPDATE jobs SET trace = ?, updated_at = ? WHERE job_id = ?",
+                (trace_blob, float(now), order_id),
+            )
+        else:
+            conn.execute("UPDATE jobs SET trace = ? WHERE job_id = ?", (trace_blob, order_id))
 
 
 def _studio_selection_memory(*, cfg: BotConfig, orch_q: OrchestratorQueue, now: float) -> dict[str, Any]:
@@ -19809,6 +19891,7 @@ def _studio_governor_preempt_active_orders(
         memory = _studio_selection_memory(cfg=cfg, orch_q=orch_q, now=now)
     except Exception:
         return 0
+
     governor = memory.get("studio_governor") if isinstance(memory.get("studio_governor"), dict) else {}
     governor_mode = str(governor.get("mode") or "").strip().lower()
     if governor_mode not in {

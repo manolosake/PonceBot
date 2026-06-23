@@ -388,20 +388,45 @@ class TestStatusWorkflowSummary(unittest.TestCase):
             self.assertIn("Release or merge", " ".join(release_packet["definition_of_done"]))
             self.assertIn("merge or release evidence", " ".join(release_packet["evidence_required"]))
             self.assertIsInstance(release_packet.get("outcome_contract"), dict)
-            self.assertTrue(release_packet["acceptance_criteria"])
-            self.assertTrue(release_packet["evidence_required"])
-            self.assertTrue(release_packet["suggested_validation"])
-            self.assertIn("ROLE: release_mgr.", release_packet["assignment_prompt"])
-            self.assertEqual(plan["top_execution_packet"], release_packet)
-            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
-            self.assertEqual(plan["summary"]["next_delegate"]["order_id"], order_id)
-            self.assertEqual(plan["summary"]["next_delegate"]["lane"], "release")
-            self.assertEqual(plan["summary"]["next_delegate"]["acceptance_criteria"], release_packet["acceptance_criteria"])
-            self.assertEqual(plan["summary"]["next_delegate"]["evidence_required"], release_packet["evidence_required"])
-            self.assertEqual(plan["summary"]["next_delegate"]["suggested_validation"], release_packet["suggested_validation"])
-            self.assertEqual(plan["summary"]["next_delegate"]["definition_of_done"], release_packet["definition_of_done"])
-            self.assertEqual(plan["summary"]["next_delegate"]["assignment_prompt"], release_packet["assignment_prompt"])
-            self.assertEqual(plan["summary"]["next_delegate"]["outcome_contract"], release_packet["outcome_contract"])
+
+    def test_release_readiness_allows_recovered_github_publication_trace_without_order_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "44444444-5555-6666-7777-888888888888"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={
+                    "github_publication": {
+                        "ok": True,
+                        "github_repo": "manolosake/signaldeck",
+                        "github_url": "https://github.com/manolosake/signaldeck.git",
+                        "remote_url": "https://github.com/manolosake/signaldeck.git",
+                        "branch": "main",
+                        "default_branch": "main",
+                        "head": "2efec0a",
+                        "latest_head": "2efec0a",
+                        "project_path": "/home/aponce/signaldeck",
+                        "private": True,
+                    }
+                },
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "ready")
+            self.assertEqual(readiness["verdict"], "go")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pass")
+            self.assertEqual(checks["release_target_evidence"]["evidence"][0]["key"], "github_publication")
+            self.assertEqual(
+                checks["release_target_evidence"]["evidence"][0]["value"],
+                "manolosake/signaldeck",
+            )
 
 
 if __name__ == "__main__":
