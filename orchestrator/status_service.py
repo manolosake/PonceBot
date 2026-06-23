@@ -1006,7 +1006,8 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
     publication_url_l = publication_url.lower()
     publication_has_github_url = publication_url_l.startswith("https://github.com/") or publication_url_l.startswith("http://github.com/") or publication_url.startswith("git@github.com:")
     publication_target = publication_repo or (publication_url if publication_has_github_url else "")
-    if publication_ok and publication_target and publication_latest_head:
+    publication_private_confirmed = _github_publication_private_confirmed(publication.get("private"))
+    if publication_ok and publication_target and publication_latest_head and publication_private_confirmed:
         evidence.append({"kind": "trace", "key": "github_publication", "value": publication_target})
 
     delivery = trace.get("project_incubator_delivery") if isinstance(trace.get("project_incubator_delivery"), dict) else {}
@@ -1040,6 +1041,14 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
         if len(out) >= 5:
             break
     return out
+
+
+def _github_publication_private_confirmed(private_raw: Any) -> bool:
+    if private_raw is True or private_raw == 1:
+        return True
+    if isinstance(private_raw, str):
+        return private_raw.strip().lower() in {"1", "true", "yes", "private"}
+    return False
 
 
 def _task_summary(task: Task | None, fallback: str) -> str:
