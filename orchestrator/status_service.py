@@ -2733,8 +2733,23 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
 
 def _publication_recovery_owner_role(required_action: str) -> str:
     action_key = str(required_action or "").strip().lower()
+    implementation_actions = {
+        "initialize_git_or_archive",
+        "commit_initial_and_publish_or_archive",
+        "replace_non_github_remote_with_private_github_or_archive",
+        "repair_github_repo_identity_or_archive",
+    }
+    release_actions = {
+        "create_private_remote_and_push_or_archive",
+        "confirm_private_github_repo_or_archive",
+        "backfill_latest_head_or_validate_private_github",
+    }
     if action_key == "archive_or_reject_missing_path":
         return "product_ops"
+    if action_key in implementation_actions:
+        return "implementer_local"
+    if action_key in release_actions:
+        return "release_mgr"
     return "release_mgr"
 
 

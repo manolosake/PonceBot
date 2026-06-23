@@ -601,9 +601,20 @@ class TestStatusService(unittest.TestCase):
     def test_proactive_action_plan_surfaces_specific_publication_recovery_actions(self) -> None:
         cases = [
             (
+                "initialize_git_or_archive",
+                "Initialize a local Git repository for SignalDeck, or archive the project if it should not be published.",
+                "order-init",
+                "implementer_local",
+                [
+                    "publication target facts confirmed against the current local repo or GitHub target",
+                ],
+                [],
+            ),
+            (
                 "commit_initial_and_publish_or_archive",
                 "Create the initial Git commit for Submittal Chase Desk and publish it to a private GitHub repo, or archive it.",
                 "order-commit",
+                "implementer_local",
                 [
                     "initial commit evidence or archive rationale",
                     "private GitHub publication evidence for the initial publish attempt",
@@ -611,9 +622,30 @@ class TestStatusService(unittest.TestCase):
                 [],
             ),
             (
+                "replace_non_github_remote_with_private_github_or_archive",
+                "Replace the current non-GitHub remote for SignalDeck with a private GitHub repo, or archive it.",
+                "order-replace",
+                "implementer_local",
+                [
+                    "publication target facts confirmed against the current local repo or GitHub target",
+                ],
+                [],
+            ),
+            (
+                "repair_github_repo_identity_or_archive",
+                "Repair the GitHub repo identity for SignalDeck so the recorded repo matches the remote, or archive it.",
+                "order-repair",
+                "implementer_local",
+                [
+                    "publication target facts confirmed against the current local repo or GitHub target",
+                ],
+                [],
+            ),
+            (
                 "create_private_remote_and_push_or_archive",
                 "Create a private GitHub remote for SignalDeck and push the latest local state, or archive it.",
                 "order-remote",
+                "release_mgr",
                 [
                     "private remote creation or verification evidence",
                     "push result for the recovered publication target or archive rationale",
@@ -621,9 +653,20 @@ class TestStatusService(unittest.TestCase):
                 [],
             ),
             (
+                "confirm_private_github_repo_or_archive",
+                "Confirm that SignalDeck is published to a private GitHub repo, or archive it if privacy requirements cannot be met.",
+                "order-confirm",
+                "release_mgr",
+                [
+                    "publication target facts confirmed against the current local repo or GitHub target",
+                ],
+                [],
+            ),
+            (
                 "backfill_latest_head_or_validate_private_github",
                 "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
                 "order-head",
+                "release_mgr",
                 [
                     "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
                     "recorded head or visibility verification summary tied to the recovered publication target",
@@ -635,7 +678,7 @@ class TestStatusService(unittest.TestCase):
             ),
         ]
 
-        for required_action, expected_action, source_order_id, expected_evidence, expected_contract in cases:
+        for required_action, expected_action, source_order_id, expected_owner_role, expected_evidence, expected_contract in cases:
             with self.subTest(required_action=required_action):
                 with tempfile.TemporaryDirectory() as td:
                     storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -708,6 +751,7 @@ class TestStatusService(unittest.TestCase):
                     delegation_packet = publication_recovery.get("delegation_packet")
                     self.assertIsInstance(delegation_packet, dict)
                     assert isinstance(delegation_packet, dict)
+                    self.assertEqual(delegation_packet["owner_role"], expected_owner_role)
                     self.assertEqual(delegation_packet["action"], expected_action)
                     for evidence in expected_evidence:
                         self.assertIn(evidence, delegation_packet["evidence_required"])
@@ -717,6 +761,8 @@ class TestStatusService(unittest.TestCase):
                         )
                         self.assertIn(contract_line, combined_lines)
                     self.assertEqual(plan["summary"]["top_action"], expected_action)
+                    self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], expected_owner_role)
+                    self.assertIn(f"ROLE: {expected_owner_role}.", delegation_packet["assignment_prompt"])
                     self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
 
     def test_proactive_action_plan_tolerates_publication_recovery_tables_without_new_columns(self) -> None:
