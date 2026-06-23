@@ -428,6 +428,76 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 "manolosake/signaldeck",
             )
 
+    def test_release_readiness_allows_recovered_github_publication_trace_with_ssh_remote_url(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "45454545-5656-6767-7878-898989898989"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={
+                    "github_publication": {
+                        "ok": True,
+                        "remote_url": "ssh://git@github.com/manolosake/signaldeck.git",
+                        "branch": "main",
+                        "default_branch": "main",
+                        "head": "2efec0a",
+                        "latest_head": "2efec0a",
+                        "project_path": "/home/aponce/signaldeck",
+                        "private": True,
+                    }
+                },
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "ready")
+            self.assertEqual(readiness["verdict"], "go")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pass")
+            self.assertEqual(checks["release_target_evidence"]["evidence"][0]["key"], "github_publication")
+            self.assertEqual(
+                checks["release_target_evidence"]["evidence"][0]["value"],
+                "ssh://git@github.com/manolosake/signaldeck.git",
+            )
+
+    def test_release_readiness_rejects_recovered_github_publication_trace_with_malformed_ssh_remote_url(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "46464646-5757-6868-7979-909090909090"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={
+                    "github_publication": {
+                        "ok": True,
+                        "remote_url": "ssh://git@github.com/",
+                        "branch": "main",
+                        "default_branch": "main",
+                        "head": "2efec0a",
+                        "latest_head": "2efec0a",
+                        "project_path": "/home/aponce/signaldeck",
+                        "private": True,
+                    }
+                },
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
+
     def test_release_readiness_rejects_local_only_recovered_github_publication(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")

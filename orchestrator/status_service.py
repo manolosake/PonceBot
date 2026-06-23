@@ -1003,9 +1003,7 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
     publication_latest_head = str(publication.get("latest_head") or "").strip()
     publication_repo = str(publication.get("github_repo") or "").strip()
     publication_url = str(publication.get("github_url") or "").strip() or str(publication.get("remote_url") or "").strip()
-    publication_url_l = publication_url.lower()
-    publication_has_github_url = publication_url_l.startswith("https://github.com/") or publication_url_l.startswith("http://github.com/") or publication_url.startswith("git@github.com:")
-    publication_target = publication_repo or (publication_url if publication_has_github_url else "")
+    publication_target = publication_repo or (publication_url if _github_repo_full_name_from_remote_url(publication_url) else "")
     publication_private_confirmed = _github_publication_private_confirmed(publication.get("private"))
     if publication_ok and publication_target and publication_latest_head and publication_private_confirmed:
         evidence.append({"kind": "trace", "key": "github_publication", "value": publication_target})
@@ -1041,6 +1039,36 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
         if len(out) >= 5:
             break
     return out
+
+
+def _github_repo_full_name_from_remote_url(remote_url: str) -> str:
+    text = str(remote_url or "").strip()
+    if not text:
+        return ""
+    if text.startswith("git@github.com:"):
+        path = text.split(":", 1)[1]
+    else:
+        try:
+            parsed = urllib.parse.urlparse(text)
+        except Exception:
+            return ""
+        hostname = (parsed.hostname or "").strip().lower()
+        if hostname != "github.com":
+            return ""
+        if parsed.scheme in {"http", "https"}:
+            path = parsed.path
+        elif parsed.scheme == "ssh" and (parsed.username or "").strip().lower() == "git":
+            path = parsed.path
+        else:
+            return ""
+    parts = [segment.strip() for segment in str(path or "").split("/") if segment.strip()]
+    if len(parts) != 2:
+        return ""
+    owner, repo = parts
+    repo = repo.removesuffix(".git")
+    if not owner or not repo:
+        return ""
+    return f"{owner}/{repo}"
 
 
 def _github_publication_private_confirmed(private_raw: Any) -> bool:
