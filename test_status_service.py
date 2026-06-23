@@ -407,6 +407,39 @@ class TestStatusService(unittest.TestCase):
             self.assertEqual(item["missing_fields"], ["github_url", "private"])
             self.assertEqual(item["status"], "open")
             self.assertEqual(item["source_order_id"], "order-1")
+            delegation_packet = publication_recovery.get("delegation_packet")
+            self.assertIsInstance(delegation_packet, dict)
+            assert isinstance(delegation_packet, dict)
+            self.assertEqual(delegation_packet["owner_role"], "release_mgr")
+            self.assertEqual(delegation_packet["lane"], "publication_recovery")
+            self.assertEqual(delegation_packet["order_id"], "order-1")
+            self.assertEqual(
+                delegation_packet["action"],
+                "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+            )
+            self.assertIn("github_url", delegation_packet["evidence_required"])
+            self.assertIn("private", delegation_packet["evidence_required"])
+            self.assertIn(
+                "GitHub repo, URL, head, and visibility evidence are recorded or an explicit blocker is attached.",
+                delegation_packet["definition_of_done"],
+            )
+            self.assertIn("ROLE: release_mgr.", delegation_packet["assignment_prompt"])
+
+            self.assertEqual(plan["summary"]["active_proactive_orders"], 0)
+            self.assertEqual(plan["summary"]["top_lane"], "publication_recovery")
+            self.assertEqual(
+                plan["summary"]["top_action"],
+                "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+            )
+            self.assertEqual(plan["top_execution_packet"], delegation_packet)
+            self.assertEqual(plan["summary"]["next_delegate"]["owner_role"], "release_mgr")
+            self.assertEqual(plan["summary"]["next_delegate"]["lane"], "publication_recovery")
+            self.assertEqual(plan["summary"]["next_delegate"]["action"], delegation_packet["action"])
+            lane = next(lane for lane in plan["lanes"] if lane["lane"] == "publication_recovery")
+            self.assertEqual(lane["count"], 1)
+            self.assertEqual(lane["execution_packet"], delegation_packet)
+            self.assertEqual(lane["orders"][0]["order_id"], "order-1")
+            self.assertEqual(lane["orders"][0]["decision"], "publication_recovery")
 
     def test_proactive_action_plan_tolerates_malformed_publication_recovery_fields(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -488,6 +521,12 @@ class TestStatusService(unittest.TestCase):
             self.assertNotIn("latest_head", item)
             self.assertEqual(item["source_order_id"], "order-bad")
             self.assertNotIn("updated_at", item)
+            delegation_packet = publication_recovery.get("delegation_packet")
+            self.assertIsInstance(delegation_packet, dict)
+            assert isinstance(delegation_packet, dict)
+            self.assertEqual(delegation_packet["owner_role"], "product_ops")
+            self.assertEqual(delegation_packet["order_id"], "order-bad")
+            self.assertIn("archive or reject Broken Project", delegation_packet["action"])
 
     def test_proactive_action_plan_tolerates_publication_recovery_tables_without_new_columns(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -2731,6 +2731,122 @@ def _proactive_lane_execution_packet(order: dict[str, Any], lane: str, label: st
     return packet
 
 
+def _publication_recovery_owner_role(required_action: str) -> str:
+    action_key = str(required_action or "").strip().lower()
+    if action_key == "archive_or_reject_missing_path":
+        return "product_ops"
+    return "release_mgr"
+
+
+def _publication_recovery_action(item: dict[str, Any]) -> str:
+    required_action = str(item.get("required_action") or "").strip().lower()
+    project_name = str(item.get("project_name") or item.get("github_repo") or item.get("project_path") or "project").strip()
+    if required_action == "archive_or_reject_missing_path":
+        return f"Decide whether to archive or reject {project_name} because no publication target is currently valid."
+    if required_action == "resolve_publication_contract":
+        return (
+            f"Recover publication evidence for {project_name} by confirming the GitHub target, head, "
+            "and publication visibility proof."
+        )
+    return f"Resolve the open publication recovery item for {project_name}."
+
+
+def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | None:
+    items = [item for item in list(summary.get("items") or []) if isinstance(item, dict)]
+    if not items:
+        return None
+
+    item = items[0]
+    required_action = str(item.get("required_action") or "").strip()
+    owner_role = _publication_recovery_owner_role(required_action)
+    action = _publication_recovery_action(item)
+    project_name = str(item.get("project_name") or item.get("github_repo") or item.get("project_path") or "project").strip()
+    project_path = str(item.get("project_path") or "").strip()
+    github_repo = str(item.get("github_repo") or "").strip()
+    github_url = str(item.get("github_url") or "").strip()
+    latest_head = str(item.get("latest_head") or "").strip()
+    source_order_id = str(item.get("source_order_id") or "").strip()
+    missing_fields = [entry for entry in _proactive_packet_list(item.get("missing_fields")) if entry]
+
+    inspect_endpoint = "/api/v1/orchestration/proactive-action-plan"
+    handoff_endpoint = inspect_endpoint
+
+    target_label = github_repo or project_path or project_name
+    acceptance_criteria = [
+        f"Inspect the open publication recovery entry for {project_name} in {inspect_endpoint}.",
+        action,
+        f"Work only on the publication recovery item for {target_label}.",
+    ]
+    if missing_fields:
+        acceptance_criteria.append("Close the documented publication evidence gaps: " + ", ".join(missing_fields) + ".")
+    if source_order_id:
+        acceptance_criteria.append(f"Preserve traceability back to source order {source_order_id}.")
+
+    evidence_required = [
+        "publication recovery decision summary",
+        "updated publication evidence or explicit archive/reject rationale",
+    ]
+    if github_repo:
+        evidence_required.append(f"github_repo={github_repo}")
+    if github_url:
+        evidence_required.append(f"github_url={github_url}")
+    if latest_head:
+        evidence_required.append(f"latest_head={latest_head}")
+    for field in missing_fields:
+        evidence_required.append(field)
+
+    definition_of_done = [
+        "The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale.",
+        "The status entry reflects the latest publication target facts and remaining blockers, if any.",
+    ]
+    if required_action.lower() == "archive_or_reject_missing_path":
+        definition_of_done.append("A keep/archive/reject decision is recorded before fresh publication work continues.")
+    else:
+        definition_of_done.append("GitHub repo, URL, head, and visibility evidence are recorded or an explicit blocker is attached.")
+
+    suggested_validation = [
+        "Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up.",
+        "Verify the recorded publication evidence matches the current local repo or GitHub target.",
+    ]
+
+    prompt_lines = [
+        f"ROLE: {owner_role}.",
+        "",
+        f"Task: Publication recovery for {project_name}.",
+        "Scope: Resolve only the open publication recovery item surfaced by the proactive action plan report.",
+        f"Inspect endpoint: {inspect_endpoint}",
+        f"Handoff endpoint: {handoff_endpoint}",
+        f"Action: {action}",
+        "",
+        "Acceptance criteria:",
+        *(f"- {criterion}" for criterion in acceptance_criteria),
+        "",
+        "Definition of done:",
+        *(f"- {criterion}" for criterion in definition_of_done),
+        "",
+        "Evidence required:",
+        *(f"- {criterion}" for criterion in evidence_required),
+        "",
+        "Suggested validation:",
+        *(f"- {criterion}" for criterion in suggested_validation),
+    ]
+
+    packet = {
+        "owner_role": owner_role,
+        "action": action,
+        "inspect_endpoint": inspect_endpoint,
+        "handoff_endpoint": handoff_endpoint,
+        "acceptance_criteria": acceptance_criteria,
+        "definition_of_done": definition_of_done,
+        "evidence_required": evidence_required,
+        "suggested_validation": suggested_validation,
+        "assignment_prompt": "\n".join(prompt_lines),
+        "order_id": source_order_id or f"publication-recovery:{project_name.lower().replace(' ', '-')}",
+        "lane": "publication_recovery",
+    }
+    return packet
+
+
 def _handoff_action_profile(
     *,
     release_readiness: dict[str, Any],
@@ -4387,6 +4503,17 @@ class StatusService:
         if not isinstance(db_path, Path):
             return []
 
+        def _recovery_row_rank(row: sqlite3.Row) -> tuple[int, int, int, float]:
+            status = str(row["status"] or "").strip().lower()
+            resolved_score = 1 if status in {"resolved", "complete", "completed", "published", "closed"} else 0
+            completeness_score = 0
+            for field in ("github_repo", "github_url", "latest_head"):
+                if str(row[field] or "").strip():
+                    completeness_score += 1
+            github_identity_score = 1 if completeness_score >= 2 else 0
+            updated_at = _safe_float(row["updated_at"])
+            return (resolved_score, completeness_score, github_identity_score, updated_at)
+
         candidates: list[dict[str, Any]] = []
         try:
             with sqlite3.connect(str(db_path), timeout=3.0) as conn:
@@ -4399,6 +4526,7 @@ class StatusService:
 
                 portfolio_rows: list[sqlite3.Row] = []
                 recovery_rows_by_key: dict[str, sqlite3.Row] = {}
+                matched_project_keys: set[str] = set()
 
                 if "studio_portfolio_projects" in table_names:
                     portfolio_columns = {
@@ -4431,6 +4559,11 @@ class StatusService:
                         """,
                         (oid, oid),
                     ).fetchall()
+                    matched_project_keys = {
+                        str(row["project_key"] or "").strip()
+                        for row in portfolio_rows
+                        if str(row["project_key"] or "").strip()
+                    }
 
                 if "studio_publication_recovery" in table_names:
                     recovery_columns = {
@@ -4438,24 +4571,54 @@ class StatusService:
                         for column in conn.execute("PRAGMA table_info(studio_publication_recovery)").fetchall()
                         if str(column["name"]).strip()
                     }
-                    recovery_fields = ["project_key", "github_repo", "github_url", "latest_head", "updated_at"]
+                    recovery_fields = [
+                        "project_key",
+                        "github_repo",
+                        "github_url",
+                        "latest_head",
+                        "status",
+                        "updated_at",
+                    ]
                     recovery_select = [
                         field if field in recovery_columns else f"NULL AS {field}"
                         for field in recovery_fields
                     ]
-                    recovery_rows = conn.execute(
-                        f"""
-                        SELECT {", ".join(recovery_select)}
-                        FROM studio_publication_recovery
-                        WHERE source_order_id = ?
-                        ORDER BY updated_at DESC
-                        LIMIT 5
-                        """,
-                        (oid,),
-                    ).fetchall()
+                    recovery_queries: list[tuple[str, tuple[Any, ...]]] = []
+                    recovery_queries.append(
+                        (
+                            f"""
+                            SELECT {", ".join(recovery_select)}
+                            FROM studio_publication_recovery
+                            WHERE source_order_id = ?
+                            ORDER BY updated_at DESC
+                            LIMIT 20
+                            """,
+                            (oid,),
+                        )
+                    )
+                    if matched_project_keys:
+                        placeholders = ", ".join("?" for _ in matched_project_keys)
+                        recovery_queries.append(
+                            (
+                                f"""
+                                SELECT {", ".join(recovery_select)}
+                                FROM studio_publication_recovery
+                                WHERE project_key IN ({placeholders})
+                                ORDER BY updated_at DESC
+                                LIMIT 50
+                                """,
+                                tuple(sorted(matched_project_keys)),
+                            )
+                        )
+                    recovery_rows: list[sqlite3.Row] = []
+                    for query, params in recovery_queries:
+                        recovery_rows.extend(conn.execute(query, params).fetchall())
                     for row in recovery_rows:
                         project_key = str(row["project_key"] or "").strip()
-                        if project_key and project_key not in recovery_rows_by_key:
+                        if not project_key:
+                            continue
+                        existing = recovery_rows_by_key.get(project_key)
+                        if existing is None or _recovery_row_rank(row) > _recovery_row_rank(existing):
                             recovery_rows_by_key[project_key] = row
 
                 for row in portfolio_rows:
@@ -4512,6 +4675,9 @@ class StatusService:
         generated_at = float(priorities.get("generated_at") or time.time())
         lim = int(priorities.get("limit") or max(1, min(200, int(limit))))
         publication_recovery = self._publication_recovery_summary(item_limit=min(5, lim))
+        publication_recovery_packet = (
+            _publication_recovery_packet(publication_recovery) if isinstance(publication_recovery, dict) else None
+        )
         lane_defs = [
             ("release", "Release"),
             ("unblock", "Unblock"),
@@ -4596,6 +4762,43 @@ class StatusService:
                 }
             )
 
+        if isinstance(publication_recovery_packet, dict) and not any(int(lane.get("count") or 0) > 0 for lane in lanes):
+            recovery_item = (
+                publication_recovery.get("items")[0]
+                if isinstance(publication_recovery, dict)
+                and isinstance(publication_recovery.get("items"), list)
+                and publication_recovery.get("items")
+                and isinstance(publication_recovery.get("items")[0], dict)
+                else {}
+            )
+            lanes.append(
+                {
+                    "lane": "publication_recovery",
+                    "label": "Publication Recovery",
+                    "count": 1,
+                    "recommended_next_action": publication_recovery_packet.get("action"),
+                    "execution_packet": publication_recovery_packet,
+                    "orders": [
+                        {
+                            "rank": 1,
+                            "order_id": publication_recovery_packet.get("order_id"),
+                            "order_id_short": "pub-recov",
+                            "title": str(recovery_item.get("project_name") or "Publication recovery").strip(),
+                            "priority": 1,
+                            "phase": "publication_recovery",
+                            "current_stage": "deploy",
+                            "readiness_state": "not_ready",
+                            "readiness_verdict": "wait",
+                            "decision": "publication_recovery",
+                            "why": str(recovery_item.get("reason") or "Open publication recovery item requires follow-up.").strip(),
+                            "next_action": publication_recovery_packet.get("action"),
+                            "handoff": {},
+                            "updated_at": recovery_item.get("updated_at"),
+                        }
+                    ],
+                }
+            )
+
         top_order: dict[str, Any] | None = None
         top_lane = None
         top_rank: int | None = None
@@ -4621,6 +4824,10 @@ class StatusService:
                     packet = lane.get("execution_packet")
                     top_execution_packet = packet if isinstance(packet, dict) else None
                     break
+        if top_execution_packet is None and isinstance(publication_recovery_packet, dict):
+            top_execution_packet = publication_recovery_packet
+            top_lane = "publication_recovery"
+            top_order = None
         next_delegate = None
         if isinstance(top_execution_packet, dict):
             next_delegate = {
@@ -4671,13 +4878,19 @@ class StatusService:
                 "lanes": lane_counts,
                 "selection_quality": selection_quality_counts,
                 "top_lane": top_lane,
-                "top_action": (str(top_order.get("next_action") or "") if isinstance(top_order, dict) else None),
+                "top_action": (
+                    str(top_order.get("next_action") or "")
+                    if isinstance(top_order, dict)
+                    else (str(top_execution_packet.get("action") or "") if isinstance(top_execution_packet, dict) else None)
+                ),
                 "next_delegate": next_delegate,
             },
             "lanes": lanes,
             "top_execution_packet": top_execution_packet,
         }
         if isinstance(publication_recovery, dict):
+            if isinstance(publication_recovery_packet, dict):
+                publication_recovery["delegation_packet"] = publication_recovery_packet
             report["publication_recovery"] = publication_recovery
         return report
 

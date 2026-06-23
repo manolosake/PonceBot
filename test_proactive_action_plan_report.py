@@ -318,6 +318,104 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("| SignalDeck | manolosake/signaldeck | url=https://github.com/manolosake/signaldeck; head=abc1234def5678; order=order-17 | resolve_publication_contract | private | open: Private visibility confirmation is still missing. |", rendered)
         self.assertIn("| Local Only Project | /home/aponce/local-only-project | - | archive_or_reject_missing_path | github_repo, github_url | open: No GitHub publication target was found. |", rendered)
 
+    def test_render_markdown_surfaces_publication_recovery_delegate_without_proactive_orders(self) -> None:
+        report = {
+            "generated_at": 123.0,
+            "chat_id": 7,
+            "limit": 10,
+            "summary": {
+                "active_proactive_orders": 0,
+                "returned": 1,
+                "lanes": {"publication_recovery": 1},
+                "selection_quality": {},
+                "top_lane": "publication_recovery",
+                "top_action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                "next_delegate": {
+                    "owner_role": "release_mgr",
+                    "order_id": "order-17",
+                    "lane": "publication_recovery",
+                    "action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                    "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
+                    "evidence_required": ["publication recovery decision summary", "github_url", "private"],
+                    "suggested_validation": ["Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up."],
+                    "definition_of_done": ["The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale."],
+                    "assignment_prompt": "ROLE: release_mgr.\nAction: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                },
+            },
+            "top_execution_packet": {
+                "owner_role": "release_mgr",
+                "order_id": "order-17",
+                "lane": "publication_recovery",
+                "action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
+                "evidence_required": ["publication recovery decision summary", "github_url", "private"],
+                "suggested_validation": ["Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up."],
+                "definition_of_done": ["The publication recovery item is either resolved with publication evidence or explicitly archived/rejected with rationale."],
+                "assignment_prompt": "ROLE: release_mgr.\nAction: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+            },
+            "lanes": [
+                {
+                    "lane": "publication_recovery",
+                    "label": "Publication Recovery",
+                    "count": 1,
+                    "recommended_next_action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                    "execution_packet": {
+                        "owner_role": "release_mgr",
+                        "order_id": "order-17",
+                        "lane": "publication_recovery",
+                        "action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                    },
+                    "orders": [
+                        {
+                            "rank": 1,
+                            "order_id": "order-17",
+                            "order_id_short": "pub-recov",
+                            "current_stage": "deploy",
+                            "readiness_verdict": "wait",
+                            "next_action": "Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.",
+                        }
+                    ],
+                }
+            ],
+            "publication_recovery": {
+                "count": 1,
+                "truncated": False,
+                "items": [
+                    {
+                        "project_name": "SignalDeck",
+                        "project_path": "/home/aponce/signaldeck",
+                        "github_repo": "manolosake/signaldeck",
+                        "required_action": "resolve_publication_contract",
+                        "reason": "Private visibility confirmation is still missing.",
+                        "missing_json": '["github_url", "private"]',
+                        "missing_fields": ["github_url", "private"],
+                        "status": "open",
+                        "github_url": "https://github.com/manolosake/signaldeck",
+                        "latest_head": "abc1234def5678",
+                        "source_order_id": "order-17",
+                    }
+                ],
+            },
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn("- Active proactive orders: 0", rendered)
+        self.assertIn("- Top lane: publication_recovery", rendered)
+        self.assertIn("## Top Execution Packet", rendered)
+        self.assertIn("- owner_role: release_mgr", rendered)
+        self.assertIn("- lane: publication_recovery", rendered)
+        self.assertIn("- order_id: order-17", rendered)
+        self.assertIn("## Next Delegate", rendered)
+        self.assertIn("- action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
+        self.assertIn("## Publication Recovery", rendered)
+        self.assertIn("## Publication Recovery\n\n- Recommended next action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
+        self.assertIn("| 1 | pub-recov | deploy | wait | - | Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof. |", rendered)
+
     def test_render_markdown_escapes_publication_recovery_pipe_characters(self) -> None:
         report = self._base_report()
         report["publication_recovery"] = {
