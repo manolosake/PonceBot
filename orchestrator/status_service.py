@@ -990,7 +990,33 @@ def _readiness_trace_event_evidence(traces: list[dict[str, Any]], *, event_types
     return out
 
 
-def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]:
+def _release_target_evidence_from_github_publication(
+    publication: dict[str, Any],
+    *,
+    key: str,
+    kind: str,
+) -> dict[str, Any] | None:
+    publication_ok = bool(publication.get("ok", False))
+    publication_latest_head = str(publication.get("latest_head") or "").strip()
+    publication_repo = str(publication.get("github_repo") or "").strip()
+    publication_url = str(publication.get("github_url") or "").strip() or str(publication.get("remote_url") or "").strip()
+    publication_repo_from_url = _github_repo_full_name_from_remote_url(publication_url)
+    if not publication_repo_from_url:
+        return None
+    if publication_repo and publication_repo != publication_repo_from_url:
+        return None
+    publication_target = publication_repo or publication_url
+    publication_private_confirmed = _github_publication_private_confirmed(publication.get("private"))
+    if publication_ok and publication_target and publication_latest_head and publication_private_confirmed:
+        return {"kind": kind, "key": key, "value": publication_target}
+    return None
+
+
+def _release_target_evidence(
+    root_trace: dict[str, Any],
+    *,
+    persisted_evidence: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     trace = dict(root_trace or {})
     evidence: list[dict[str, Any]] = []
 
@@ -1009,14 +1035,13 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
             evidence.append(_readiness_trace_evidence("deployed_commit", deployed_commit))
 
     publication = trace.get("github_publication") if isinstance(trace.get("github_publication"), dict) else {}
-    publication_ok = bool(publication.get("ok", False))
-    publication_latest_head = str(publication.get("latest_head") or "").strip()
-    publication_repo = str(publication.get("github_repo") or "").strip()
-    publication_url = str(publication.get("github_url") or "").strip() or str(publication.get("remote_url") or "").strip()
-    publication_target = publication_repo or (publication_url if _github_repo_full_name_from_remote_url(publication_url) else "")
-    publication_private_confirmed = _github_publication_private_confirmed(publication.get("private"))
-    if publication_ok and publication_target and publication_latest_head and publication_private_confirmed:
-        evidence.append({"kind": "trace", "key": "github_publication", "value": publication_target})
+    publication_evidence = _release_target_evidence_from_github_publication(
+        publication,
+        key="github_publication",
+        kind="trace",
+    )
+    if publication_evidence is not None:
+        evidence.append(publication_evidence)
 
     delivery = trace.get("project_incubator_delivery") if isinstance(trace.get("project_incubator_delivery"), dict) else {}
     delivery_ok = bool(delivery.get("ok", False))
@@ -1035,6 +1060,9 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
         marker in studio_summary_l for marker in ("github.com", "/home/", "project=")
     ):
         evidence.append({"kind": "trace", "key": "studio_terminal_outcome", "value": studio_summary[:280]})
+    for item in list(persisted_evidence or []):
+        if isinstance(item, dict):
+            evidence.append(item)
 
     out: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -1162,6 +1190,7 @@ def _build_release_readiness(
     decision_log: list[dict[str, Any]],
     traces: list[dict[str, Any]],
     artifacts: list[dict[str, Any]],
+    persisted_release_target_evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     root_trace = dict((root_task.trace or {}) if root_task is not None else {})
     proactive_keys_present = any(str(key).startswith("proactive_") for key in root_trace.keys())
@@ -1213,7 +1242,10 @@ def _build_release_readiness(
     merged_to_main = bool(root_trace.get("merged_to_main", False))
     deploy_status = str(root_trace.get("deploy_status") or "").strip().lower()
     already_released = bool(merged_to_main or deploy_status in {"ok", "scheduled"})
-    release_target_evidence = _release_target_evidence(root_trace)
+    release_target_evidence = _release_target_evidence(
+        root_trace,
+        persisted_evidence=persisted_release_target_evidence,
+    )
     has_release_target_evidence = bool(release_target_evidence)
 
     delivery_blocked = [t for t in delivery_children if str(t.state or "").strip().lower() in _BLOCKING_TASK_STATES]
@@ -3240,6 +3272,7 @@ class StatusService:
             artifacts.extend(_artifact_refs_from_trace_events(traces))
 
             workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+            persisted_release_target_evidence = self._persisted_release_target_evidence(oid)
             readiness = _build_release_readiness(
                 order_row=order_row,
                 root_task=root_task,
@@ -3248,6 +3281,7 @@ class StatusService:
                 decision_log=decision_log,
                 traces=traces,
                 artifacts=artifacts,
+                persisted_release_target_evidence=persisted_release_target_evidence,
             )
             children_by_state = _count_task_states(children)
             children_by_role: dict[str, int] = {}
@@ -3406,6 +3440,7 @@ class StatusService:
             artifacts.extend(_artifact_refs_from_trace_events(traces))
 
             workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+            persisted_release_target_evidence = self._persisted_release_target_evidence(oid)
             readiness = _build_release_readiness(
                 order_row=order_row,
                 root_task=root_task,
@@ -3414,6 +3449,7 @@ class StatusService:
                 decision_log=decision_log,
                 traces=traces,
                 artifacts=artifacts,
+                persisted_release_target_evidence=persisted_release_target_evidence,
             )
 
             readiness_state = str(readiness.get("state") or "unknown").strip().lower() or "unknown"
@@ -4341,6 +4377,136 @@ class StatusService:
             "truncated": open_count > len(items),
         }
 
+    def _persisted_release_target_evidence(self, order_id: str) -> list[dict[str, Any]]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            return []
+
+        storage = getattr(self.orch_q, "_storage", None)
+        db_path = getattr(storage, "path", None)
+        if not isinstance(db_path, Path):
+            return []
+
+        candidates: list[dict[str, Any]] = []
+        try:
+            with sqlite3.connect(str(db_path), timeout=3.0) as conn:
+                conn.row_factory = sqlite3.Row
+                table_names = {
+                    str(row["name"]).strip()
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                    if str(row["name"]).strip()
+                }
+
+                portfolio_rows: list[sqlite3.Row] = []
+                recovery_rows_by_key: dict[str, sqlite3.Row] = {}
+
+                if "studio_portfolio_projects" in table_names:
+                    portfolio_columns = {
+                        str(column["name"]).strip()
+                        for column in conn.execute("PRAGMA table_info(studio_portfolio_projects)").fetchall()
+                        if str(column["name"]).strip()
+                    }
+                    portfolio_fields = [
+                        "project_key",
+                        "github_repo",
+                        "github_url",
+                        "latest_head",
+                        "private",
+                        "status",
+                        "source_order_id",
+                        "latest_order_id",
+                        "updated_at",
+                    ]
+                    portfolio_select = [
+                        field if field in portfolio_columns else f"NULL AS {field}"
+                        for field in portfolio_fields
+                    ]
+                    portfolio_rows = conn.execute(
+                        f"""
+                        SELECT {", ".join(portfolio_select)}
+                        FROM studio_portfolio_projects
+                        WHERE source_order_id = ? OR latest_order_id = ?
+                        ORDER BY updated_at DESC
+                        LIMIT 5
+                        """,
+                        (oid, oid),
+                    ).fetchall()
+
+                if "studio_publication_recovery" in table_names:
+                    recovery_columns = {
+                        str(column["name"]).strip()
+                        for column in conn.execute("PRAGMA table_info(studio_publication_recovery)").fetchall()
+                        if str(column["name"]).strip()
+                    }
+                    recovery_fields = ["project_key", "github_repo", "github_url", "latest_head", "updated_at"]
+                    recovery_select = [
+                        field if field in recovery_columns else f"NULL AS {field}"
+                        for field in recovery_fields
+                    ]
+                    recovery_rows = conn.execute(
+                        f"""
+                        SELECT {", ".join(recovery_select)}
+                        FROM studio_publication_recovery
+                        WHERE source_order_id = ?
+                        ORDER BY updated_at DESC
+                        LIMIT 5
+                        """,
+                        (oid,),
+                    ).fetchall()
+                    for row in recovery_rows:
+                        project_key = str(row["project_key"] or "").strip()
+                        if project_key and project_key not in recovery_rows_by_key:
+                            recovery_rows_by_key[project_key] = row
+
+                for row in portfolio_rows:
+                    private_raw = row["private"]
+                    if not _github_publication_private_confirmed(private_raw):
+                        continue
+                    status = str(row["status"] or "").strip().lower()
+                    if not status.startswith("published"):
+                        continue
+                    project_key = str(row["project_key"] or "").strip()
+                    recovery_row = recovery_rows_by_key.get(project_key)
+                    publication = {
+                        "ok": True,
+                        "github_repo": (
+                            str(row["github_repo"] or "").strip()
+                            or (str(recovery_row["github_repo"] or "").strip() if recovery_row is not None else "")
+                        ),
+                        "github_url": (
+                            str(row["github_url"] or "").strip()
+                            or (str(recovery_row["github_url"] or "").strip() if recovery_row is not None else "")
+                        ),
+                        "latest_head": (
+                            str(row["latest_head"] or "").strip()
+                            or (str(recovery_row["latest_head"] or "").strip() if recovery_row is not None else "")
+                        ),
+                        "private": private_raw,
+                    }
+                    evidence = _release_target_evidence_from_github_publication(
+                        publication,
+                        key="persisted_github_publication",
+                        kind="sqlite",
+                    )
+                    if evidence is not None:
+                        candidates.append(evidence)
+        except Exception:
+            return []
+
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in candidates:
+            key = str(item.get("key") or "").strip()
+            value = str(item.get("value") or "").strip()
+            marker = (key, value)
+            if not key or not value or marker in seen:
+                continue
+            seen.add(marker)
+            out.append(item)
+            if len(out) >= 3:
+                break
+        return out
+
     def proactive_action_plan(self, chat_id: int | None = None, limit: int = 20) -> dict[str, Any]:
         priorities = self.proactive_priorities(chat_id=chat_id, limit=limit)
         generated_at = float(priorities.get("generated_at") or time.time())
@@ -4866,6 +5032,7 @@ class StatusService:
             counts_by_role[role] = counts_by_role.get(role, 0) + 1
 
         workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+        persisted_release_target_evidence = self._persisted_release_target_evidence(oid)
         release_readiness = _build_release_readiness(
             order_row=order_row,
             root_task=root_task,
@@ -4874,6 +5041,7 @@ class StatusService:
             decision_log=decision_log,
             traces=traces,
             artifacts=artifacts,
+            persisted_release_target_evidence=persisted_release_target_evidence,
         )
 
         return {
@@ -4964,6 +5132,7 @@ class StatusService:
         artifacts.extend(_artifact_refs_from_trace_events(traces))
 
         workflow = _build_order_workflow(order_row=order_row, root_task=root_task, children=children)
+        persisted_release_target_evidence = self._persisted_release_target_evidence(oid)
         release_readiness = _build_release_readiness(
             order_row=order_row,
             root_task=root_task,
@@ -4972,6 +5141,7 @@ class StatusService:
             decision_log=decision_log,
             traces=traces,
             artifacts=artifacts,
+            persisted_release_target_evidence=persisted_release_target_evidence,
         )
 
         return {

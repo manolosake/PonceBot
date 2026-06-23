@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -464,6 +465,370 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 checks["release_target_evidence"]["evidence"][0]["value"],
                 "ssh://git@github.com/manolosake/signaldeck.git",
             )
+
+    def test_release_readiness_allows_persisted_private_publication_recovery_without_root_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "45959595-6060-7171-8282-939393939393"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "signaldeck",
+                        "SignalDeck",
+                        "/home/aponce/signaldeck",
+                        "manolosake/signaldeck",
+                        "",
+                        "main",
+                        "",
+                        1,
+                        "published_private",
+                        order_id,
+                        order_id,
+                        "published_project",
+                        "Recovered private publication evidence.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_publication_recovery(
+                        recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                        latest_head, missing_json, required_action, status, reason, source_order_id, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "recovery-1",
+                        "signaldeck",
+                        "SignalDeck",
+                        "/home/aponce/signaldeck",
+                        "",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "2efec0a",
+                        "[]",
+                        "resolve_publication_contract",
+                        "resolved",
+                        "Recovered GitHub target evidence from SQLite.",
+                        order_id,
+                        11.0,
+                        21.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "ready")
+            self.assertEqual(readiness["verdict"], "go")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pass")
+            self.assertEqual(checks["release_target_evidence"]["evidence"][0]["key"], "persisted_github_publication")
+            self.assertEqual(
+                checks["release_target_evidence"]["evidence"][0]["value"],
+                "manolosake/signaldeck",
+            )
+
+    def test_release_readiness_rejects_persisted_publication_recovery_without_valid_github_url(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "46060606-7171-8282-9393-040404040404"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE studio_publication_recovery (
+                        recovery_id TEXT PRIMARY KEY,
+                        project_key TEXT NOT NULL,
+                        project_name TEXT,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        latest_head TEXT,
+                        missing_json TEXT NOT NULL DEFAULT '[]',
+                        required_action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        source_order_id TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "broken-repo",
+                        "Broken Repo",
+                        "/home/aponce/broken-repo",
+                        "manolosake/broken-repo",
+                        "",
+                        "main",
+                        "2efec0a",
+                        1,
+                        "published_private",
+                        order_id,
+                        order_id,
+                        "published_project",
+                        "Persisted publication exists but target is malformed.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
+
+    def test_release_readiness_rejects_persisted_publication_recovery_on_repo_url_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "46171717-8282-9393-0404-151515151515"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "mismatch-repo",
+                        "Mismatch Repo",
+                        "/home/aponce/mismatch-repo",
+                        "manolosake/right-repo",
+                        "https://github.com/manolosake/wrong-repo.git",
+                        "main",
+                        "2efec0a",
+                        1,
+                        "published_private",
+                        order_id,
+                        order_id,
+                        "published_project",
+                        "Persisted publication has mismatched repo identity.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
+
+    def test_release_readiness_rejects_persisted_publication_recovery_with_non_github_url(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "46282828-9393-0404-1515-262626262626"
+            self._make_ready_proactive_order(q, order_id=order_id)
+
+            with sqlite3.connect(storage.path) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE studio_portfolio_projects (
+                        project_key TEXT PRIMARY KEY,
+                        project_name TEXT NOT NULL,
+                        project_path TEXT,
+                        github_repo TEXT,
+                        github_url TEXT,
+                        default_branch TEXT,
+                        latest_head TEXT,
+                        private INTEGER,
+                        status TEXT NOT NULL,
+                        source_order_id TEXT,
+                        latest_order_id TEXT,
+                        latest_outcome_status TEXT,
+                        latest_summary TEXT,
+                        validation_summary TEXT,
+                        monetization_summary TEXT,
+                        next_milestone TEXT,
+                        first_seen_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone, first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "nongithub-repo",
+                        "NonGitHub Repo",
+                        "/home/aponce/nongithub-repo",
+                        "manolosake/nongithub-repo",
+                        "https://gitlab.com/manolosake/nongithub-repo.git",
+                        "main",
+                        "2efec0a",
+                        1,
+                        "published_private",
+                        order_id,
+                        order_id,
+                        "published_project",
+                        "Persisted publication points to a non-GitHub remote.",
+                        None,
+                        None,
+                        None,
+                        10.0,
+                        20.0,
+                    ),
+                )
+                conn.commit()
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
 
     def test_release_readiness_rejects_recovered_github_publication_trace_with_malformed_ssh_remote_url(self) -> None:
         with tempfile.TemporaryDirectory() as td:
