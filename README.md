@@ -24,11 +24,14 @@ The r530 deployment runs from:
 Source-of-truth files:
 
 - `bot.py`: Telegram bot, scheduler, orchestration, Studio memory, gates, and outcome logic.
+- `alexa_gateway.py`: Alexa Custom Skill gateway for Echo Pop voice access.
 - `orchestrator/agents.yaml`: agent roster, models, effort, prompts, and role limits.
 - `orchestrator/runbooks.yaml`: scheduled runbooks and diagnostics.
 - `codexbot.env.example`: documented environment knobs.
 - `systemd/`: user/system service definitions.
 - `tools/`: deploy, diagnostics, reports, security, and production helpers.
+
+Echo Pop voice setup is documented in `docs/alexa_echo_pop.md`.
 
 Production-specific secrets and overrides live outside git or in the private runtime env file. Do not commit real tokens, passwords, IDs, or private env files.
 

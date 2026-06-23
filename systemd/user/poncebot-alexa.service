@@ -1,0 +1,26 @@
+[Unit]
+Description=PonceBot Alexa Custom Skill gateway
+After=network-online.target codexbot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/aponce/codexbot
+EnvironmentFile=/home/aponce/codexbot/codexbot.env
+Environment=ENV_FILE=/home/aponce/codexbot/codexbot.env
+Environment=CODEXBOT_PYTHON_BIN=/home/aponce/codexbot/.venv/bin/python
+Environment=BOT_STATE_FILE=/home/aponce/codexbot/state.json
+Environment=BOT_AUTH_USERS_FILE=/home/aponce/codexbot/users.json
+Environment=BOT_AUTH_PROFILES_FILE=/home/aponce/codexbot/profiles.json
+Environment=BOT_ORCHESTRATOR_DB_PATH=/home/aponce/codexbot/data/jobs.sqlite
+Environment=BOT_ORCHESTRATOR_AGENT_PROFILES=/home/aponce/codexbot/orchestrator/agents.yaml
+Environment=BOT_RUNBOOKS_PATH=/home/aponce/codexbot/orchestrator/runbooks.yaml
+Environment=BOT_WORKTREE_ROOT=/home/aponce/codexbot/data/worktrees
+Environment=BOT_ARTIFACTS_ROOT=/home/aponce/codexbot/data/artifacts
+Environment=PONCEBOT_ALEXA_LISTEN=127.0.0.1:8095
+ExecStart=/home/aponce/codexbot/.venv/bin/python /home/aponce/codexbot/alexa_gateway.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

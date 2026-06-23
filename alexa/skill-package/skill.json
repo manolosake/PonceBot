@@ -1,0 +1,64 @@
+{
+  "manifest": {
+    "manifestVersion": "1.0",
+    "publishingInformation": {
+      "category": "PRODUCTIVITY",
+      "isAvailableWorldwide": false,
+      "distributionCountries": [
+        "MX",
+        "US"
+      ],
+      "testingInstructions": "Private Echo Pop skill for Alejandro Ponce. Say: Alexa, abre Ponce Bot. Then ask Ponce Bot for status, agents, pending work, or a CEO command.",
+      "locales": {
+        "es-MX": {
+          "name": "Ponce Bot",
+          "summary": "Canal de voz privado para hablar con PonceBot desde un Echo Pop.",
+          "description": "Ponce Bot conecta Alexa con el plano on-demand de PonceBot en r530. Permite dictar preguntas o instrucciones cortas y escuchar la respuesta cuando el trabajo termina rapido; si tarda mas, deja un ticket en PonceBot.",
+          "examplePhrases": [
+            "Alexa, abre Ponce Bot",
+            "Alexa, pregunta a Ponce Bot que esta haciendo",
+            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+          ],
+          "keywords": [
+            "poncebot",
+            "productividad",
+            "asistente"
+          ]
+        },
+        "es-US": {
+          "name": "Ponce Bot",
+          "summary": "Private voice channel for PonceBot from an Echo Pop.",
+          "description": "Ponce Bot connects Alexa to the on-demand PonceBot command plane on r530. It lets Alejandro dictate short questions or commands and hear the answer when the job finishes quickly; longer work is queued as a PonceBot ticket.",
+          "examplePhrases": [
+            "Alexa, abre Ponce Bot",
+            "Alexa, pregunta a Ponce Bot que esta haciendo",
+            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+          ],
+          "keywords": [
+            "poncebot",
+            "productivity",
+            "assistant"
+          ]
+        }
+      }
+    },
+    "apis": {
+      "custom": {
+        "endpoint": {
+          "uri": "https://REPLACE_WITH_PUBLIC_HTTPS_HOST/alexa/REPLACE_WITH_PATH_SECRET"
+        }
+      }
+    },
+    "privacyAndCompliance": {
+      "allowsPurchases": false,
+      "usesPersonalInfo": false,
+      "isChildDirected": false,
+      "isExportCompliant": true,
+      "containsAds": false,
+      "locales": {
+        "es-MX": {},
+        "es-US": {}
+      }
+    }
+  }
+}
