@@ -2866,6 +2866,38 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(result["default_branch"], "main")
         self.assertTrue(result["_has_commit"])
 
+    def test_publication_probe_refreshes_stale_local_head_without_overwriting_branch(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "signal-deck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+
+            result = bot._studio_project_git_publication_probe(
+                {
+                    "project_path": str(project),
+                    "github_repo": "",
+                    "github_url": "",
+                    "default_branch": "stale-branch",
+                    "latest_head": "deadbee",
+                }
+            )
+
+        self.assertEqual(result["default_branch"], "stale-branch")
+        self.assertEqual(result["latest_head"], head)
+        self.assertTrue(result["_has_commit"])
+
     def test_publication_contract_reconcile_does_not_trust_arbitrary_github_remote_name(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:
             real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
@@ -2946,6 +2978,228 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(recovery_row["required_action"], "replace_non_github_remote_with_private_github_or_archive")
         self.assertIn("origin remote is not GitHub", recovery_row["reason"])
         self.assertIn('"github_repo"', recovery_row["missing_json"])
+
+    def test_publication_contract_reconcile_refreshes_stale_local_head_without_overwriting_branch_evidence(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "signal-deck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/signaldeck.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_172.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-stale-local",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/signaldeck",
+                                    "github_url": "https://github.com/manolosake/signaldeck.git",
+                                    "default_branch": "stale-branch",
+                                    "latest_head": "deadbee",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/signaldeck",
+                        "SignalDeck",
+                        str(project),
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "stale-branch",
+                        "deadbee",
+                        1,
+                        "published_private",
+                        "order-stale-local",
+                        "order-stale-local",
+                        "published_project",
+                        "Stored publication evidence is stale.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, default_branch, latest_head, updated_at FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, latest_head, updated_at FROM studio_publication_recovery"
+                ).fetchone()
+                job_row = conn.execute("SELECT trace, updated_at FROM jobs WHERE job_id = ?", ("order-stale-local",)).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["default_branch"], "stale-branch")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertEqual(project_row["updated_at"], now + 60)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["latest_head"], head)
+        self.assertEqual(recovery_row["updated_at"], now + 60)
+        self.assertIsNotNone(job_row)
+        trace = json.loads(str(job_row["trace"] or "{}"))
+        publication = trace.get("github_publication")
+        self.assertIsInstance(publication, dict)
+        self.assertEqual(publication["branch"], "stale-branch")
+        self.assertEqual(publication["default_branch"], "stale-branch")
+        self.assertEqual(publication["head"], head)
+        self.assertEqual(publication["latest_head"], head)
+        self.assertEqual(job_row["updated_at"], now + 60)
+
+    def test_publication_contract_reconcile_does_not_replace_default_branch_from_feature_checkout(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "signal-deck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "checkout", "-b", "feature/x"], cwd=project)
+            (project / "feature.txt").write_text("branch work\n", encoding="utf-8")
+            run(["git", "add", "feature.txt"], cwd=project)
+            run(["git", "commit", "-m", "feature work"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/signaldeck.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_272.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    "CREATE TABLE jobs(job_id TEXT PRIMARY KEY, trace TEXT NOT NULL DEFAULT '{}', updated_at REAL)"
+                )
+                conn.execute(
+                    "INSERT INTO jobs(job_id, trace, updated_at) VALUES (?, ?, ?)",
+                    (
+                        "order-feature-branch",
+                        json.dumps(
+                            {
+                                "github_publication": {
+                                    "ok": True,
+                                    "github_repo": "manolosake/signaldeck",
+                                    "github_url": "https://github.com/manolosake/signaldeck.git",
+                                    "default_branch": "main",
+                                    "latest_head": "deadbee",
+                                    "private": True,
+                                }
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/signaldeck",
+                        "SignalDeck",
+                        str(project),
+                        "manolosake/signaldeck",
+                        "https://github.com/manolosake/signaldeck.git",
+                        "main",
+                        "deadbee",
+                        1,
+                        "published_private",
+                        "order-feature-branch",
+                        "order-feature-branch",
+                        "published_project",
+                        "Stored publication evidence is stale.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, default_branch, latest_head, updated_at FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, latest_head, updated_at FROM studio_publication_recovery"
+                ).fetchone()
+                job_row = conn.execute("SELECT trace, updated_at FROM jobs WHERE job_id = ?", ("order-feature-branch",)).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertEqual(project_row["updated_at"], now + 60)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertEqual(recovery_row["required_action"], "resolve_publication_contract")
+        self.assertEqual(recovery_row["latest_head"], head)
+        self.assertEqual(recovery_row["updated_at"], now + 60)
+        self.assertIsNotNone(job_row)
+        trace = json.loads(str(job_row["trace"] or "{}"))
+        publication = trace.get("github_publication")
+        self.assertIsInstance(publication, dict)
+        self.assertEqual(publication["branch"], "main")
+        self.assertEqual(publication["default_branch"], "main")
+        self.assertEqual(publication["head"], head)
+        self.assertEqual(publication["latest_head"], head)
+        self.assertEqual(job_row["updated_at"], now + 60)
 
     def test_publication_contract_reconcile_keeps_unconfirmed_private_github_open(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:

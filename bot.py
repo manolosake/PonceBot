@@ -18668,11 +18668,18 @@ def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, 
     head = _run_git(project_dir, ["rev-parse", "--short", "HEAD"], check=False)
     if head.returncode == 0 and str(head.stdout or "").strip():
         result["_has_commit"] = True
-        if not str(result.get("latest_head") or "").strip():
-            result["latest_head"] = str(head.stdout or "").strip()
+        result["latest_head"] = str(head.stdout or "").strip()
+    branch_name = ""
     branch = _run_git(project_dir, ["branch", "--show-current"], check=False)
-    if branch.returncode == 0 and str(branch.stdout or "").strip() and not str(result.get("default_branch") or "").strip():
-        result["default_branch"] = str(branch.stdout or "").strip()
+    if branch.returncode == 0 and str(branch.stdout or "").strip():
+        branch_name = str(branch.stdout or "").strip()
+    if not branch_name:
+        symbolic = _run_git(project_dir, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        symbolic_name = str(symbolic.stdout or "").strip()
+        if symbolic.returncode == 0 and symbolic_name and symbolic_name != "HEAD":
+            branch_name = symbolic_name
+    if branch_name and not str(result.get("default_branch") or "").strip():
+        result["default_branch"] = branch_name
     if not str(result.get("default_branch") or "").strip():
         try:
             head_ref = (project_dir / ".git" / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
