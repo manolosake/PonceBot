@@ -18330,11 +18330,14 @@ def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
     latest_head = str(project.get("latest_head") or "").strip()
     private_raw = project.get("private")
     private_confirmed = _studio_github_publication_private_confirmed(private_raw)
-    github_remote_verified = bool(github_url and _github_repo_full_name_from_remote_url(github_url))
+    remote_repo = _github_repo_full_name_from_remote_url(github_url)
+    github_remote_verified = bool(github_url and remote_repo)
     if not github_repo:
         missing.append("github_repo")
     if not github_remote_verified:
         missing.append("github_url")
+    elif github_repo and remote_repo and github_repo != remote_repo:
+        missing.append("github_identity")
     if not latest_head:
         missing.append("latest_head")
     if not private_confirmed:
@@ -18344,14 +18347,18 @@ def _studio_publication_contract_missing(project: dict[str, Any]) -> list[str]:
 
 def _studio_publication_contract_reason(project: Mapping[str, Any], missing: Sequence[str]) -> str:
     reasons: list[str] = []
+    github_repo = str(project.get("github_repo") or "").strip()
     github_url = str(project.get("github_url") or "").strip()
-    if github_url and not _github_repo_full_name_from_remote_url(github_url):
+    remote_repo = _github_repo_full_name_from_remote_url(github_url)
+    if github_url and not remote_repo:
         reasons.append("origin remote is not GitHub")
     for field in missing:
         if field == "github_repo":
             reasons.append("github_repo missing")
-        elif field == "github_url" and not (github_url and not _github_repo_full_name_from_remote_url(github_url)):
+        elif field == "github_url" and not (github_url and not remote_repo):
             reasons.append("github_url missing")
+        elif field == "github_identity" and github_repo and remote_repo:
+            reasons.append(f"github_repo {github_repo} does not match github_url repo {remote_repo}")
         elif field == "latest_head":
             reasons.append("latest_head missing")
         elif field == "private":
@@ -18378,6 +18385,8 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
         return "commit_initial_and_publish_or_archive"
     if has_remote and not github_remote_verified:
         return "replace_non_github_remote_with_private_github_or_archive"
+    if "github_identity" in missing:
+        return "repair_github_repo_identity_or_archive"
     if not has_remote or "github_repo" in missing or "github_url" in missing:
         return "create_private_remote_and_push_or_archive"
     if "private" in missing:
@@ -18741,7 +18750,7 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 reconciled_rows.append((row, project, _studio_publication_contract_missing(project)))
             changed = 0
             for row, project, missing in reconciled_rows:
-                if missing:
+                if missing and "github_identity" not in missing:
                     sibling = _studio_complete_publication_sibling(project, reconciled_projects)
                     if sibling:
                         project = _studio_merge_publication_evidence(

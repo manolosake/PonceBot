@@ -2662,11 +2662,94 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(project_row["github_repo"], "manolosake/other-repo")
         self.assertEqual(project_row["github_url"], "https://github.com/manolosake/permit-sprint.git")
         self.assertEqual(project_row["latest_head"], head)
-        self.assertIn("private GitHub visibility unconfirmed", project_row["latest_summary"])
+        self.assertIn("does not match github_url repo", project_row["latest_summary"])
         self.assertIsNotNone(recovery_row)
         self.assertEqual(recovery_row["status"], "open")
-        self.assertEqual(recovery_row["required_action"], "confirm_private_github_repo_or_archive")
+        self.assertEqual(recovery_row["required_action"], "repair_github_repo_identity_or_archive")
+        self.assertIn("does not match github_url repo", recovery_row["reason"])
+        self.assertIn('"github_identity"', recovery_row["missing_json"])
         self.assertIn('"private"', recovery_row["missing_json"])
+
+    def test_publication_contract_reconcile_keeps_private_repo_url_mismatch_open(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "permit-sprint"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Permit Sprint\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/permit-sprint.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_222.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "manolosake/other-repo",
+                        "Permit Sprint",
+                        str(project),
+                        "manolosake/other-repo",
+                        "https://github.com/manolosake/permit-sprint.git",
+                        "main",
+                        head,
+                        1,
+                        "published_private",
+                        "order-private-identity-mismatch",
+                        "order-private-identity-mismatch",
+                        "published_project",
+                        "Published repo verified.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.object(bot, "_github_repo_private_visibility") as private_visibility:
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            private_visibility.assert_not_called()
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, private, github_repo, github_url, latest_head, latest_summary FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, reason, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["private"], 1)
+        self.assertEqual(project_row["github_repo"], "manolosake/other-repo")
+        self.assertEqual(project_row["github_url"], "https://github.com/manolosake/permit-sprint.git")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertIn("does not match github_url repo", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "repair_github_repo_identity_or_archive")
+        self.assertIn("does not match github_url repo", recovery_row["reason"])
+        self.assertIn('"github_identity"', recovery_row["missing_json"])
 
     def test_publication_contract_reconcile_recovers_github_remote_when_origin_is_non_github(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:
