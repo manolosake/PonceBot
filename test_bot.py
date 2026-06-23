@@ -2344,6 +2344,200 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("origin remote is not GitHub", recovery_row["reason"])
         self.assertIn('"github_url"', recovery_row["missing_json"])
 
+    def test_publication_contract_reconcile_recovers_github_remote_when_origin_is_non_github(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "winback-workbench"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Winback Workbench\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@example.com:team/winback-workbench.git"], cwd=project)
+            run(["git", "remote", "add", "github", "git@github.com:manolosake/winback-workbench.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_165.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project).lower(),
+                        "Winback Workbench",
+                        str(project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-github-remote",
+                        "order-github-remote",
+                        "published_project",
+                        "Local project needs publication evidence.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, default_branch, latest_head FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, reason FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "published_private")
+        self.assertEqual(project_row["github_repo"], "manolosake/winback-workbench")
+        self.assertIn("github.com", project_row["github_url"])
+        self.assertIn("manolosake/winback-workbench", project_row["github_url"])
+        self.assertEqual(project_row["default_branch"], "main")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "resolved")
+        self.assertNotIn("replace_non_github_remote_with_private_github_or_archive", str(recovery_row["required_action"] or ""))
+        self.assertNotIn("origin remote is not GitHub", str(recovery_row["reason"] or ""))
+
+    def test_publication_probe_prefers_origin_when_origin_is_github(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "signal-deck"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# SignalDeck\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@github.com:manolosake/signaldeck.git"], cwd=project)
+            run(["git", "remote", "add", "github", "git@github.com:manolosake/signaldeck-mirror.git"], cwd=project)
+
+            result = bot._studio_project_git_publication_probe(
+                {
+                    "project_path": str(project),
+                    "github_repo": "",
+                    "github_url": "",
+                    "default_branch": "",
+                    "latest_head": "",
+                }
+            )
+
+        self.assertEqual(result["github_repo"], "manolosake/signaldeck")
+        self.assertIn("github.com", result["github_url"])
+        self.assertIn("manolosake/signaldeck", result["github_url"])
+        self.assertNotIn("signaldeck-mirror", result["github_url"])
+        self.assertEqual(result["default_branch"], "main")
+        self.assertTrue(result["_has_commit"])
+
+    def test_publication_contract_reconcile_does_not_trust_arbitrary_github_remote_name(self) -> None:
+        def run(cmd: list[str], cwd: Path) -> str:
+            real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"
+            if cmd and cmd[0] == "git":
+                cmd = [real_git, *cmd[1:]]
+            return subprocess.run(cmd, cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "permit-sprint"
+            project.mkdir()
+            run(["git", "init", "-b", "main"], cwd=project)
+            run(["git", "config", "user.email", "test@example.com"], cwd=project)
+            run(["git", "config", "user.name", "test"], cwd=project)
+            (project / "README.md").write_text("# Permit Sprint\n", encoding="utf-8")
+            run(["git", "add", "README.md"], cwd=project)
+            run(["git", "commit", "-m", "initial"], cwd=project)
+            run(["git", "remote", "add", "origin", "git@example.com:team/permit-sprint.git"], cwd=project)
+            run(["git", "remote", "add", "upstream", "git@github.com:manolosake/permit-sprint.git"], cwd=project)
+            head = run(["git", "rev-parse", "--short", "HEAD"], cwd=project)
+            db = root / "jobs.sqlite"
+            now = 229_170.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(project).lower(),
+                        "Permit Sprint",
+                        str(project),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-upstream-remote",
+                        "order-upstream-remote",
+                        "published_project",
+                        "Local project needs publication evidence.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row = conn.execute(
+                    "SELECT status, github_repo, github_url, latest_head, latest_summary FROM studio_portfolio_projects"
+                ).fetchone()
+                recovery_row = conn.execute(
+                    "SELECT status, required_action, reason, missing_json FROM studio_publication_recovery"
+                ).fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(project_row)
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertEqual(project_row["github_repo"], "")
+        self.assertEqual(project_row["github_url"], "git@example.com:team/permit-sprint.git")
+        self.assertEqual(project_row["latest_head"], head)
+        self.assertIn("origin remote is not GitHub", project_row["latest_summary"])
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "replace_non_github_remote_with_private_github_or_archive")
+        self.assertIn("origin remote is not GitHub", recovery_row["reason"])
+        self.assertIn('"github_repo"', recovery_row["missing_json"])
+
     def test_publication_contract_reconcile_keeps_unconfirmed_private_github_open(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:
             real_git = os.environ.get("PONCEBOT_REAL_GIT") or shutil.which("git") or "git"

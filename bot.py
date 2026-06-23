@@ -18425,6 +18425,22 @@ def _studio_upsert_publication_recovery_conn(
 
 
 def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, Any]:
+    def _preferred_remote_url() -> str:
+        def _remote_url(name: str) -> str:
+            remote = _run_git(project_dir, ["remote", "get-url", name], check=False)
+            if remote.returncode != 0:
+                return ""
+            return str(remote.stdout or "").strip()
+
+        origin_url = _remote_url("origin")
+        if _github_repo_full_name_from_remote_url(origin_url):
+            return origin_url
+
+        github_url = _remote_url("github")
+        if _github_repo_full_name_from_remote_url(github_url):
+            return github_url
+        return origin_url
+
     result = dict(project)
     project_path = str(result.get("project_path") or "").strip()
     if not project_path:
@@ -18445,9 +18461,7 @@ def _studio_project_git_publication_probe(project: dict[str, Any]) -> dict[str, 
     if not result["_has_git"]:
         return result
     if not str(result.get("github_url") or "").strip():
-        remote = _run_git(project_dir, ["remote", "get-url", "origin"], check=False)
-        if remote.returncode == 0:
-            result["github_url"] = str(remote.stdout or "").strip()
+        result["github_url"] = _preferred_remote_url()
     if not str(result.get("github_repo") or "").strip() and str(result.get("github_url") or "").strip():
         result["github_repo"] = _github_repo_full_name_from_remote_url(str(result.get("github_url") or ""))
     head = _run_git(project_dir, ["rev-parse", "--short", "HEAD"], check=False)
