@@ -17310,6 +17310,7 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         "studio_quality_low_24h": 0,
         "studio_publication_recovery_count": 0,
         "studio_publication_recovery_items": [],
+        "studio_publication_recovery_records": [],
     }
     cutoff = float(now) - 72.0 * 3600.0
     try:
@@ -17492,7 +17493,8 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
             if recovery_table:
                 recovery_rows = conn.execute(
                     """
-                    SELECT project_key, project_name, project_path, github_repo, required_action, reason, updated_at
+                    SELECT recovery_id, project_key, project_name, project_path, github_repo,
+                           required_action, reason, source_order_id, updated_at
                     FROM studio_publication_recovery
                     WHERE status = 'open'
                     ORDER BY updated_at DESC
@@ -17512,6 +17514,19 @@ def _studio_recent_cycle_outcome_memory(db_path: Path, *, now: float) -> dict[st
         path = str(row["project_path"] or "").strip()
         repo = str(row["github_repo"] or "").strip()
         reason = _studio_one_line(row["reason"], max_chars=90, default="")
+        memory["studio_publication_recovery_records"].append(
+            {
+                "recovery_id": str(row["recovery_id"] or "").strip().lower(),
+                "project_key": str(row["project_key"] or "").strip().lower(),
+                "project_name": name,
+                "project_path": path,
+                "github_repo": repo,
+                "required_action": action,
+                "reason": reason,
+                "source_order_id": str(row["source_order_id"] or "").strip(),
+                "updated_at": float(row["updated_at"] or 0.0),
+            }
+        )
         bits = [name]
         if action:
             bits.append(action)
@@ -19627,6 +19642,12 @@ def _studio_publication_recovery_opportunity(memory: dict[str, Any]) -> dict[str
         for item in (memory.get("studio_publication_recovery_items") or [])[:5]
         if str(item).strip()
     ]
+    records = [
+        dict(item)
+        for item in (memory.get("studio_publication_recovery_records") or [])[:5]
+        if isinstance(item, dict)
+    ]
+    primary = records[0] if records else {}
     item_text = "; ".join(items) or "publication recovery queue has open items"
     opportunity = {
         "key": "publication-recovery",
@@ -19668,6 +19689,12 @@ def _studio_publication_recovery_opportunity(memory: dict[str, Any]) -> dict[str
             f"Publication debt blocks trustworthy factory outcomes. Open items: {_studio_one_line(item_text, max_chars=240)}"
         ),
         "publication_recovery_items": items,
+        "recovery_id": str(primary.get("recovery_id") or "").strip().lower(),
+        "recovery_project_key": str(primary.get("project_key") or "").strip().lower(),
+        "recovery_project_name": str(primary.get("project_name") or "").strip(),
+        "recovery_project_path": str(primary.get("project_path") or "").strip(),
+        "recovery_github_repo": str(primary.get("github_repo") or "").strip(),
+        "recovery_source_order_id": str(primary.get("source_order_id") or "").strip(),
     }
     return _studio_apply_factory_value_assessment(opportunity)
 
@@ -20651,6 +20678,13 @@ def _studio_complete_cycle_for_order_db(
                 outcome_summary=outcome_summary,
                 now=ts,
             )
+            _studio_close_negative_publication_recovery_for_order_conn(
+                conn=conn,
+                order_id=order_id,
+                outcome_status=outcome_status,
+                outcome_summary=outcome_summary,
+                now=ts,
+            )
             _studio_record_quality_audit_for_order_conn(
                 conn=conn,
                 order_id=order_id,
@@ -20677,6 +20711,125 @@ def _studio_complete_cycle_for_order(
         outcome_status=outcome_status,
         outcome_summary=outcome_summary,
         now=now,
+    )
+
+
+def _studio_close_negative_publication_recovery_for_order_conn(
+    *,
+    conn: sqlite3.Connection,
+    order_id: str,
+    outcome_status: str,
+    outcome_summary: str,
+    now: float,
+) -> None:
+    negative_outcomes = {"rejected_low_value", "blocked_need_operator", "failed_root_caused"}
+    if str(outcome_status or "").strip() not in negative_outcomes:
+        return
+    order_id = str(order_id or "").strip()
+    if not order_id:
+        return
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='studio_publication_recovery'"
+    ).fetchone()
+    if table is None:
+        return
+
+    trace: dict[str, Any] = {}
+    try:
+        row = conn.execute("SELECT trace FROM jobs WHERE job_id = ?", (order_id,)).fetchone()
+        if row is not None:
+            raw_trace = row["trace"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(raw_trace, str) and raw_trace.strip():
+                parsed = json.loads(raw_trace)
+                if isinstance(parsed, dict):
+                    trace = parsed
+    except Exception:
+        trace = {}
+
+    recovery_id = str(trace.get("studio_recovery_id") or "").strip().lower()
+    project_key = str(trace.get("studio_recovery_project_key") or "").strip().lower()
+    github_repo = str(trace.get("studio_recovery_github_repo") or "").strip().lower()
+    project_path = str(trace.get("studio_recovery_project_path") or "").strip()
+    source_order_id = str(trace.get("studio_recovery_source_order_id") or "").strip()
+
+    target_row = None
+    if recovery_id:
+        target_row = conn.execute(
+            """
+            SELECT recovery_id
+            FROM studio_publication_recovery
+            WHERE recovery_id = ?
+              AND status = 'open'
+            LIMIT 1
+            """,
+            (recovery_id,),
+        ).fetchone()
+    if target_row is None and project_key:
+        target_row = conn.execute(
+            """
+            SELECT recovery_id
+            FROM studio_publication_recovery
+            WHERE project_key = ?
+              AND status = 'open'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (project_key,),
+        ).fetchone()
+    if target_row is None and github_repo:
+        target_row = conn.execute(
+            """
+            SELECT recovery_id
+            FROM studio_publication_recovery
+            WHERE LOWER(COALESCE(github_repo, '')) = ?
+              AND status = 'open'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (github_repo,),
+        ).fetchone()
+    if target_row is None and project_path:
+        target_row = conn.execute(
+            """
+            SELECT recovery_id
+            FROM studio_publication_recovery
+            WHERE project_path = ?
+              AND status = 'open'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (project_path,),
+        ).fetchone()
+    if target_row is None and source_order_id:
+        target_row = conn.execute(
+            """
+            SELECT recovery_id
+            FROM studio_publication_recovery
+            WHERE source_order_id = ?
+              AND status = 'open'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (source_order_id,),
+        ).fetchone()
+    if target_row is None:
+        return
+
+    conn.execute(
+        """
+        UPDATE studio_publication_recovery
+        SET status = ?,
+            reason = ?,
+            updated_at = ?
+        WHERE recovery_id = ?
+          AND status = 'open'
+        """,
+        (
+            str(outcome_status).strip(),
+            _studio_one_line(outcome_summary, max_chars=500, default=str(outcome_status)),
+            float(now),
+            str(target_row["recovery_id"] if isinstance(target_row, sqlite3.Row) else target_row[0]),
+        ),
     )
 
 
@@ -22625,6 +22778,24 @@ def _spawn_proactive_order(
         if is_publication_recovery_lane
         else []
     )
+    recovery_target_lines = []
+    if is_publication_recovery_lane:
+        recovery_name = str(studio_selected.get("recovery_project_name") or "").strip()
+        recovery_path = str(studio_selected.get("recovery_project_path") or "").strip()
+        recovery_repo = str(studio_selected.get("recovery_github_repo") or "").strip()
+        recovery_id = str(studio_selected.get("recovery_id") or "").strip().lower()
+        recovery_source_order_id = str(studio_selected.get("recovery_source_order_id") or "").strip()
+        if recovery_name or recovery_path or recovery_repo or recovery_id:
+            recovery_target_lines = [
+                "Primary recovery target:",
+                f"- recovery_id: {recovery_id or '(unknown)'}",
+                f"- project: {recovery_name or '(unknown)'}",
+                f"- repo: {recovery_repo or '(none)'}",
+                f"- path: {recovery_path or '(none)'}",
+                f"- source_order_id: {recovery_source_order_id or '(none)'}",
+                "- If you close this target negatively, the terminal outcome summary must name the asset and the exact reject/block/failure evidence.",
+                "",
+            ]
 
     prompt_lines = [
         "AUTONOMOUS PROACTIVE SPRINT",
@@ -22664,6 +22835,7 @@ def _spawn_proactive_order(
                 "Studio packet:",
                 str(studio_cycle.get("prompt_packet") or "").strip(),
                 "",
+                *recovery_target_lines,
             ]
             if studio_cycle
             else []
@@ -22733,6 +22905,12 @@ def _spawn_proactive_order(
         "studio_evidence_target": str(studio_selected.get("evidence_target") or "").strip() or None,
         "studio_risk_summary": str(studio_selected.get("risk_summary") or "").strip() or None,
         "studio_opportunity_count": len(studio_opportunities),
+        "studio_recovery_id": (str(studio_selected.get("recovery_id") or "").strip().lower() or None),
+        "studio_recovery_project_key": (str(studio_selected.get("recovery_project_key") or "").strip().lower() or None),
+        "studio_recovery_project_name": (str(studio_selected.get("recovery_project_name") or "").strip() or None),
+        "studio_recovery_project_path": (str(studio_selected.get("recovery_project_path") or "").strip() or None),
+        "studio_recovery_github_repo": (str(studio_selected.get("recovery_github_repo") or "").strip() or None),
+        "studio_recovery_source_order_id": (str(studio_selected.get("recovery_source_order_id") or "").strip() or None),
         "required_outcome_types": list(_STUDIO_OUTCOME_TYPES),
         "runbook_id": "skynet_proactive_lane",
         "profile_name": str(base_profile.get("name") or controller_role),
@@ -22804,6 +22982,12 @@ def _spawn_proactive_order(
             studio_thesis=(str(studio_selected.get("thesis") or "").strip() or None),
             studio_operator_visible_outcome=(str(studio_selected.get("operator_visible_outcome") or "").strip() or None),
             studio_evidence_target=(str(studio_selected.get("evidence_target") or "").strip() or None),
+            studio_recovery_id=(str(studio_selected.get("recovery_id") or "").strip().lower() or None),
+            studio_recovery_project_key=(str(studio_selected.get("recovery_project_key") or "").strip().lower() or None),
+            studio_recovery_project_name=(str(studio_selected.get("recovery_project_name") or "").strip() or None),
+            studio_recovery_project_path=(str(studio_selected.get("recovery_project_path") or "").strip() or None),
+            studio_recovery_github_repo=(str(studio_selected.get("recovery_github_repo") or "").strip() or None),
+            studio_recovery_source_order_id=(str(studio_selected.get("recovery_source_order_id") or "").strip() or None),
         )
         if studio_cycle_id:
             _studio_attach_order(cfg=cfg, cycle_id=studio_cycle_id, order_id=order_id, now=now)
