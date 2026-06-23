@@ -87,7 +87,7 @@ class AlexaGateway:
         req_type = str(req.get("type") or "").strip()
         if req_type == "LaunchRequest":
             return _alexa_response(
-                "Aqui control del servidor, conectado a PonceBot. Que necesitas?",
+                "Aqui servidor remoto, conectado a r530. Que necesitas?",
                 reprompt="Dime que quieres revisar o pedir.",
                 should_end_session=False,
             )
@@ -97,7 +97,7 @@ class AlexaGateway:
 
         if req_type != "IntentRequest":
             return _alexa_response(
-                "No pude entender esa solicitud. Puedes decir: pregunta a control del servidor.",
+                "No pude entender esa solicitud. Puedes decir: pregunta a servidor remoto.",
                 reprompt="Que quieres revisar o pedir?",
                 should_end_session=False,
             )
@@ -110,14 +110,14 @@ class AlexaGateway:
 
         if intent_name in ("AMAZON.HelpIntent", "AMAZON.NavigateHomeIntent"):
             return _alexa_response(
-                "Puedes decir: pregunta a control del servidor que tengo pendiente hoy.",
+                "Puedes decir: pregunta a servidor remoto que tengo pendiente hoy.",
                 reprompt="Que quieres revisar o pedir?",
                 should_end_session=False,
             )
 
         if intent_name in ("AMAZON.FallbackIntent", ""):
             return _alexa_response(
-                "No cache la instruccion. Intenta con: pregunta a control del servidor.",
+                "No cache la instruccion. Intenta con: pregunta a servidor remoto.",
                 reprompt="Dime que quieres revisar o pedir.",
                 should_end_session=False,
             )
@@ -148,7 +148,7 @@ class AlexaGateway:
                     _speech_text(summary, max_chars=self.gateway_cfg.max_speech_chars),
                     reprompt="Quieres pedirle algo mas al servidor?",
                     should_end_session=False,
-                    card_title="Control del Servidor",
+                    card_title="Servidor Remoto",
                     card_text=summary,
                 )
             if task.state in ("failed", "cancelled"):

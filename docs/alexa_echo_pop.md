@@ -93,7 +93,7 @@ https://r530.tail3525c1.ts.net/alexa/pon-un-secreto-largo-aqui
 
 1. Crear una Custom Skill.
 2. Locales configurados: `es-MX`, `es-US` y `es-ES`.
-3. Invocation name: `control del servidor`.
+3. Invocation name: `servidor remoto`.
 4. Importar o copiar el skill package desde `alexa/skill-package`.
 5. Si se configura manualmente, copiar el interaction model desde:
    - `alexa/skill-package/interactionModels/custom/es-MX.json`
@@ -118,7 +118,7 @@ configurado.
 ## Frases de uso
 
 ```text
-Alexa, abre control del servidor.
-Alexa, pregunta a control del servidor que tengo pendiente hoy.
-Alexa, dile a control del servidor revisa el estado de los agentes.
+Alexa, abre servidor remoto.
+Alexa, pregunta a servidor remoto que tengo pendiente hoy.
+Alexa, dile a servidor remoto revisa el estado de los agentes.
 ```

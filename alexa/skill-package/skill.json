@@ -9,16 +9,16 @@
         "MX",
         "US"
       ],
-      "testingInstructions": "Private Echo Pop skill for Alejandro Ponce. Say: Alexa, abre control del servidor. Then ask for status, agents, pending work, or a CEO command. The backend is PonceBot on r530.",
+      "testingInstructions": "Private Echo Pop skill for Alejandro Ponce. Say: Alexa, abre servidor remoto. Then ask for status, agents, pending work, or a CEO command. The backend runs on r530.",
       "locales": {
         "es-MX": {
-          "name": "Control del Servidor",
-          "summary": "Control privado de voz para r530 desde un Echo Pop.",
-          "description": "Control del Servidor conecta Alexa con PonceBot en r530. Permite dictar preguntas o instrucciones cortas, consultar estado operativo y dejar trabajos en cola cuando el resultado tarda mas de unos segundos.",
+          "name": "Servidor Remoto",
+          "summary": "Control privado de voz para revisar r530 desde Alexa.",
+          "description": "Servidor Remoto conecta Alexa con el servidor privado r530 para consultar estado operativo y enviar instrucciones cortas. Es una skill privada de productividad para uso personal.",
           "examplePhrases": [
-            "Alexa, abre control del servidor",
-            "Alexa, pregunta a control del servidor que esta haciendo",
-            "Alexa, dile a control del servidor revisa el estado de los agentes"
+            "Alexa, abre servidor remoto",
+            "Alexa, pregunta a servidor remoto que esta haciendo",
+            "Alexa, dile a servidor remoto revisa el estado de los agentes"
           ],
           "keywords": [
             "servidor",
@@ -27,28 +27,28 @@
           ]
         },
         "es-US": {
-          "name": "Control del Servidor",
-          "summary": "Private voice control for r530 from an Echo Pop.",
-          "description": "Control del Servidor connects Alexa to PonceBot on r530. It lets Alejandro dictate short questions or commands, check operational status, and queue work when the result takes more than a few seconds.",
+          "name": "Servidor Remoto",
+          "summary": "Control privado de voz para revisar r530 desde Alexa.",
+          "description": "Servidor Remoto conecta Alexa con el servidor privado r530 para consultar estado operativo y enviar instrucciones cortas. Es una skill privada de productividad para uso personal.",
           "examplePhrases": [
-            "Alexa, abre control del servidor",
-            "Alexa, pregunta a control del servidor que esta haciendo",
-            "Alexa, dile a control del servidor revisa el estado de los agentes"
+            "Alexa, abre servidor remoto",
+            "Alexa, pregunta a servidor remoto que esta haciendo",
+            "Alexa, dile a servidor remoto revisa el estado de los agentes"
           ],
           "keywords": [
             "servidor",
-            "productivity",
-            "assistant"
+            "asistente",
+            "productividad"
           ]
         },
         "es-ES": {
-          "name": "Control del Servidor",
-          "summary": "Control privado de voz para r530 desde un Echo Pop.",
-          "description": "Control del Servidor conecta Alexa con PonceBot en r530. Permite dictar preguntas o instrucciones cortas, consultar estado operativo y dejar trabajos en cola cuando el resultado tarda mas de unos segundos.",
+          "name": "Servidor Remoto",
+          "summary": "Control privado de voz para revisar r530 desde Alexa.",
+          "description": "Servidor Remoto conecta Alexa con el servidor privado r530 para consultar estado operativo y enviar instrucciones cortas. Es una skill privada de productividad para uso personal.",
           "examplePhrases": [
-            "Alexa, abre control del servidor",
-            "Alexa, pregunta a control del servidor que esta haciendo",
-            "Alexa, dile a control del servidor revisa el estado de los agentes"
+            "Alexa, abre servidor remoto",
+            "Alexa, pregunta a servidor remoto que esta haciendo",
+            "Alexa, dile a servidor remoto revisa el estado de los agentes"
           ],
           "keywords": [
             "servidor",
