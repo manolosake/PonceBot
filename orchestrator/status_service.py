@@ -1000,12 +1000,13 @@ def _release_target_evidence(root_trace: dict[str, Any]) -> list[dict[str, Any]]
 
     publication = trace.get("github_publication") if isinstance(trace.get("github_publication"), dict) else {}
     publication_ok = bool(publication.get("ok", False))
-    publication_target = (
-        str(publication.get("github_repo") or "").strip()
-        or str(publication.get("remote_url") or "").strip()
-        or str(publication.get("project_path") or "").strip()
-    )
-    if publication_ok and publication_target:
+    publication_latest_head = str(publication.get("latest_head") or "").strip()
+    publication_repo = str(publication.get("github_repo") or "").strip()
+    publication_url = str(publication.get("github_url") or "").strip() or str(publication.get("remote_url") or "").strip()
+    publication_url_l = publication_url.lower()
+    publication_has_github_url = publication_url_l.startswith("https://github.com/") or publication_url_l.startswith("http://github.com/") or publication_url.startswith("git@github.com:")
+    publication_target = publication_repo or (publication_url if publication_has_github_url else "")
+    if publication_ok and publication_target and publication_latest_head:
         evidence.append({"kind": "trace", "key": "github_publication", "value": publication_target})
 
     delivery = trace.get("project_incubator_delivery") if isinstance(trace.get("project_incubator_delivery"), dict) else {}

@@ -428,6 +428,63 @@ class TestStatusWorkflowSummary(unittest.TestCase):
                 "manolosake/signaldeck",
             )
 
+    def test_release_readiness_rejects_local_only_recovered_github_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "55555555-6666-7777-8888-999999999999"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={
+                    "github_publication": {
+                        "ok": True,
+                        "project_path": "/home/aponce/local-only-project",
+                        "latest_head": "2efec0a",
+                    }
+                },
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
+
+    def test_release_readiness_rejects_incomplete_recovered_github_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
+            profiles = {"skynet": {"role": "skynet", "max_parallel_jobs": 1}}
+            q = OrchestratorQueue(storage=storage, role_profiles=profiles)
+            order_id = "66666666-7777-8888-9999-000000000000"
+            self._make_ready_proactive_order(
+                q,
+                order_id=order_id,
+                trace_extra={
+                    "github_publication": {
+                        "ok": True,
+                        "github_repo": "manolosake/signaldeck",
+                        "github_url": "https://github.com/manolosake/signaldeck.git",
+                        "project_path": "/home/aponce/signaldeck",
+                    }
+                },
+            )
+
+            svc = StatusService(orch_q=q, role_profiles=profiles, cache_ttl_seconds=0)
+            packet = svc.order_evidence_packet(order_id)
+            readiness = packet["release_readiness"]
+
+            self.assertEqual(readiness["state"], "not_ready")
+            self.assertEqual(readiness["verdict"], "wait")
+            checks = {check["key"]: check for check in readiness["checks"]}
+            self.assertEqual(checks["release_target_evidence"]["status"], "pending")
+            self.assertEqual(checks["release_target_evidence"]["evidence"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
