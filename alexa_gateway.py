@@ -87,8 +87,8 @@ class AlexaGateway:
         req_type = str(req.get("type") or "").strip()
         if req_type == "LaunchRequest":
             return _alexa_response(
-                "Aqui Ponce Bot. Que necesitas?",
-                reprompt="Dime que quieres preguntarle a Ponce Bot.",
+                "Aqui control del servidor, conectado a PonceBot. Que necesitas?",
+                reprompt="Dime que quieres revisar o pedir.",
                 should_end_session=False,
             )
 
@@ -97,8 +97,8 @@ class AlexaGateway:
 
         if req_type != "IntentRequest":
             return _alexa_response(
-                "No pude entender esa solicitud. Puedes decir: pregunta a Ponce Bot.",
-                reprompt="Que quieres preguntarle a Ponce Bot?",
+                "No pude entender esa solicitud. Puedes decir: pregunta a control del servidor.",
+                reprompt="Que quieres revisar o pedir?",
                 should_end_session=False,
             )
 
@@ -110,30 +110,30 @@ class AlexaGateway:
 
         if intent_name in ("AMAZON.HelpIntent", "AMAZON.NavigateHomeIntent"):
             return _alexa_response(
-                "Puedes decir: pregunta a Ponce Bot que tengo pendiente hoy.",
-                reprompt="Que quieres preguntarle a Ponce Bot?",
+                "Puedes decir: pregunta a control del servidor que tengo pendiente hoy.",
+                reprompt="Que quieres revisar o pedir?",
                 should_end_session=False,
             )
 
         if intent_name in ("AMAZON.FallbackIntent", ""):
             return _alexa_response(
-                "No cache la instruccion. Intenta con: pregunta a Ponce Bot.",
-                reprompt="Dime tu pregunta para Ponce Bot.",
+                "No cache la instruccion. Intenta con: pregunta a control del servidor.",
+                reprompt="Dime que quieres revisar o pedir.",
                 should_end_session=False,
             )
 
         if intent_name != "AskPonceIntent":
             return _alexa_response(
-                "Ese intent todavia no esta conectado a Ponce Bot.",
-                reprompt="Que quieres preguntarle a Ponce Bot?",
+                "Ese intent todavia no esta conectado al servidor.",
+                reprompt="Que quieres revisar o pedir?",
                 should_end_session=False,
             )
 
         query = _extract_query(intent).strip()
         if not query:
             return _alexa_response(
-                "Que quieres preguntarle a Ponce Bot?",
-                reprompt="Dime tu pregunta para Ponce Bot.",
+                "Que quieres revisar o pedir?",
+                reprompt="Dime que quieres revisar o pedir.",
                 should_end_session=False,
             )
 
@@ -146,20 +146,20 @@ class AlexaGateway:
             if task.state == "done" and result_status in ("", "ok") and summary:
                 return _alexa_response(
                     _speech_text(summary, max_chars=self.gateway_cfg.max_speech_chars),
-                    reprompt="Quieres pedirle algo mas a Ponce Bot?",
+                    reprompt="Quieres pedirle algo mas al servidor?",
                     should_end_session=False,
-                    card_title="Ponce Bot",
+                    card_title="Control del Servidor",
                     card_text=summary,
                 )
             if task.state in ("failed", "cancelled"):
                 return _alexa_response(
-                    "Ponce Bot no pudo completar eso. Ya quedo registrado para revisarlo.",
+                    "El servidor no pudo completar eso. Ya quedo registrado para revisarlo.",
                     should_end_session=False,
                 )
 
         return _alexa_response(
-            f"Listo, se lo pase a Ponce Bot. Ticket {job_id[:8]}.",
-            reprompt="Puedes pedirme otra cosa para Ponce Bot.",
+            f"Listo, se lo pase al servidor. Ticket {job_id[:8]}.",
+            reprompt="Puedes pedirme otra cosa para el servidor.",
             should_end_session=False,
         )
 

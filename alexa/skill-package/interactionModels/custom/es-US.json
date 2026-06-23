@@ -1,7 +1,7 @@
 {
   "interactionModel": {
     "languageModel": {
-      "invocationName": "ponce bot",
+      "invocationName": "control del servidor",
       "intents": [
         {
           "name": "AskPonceIntent",
@@ -13,20 +13,17 @@
           ],
           "samples": [
             "pregunta {query}",
-            "pregunta a ponce bot {query}",
             "preguntale {query}",
-            "preguntale a ponce bot {query}",
             "dile {query}",
-            "dile a ponce bot {query}",
             "necesito {query}",
             "quiero {query}",
             "revisa {query}",
-            "revisa con ponce bot {query}",
             "consulta {query}",
-            "consulta con ponce bot {query}",
             "que {query}",
             "cual es {query}",
-            "como va {query}"
+            "como va {query}",
+            "estado de {query}",
+            "verifica {query}"
           ]
         },
         {

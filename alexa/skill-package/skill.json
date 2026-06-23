@@ -9,49 +9,49 @@
         "MX",
         "US"
       ],
-      "testingInstructions": "Private Echo Pop skill for Alejandro Ponce. Say: Alexa, abre Ponce Bot. Then ask Ponce Bot for status, agents, pending work, or a CEO command.",
+      "testingInstructions": "Private Echo Pop skill for Alejandro Ponce. Say: Alexa, abre control del servidor. Then ask for status, agents, pending work, or a CEO command. The backend is PonceBot on r530.",
       "locales": {
         "es-MX": {
-          "name": "Ponce Bot",
-          "summary": "Canal de voz privado para hablar con PonceBot desde un Echo Pop.",
-          "description": "Ponce Bot conecta Alexa con el plano on-demand de PonceBot en r530. Permite dictar preguntas o instrucciones cortas y escuchar la respuesta cuando el trabajo termina rapido; si tarda mas, deja un ticket en PonceBot.",
+          "name": "Control del Servidor",
+          "summary": "Control privado de voz para r530 desde un Echo Pop.",
+          "description": "Control del Servidor conecta Alexa con PonceBot en r530. Permite dictar preguntas o instrucciones cortas, consultar estado operativo y dejar trabajos en cola cuando el resultado tarda mas de unos segundos.",
           "examplePhrases": [
-            "Alexa, abre Ponce Bot",
-            "Alexa, pregunta a Ponce Bot que esta haciendo",
-            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+            "Alexa, abre control del servidor",
+            "Alexa, pregunta a control del servidor que esta haciendo",
+            "Alexa, dile a control del servidor revisa el estado de los agentes"
           ],
           "keywords": [
-            "poncebot",
+            "servidor",
             "productividad",
             "asistente"
           ]
         },
         "es-US": {
-          "name": "Ponce Bot",
-          "summary": "Private voice channel for PonceBot from an Echo Pop.",
-          "description": "Ponce Bot connects Alexa to the on-demand PonceBot command plane on r530. It lets Alejandro dictate short questions or commands and hear the answer when the job finishes quickly; longer work is queued as a PonceBot ticket.",
+          "name": "Control del Servidor",
+          "summary": "Private voice control for r530 from an Echo Pop.",
+          "description": "Control del Servidor connects Alexa to PonceBot on r530. It lets Alejandro dictate short questions or commands, check operational status, and queue work when the result takes more than a few seconds.",
           "examplePhrases": [
-            "Alexa, abre Ponce Bot",
-            "Alexa, pregunta a Ponce Bot que esta haciendo",
-            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+            "Alexa, abre control del servidor",
+            "Alexa, pregunta a control del servidor que esta haciendo",
+            "Alexa, dile a control del servidor revisa el estado de los agentes"
           ],
           "keywords": [
-            "poncebot",
+            "servidor",
             "productivity",
             "assistant"
           ]
         },
         "es-ES": {
-          "name": "Ponce Bot",
-          "summary": "Canal de voz privado para hablar con PonceBot desde un Echo Pop.",
-          "description": "Ponce Bot conecta Alexa con el plano on-demand de PonceBot en r530. Permite dictar preguntas o instrucciones cortas y escuchar la respuesta cuando el trabajo termina rapido; si tarda mas, deja un ticket en PonceBot.",
+          "name": "Control del Servidor",
+          "summary": "Control privado de voz para r530 desde un Echo Pop.",
+          "description": "Control del Servidor conecta Alexa con PonceBot en r530. Permite dictar preguntas o instrucciones cortas, consultar estado operativo y dejar trabajos en cola cuando el resultado tarda mas de unos segundos.",
           "examplePhrases": [
-            "Alexa, abre Ponce Bot",
-            "Alexa, pregunta a Ponce Bot que esta haciendo",
-            "Alexa, dile a Ponce Bot revisa el estado de los agentes"
+            "Alexa, abre control del servidor",
+            "Alexa, pregunta a control del servidor que esta haciendo",
+            "Alexa, dile a control del servidor revisa el estado de los agentes"
           ],
           "keywords": [
-            "poncebot",
+            "servidor",
             "productividad",
             "asistente"
           ]

@@ -43,7 +43,9 @@ def test_extract_query_from_search_slot() -> None:
 
 
 def test_launch_response_keeps_session_open() -> None:
-    out = alexa_gateway._alexa_response("Aqui Ponce Bot.", reprompt="Que necesitas?", should_end_session=False)
+    out = alexa_gateway._alexa_response(
+        "Aqui control del servidor.", reprompt="Que necesitas?", should_end_session=False
+    )
     assert out["version"] == "1.0"
     assert out["response"]["shouldEndSession"] is False
     assert out["response"]["outputSpeech"]["type"] == "SSML"
@@ -158,7 +160,7 @@ def test_alexa_skill_package_has_manifest_and_locales() -> None:
     assert "REPLACE_WITH_PUBLIC_HTTPS_HOST" in uri
     locales = manifest["manifest"]["publishingInformation"]["locales"]
     assert set(locales) >= {"es-MX", "es-US"}
-    assert locales["es-MX"]["name"] == "Ponce Bot"
+    assert locales["es-MX"]["name"] == "Control del Servidor"
 
 
 def test_alexa_interaction_models_route_freeform_query() -> None:
@@ -179,6 +181,6 @@ def test_alexa_interaction_models_route_freeform_query() -> None:
             if intent["name"] == "AskPonceIntent"
         )
 
-        assert language_model["invocationName"] == "ponce bot"
+        assert language_model["invocationName"] == "control del servidor"
         assert {"name": "query", "type": "AMAZON.SearchQuery"} in ask_intent["slots"]
         assert any("{query}" in sample for sample in ask_intent["samples"])
