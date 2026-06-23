@@ -18394,6 +18394,43 @@ def _studio_upsert_publication_recovery_conn(
     if not key:
         return
     action = _studio_publication_recovery_action(project, missing)
+    project_name = str(project.get("project_name") or "")
+    project_path = str(project.get("project_path") or "")
+    github_repo = str(project.get("github_repo") or "")
+    github_url = str(project.get("github_url") or "")
+    latest_head = str(project.get("latest_head") or "")
+    missing_json = _studio_json(list(dict.fromkeys(missing)))
+    status_value = str(status or "open")
+    reason_value = _studio_one_line(reason, max_chars=500, default=action)
+    source_order_id = str(project.get("source_order_id") or project.get("latest_order_id") or "")
+    existing = conn.execute(
+        """
+        SELECT project_name, project_path, github_repo, github_url, latest_head, missing_json,
+               required_action, status, reason, source_order_id
+        FROM studio_publication_recovery
+        WHERE recovery_id = ?
+        """,
+        (key,),
+    ).fetchone()
+    if existing is not None:
+        effective_project_path = project_path or str(existing["project_path"] or "")
+        effective_github_repo = github_repo or str(existing["github_repo"] or "")
+        effective_github_url = github_url or str(existing["github_url"] or "")
+        effective_latest_head = latest_head or str(existing["latest_head"] or "")
+        effective_source_order_id = source_order_id or str(existing["source_order_id"] or "")
+        if (
+            str(existing["project_name"] or "") == project_name
+            and str(existing["project_path"] or "") == effective_project_path
+            and str(existing["github_repo"] or "") == effective_github_repo
+            and str(existing["github_url"] or "") == effective_github_url
+            and str(existing["latest_head"] or "") == effective_latest_head
+            and str(existing["missing_json"] or "") == missing_json
+            and str(existing["required_action"] or "") == action
+            and str(existing["status"] or "") == status_value
+            and str(existing["reason"] or "") == reason_value
+            and str(existing["source_order_id"] or "") == effective_source_order_id
+        ):
+            return
     conn.execute(
         """
         INSERT INTO studio_publication_recovery(
@@ -18417,16 +18454,16 @@ def _studio_upsert_publication_recovery_conn(
         (
             key,
             key,
-            str(project.get("project_name") or ""),
-            str(project.get("project_path") or ""),
-            str(project.get("github_repo") or ""),
-            str(project.get("github_url") or ""),
-            str(project.get("latest_head") or ""),
-            _studio_json(list(dict.fromkeys(missing))),
+            project_name,
+            project_path,
+            github_repo,
+            github_url,
+            latest_head,
+            missing_json,
             action,
-            str(status or "open"),
-            _studio_one_line(reason, max_chars=500, default=action),
-            str(project.get("source_order_id") or project.get("latest_order_id") or ""),
+            status_value,
+            reason_value,
+            source_order_id,
             float(now),
             float(now),
         ),
@@ -18550,29 +18587,53 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 project = _studio_project_git_publication_probe(dict(row))
                 missing = _studio_publication_contract_missing(project)
                 if not missing:
-                    conn.execute(
-                        """
-                        UPDATE studio_portfolio_projects
-                        SET status = ?,
-                            github_repo = COALESCE(NULLIF(?, ''), github_repo),
-                            github_url = COALESCE(NULLIF(?, ''), github_url),
-                            default_branch = COALESCE(NULLIF(?, ''), default_branch),
-                            latest_head = COALESCE(NULLIF(?, ''), latest_head),
-                            private = ?,
-                            updated_at = ?
-                        WHERE project_key = ?
-                        """,
-                        (
-                            "published_private",
-                            str(project.get("github_repo") or ""),
-                            str(project.get("github_url") or ""),
-                            str(project.get("default_branch") or ""),
-                            str(project.get("latest_head") or ""),
-                            int(project.get("private") or 0),
-                            float(now),
-                            row["project_key"],
-                        ),
+                    github_repo = str(project.get("github_repo") or "")
+                    github_url = str(project.get("github_url") or "")
+                    default_branch = str(project.get("default_branch") or "")
+                    latest_head = str(project.get("latest_head") or "")
+                    private_value = int(project.get("private") or 0)
+                    current_status = str(row["status"] or "")
+                    current_github_repo = str(row["github_repo"] or "")
+                    current_github_url = str(row["github_url"] or "")
+                    current_default_branch = str(row["default_branch"] or "")
+                    current_latest_head = str(row["latest_head"] or "")
+                    current_private = int(row["private"] or 0)
+                    effective_github_repo = github_repo or current_github_repo
+                    effective_github_url = github_url or current_github_url
+                    effective_default_branch = default_branch or current_default_branch
+                    effective_latest_head = latest_head or current_latest_head
+                    row_changed = (
+                        current_status != "published_private"
+                        or current_github_repo != effective_github_repo
+                        or current_github_url != effective_github_url
+                        or current_default_branch != effective_default_branch
+                        or current_latest_head != effective_latest_head
+                        or current_private != private_value
                     )
+                    if row_changed:
+                        conn.execute(
+                            """
+                            UPDATE studio_portfolio_projects
+                            SET status = ?,
+                                github_repo = COALESCE(NULLIF(?, ''), github_repo),
+                                github_url = COALESCE(NULLIF(?, ''), github_url),
+                                default_branch = COALESCE(NULLIF(?, ''), default_branch),
+                                latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                                private = ?,
+                                updated_at = ?
+                            WHERE project_key = ?
+                            """,
+                            (
+                                "published_private",
+                                github_repo,
+                                github_url,
+                                default_branch,
+                                latest_head,
+                                private_value,
+                                float(now),
+                                row["project_key"],
+                            ),
+                        )
                     _studio_backfill_publication_trace_evidence_conn(
                         conn=conn,
                         order_ids=(row["source_order_id"], row["latest_order_id"]),
@@ -18587,7 +18648,8 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         status="resolved",
                         reason="Publication contract is complete after local Git evidence backfill.",
                     )
-                    changed += 1
+                    if row_changed:
+                        changed += 1
                     continue
                 current_summary = str(row["latest_summary"] or "").strip()
                 prefix = _studio_publication_contract_reason(project, missing)
@@ -18597,30 +18659,51 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     if current_summary.lower().startswith(("publication incomplete:", "publication evidence incomplete:"))
                     else _studio_one_line(f"{prefix} Required recovery: {action}. {current_summary}", max_chars=500, default=prefix)
                 )
-                conn.execute(
-                    """
-                    UPDATE studio_portfolio_projects
-                    SET status = 'needs_publication',
-                        github_repo = COALESCE(NULLIF(?, ''), github_repo),
-                        github_url = COALESCE(NULLIF(?, ''), github_url),
-                        default_branch = COALESCE(NULLIF(?, ''), default_branch),
-                        latest_head = COALESCE(NULLIF(?, ''), latest_head),
-                        private = ?,
-                        latest_summary = ?,
-                        updated_at = ?
-                    WHERE project_key = ?
-                    """,
-                    (
-                        str(project.get("github_repo") or ""),
-                        str(project.get("github_url") or ""),
-                        str(project.get("default_branch") or ""),
-                        str(project.get("latest_head") or ""),
-                        int(project.get("private") or 0),
-                        summary,
-                        float(now),
-                        row["project_key"],
-                    ),
+                github_repo = str(project.get("github_repo") or "")
+                github_url = str(project.get("github_url") or "")
+                default_branch = str(project.get("default_branch") or "")
+                latest_head = str(project.get("latest_head") or "")
+                private_value = int(project.get("private") or 0)
+                current_status = str(row["status"] or "")
+                current_github_repo = str(row["github_repo"] or "")
+                current_github_url = str(row["github_url"] or "")
+                current_default_branch = str(row["default_branch"] or "")
+                current_latest_head = str(row["latest_head"] or "")
+                current_private = int(row["private"] or 0)
+                row_changed = (
+                    current_status != "needs_publication"
+                    or current_github_repo != (github_repo or current_github_repo)
+                    or current_github_url != (github_url or current_github_url)
+                    or current_default_branch != (default_branch or current_default_branch)
+                    or current_latest_head != (latest_head or current_latest_head)
+                    or current_private != private_value
+                    or current_summary != summary
                 )
+                if row_changed:
+                    conn.execute(
+                        """
+                        UPDATE studio_portfolio_projects
+                        SET status = 'needs_publication',
+                            github_repo = COALESCE(NULLIF(?, ''), github_repo),
+                            github_url = COALESCE(NULLIF(?, ''), github_url),
+                            default_branch = COALESCE(NULLIF(?, ''), default_branch),
+                            latest_head = COALESCE(NULLIF(?, ''), latest_head),
+                            private = ?,
+                            latest_summary = ?,
+                            updated_at = ?
+                        WHERE project_key = ?
+                        """,
+                        (
+                            github_repo,
+                            github_url,
+                            default_branch,
+                            latest_head,
+                            private_value,
+                            summary,
+                            float(now),
+                            row["project_key"],
+                        ),
+                    )
                 _studio_upsert_publication_recovery_conn(
                     conn=conn,
                     project=project,
@@ -18629,7 +18712,8 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     status="open",
                     reason=summary,
                 )
-                changed += 1
+                if row_changed:
+                    changed += 1
             conn.commit()
             return changed
     except Exception:
@@ -18695,8 +18779,12 @@ def _studio_backfill_publication_trace_evidence_conn(
                 current_trace = {}
         elif isinstance(raw_trace, dict):
             current_trace = dict(raw_trace)
-        current_trace["github_publication"] = publication
-        trace_blob = json.dumps(current_trace, sort_keys=True)
+        next_trace = dict(current_trace)
+        next_trace["github_publication"] = publication
+        trace_blob = json.dumps(next_trace, sort_keys=True)
+        current_trace_blob = json.dumps(current_trace, sort_keys=True)
+        if trace_blob == current_trace_blob:
+            continue
         if update_updated_at:
             conn.execute(
                 "UPDATE jobs SET trace = ?, updated_at = ? WHERE job_id = ?",

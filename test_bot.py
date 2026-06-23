@@ -2236,15 +2236,36 @@ class TestStudioOutcomeMemory(unittest.TestCase):
             with sqlite3.connect(db) as conn:
                 conn.row_factory = sqlite3.Row
                 project_row = conn.execute(
-                    "SELECT status, github_repo, github_url, default_branch, latest_head FROM studio_portfolio_projects"
+                    """
+                    SELECT status, github_repo, github_url, default_branch, latest_head, updated_at
+                    FROM studio_portfolio_projects
+                    """
                 ).fetchone()
                 recovery_row = conn.execute(
-                    "SELECT status, required_action FROM studio_publication_recovery"
+                    "SELECT status, required_action, updated_at FROM studio_publication_recovery"
                 ).fetchone()
                 job_row = conn.execute("SELECT trace, updated_at FROM jobs WHERE job_id = ?", ("order-1",)).fetchone()
+            second_changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 120)
+            with sqlite3.connect(db) as conn:
+                conn.row_factory = sqlite3.Row
+                project_row_second = conn.execute(
+                    """
+                    SELECT status, github_repo, github_url, default_branch, latest_head, updated_at
+                    FROM studio_portfolio_projects
+                    """
+                ).fetchone()
+                recovery_row_second = conn.execute(
+                    "SELECT status, required_action, updated_at FROM studio_publication_recovery"
+                ).fetchone()
+                job_row_second = conn.execute(
+                    "SELECT trace, updated_at FROM jobs WHERE job_id = ?",
+                    ("order-1",),
+                ).fetchone()
 
         self.assertEqual(changed, 1)
+        self.assertEqual(second_changed, 0)
         self.assertIsNotNone(project_row)
+        self.assertIsNotNone(project_row_second)
         self.assertEqual(project_row["status"], "published_private")
         self.assertEqual(project_row["github_repo"], "manolosake/signaldeck")
         self.assertIn("github.com", project_row["github_url"])
@@ -2252,9 +2273,12 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(project_row["default_branch"], "main")
         self.assertEqual(project_row["latest_head"], head)
         self.assertIsNotNone(recovery_row)
+        self.assertIsNotNone(recovery_row_second)
         self.assertEqual(recovery_row["status"], "resolved")
         self.assertIsNotNone(job_row)
+        self.assertIsNotNone(job_row_second)
         trace = json.loads(str(job_row["trace"] or "{}"))
+        trace_second = json.loads(str(job_row_second["trace"] or "{}"))
         publication = trace.get("github_publication")
         self.assertIsInstance(publication, dict)
         self.assertEqual(publication["github_repo"], "manolosake/signaldeck")
@@ -2267,7 +2291,13 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(publication["project_path"], str(project))
         self.assertTrue(publication["private"])
         self.assertEqual(trace["seed"], "value")
+        self.assertEqual(trace_second, trace)
+        self.assertEqual(project_row["updated_at"], now + 60)
+        self.assertEqual(project_row_second["updated_at"], project_row["updated_at"])
+        self.assertEqual(recovery_row["updated_at"], now + 60)
+        self.assertEqual(recovery_row_second["updated_at"], recovery_row["updated_at"])
         self.assertEqual(job_row["updated_at"], now + 60)
+        self.assertEqual(job_row_second["updated_at"], job_row["updated_at"])
 
     def test_publication_contract_reconcile_keeps_non_github_remote_open(self) -> None:
         def run(cmd: list[str], cwd: Path) -> str:
