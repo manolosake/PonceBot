@@ -338,11 +338,16 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                     "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
                     "current_target_facts": {
+                        "recovery_id": "recovery-17",
+                        "project_key": "signaldeck",
+                        "project_name": "SignalDeck",
                         "project_path": "/home/aponce/signaldeck",
+                        "target_label": "github:manolosake/signaldeck",
                         "github_repo": "manolosake/signaldeck",
                         "github_url": "https://github.com/manolosake/signaldeck",
                         "latest_head": "abc1234def5678",
                     },
+                    "required_action": "resolve_publication_contract",
                     "missing_fields": ["github_url", "private"],
                     "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
                     "evidence_required": ["publication recovery decision summary", "github_url", "private"],
@@ -370,11 +375,16 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                 "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
                 "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
                 "current_target_facts": {
+                    "recovery_id": "recovery-17",
+                    "project_key": "signaldeck",
+                    "project_name": "SignalDeck",
                     "project_path": "/home/aponce/signaldeck",
+                    "target_label": "github:manolosake/signaldeck",
                     "github_repo": "manolosake/signaldeck",
                     "github_url": "https://github.com/manolosake/signaldeck",
                     "latest_head": "abc1234def5678",
                 },
+                "required_action": "resolve_publication_contract",
                 "missing_fields": ["github_url", "private"],
                 "acceptance_criteria": ["Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."],
                 "evidence_required": ["publication recovery decision summary", "github_url", "private"],
@@ -446,6 +456,12 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- owner_role: release_mgr", rendered)
         self.assertIn("- lane: publication_recovery", rendered)
         self.assertIn("- order_id: order-17", rendered)
+        self.assertIn("- recovery_id: recovery-17", rendered)
+        self.assertIn("- project_key: signaldeck", rendered)
+        self.assertIn("- project_name: SignalDeck", rendered)
+        self.assertIn("- project_path: /home/aponce/signaldeck", rendered)
+        self.assertIn("- target_label: github:manolosake/signaldeck", rendered)
+        self.assertIn("- required_action: resolve_publication_contract", rendered)
         self.assertIn("- current_target_facts:", rendered)
         self.assertIn("  - github_repo=manolosake/signaldeck", rendered)
         self.assertIn("  - latest_head=abc1234def5678", rendered)
@@ -460,6 +476,13 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("    - archived: recovery_status, reason, evidence", rendered)
         self.assertIn("## Next Delegate", rendered)
         self.assertIn("- action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
+        next_delegate_section = rendered.split("## Next Delegate", 1)[1].split("## Publication Recovery", 1)[0]
+        self.assertIn("- recovery_id: recovery-17", next_delegate_section)
+        self.assertIn("- project_key: signaldeck", next_delegate_section)
+        self.assertIn("- project_name: SignalDeck", next_delegate_section)
+        self.assertIn("- project_path: /home/aponce/signaldeck", next_delegate_section)
+        self.assertIn("- target_label: github:manolosake/signaldeck", next_delegate_section)
+        self.assertIn("- required_action: resolve_publication_contract", next_delegate_section)
         self.assertIn("## Publication Recovery", rendered)
         self.assertIn("## Publication Recovery\n\n- Recommended next action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
         self.assertIn("| 1 | pub-recov | deploy | wait | - | Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof. |", rendered)

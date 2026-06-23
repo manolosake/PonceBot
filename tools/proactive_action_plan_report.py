@@ -154,6 +154,19 @@ def _append_mapping(lines: list[str], title: str, mapping: Any) -> None:
         lines.append(f"  - {item}")
 
 
+def _append_current_target_identifiers(lines: list[str], packet: Any) -> None:
+    if not isinstance(packet, dict):
+        return
+    current_target_facts = packet.get("current_target_facts") if isinstance(packet.get("current_target_facts"), dict) else {}
+    for key in ("recovery_id", "project_key", "project_name", "project_path", "target_label", "required_action"):
+        value = packet.get(key)
+        if value is None:
+            value = current_target_facts.get(key)
+        text = _one_line(value, default="")
+        if text and text != "-":
+            lines.append(f"- {key}: {text}")
+
+
 def _find_top_order(report: dict[str, Any], order_id: Any) -> dict[str, Any]:
     oid = str(order_id or "").strip()
     if not oid:
@@ -286,6 +299,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Top Execution Packet", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(top_execution_packet.get(key))}")
+        _append_current_target_identifiers(lines, top_execution_packet)
         _append_mapping(lines, "current_target_facts", top_execution_packet.get("current_target_facts"))
         _append_list(lines, "missing_fields", top_execution_packet.get("missing_fields"))
         _append_list(lines, "acceptance_criteria", top_execution_packet.get("acceptance_criteria"))
@@ -332,6 +346,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend(["", "## Next Delegate", ""])
         for key in ("owner_role", "lane", "order_id", "action", "inspect_endpoint", "handoff_endpoint"):
             lines.append(f"- {key}: {_one_line(next_delegate.get(key))}")
+        _append_current_target_identifiers(lines, next_delegate)
         _append_mapping(lines, "current_target_facts", next_delegate.get("current_target_facts"))
         _append_list(lines, "missing_fields", next_delegate.get("missing_fields"))
         _append_list(lines, "acceptance_criteria", next_delegate.get("acceptance_criteria"))
