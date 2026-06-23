@@ -293,6 +293,9 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "missing_json": '["private"]',
                     "missing_fields": ["private"],
                     "status": "open",
+                    "github_url": "https://github.com/manolosake/signaldeck",
+                    "latest_head": "abc1234def5678",
+                    "source_order_id": "order-17",
                 },
                 {
                     "project_name": "Local Only Project",
@@ -311,9 +314,9 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("## Publication Recovery", rendered)
         self.assertIn("- Open items: 2", rendered)
         self.assertIn("- Truncated: True", rendered)
-        self.assertIn("| Project | Target | Required action | Missing | Status | Reason |", rendered)
-        self.assertIn("| SignalDeck | manolosake/signaldeck | resolve_publication_contract | private | open | Private visibility confirmation is still missing. |", rendered)
-        self.assertIn("| Local Only Project | /home/aponce/local-only-project | archive_or_reject_missing_path | github_repo, github_url | open | No GitHub publication target was found. |", rendered)
+        self.assertIn("| Project | Target | Evidence | Required action | Missing | Status |", rendered)
+        self.assertIn("| SignalDeck | manolosake/signaldeck | url=https://github.com/manolosake/signaldeck; head=abc1234def5678; order=order-17 | resolve_publication_contract | private | open: Private visibility confirmation is still missing. |", rendered)
+        self.assertIn("| Local Only Project | /home/aponce/local-only-project | - | archive_or_reject_missing_path | github_repo, github_url | open: No GitHub publication target was found. |", rendered)
 
     def test_render_markdown_escapes_publication_recovery_pipe_characters(self) -> None:
         report = self._base_report()
@@ -329,13 +332,41 @@ class TestProactiveActionPlanReport(unittest.TestCase):
                     "missing_json": '["github_repo|github_url"]',
                     "missing_fields": ["github_repo|github_url"],
                     "status": "open|queued",
+                    "github_url": "https://github.com/org/signal|deck",
+                    "latest_head": "abc|123",
+                    "source_order_id": "order|42",
                 }
             ],
         }
 
         rendered = report_tool.render_markdown(report)
 
-        self.assertIn("| Signal\\|Deck | /home/aponce/signal\\|deck | resolve\\|publication_contract | github_repo\\|github_url | open\\|queued | Confirm private\\|visibility before publish. |", rendered)
+        self.assertIn("| Signal\\|Deck | /home/aponce/signal\\|deck | url=https://github.com/org/signal\\|deck; head=abc\\|123; order=order\\|42 | resolve\\|publication_contract | github_repo\\|github_url | open\\|queued: Confirm private\\|visibility before publish. |", rendered)
+
+    def test_render_markdown_degrades_when_publication_recovery_evidence_fields_are_missing_or_malformed(self) -> None:
+        report = self._base_report()
+        report["publication_recovery"] = {
+            "count": 1,
+            "truncated": False,
+            "items": [
+                {
+                    "project_name": "Malformed Recovery",
+                    "project_path": "/home/aponce/malformed",
+                    "required_action": "resolve_publication_contract",
+                    "reason": None,
+                    "missing_json": "{not-json",
+                    "missing_fields": [],
+                    "status": 17,
+                    "github_url": "",
+                    "latest_head": None,
+                    "source_order_id": [],
+                }
+            ],
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn("| Malformed Recovery | /home/aponce/malformed | - | resolve_publication_contract | {not-json | 17 |", rendered)
 
     def test_render_receipt_markdown_includes_selection_order_and_persisted_sections(self) -> None:
         rendered = report_tool.render_receipt_markdown(self._base_receipt_report())

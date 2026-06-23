@@ -40,6 +40,34 @@ def _markdown_table_cell(value: Any, *, default: str = "-") -> str:
     return _one_line(value, default=default).replace("|", "\\|")
 
 
+def _compact_scalar_text(value: Any) -> str:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    return _one_line(value, default="")
+
+
+def _publication_recovery_evidence(item: dict[str, Any]) -> str:
+    evidence: list[str] = []
+    github_url = _compact_scalar_text(item.get("github_url"))
+    latest_head = _compact_scalar_text(item.get("latest_head"))
+    source_order_id = _compact_scalar_text(item.get("source_order_id"))
+    if github_url:
+        evidence.append(f"url={github_url}")
+    if latest_head:
+        evidence.append(f"head={latest_head}")
+    if source_order_id:
+        evidence.append(f"order={source_order_id}")
+    return "; ".join(evidence) or "-"
+
+
+def _publication_recovery_status(item: dict[str, Any]) -> str:
+    status = _one_line(item.get("status"), default="-")
+    reason = _one_line(item.get("reason"), default="")
+    if reason:
+        return f"{status}: {reason}"
+    return status
+
+
 def _as_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
@@ -194,7 +222,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             lines.extend(
                 [
                     "",
-                    "| Project | Target | Required action | Missing | Status | Reason |",
+                    "| Project | Target | Evidence | Required action | Missing | Status |",
                     "| --- | --- | --- | --- | --- | --- |",
                 ]
             )
@@ -209,10 +237,10 @@ def render_markdown(report: dict[str, Any]) -> str:
                         [
                             _markdown_table_cell(item.get("project_name")),
                             _markdown_table_cell(target),
+                            _markdown_table_cell(_publication_recovery_evidence(item)),
                             _markdown_table_cell(item.get("required_action")),
                             _markdown_table_cell(missing),
-                            _markdown_table_cell(item.get("status")),
-                            _markdown_table_cell(item.get("reason")),
+                            _markdown_table_cell(_publication_recovery_status(item)),
                         ]
                     )
                     + " |"

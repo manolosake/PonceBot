@@ -4266,9 +4266,31 @@ class StatusService:
                 ).fetchone()
                 if not table_row:
                     return None
+                table_columns = {
+                    str(column["name"]).strip()
+                    for column in conn.execute("PRAGMA table_info(studio_publication_recovery)").fetchall()
+                    if str(column["name"]).strip()
+                }
+                recovery_fields = [
+                    "project_name",
+                    "project_path",
+                    "github_repo",
+                    "github_url",
+                    "latest_head",
+                    "required_action",
+                    "reason",
+                    "missing_json",
+                    "status",
+                    "source_order_id",
+                    "updated_at",
+                ]
+                select_fields = [
+                    field if field in table_columns else f"NULL AS {field}"
+                    for field in recovery_fields
+                ]
                 rows = conn.execute(
-                    """
-                    SELECT project_name, project_path, github_repo, required_action, reason, missing_json, status, updated_at
+                    f"""
+                    SELECT {", ".join(select_fields)}
                     FROM studio_publication_recovery
                     WHERE status = 'open'
                     ORDER BY updated_at DESC
@@ -4301,11 +4323,14 @@ class StatusService:
                 "project_name": str(row["project_name"] or "").strip() or None,
                 "project_path": str(row["project_path"] or "").strip() or None,
                 "github_repo": str(row["github_repo"] or "").strip() or None,
+                "github_url": str(row["github_url"] or "").strip() or None,
+                "latest_head": str(row["latest_head"] or "").strip() or None,
                 "required_action": str(row["required_action"] or "").strip() or None,
                 "reason": str(row["reason"] or "").strip() or None,
                 "missing_json": missing_json or "[]",
                 "missing_fields": missing_fields,
                 "status": str(row["status"] or "").strip() or "open",
+                "source_order_id": str(row["source_order_id"] or "").strip() or None,
                 "updated_at": _safe_float(row["updated_at"]),
             }
             items.append({key: value for key, value in item.items() if value is not None})
