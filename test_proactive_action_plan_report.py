@@ -416,6 +416,126 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("## Publication Recovery\n\n- Recommended next action: Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof.", rendered)
         self.assertIn("| 1 | pub-recov | deploy | wait | - | Recover publication evidence for SignalDeck by confirming the GitHub target, head, and publication visibility proof. |", rendered)
 
+    def test_render_markdown_includes_latest_head_backfill_publication_recovery_contract(self) -> None:
+        report = {
+            "generated_at": 123.0,
+            "chat_id": 7,
+            "limit": 10,
+            "summary": {
+                "active_proactive_orders": 0,
+                "returned": 1,
+                "lanes": {"publication_recovery": 1},
+                "selection_quality": {},
+                "top_lane": "publication_recovery",
+                "top_action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                "next_delegate": {
+                    "owner_role": "release_mgr",
+                    "order_id": "order-head",
+                    "lane": "publication_recovery",
+                    "action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                    "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                    "acceptance_criteria": [
+                        "Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."
+                    ],
+                    "evidence_required": [
+                        "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
+                        "recorded head or visibility verification summary tied to the recovered publication target",
+                    ],
+                    "suggested_validation": [
+                        "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
+                    ],
+                    "definition_of_done": [
+                        "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
+                    ],
+                    "assignment_prompt": "ROLE: release_mgr.\nAction: Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                },
+            },
+            "top_execution_packet": {
+                "owner_role": "release_mgr",
+                "order_id": "order-head",
+                "lane": "publication_recovery",
+                "action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                "inspect_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "handoff_endpoint": "/api/v1/orchestration/proactive-action-plan",
+                "acceptance_criteria": [
+                    "Inspect the open publication recovery entry for SignalDeck in /api/v1/orchestration/proactive-action-plan."
+                ],
+                "evidence_required": [
+                    "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
+                    "recorded head or visibility verification summary tied to the recovered publication target",
+                ],
+                "suggested_validation": [
+                    "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
+                ],
+                "definition_of_done": [
+                    "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
+                ],
+                "assignment_prompt": "ROLE: release_mgr.\nAction: Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+            },
+            "lanes": [
+                {
+                    "lane": "publication_recovery",
+                    "label": "Publication Recovery",
+                    "count": 1,
+                    "recommended_next_action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                    "execution_packet": {
+                        "owner_role": "release_mgr",
+                        "order_id": "order-head",
+                        "lane": "publication_recovery",
+                        "action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                    },
+                    "orders": [
+                        {
+                            "rank": 1,
+                            "order_id": "order-head",
+                            "order_id_short": "pub-head",
+                            "current_stage": "deploy",
+                            "readiness_verdict": "wait",
+                            "next_action": "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                        }
+                    ],
+                }
+            ],
+            "publication_recovery": {
+                "count": 1,
+                "truncated": False,
+                "items": [
+                    {
+                        "project_name": "SignalDeck",
+                        "project_path": "/home/aponce/signaldeck",
+                        "github_repo": "manolosake/signaldeck",
+                        "required_action": "backfill_latest_head_or_validate_private_github",
+                        "reason": "Private GitHub target is known but latest_head evidence is missing.",
+                        "missing_json": '["latest_head"]',
+                        "missing_fields": ["latest_head"],
+                        "status": "open",
+                        "github_url": "https://github.com/manolosake/signaldeck",
+                        "source_order_id": "order-head",
+                    }
+                ],
+            },
+        }
+
+        rendered = report_tool.render_markdown(report)
+
+        self.assertIn(
+            "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
+            rendered,
+        )
+        self.assertIn(
+            "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded.",
+            rendered,
+        )
+        self.assertIn(
+            "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker.",
+            rendered,
+        )
+        self.assertIn(
+            "| SignalDeck | manolosake/signaldeck | url=https://github.com/manolosake/signaldeck; order=order-head | backfill_latest_head_or_validate_private_github | latest_head | open: Private GitHub target is known but latest_head evidence is missing. |",
+            rendered,
+        )
+
     def test_render_markdown_escapes_publication_recovery_pipe_characters(self) -> None:
         report = self._base_report()
         report["publication_recovery"] = {

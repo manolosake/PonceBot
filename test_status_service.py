@@ -608,6 +608,7 @@ class TestStatusService(unittest.TestCase):
                     "initial commit evidence or archive rationale",
                     "private GitHub publication evidence for the initial publish attempt",
                 ],
+                [],
             ),
             (
                 "create_private_remote_and_push_or_archive",
@@ -617,10 +618,24 @@ class TestStatusService(unittest.TestCase):
                     "private remote creation or verification evidence",
                     "push result for the recovered publication target or archive rationale",
                 ],
+                [],
+            ),
+            (
+                "backfill_latest_head_or_validate_private_github",
+                "Backfill the latest published head for SignalDeck or validate the private GitHub target if the head cannot be confirmed.",
+                "order-head",
+                [
+                    "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
+                    "recorded head or visibility verification summary tied to the recovered publication target",
+                ],
+                [
+                    "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded.",
+                    "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker.",
+                ],
             ),
         ]
 
-        for required_action, expected_action, source_order_id, expected_evidence in cases:
+        for required_action, expected_action, source_order_id, expected_evidence, expected_contract in cases:
             with self.subTest(required_action=required_action):
                 with tempfile.TemporaryDirectory() as td:
                     storage = SQLiteTaskStorage(Path(td) / "jobs.sqlite")
@@ -696,6 +711,11 @@ class TestStatusService(unittest.TestCase):
                     self.assertEqual(delegation_packet["action"], expected_action)
                     for evidence in expected_evidence:
                         self.assertIn(evidence, delegation_packet["evidence_required"])
+                    for contract_line in expected_contract:
+                        combined_lines = (
+                            delegation_packet["definition_of_done"] + delegation_packet["suggested_validation"]
+                        )
+                        self.assertIn(contract_line, combined_lines)
                     self.assertEqual(plan["summary"]["top_action"], expected_action)
                     self.assertIn(f"Action: {expected_action}", delegation_packet["assignment_prompt"])
 

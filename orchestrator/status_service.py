@@ -2863,6 +2863,13 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
                 "private GitHub publication evidence for the initial publish attempt",
             ]
         )
+    elif required_action.lower() == "backfill_latest_head_or_validate_private_github":
+        evidence_required.extend(
+            [
+                "latest local Git head backfill evidence or proof that the private GitHub target was validated without a new head",
+                "recorded head or visibility verification summary tied to the recovered publication target",
+            ]
+        )
     else:
         evidence_required.append("publication target facts confirmed against the current local repo or GitHub target")
     for field in missing_fields:
@@ -2874,6 +2881,10 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
     ]
     if required_action.lower() == "archive_or_reject_missing_path":
         definition_of_done.append("A keep/archive/reject decision is recorded before fresh publication work continues.")
+    elif required_action.lower() == "backfill_latest_head_or_validate_private_github":
+        definition_of_done.append(
+            "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
+        )
     else:
         definition_of_done.append("GitHub repo, URL, head, and visibility evidence are recorded or an explicit blocker is attached.")
 
@@ -2881,6 +2892,10 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         "Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up.",
         "Verify the recorded publication evidence matches the current local repo or GitHub target.",
     ]
+    if required_action.lower() == "backfill_latest_head_or_validate_private_github":
+        suggested_validation.append(
+            "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
+        )
 
     prompt_lines = [
         f"ROLE: {owner_role}.",
