@@ -18441,6 +18441,37 @@ def _invalid_publication_scope_path(path: str) -> bool:
     return resolved in invalid_roots
 
 
+def _studio_rank_publication_recovery_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for record in records or []:
+        if isinstance(record, Mapping):
+            ranked.append(dict(record))
+    if len(ranked) < 2:
+        return ranked
+    return sorted(
+        ranked,
+        key=lambda record: 1 if _invalid_publication_scope_path(str(record.get("project_path") or "").strip()) else 0,
+    )
+
+
+def _studio_publication_recovery_record_item(record: Mapping[str, Any]) -> str:
+    name = str(record.get("project_name") or record.get("project_key") or "portfolio project").strip()
+    action = str(record.get("required_action") or "").strip()
+    path = str(record.get("project_path") or "").strip()
+    repo = str(record.get("github_repo") or "").strip()
+    reason = _studio_one_line(record.get("reason"), max_chars=90, default="")
+    bits = [name]
+    if action:
+        bits.append(action)
+    if repo:
+        bits.append(repo)
+    elif path:
+        bits.append(path)
+    if reason:
+        bits.append(reason)
+    return _studio_one_line(" · ".join(bits), max_chars=180)
+
+
 def _studio_publication_recovery_action(project: dict[str, Any], missing: list[str]) -> str:
     path = str(project.get("project_path") or "").strip()
     path_exists = project.get("_path_exists")
@@ -19838,16 +19869,16 @@ def _studio_publication_recovery_opportunity(memory: dict[str, Any]) -> dict[str
     count = int(memory.get("studio_publication_recovery_count", 0) or 0)
     if count <= 0:
         return None
-    items = [
-        str(item)
-        for item in (memory.get("studio_publication_recovery_items") or [])[:5]
-        if str(item).strip()
-    ]
-    records = [
-        dict(item)
-        for item in (memory.get("studio_publication_recovery_records") or [])[:5]
-        if isinstance(item, dict)
-    ]
+    records = _studio_rank_publication_recovery_records(memory.get("studio_publication_recovery_records") or [])
+    preview_records = records[:5]
+    if preview_records:
+        items = [_studio_publication_recovery_record_item(item) for item in preview_records]
+    else:
+        items = [
+            str(item)
+            for item in (memory.get("studio_publication_recovery_items") or [])[:5]
+            if str(item).strip()
+        ]
     primary = records[0] if records else {}
     item_text = "; ".join(items) or "publication recovery queue has open items"
     opportunity = {

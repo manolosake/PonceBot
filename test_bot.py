@@ -4864,6 +4864,104 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(opportunity["type"], "PUBLICATION_RECOVERY")
         self.assertGreaterEqual(int(opportunity["score"]), 100)
 
+    def test_publication_recovery_opportunity_deprioritizes_container_root_primary_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            factory_root = Path(td) / "factory"
+            child_project = factory_root / "signaldesk"
+            factory_root.mkdir()
+            child_project.mkdir()
+            memory = {
+                "studio_publication_recovery_count": 2,
+                "studio_publication_recovery_items": [
+                    "Factory Root · archive_or_reject_missing_path",
+                    "SignalDesk · initialize_git_or_archive",
+                ],
+                "studio_publication_recovery_records": [
+                    {
+                        "recovery_id": "recovery-root",
+                        "project_key": "factory-root",
+                        "project_name": "Factory Root",
+                        "project_path": str(factory_root),
+                        "github_repo": "",
+                        "required_action": "archive_or_reject_missing_path",
+                        "reason": "Broad container path was recorded as the publication target.",
+                        "source_order_id": "order-root",
+                        "updated_at": 200.0,
+                    },
+                    {
+                        "recovery_id": "recovery-child",
+                        "project_key": "signaldesk",
+                        "project_name": "SignalDesk",
+                        "project_path": str(child_project),
+                        "github_repo": "",
+                        "required_action": "initialize_git_or_archive",
+                        "reason": "Concrete child project can still be recovered.",
+                        "source_order_id": "order-child",
+                        "updated_at": 100.0,
+                    },
+                ],
+            }
+            with patch.dict(os.environ, {"BOT_FACTORY_REPO_ROOTS": str(factory_root)}, clear=False):
+                opportunity = bot._studio_publication_recovery_opportunity(memory)
+
+        self.assertIsNotNone(opportunity)
+        assert opportunity is not None
+        self.assertEqual(opportunity["recovery_id"], "recovery-child")
+        self.assertEqual(opportunity["recovery_project_name"], "SignalDesk")
+        self.assertEqual(opportunity["recovery_project_path"], str(child_project))
+        self.assertTrue(opportunity["publication_recovery_items"])
+        self.assertIn("SignalDesk", opportunity["publication_recovery_items"][0])
+        self.assertNotIn("Factory Root", opportunity["publication_recovery_items"][0])
+
+    def test_publication_recovery_opportunity_ranks_before_preview_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            factory_root = Path(td) / "factory"
+            child_project = factory_root / "signaldesk"
+            factory_root.mkdir()
+            child_project.mkdir()
+            records = []
+            for idx in range(5):
+                records.append(
+                    {
+                        "recovery_id": f"recovery-root-{idx}",
+                        "project_key": f"factory-root-{idx}",
+                        "project_name": f"Factory Root {idx}",
+                        "project_path": str(factory_root),
+                        "github_repo": "",
+                        "required_action": "archive_or_reject_missing_path",
+                        "reason": "Broad container path was recorded as the publication target.",
+                        "source_order_id": f"order-root-{idx}",
+                        "updated_at": 300.0 - idx,
+                    }
+                )
+            records.append(
+                {
+                    "recovery_id": "recovery-child",
+                    "project_key": "signaldesk",
+                    "project_name": "SignalDesk",
+                    "project_path": str(child_project),
+                    "github_repo": "",
+                    "required_action": "initialize_git_or_archive",
+                    "reason": "Concrete child project can still be recovered.",
+                    "source_order_id": "order-child",
+                    "updated_at": 100.0,
+                }
+            )
+            memory = {
+                "studio_publication_recovery_count": len(records),
+                "studio_publication_recovery_records": records,
+            }
+            with patch.dict(os.environ, {"BOT_FACTORY_REPO_ROOTS": str(factory_root)}, clear=False):
+                opportunity = bot._studio_publication_recovery_opportunity(memory)
+
+        self.assertIsNotNone(opportunity)
+        assert opportunity is not None
+        self.assertEqual(opportunity["recovery_id"], "recovery-child")
+        self.assertEqual(opportunity["recovery_project_path"], str(child_project))
+        self.assertEqual(len(opportunity["publication_recovery_items"]), 5)
+        self.assertIn("SignalDesk", opportunity["publication_recovery_items"][0])
+        self.assertNotIn("Factory Root 4", opportunity["publication_recovery_items"][0])
+
     def test_orphaned_active_cycle_finalizer_skips_minimal_fixture_without_order_tables(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
