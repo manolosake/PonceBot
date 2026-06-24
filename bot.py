@@ -18575,36 +18575,40 @@ def _studio_publication_recovery_matches_project(
 ) -> bool:
     project_key = str(project.get("project_key") or "").strip().lower()
     recovery_key = str(recovery_project.get("project_key") or "").strip().lower()
-    if project_key and recovery_key and project_key != recovery_key:
-        return False
-
-    project_order_ids = {
-        str(raw_order_id or "").strip().lower()
-        for raw_order_id in (project.get("source_order_id"), project.get("latest_order_id"))
-        if str(raw_order_id or "").strip()
-    }
-    recovery_order_id = str(recovery_project.get("source_order_id") or recovery_project.get("latest_order_id") or "").strip().lower()
-    if recovery_order_id and project_order_ids and recovery_order_id not in project_order_ids:
-        return False
-
     project_path = str(project.get("project_path") or "").strip().lower()
     recovery_path = str(recovery_project.get("project_path") or "").strip().lower()
-    if project_path and recovery_path and project_path != recovery_path:
-        return False
-
     project_repo = str(project.get("github_repo") or _github_repo_full_name_from_remote_url(str(project.get("github_url") or "")) or "").strip().lower()
     recovery_repo = str(
         recovery_project.get("github_repo")
         or _github_repo_full_name_from_remote_url(str(recovery_project.get("github_url") or ""))
         or ""
     ).strip().lower()
-    if project_repo and recovery_repo and project_repo != recovery_repo:
+    project_order_ids = {
+        str(raw_order_id or "").strip().lower()
+        for raw_order_id in (project.get("source_order_id"), project.get("latest_order_id"))
+        if str(raw_order_id or "").strip()
+    }
+    recovery_order_id = str(recovery_project.get("source_order_id") or recovery_project.get("latest_order_id") or "").strip().lower()
+
+    same_key = bool(project_key and recovery_key and project_key == recovery_key)
+    same_order = bool(recovery_order_id and recovery_order_id in project_order_ids)
+    same_path = bool(project_path and recovery_path and project_path == recovery_path)
+    same_repo = bool(project_repo and recovery_repo and project_repo == recovery_repo)
+
+    if project_key and recovery_key and project_key != recovery_key and not (same_order or same_path or same_repo):
+        return False
+    if recovery_order_id and project_order_ids and recovery_order_id not in project_order_ids and not (same_path or same_repo):
+        return False
+    if project_path and recovery_path and project_path != recovery_path and not (same_order or same_repo):
+        return False
+    if project_repo and recovery_repo and project_repo != recovery_repo and not (same_order or same_path):
         return False
 
     return bool(
-        (recovery_order_id and recovery_order_id in project_order_ids)
-        or (project_path and recovery_path and project_path == recovery_path)
-        or (project_repo and recovery_repo and project_repo == recovery_repo)
+        same_key
+        or same_order
+        or same_path
+        or same_repo
     )
 
 
@@ -18616,10 +18620,12 @@ def _studio_upsert_publication_recovery_conn(
     now: float,
     status: str,
     reason: str,
-) -> None:
-    key = str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "").strip().lower()
+) -> bool:
+    recovery_id = str(project.get("_recovery_id") or "").strip().lower()
+    project_key = str(project.get("project_key") or project.get("github_repo") or project.get("project_path") or "").strip().lower()
+    key = recovery_id or project_key
     if not key:
-        return
+        return False
     action = "resolve_publication_contract" if not missing else _studio_publication_recovery_action(project, missing)
     project_name = str(project.get("project_name") or "")
     project_path = str(project.get("project_path") or "")
@@ -18630,9 +18636,10 @@ def _studio_upsert_publication_recovery_conn(
     status_value = str(status or "open")
     reason_value = _studio_one_line(reason, max_chars=500, default=action)
     source_order_id = str(project.get("source_order_id") or project.get("latest_order_id") or "")
+    stored_project_key = project_key or key
     existing = conn.execute(
         """
-        SELECT project_name, project_path, github_repo, github_url, latest_head, missing_json,
+        SELECT project_key, project_name, project_path, github_repo, github_url, latest_head, missing_json,
                required_action, status, reason, source_order_id
         FROM studio_publication_recovery
         WHERE recovery_id = ?
@@ -18640,12 +18647,15 @@ def _studio_upsert_publication_recovery_conn(
         (key,),
     ).fetchone()
     if existing is not None:
+        effective_project_key = stored_project_key or str(existing["project_key"] or "")
         effective_project_path = project_path or str(existing["project_path"] or "")
         effective_github_repo = github_repo or str(existing["github_repo"] or "")
         effective_github_url = github_url or str(existing["github_url"] or "")
         effective_latest_head = latest_head or str(existing["latest_head"] or "")
         effective_source_order_id = source_order_id or str(existing["source_order_id"] or "")
         if (
+            str(existing["project_key"] or "") == effective_project_key
+            and
             str(existing["project_name"] or "") == project_name
             and str(existing["project_path"] or "") == effective_project_path
             and str(existing["github_repo"] or "") == effective_github_repo
@@ -18657,7 +18667,7 @@ def _studio_upsert_publication_recovery_conn(
             and str(existing["reason"] or "") == reason_value
             and str(existing["source_order_id"] or "") == effective_source_order_id
         ):
-            return
+            return False
     conn.execute(
         """
         INSERT INTO studio_publication_recovery(
@@ -18666,6 +18676,7 @@ def _studio_upsert_publication_recovery_conn(
             first_seen_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(recovery_id) DO UPDATE SET
+            project_key = COALESCE(NULLIF(excluded.project_key, ''), studio_publication_recovery.project_key),
             project_name = excluded.project_name,
             project_path = COALESCE(NULLIF(excluded.project_path, ''), studio_publication_recovery.project_path),
             github_repo = COALESCE(NULLIF(excluded.github_repo, ''), studio_publication_recovery.github_repo),
@@ -18680,7 +18691,7 @@ def _studio_upsert_publication_recovery_conn(
         """,
         (
             key,
-            key,
+            stored_project_key,
             project_name,
             project_path,
             github_repo,
@@ -18695,6 +18706,7 @@ def _studio_upsert_publication_recovery_conn(
             float(now),
         ),
     )
+    return True
 
 
 def _studio_publication_trace_evidence_conn(
@@ -18945,10 +18957,13 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 """
             ).fetchall()
             open_recovery_rows_by_key: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            open_recovery_projects: list[tuple[str, dict[str, Any]]] = []
             for recovery_row in open_recovery_rows or []:
                 recovery_project = _studio_publication_recovery_row_project(recovery_row)
                 recovery_key = str(recovery_project.get("project_key") or "").strip().lower()
                 recovery_id = str(recovery_row["recovery_id"] or "").strip().lower()
+                if recovery_id:
+                    open_recovery_projects.append((recovery_id, recovery_project))
                 if recovery_key and recovery_id:
                     open_recovery_rows_by_key.setdefault(recovery_key, []).append((recovery_id, recovery_project))
             reconciled_rows: list[tuple[sqlite3.Row, dict[str, Any], list[str], set[str]]] = []
@@ -18963,6 +18978,14 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         continue
                     project = _studio_merge_publication_evidence(project, recovery_project)
                     matching_recovery_ids.add(recovery_id)
+                if not matching_recovery_ids:
+                    for recovery_id, recovery_project in open_recovery_projects:
+                        if recovery_id in matching_recovery_ids:
+                            continue
+                        if not _studio_publication_recovery_matches_project(project, recovery_project):
+                            continue
+                        project = _studio_merge_publication_evidence(project, recovery_project)
+                        matching_recovery_ids.add(recovery_id)
                 project = _studio_merge_publication_evidence(
                     project,
                     _studio_publication_trace_evidence_conn(
@@ -18987,32 +19010,25 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                 if negative_closeout:
                     terminal_status, terminal_reason = negative_closeout
                     recovery_changed = False
-                    _studio_upsert_publication_recovery_conn(
-                        conn=conn,
-                        project=project,
-                        missing=missing,
-                        now=now,
-                        status=terminal_status,
-                        reason=terminal_reason,
-                    )
-                    for recovery_id in matching_recovery_ids:
-                        cursor = conn.execute(
-                            """
-                            UPDATE studio_publication_recovery
-                            SET status = ?,
-                                reason = ?,
-                                updated_at = ?
-                            WHERE recovery_id = ?
-                            """,
-                            (
-                                terminal_status,
-                                terminal_reason,
-                                float(now),
-                                recovery_id,
-                            ),
+                    if matching_recovery_ids:
+                        for recovery_id in matching_recovery_ids:
+                            recovery_changed = _studio_upsert_publication_recovery_conn(
+                                conn=conn,
+                                project={**project, "_recovery_id": recovery_id},
+                                missing=missing,
+                                now=now,
+                                status=terminal_status,
+                                reason=terminal_reason,
+                            ) or recovery_changed
+                    else:
+                        recovery_changed = _studio_upsert_publication_recovery_conn(
+                            conn=conn,
+                            project=project,
+                            missing=missing,
+                            now=now,
+                            status=terminal_status,
+                            reason=terminal_reason,
                         )
-                        if int(cursor.rowcount or 0) > 0:
-                            recovery_changed = True
                     touched_recovery_ids.update(matching_recovery_ids)
                     if recovery_changed:
                         changed += 1
@@ -19072,31 +19088,28 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                         project=project,
                         now=now,
                     )
-                    _studio_upsert_publication_recovery_conn(
-                        conn=conn,
-                        project=project,
-                        missing=[],
-                        now=now,
-                        status="resolved",
-                        reason=resolved_reason,
-                    )
-                    for recovery_id in matching_recovery_ids:
-                        conn.execute(
-                            """
-                            UPDATE studio_publication_recovery
-                            SET status = 'resolved',
-                                reason = ?,
-                                updated_at = ?
-                            WHERE recovery_id = ?
-                            """,
-                            (
-                                resolved_reason,
-                                float(now),
-                                recovery_id,
-                            ),
+                    recovery_changed = False
+                    if matching_recovery_ids:
+                        for recovery_id in matching_recovery_ids:
+                            recovery_changed = _studio_upsert_publication_recovery_conn(
+                                conn=conn,
+                                project={**project, "_recovery_id": recovery_id},
+                                missing=[],
+                                now=now,
+                                status="resolved",
+                                reason=resolved_reason,
+                            ) or recovery_changed
+                    else:
+                        recovery_changed = _studio_upsert_publication_recovery_conn(
+                            conn=conn,
+                            project=project,
+                            missing=[],
+                            now=now,
+                            status="resolved",
+                            reason=resolved_reason,
                         )
                     touched_recovery_ids.update(matching_recovery_ids)
-                    if row_changed:
+                    if row_changed or recovery_changed:
                         changed += 1
                     continue
                 current_summary = str(row["latest_summary"] or "").strip()
@@ -19152,15 +19165,27 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             row["project_key"],
                         ),
                     )
-                _studio_upsert_publication_recovery_conn(
-                    conn=conn,
-                    project=project,
-                    missing=missing,
-                    now=now,
-                    status="open",
-                    reason=summary,
-                )
-                if row_changed:
+                recovery_changed = False
+                if matching_recovery_ids:
+                    for recovery_id in matching_recovery_ids:
+                        recovery_changed = _studio_upsert_publication_recovery_conn(
+                            conn=conn,
+                            project={**project, "_recovery_id": recovery_id},
+                            missing=missing,
+                            now=now,
+                            status="open",
+                            reason=summary,
+                        ) or recovery_changed
+                else:
+                    recovery_changed = _studio_upsert_publication_recovery_conn(
+                        conn=conn,
+                        project=project,
+                        missing=missing,
+                        now=now,
+                        status="open",
+                        reason=summary,
+                    )
+                if row_changed or recovery_changed:
                     changed += 1
             for recovery_row in open_recovery_rows or []:
                 recovery_id = str(recovery_row["recovery_id"] or "").strip().lower()
@@ -19212,15 +19237,16 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                     project=recovery_project,
                     now=now,
                 )
-                _studio_upsert_publication_recovery_conn(
+                recovery_changed = _studio_upsert_publication_recovery_conn(
                     conn=conn,
-                    project=recovery_project,
+                    project={**recovery_project, "_recovery_id": recovery_id},
                     missing=[],
                     now=now,
                     status="resolved",
                     reason="Publication contract is complete after authoritative evidence reconciliation.",
                 )
-                changed += 1
+                if recovery_changed:
+                    changed += 1
             conn.commit()
             return changed
     except Exception:
