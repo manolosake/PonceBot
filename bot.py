@@ -18502,6 +18502,32 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
     return "resolve_publication_contract"
 
 
+def _studio_negative_publication_recovery_closeout(
+    project: Mapping[str, Any],
+    missing: Sequence[str],
+) -> tuple[str, str] | None:
+    action = _studio_publication_recovery_action(dict(project), list(missing))
+    if action != "archive_or_reject_missing_path":
+        return None
+
+    path = str(project.get("project_path") or "").strip()
+    if not path:
+        detail = "project_path missing"
+    elif _invalid_publication_scope_path(path):
+        detail = f"project_path {path} is outside valid publication scope"
+    elif project.get("_path_exists") is False:
+        detail = f"project_path {path} does not exist"
+    else:
+        detail = f"project_path {path} is invalid for publication recovery"
+
+    reason = _studio_one_line(
+        f"Rejected publication recovery: {detail}; required_action archive_or_reject_missing_path confirms no recoverable asset.",
+        max_chars=500,
+        default="Rejected publication recovery: project_path missing.",
+    )
+    return ("rejected_low_value", reason)
+
+
 def _studio_complete_publication_sibling(
     project: Mapping[str, Any],
     sibling_projects: Iterable[Mapping[str, Any]],
@@ -18957,6 +18983,40 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             _studio_normalize_github_publication(sibling),
                         )
                         missing = _studio_publication_contract_missing(project)
+                negative_closeout = _studio_negative_publication_recovery_closeout(project, missing)
+                if negative_closeout:
+                    terminal_status, terminal_reason = negative_closeout
+                    recovery_changed = False
+                    _studio_upsert_publication_recovery_conn(
+                        conn=conn,
+                        project=project,
+                        missing=missing,
+                        now=now,
+                        status=terminal_status,
+                        reason=terminal_reason,
+                    )
+                    for recovery_id in matching_recovery_ids:
+                        cursor = conn.execute(
+                            """
+                            UPDATE studio_publication_recovery
+                            SET status = ?,
+                                reason = ?,
+                                updated_at = ?
+                            WHERE recovery_id = ?
+                            """,
+                            (
+                                terminal_status,
+                                terminal_reason,
+                                float(now),
+                                recovery_id,
+                            ),
+                        )
+                        if int(cursor.rowcount or 0) > 0:
+                            recovery_changed = True
+                    touched_recovery_ids.update(matching_recovery_ids)
+                    if recovery_changed:
+                        changed += 1
+                    continue
                 if not missing:
                     resolved_reason = "Publication contract is complete after local Git evidence backfill."
                     github_repo = str(project.get("github_repo") or "")
@@ -19123,6 +19183,27 @@ def _studio_reconcile_portfolio_publication_contract(db_path: Path, *, now: floa
                             _studio_normalize_github_publication(sibling),
                         )
                         missing = _studio_publication_contract_missing(recovery_project)
+                negative_closeout = _studio_negative_publication_recovery_closeout(recovery_project, missing)
+                if negative_closeout:
+                    terminal_status, terminal_reason = negative_closeout
+                    conn.execute(
+                        """
+                        UPDATE studio_publication_recovery
+                        SET status = ?,
+                            reason = ?,
+                            updated_at = ?
+                        WHERE recovery_id = ?
+                          AND status = 'open'
+                        """,
+                        (
+                            terminal_status,
+                            terminal_reason,
+                            float(now),
+                            recovery_id,
+                        ),
+                    )
+                    changed += 1
+                    continue
                 if missing:
                     continue
                 _studio_backfill_publication_trace_evidence_conn(

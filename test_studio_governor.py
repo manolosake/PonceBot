@@ -1001,6 +1001,335 @@ def test_studio_reconciles_incomplete_published_portfolio_projects(tmp_path):
     assert memory["studio_portfolio_total"] == 0
 
 
+def test_studio_reconcile_closes_missing_path_publication_recovery_row(tmp_path):
+    now = 1_700_000_100.0
+    db_path = tmp_path / "studio.sqlite"
+    missing_path = str(tmp_path / "missing-release-witness")
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_portfolio_projects(
+                project_key, project_name, project_path, github_repo, github_url,
+                default_branch, latest_head, private, status, source_order_id,
+                latest_order_id, latest_outcome_status, latest_summary,
+                validation_summary, monetization_summary, next_milestone,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                missing_path.lower(),
+                "Release Witness",
+                missing_path,
+                "",
+                "",
+                "",
+                "",
+                0,
+                "needs_publication",
+                "order-1",
+                "order-1",
+                "published_project",
+                "Publication incomplete: missing github_repo, github_url, latest_head. Required recovery: archive_or_reject_missing_path.",
+                "",
+                "",
+                "",
+                now - 10,
+                now - 10,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                missing_path.lower(),
+                missing_path.lower(),
+                "Release Witness",
+                missing_path,
+                "",
+                "",
+                "",
+                '["github_repo","github_url","latest_head","private"]',
+                "archive_or_reject_missing_path",
+                "open",
+                "Publication incomplete: missing github_repo, github_url, latest_head.",
+                "order-1",
+                now - 20,
+                now - 20,
+            ),
+        )
+        conn.commit()
+
+    changed = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now)
+
+    assert changed == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        project = conn.execute(
+            "SELECT status, latest_summary FROM studio_portfolio_projects WHERE project_key = ?",
+            (missing_path.lower(),),
+        ).fetchone()
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (missing_path.lower(),),
+        ).fetchone()
+    assert project[0] == "needs_publication"
+    assert project[1] == "Publication incomplete: missing github_repo, github_url, latest_head. Required recovery: archive_or_reject_missing_path."
+    assert recovery[0] == "rejected_low_value"
+    assert "does not exist" in recovery[1]
+    assert "archive_or_reject_missing_path confirms no recoverable asset" in recovery[1]
+
+
+def test_studio_reconcile_missing_path_closeout_is_idempotent(tmp_path):
+    now = 1_700_000_125.0
+    db_path = tmp_path / "studio.sqlite"
+    missing_path = str(tmp_path / "missing-release-witness")
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_portfolio_projects(
+                project_key, project_name, project_path, github_repo, github_url,
+                default_branch, latest_head, private, status, source_order_id,
+                latest_order_id, latest_outcome_status, latest_summary,
+                validation_summary, monetization_summary, next_milestone,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                missing_path.lower(),
+                "Release Witness",
+                missing_path,
+                "",
+                "",
+                "",
+                "",
+                0,
+                "needs_publication",
+                "order-1",
+                "order-1",
+                "published_project",
+                "Publication incomplete: missing github_repo, github_url, latest_head. Required recovery: archive_or_reject_missing_path.",
+                "",
+                "",
+                "",
+                now - 10,
+                now - 10,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                missing_path.lower(),
+                missing_path.lower(),
+                "Release Witness",
+                missing_path,
+                "",
+                "",
+                "",
+                '["github_repo","github_url","latest_head","private"]',
+                "archive_or_reject_missing_path",
+                "open",
+                "Publication incomplete: missing github_repo, github_url, latest_head.",
+                "order-1",
+                now - 20,
+                now - 20,
+            ),
+        )
+        conn.commit()
+
+    changed_first = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now)
+    changed_second = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now + 1)
+
+    assert changed_first == 1
+    assert changed_second == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        recovery = conn.execute(
+            "SELECT status FROM studio_publication_recovery WHERE recovery_id = ?",
+            (missing_path.lower(),),
+        ).fetchone()
+    assert recovery == ("rejected_low_value",)
+
+
+def test_studio_reconcile_closes_invalid_scope_publication_recovery_row_without_rewriting_portfolio_status(tmp_path, monkeypatch):
+    now = 1_700_000_150.0
+    db_path = tmp_path / "studio.sqlite"
+    invalid_scope_path = str(tmp_path / "controller-root-placeholder")
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_portfolio_projects(
+                project_key, project_name, project_path, github_repo, github_url,
+                default_branch, latest_head, private, status, source_order_id,
+                latest_order_id, latest_outcome_status, latest_summary,
+                validation_summary, monetization_summary, next_milestone,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invalid_scope_path.lower(),
+                "Release Witness",
+                invalid_scope_path,
+                "",
+                "",
+                "",
+                "",
+                0,
+                "needs_publication",
+                "order-1",
+                "order-1",
+                "published_project",
+                "Publication incomplete: missing github_repo, github_url, latest_head. Required recovery: archive_or_reject_missing_path.",
+                "",
+                "",
+                "",
+                now - 10,
+                now - 10,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invalid_scope_path.lower(),
+                invalid_scope_path.lower(),
+                "Release Witness",
+                invalid_scope_path,
+                "",
+                "",
+                "",
+                '["github_repo","github_url","latest_head","private"]',
+                "archive_or_reject_missing_path",
+                "open",
+                "Publication incomplete: missing github_repo, github_url, latest_head.",
+                "order-1",
+                now - 20,
+                now - 20,
+            ),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(bot, "_invalid_publication_scope_path", lambda path: True)
+
+    changed = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now)
+
+    assert changed == 1
+    with sqlite3.connect(str(db_path)) as conn:
+        project = conn.execute(
+            "SELECT status, latest_summary FROM studio_portfolio_projects WHERE project_key = ?",
+            (invalid_scope_path.lower(),),
+        ).fetchone()
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (invalid_scope_path.lower(),),
+        ).fetchone()
+    assert project[0] == "needs_publication"
+    assert project[1] == "Publication incomplete: missing github_repo, github_url, latest_head. Required recovery: archive_or_reject_missing_path."
+    assert recovery[0] == "rejected_low_value"
+    assert "outside valid publication scope" in recovery[1]
+    assert "archive_or_reject_missing_path confirms no recoverable asset" in recovery[1]
+
+
+def test_studio_reconcile_keeps_valid_publication_recovery_row_open(tmp_path, monkeypatch):
+    now = 1_700_000_200.0
+    db_path = tmp_path / "studio.sqlite"
+    project_path = tmp_path / "valid-release-witness"
+    project_path.mkdir()
+    bot._studio_ensure_schema(db_path)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_portfolio_projects(
+                project_key, project_name, project_path, github_repo, github_url,
+                default_branch, latest_head, private, status, source_order_id,
+                latest_order_id, latest_outcome_status, latest_summary,
+                validation_summary, monetization_summary, next_milestone,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(project_path).lower(),
+                "Release Witness",
+                str(project_path),
+                "",
+                "",
+                "",
+                "",
+                0,
+                "needs_publication",
+                "order-1",
+                "order-1",
+                "published_project",
+                "Publication incomplete: missing github_repo, github_url, latest_head.",
+                "",
+                "",
+                "",
+                now - 10,
+                now - 10,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(project_path).lower(),
+                str(project_path).lower(),
+                "Release Witness",
+                str(project_path),
+                "",
+                "",
+                "",
+                '["github_repo","github_url","latest_head","private"]',
+                "create_private_remote_and_push_or_archive",
+                "open",
+                "Publication incomplete: missing github_repo, github_url, latest_head.",
+                "order-1",
+                now - 20,
+                now - 20,
+            ),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(bot, "_invalid_publication_scope_path", lambda path: False)
+
+    changed = bot._studio_reconcile_portfolio_publication_contract(db_path, now=now)
+
+    assert changed == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        project = conn.execute(
+            "SELECT status, latest_summary FROM studio_portfolio_projects WHERE project_key = ?",
+            (str(project_path).lower(),),
+        ).fetchone()
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (str(project_path).lower(),),
+        ).fetchone()
+    assert project[0] == "needs_publication"
+    assert project[1] == "Publication incomplete: missing github_repo, github_url, latest_head."
+    assert recovery == ("open", project[1])
+
+
 def test_studio_quality_audit_flags_incomplete_published_project(tmp_path):
     now = 1_700_000_000.0
     db_path = tmp_path / "studio.sqlite"
