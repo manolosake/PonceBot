@@ -18424,6 +18424,23 @@ def _studio_publication_contract_reason(project: Mapping[str, Any], missing: Seq
     return f"Publication incomplete: {'; '.join(dict.fromkeys(reasons))}."
 
 
+def _invalid_publication_scope_path(path: str) -> bool:
+    candidate = str(path or "").strip()
+    if not candidate:
+        return False
+    try:
+        resolved = Path(candidate).expanduser().resolve()
+    except Exception:
+        try:
+            resolved = Path(candidate).expanduser()
+        except Exception:
+            return False
+
+    invalid_roots = set(_factory_repo_roots())
+    invalid_roots.add(_project_incubator_root_dir())
+    return resolved in invalid_roots
+
+
 def _studio_publication_recovery_action(project: dict[str, Any], missing: list[str]) -> str:
     path = str(project.get("project_path") or "").strip()
     path_exists = project.get("_path_exists")
@@ -18434,6 +18451,8 @@ def _studio_publication_recovery_action(project: dict[str, Any], missing: list[s
     if not path:
         return "archive_or_reject_missing_path"
     if path_exists is False:
+        return "archive_or_reject_missing_path"
+    if _invalid_publication_scope_path(path):
         return "archive_or_reject_missing_path"
     if not has_git:
         return "initialize_git_or_archive"

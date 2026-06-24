@@ -638,6 +638,17 @@ class TestStatusService(unittest.TestCase):
     def test_proactive_action_plan_surfaces_specific_publication_recovery_actions(self) -> None:
         cases = [
             (
+                "archive_or_reject_missing_path",
+                "Decide whether to archive or reject SignalDeck because no publication target is currently valid.",
+                "order-archive",
+                "product_ops",
+                [
+                    "local path verification summary",
+                    "archive/reject decision with rationale tied to the missing or invalid target",
+                ],
+                [],
+            ),
+            (
                 "initialize_git_or_archive",
                 "Initialize a local Git repository for SignalDeck, or archive the project if it should not be published.",
                 "order-init",

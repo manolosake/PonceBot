@@ -3394,6 +3394,201 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(project_row["status"], "needs_publication")
         self.assertIn("archive_or_reject_missing_path", project_row["latest_summary"])
 
+    def test_publication_recovery_action_rejects_configured_container_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            factory_root = Path(td) / "factory"
+            incubator_root = Path(td) / "incubator"
+            factory_root.mkdir()
+            incubator_root.mkdir()
+
+            project_template = {
+                "_path_exists": True,
+                "_has_git": False,
+                "_has_commit": False,
+                "github_url": "",
+            }
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_FACTORY_REPO_ROOTS": str(factory_root),
+                    "BOT_PROJECT_INCUBATOR_ROOT": str(incubator_root),
+                },
+                clear=False,
+            ):
+                factory_action = bot._studio_publication_recovery_action(
+                    {**project_template, "project_path": str(factory_root)},
+                    ["github_repo", "github_url", "latest_head"],
+                )
+                incubator_action = bot._studio_publication_recovery_action(
+                    {**project_template, "project_path": str(incubator_root)},
+                    ["github_repo", "github_url", "latest_head"],
+                )
+
+        self.assertEqual(factory_action, "archive_or_reject_missing_path")
+        self.assertEqual(incubator_action, "archive_or_reject_missing_path")
+
+    def test_publication_recovery_action_keeps_child_project_directory_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            factory_root = Path(td) / "factory"
+            incubator_root = Path(td) / "incubator"
+            factory_project = factory_root / "portfolio-app"
+            incubator_project = incubator_root / "signaldesk"
+            factory_project.mkdir(parents=True)
+            incubator_project.mkdir(parents=True)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_FACTORY_REPO_ROOTS": str(factory_root),
+                    "BOT_PROJECT_INCUBATOR_ROOT": str(incubator_root),
+                },
+                clear=False,
+            ):
+                factory_child_action = bot._studio_publication_recovery_action(
+                    {
+                        "project_path": str(factory_project),
+                        "_path_exists": True,
+                        "_has_git": False,
+                        "_has_commit": False,
+                        "github_url": "",
+                    },
+                    ["github_repo", "github_url", "latest_head"],
+                )
+                incubator_child_action = bot._studio_publication_recovery_action(
+                    {
+                        "project_path": str(incubator_project),
+                        "_path_exists": True,
+                        "_has_git": False,
+                        "_has_commit": False,
+                        "github_url": "",
+                    },
+                    ["github_repo", "github_url", "latest_head"],
+                )
+
+        self.assertEqual(factory_child_action, "initialize_git_or_archive")
+        self.assertEqual(incubator_child_action, "initialize_git_or_archive")
+
+    def test_publication_contract_reconcile_marks_configured_container_root_scope_for_archive_or_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            factory_root = root / "factory"
+            factory_root.mkdir()
+            db = root / "jobs.sqlite"
+            now = 229_255.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(factory_root).lower(),
+                        "Factory Root",
+                        str(factory_root),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-home",
+                        "order-home",
+                        "published_project",
+                        "Broad container path was recorded as the publication target.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_FACTORY_REPO_ROOTS": str(factory_root)}, clear=False):
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+                with sqlite3.connect(db) as conn:
+                    conn.row_factory = sqlite3.Row
+                    recovery_row = conn.execute(
+                        "SELECT status, required_action, missing_json FROM studio_publication_recovery"
+                    ).fetchone()
+                    project_row = conn.execute("SELECT status, latest_summary FROM studio_portfolio_projects").fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "archive_or_reject_missing_path")
+        self.assertIn("github_repo", recovery_row["missing_json"])
+        self.assertIn("github_url", recovery_row["missing_json"])
+        self.assertIn("latest_head", recovery_row["missing_json"])
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertIn("archive_or_reject_missing_path", project_row["latest_summary"])
+
+    def test_publication_contract_reconcile_keeps_child_project_scope_initializable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incubator_root = root / "incubator"
+            project_root = incubator_root / "signaldesk"
+            project_root.mkdir(parents=True)
+            db = root / "jobs.sqlite"
+            now = 229_255.0
+            bot._studio_ensure_schema(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO studio_portfolio_projects(
+                        project_key, project_name, project_path, github_repo, github_url, default_branch,
+                        latest_head, private, status, source_order_id, latest_order_id, latest_outcome_status,
+                        latest_summary, validation_summary, monetization_summary, next_milestone,
+                        first_seen_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "signaldesk",
+                        "Signaldesk",
+                        str(project_root),
+                        "",
+                        "",
+                        "",
+                        "",
+                        1,
+                        "needs_publication",
+                        "order-project",
+                        "order-project",
+                        "published_project",
+                        "Concrete child project path was recorded as the publication target.",
+                        "",
+                        "",
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+                conn.commit()
+
+            with patch.dict(os.environ, {"BOT_PROJECT_INCUBATOR_ROOT": str(incubator_root)}, clear=False):
+                changed = bot._studio_reconcile_portfolio_publication_contract(db, now=now + 60)
+                with sqlite3.connect(db) as conn:
+                    conn.row_factory = sqlite3.Row
+                    recovery_row = conn.execute(
+                        "SELECT status, required_action, missing_json FROM studio_publication_recovery"
+                    ).fetchone()
+                    project_row = conn.execute("SELECT status, latest_summary FROM studio_portfolio_projects").fetchone()
+
+        self.assertEqual(changed, 1)
+        self.assertIsNotNone(recovery_row)
+        self.assertEqual(recovery_row["status"], "open")
+        self.assertEqual(recovery_row["required_action"], "initialize_git_or_archive")
+        self.assertIn("github_repo", recovery_row["missing_json"])
+        self.assertIn("github_url", recovery_row["missing_json"])
+        self.assertIn("latest_head", recovery_row["missing_json"])
+        self.assertEqual(project_row["status"], "needs_publication")
+        self.assertIn("initialize_git_or_archive", project_row["latest_summary"])
+
     def test_publication_contract_reconcile_recovers_missing_fields_from_source_order_trace(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"
