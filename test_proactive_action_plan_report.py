@@ -316,7 +316,7 @@ class TestProactiveActionPlanReport(unittest.TestCase):
         self.assertIn("- Truncated: True", rendered)
         self.assertIn("| Project | Target | Evidence | Required action | Missing | Status |", rendered)
         self.assertIn("| SignalDeck | manolosake/signaldeck | url=https://github.com/manolosake/signaldeck; head=abc1234def5678; order=order-17 | resolve_publication_contract | private | open: Private visibility confirmation is still missing. |", rendered)
-        self.assertIn("| Local Only Project | /home/aponce/local-only-project | - | archive_or_reject_missing_path | github_repo, github_url | open: No GitHub publication target was found. |", rendered)
+        self.assertIn("| Local Only Project | /home/aponce/local-only-project | path=/home/aponce/local-only-project | archive_or_reject_missing_path | github_repo, github_url | open: No GitHub publication target was found. |", rendered)
 
     def test_render_markdown_surfaces_publication_recovery_delegate_without_proactive_orders(self) -> None:
         report = {
@@ -654,9 +654,15 @@ class TestProactiveActionPlanReport(unittest.TestCase):
             "current_target_facts": {"project_path": "/home/aponce/missing-project"},
             "missing_fields": ["github_repo", "github_url", "latest_head"],
             "acceptance_criteria": ["Inspect the open publication recovery entry for Missing Project."],
-            "evidence_required": ["archive/reject decision with rationale tied to the missing or invalid target"],
+            "evidence_required": [
+                "project_path=/home/aponce/missing-project",
+                "archive/reject decision with rationale tied to the missing or invalid target",
+            ],
             "suggested_validation": ["Verify the recovery row now records the current publication target facts or an explicit terminal blocker."],
-            "definition_of_done": ["A keep/archive/reject decision is recorded before fresh publication work continues."],
+            "definition_of_done": [
+                "A keep/archive/reject decision is recorded before fresh publication work continues.",
+                "The archive/reject decision cites exact local path evidence for /home/aponce/missing-project.",
+            ],
             "outcome_contract": {
                 "allowed_outcomes": ["resolved", "archived", "rejected_low_value", "blocked_need_operator"],
                 "required_fields_by_outcome": {
@@ -671,6 +677,8 @@ class TestProactiveActionPlanReport(unittest.TestCase):
             "assignment_prompt": "ROLE: product_ops.\nAction: Decide whether to archive or reject Missing Project because no publication target is currently valid.\n\nOutcome contract:\n- required_fields[archived]: recovery_status, reason, evidence",
         }
         rendered = report_tool.render_markdown(report)
+        self.assertIn("  - project_path=/home/aponce/missing-project", rendered)
+        self.assertIn("  - The archive/reject decision cites exact local path evidence for /home/aponce/missing-project.", rendered)
         self.assertIn("    - archived: recovery_status, reason, evidence", rendered)
         self.assertNotIn("    - archived: recovery_status, reason, evidence, github_url", rendered)
 

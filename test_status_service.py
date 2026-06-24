@@ -630,9 +630,14 @@ class TestStatusService(unittest.TestCase):
                 "local path verification summary",
                 delegation_packet["evidence_required"],
             )
+            self.assertIn("project_path=/tmp/broken", delegation_packet["evidence_required"])
             self.assertIn(
                 "archive/reject decision with rationale tied to the missing or invalid target",
                 delegation_packet["evidence_required"],
+            )
+            self.assertIn(
+                "The archive/reject decision cites exact local path evidence for /tmp/broken.",
+                delegation_packet["definition_of_done"],
             )
 
     def test_proactive_action_plan_surfaces_specific_publication_recovery_actions(self) -> None:
@@ -644,9 +649,13 @@ class TestStatusService(unittest.TestCase):
                 "product_ops",
                 [
                     "local path verification summary",
+                    "project_path=/tmp/signaldeck",
                     "archive/reject decision with rationale tied to the missing or invalid target",
                 ],
-                [],
+                [
+                    "The archive/reject decision cites exact local path evidence for /tmp/signaldeck.",
+                    "Confirm the recovery row records exact local path evidence for /tmp/signaldeck before the archive/reject decision is closed.",
+                ],
             ),
             (
                 "initialize_git_or_archive",
@@ -917,6 +926,10 @@ class TestStatusService(unittest.TestCase):
         self.assertNotIn("latest_head", contract["required_fields_by_outcome"]["archived"])
         self.assertIn("github_url", contract["required_fields_by_outcome"]["resolved"])
         self.assertIn("latest_head", contract["required_fields_by_outcome"]["resolved"])
+        self.assertIn(
+            "Confirm the recovery row records exact local path evidence for /tmp/missing-project before the archive/reject decision is closed.",
+            contract["suggested_validation"],
+        )
         self.assertIn(
             "required_fields[archived]: recovery_status, reason, evidence",
             packet["assignment_prompt"],

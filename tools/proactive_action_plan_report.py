@@ -48,9 +48,13 @@ def _compact_scalar_text(value: Any) -> str:
 
 def _publication_recovery_evidence(item: dict[str, Any]) -> str:
     evidence: list[str] = []
+    required_action = _compact_scalar_text(item.get("required_action")).lower()
+    project_path = _compact_scalar_text(item.get("project_path"))
     github_url = _compact_scalar_text(item.get("github_url"))
     latest_head = _compact_scalar_text(item.get("latest_head"))
     source_order_id = _compact_scalar_text(item.get("source_order_id"))
+    if required_action == "archive_or_reject_missing_path" and project_path:
+        evidence.append(f"path={project_path}")
     if github_url:
         evidence.append(f"url={github_url}")
     if latest_head:

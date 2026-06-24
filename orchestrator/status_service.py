@@ -2808,6 +2808,8 @@ def _publication_recovery_outcome_contract(item: dict[str, Any]) -> dict[str, An
     common_required_fields = ["recovery_status", "reason", "evidence"]
     resolved_required_fields = list(common_required_fields)
     missing_fields = [entry for entry in _proactive_packet_list(item.get("missing_fields")) if entry]
+    required_action = str(item.get("required_action") or "").strip().lower()
+    project_path = _proactive_packet_text(item.get("project_path"))
     for field in missing_fields:
         if field not in resolved_required_fields:
             resolved_required_fields.append(field)
@@ -2833,6 +2835,13 @@ def _publication_recovery_outcome_contract(item: dict[str, Any]) -> dict[str, An
     if "github_repo" in missing_fields or "github_url" in missing_fields:
         suggested_validation.append(
             "Confirm the recovery row records the recovered GitHub repo/remote target or an explicit archive/reject decision."
+        )
+    if required_action == "archive_or_reject_missing_path" and project_path:
+        suggested_validation.append(
+            f"The archive/reject decision cites exact local path evidence for {project_path}."
+        )
+        suggested_validation.append(
+            f"Confirm the recovery row records exact local path evidence for {project_path} before the archive/reject decision is closed."
         )
 
     return {
@@ -2923,6 +2932,8 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         evidence_required.append(f"github_url={github_url}")
     if latest_head:
         evidence_required.append(f"latest_head={latest_head}")
+    if project_path and required_action.lower() == "archive_or_reject_missing_path":
+        evidence_required.append(f"project_path={project_path}")
     if required_action.lower() == "create_private_remote_and_push_or_archive":
         evidence_required.extend(
             [
@@ -2962,6 +2973,10 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
     ]
     if required_action.lower() == "archive_or_reject_missing_path":
         definition_of_done.append("A keep/archive/reject decision is recorded before fresh publication work continues.")
+        if project_path:
+            definition_of_done.append(
+                f"The archive/reject decision cites exact local path evidence for {project_path}."
+            )
     elif required_action.lower() == "backfill_latest_head_or_validate_private_github":
         definition_of_done.append(
             "The latest_head field is backfilled from current publication evidence or the private GitHub target is explicitly validated with the remaining blocker recorded."
@@ -2973,6 +2988,11 @@ def _publication_recovery_packet(summary: dict[str, Any]) -> dict[str, Any] | No
         "Re-open the proactive action plan report and confirm the publication recovery item no longer needs follow-up.",
         "Verify the recorded publication evidence matches the current local repo or GitHub target.",
     ]
+    if required_action.lower() == "archive_or_reject_missing_path" and project_path:
+        suggested_validation.append(f"The archive/reject decision cites exact local path evidence for {project_path}.")
+        suggested_validation.append(
+            f"Confirm the recovery row records exact local path evidence for {project_path} before the archive/reject decision is closed."
+        )
     if required_action.lower() == "backfill_latest_head_or_validate_private_github":
         suggested_validation.append(
             "Confirm the recovery row now records latest_head or an explicit private GitHub validation blocker."
