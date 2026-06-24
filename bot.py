@@ -18438,7 +18438,26 @@ def _invalid_publication_scope_path(path: str) -> bool:
 
     invalid_roots = set(_factory_repo_roots())
     invalid_roots.add(_project_incubator_root_dir())
-    return resolved in invalid_roots
+    if resolved in invalid_roots:
+        return True
+
+    try:
+        if resolved.exists() and resolved.is_file():
+            return True
+    except Exception:
+        pass
+
+    invalid_nested_parts = set(_FACTORY_REPO_EXCLUDE_NAMES) | {"controller_snapshot"}
+    for root in invalid_roots:
+        if not _path_is_relative_to(resolved, root):
+            continue
+        try:
+            relative_parts = {part.lower() for part in resolved.relative_to(root).parts}
+        except Exception:
+            continue
+        if relative_parts & invalid_nested_parts:
+            return True
+    return False
 
 
 def _studio_rank_publication_recovery_records(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:

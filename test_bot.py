@@ -3468,6 +3468,59 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertEqual(factory_child_action, "initialize_git_or_archive")
         self.assertEqual(incubator_child_action, "initialize_git_or_archive")
 
+    def test_publication_recovery_action_rejects_nested_snapshot_descendants_under_invalid_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            incubator_root = Path(td) / "incubator"
+            snapshot_path = incubator_root / "codexbot" / "data" / "artifacts" / "job-1" / "controller_snapshot"
+            snapshot_path.mkdir(parents=True)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_PROJECT_INCUBATOR_ROOT": str(incubator_root),
+                },
+                clear=False,
+            ):
+                action = bot._studio_publication_recovery_action(
+                    {
+                        "project_path": str(snapshot_path),
+                        "_path_exists": True,
+                        "_has_git": False,
+                        "_has_commit": False,
+                        "github_url": "",
+                    },
+                    ["github_repo", "github_url", "latest_head"],
+                )
+
+        self.assertEqual(action, "archive_or_reject_missing_path")
+
+    def test_publication_recovery_action_rejects_single_file_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            incubator_root = Path(td) / "incubator"
+            incubator_root.mkdir()
+            file_target = incubator_root / "README.md"
+            file_target.write_text("# not a repo root\n", encoding="utf-8")
+
+            with patch.dict(
+                os.environ,
+                {
+                    "BOT_PROJECT_INCUBATOR_ROOT": str(incubator_root),
+                },
+                clear=False,
+            ):
+                action = bot._studio_publication_recovery_action(
+                    {
+                        "project_path": str(file_target),
+                        "_path_exists": True,
+                        "_has_git": False,
+                        "_has_commit": False,
+                        "github_url": "",
+                    },
+                    ["github_repo", "github_url", "latest_head"],
+                )
+
+        self.assertEqual(action, "archive_or_reject_missing_path")
+
     def test_publication_contract_reconcile_marks_configured_container_root_scope_for_archive_or_reject(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
