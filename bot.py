@@ -20946,6 +20946,40 @@ def _studio_complete_cycle_for_order(
     )
 
 
+def _studio_publication_recovery_terminal_status(
+    *,
+    outcome_status: str,
+    outcome_summary: str,
+    trace: Mapping[str, Any] | None = None,
+) -> str:
+    outcome = str(outcome_status or "").strip().lower()
+    if outcome not in {"rejected_low_value", "blocked_need_operator", "failed_root_caused"}:
+        return outcome
+    if outcome != "rejected_low_value":
+        return outcome
+
+    trace_mapping = trace if isinstance(trace, Mapping) else {}
+    for key in (
+        "studio_recovery_status",
+        "publication_recovery_status",
+        "recovery_status",
+    ):
+        value = str(trace_mapping.get(key) or "").strip().lower()
+        if value == "archived":
+            return "archived"
+
+    summary = str(outcome_summary or "").strip().lower()
+    archive_patterns = (
+        r"\brecovery_status\s*[:=]\s*archived\b",
+        r"\bclosed as archived\b",
+        r"\barchived after publication review\b",
+        r"\b(?:asset|project|repo|prototype|folder|item)\s+(?:was|is)\s+archived\b",
+    )
+    if any(re.search(pattern, summary) for pattern in archive_patterns):
+        return "archived"
+    return outcome
+
+
 def _studio_close_negative_publication_recovery_for_order_conn(
     *,
     conn: sqlite3.Connection,
@@ -20994,6 +21028,11 @@ def _studio_close_negative_publication_recovery_for_order_conn(
     if target_row is None:
         return
 
+    recovery_status = _studio_publication_recovery_terminal_status(
+        outcome_status=outcome_status,
+        outcome_summary=outcome_summary,
+        trace=trace,
+    )
     conn.execute(
         """
         UPDATE studio_publication_recovery
@@ -21004,7 +21043,7 @@ def _studio_close_negative_publication_recovery_for_order_conn(
           AND status = 'open'
         """,
         (
-            str(outcome_status).strip(),
+            recovery_status,
             _studio_one_line(outcome_summary, max_chars=500, default=str(outcome_status)),
             float(now),
             str(target_row["recovery_id"] if isinstance(target_row, sqlite3.Row) else target_row[0]),

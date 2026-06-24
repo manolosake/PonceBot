@@ -1825,6 +1825,222 @@ def test_studio_complete_cycle_closes_targeted_publication_recovery_on_negative_
     assert open_count == 0
 
 
+def test_studio_complete_cycle_archives_targeted_publication_recovery_when_rejection_is_explicitly_archived(tmp_path):
+    now = 2_000.0
+    db = tmp_path / "jobs.sqlite"
+    storage = SQLiteTaskStorage(db)
+    orch_q = OrchestratorQueue(storage)
+    chat_id = 123
+    order_id = "publication-recovery-order"
+    project_path = str(tmp_path / "quotekit-studio")
+    outcome_summary = (
+        "QuoteKit Studio archived after publication review: duplicate prototype with no differentiated value."
+    )
+    trace = {
+        "studio_selected_type": "PUBLICATION_RECOVERY",
+        "studio_recovery_id": project_path.lower(),
+        "studio_recovery_project_key": project_path.lower(),
+        "studio_recovery_project_name": "QuoteKit Studio",
+        "studio_recovery_project_path": project_path,
+        "studio_recovery_source_order_id": "source-order-1",
+    }
+    orch_q.submit_task(
+        Task.new(
+            job_id=order_id,
+            source="test",
+            role="skynet",
+            input_text="recover publication",
+            request_type="exec",
+            priority=1,
+            model="gpt-5.5",
+            effort="high",
+            mode_hint="full",
+            requires_approval=False,
+            max_cost_window_usd=0,
+            chat_id=chat_id,
+            state="done",
+            trace=trace,
+        )
+    )
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=chat_id,
+        title="Publication recovery order",
+        body="recover publication",
+        status="done",
+        phase="done",
+    )
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', 'publication-recovery', 'PUBLICATION_RECOVERY', NULL,
+                NULL, 'portfolio', 'Close publication debt.', 'Because open recovery rows block trust.', 'Critic agrees.',
+                'Close one recovery row with exact evidence.', 'SQLite evidence.', 'Low.', 'packet', '[]',
+                '', '', ?, ?, ?)
+            """,
+            ("cycle-1", now, order_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_path.lower(),
+                project_path.lower(),
+                "QuoteKit Studio",
+                project_path,
+                "",
+                "",
+                "",
+                '["github_repo"]',
+                "create_private_remote_and_push_or_archive",
+                "open",
+                "Publication incomplete: missing private GitHub publication evidence.",
+                "source-order-1",
+                now - 60,
+                now - 60,
+            ),
+        )
+        conn.commit()
+
+    bot._studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status="rejected_low_value",
+        outcome_summary=outcome_summary,
+        now=now,
+    )
+
+    with sqlite3.connect(db) as conn:
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (project_path.lower(),),
+        ).fetchone()
+        cycle = conn.execute(
+            "SELECT status, outcome_status FROM studio_cycles WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+
+    assert recovery == ("archived", outcome_summary)
+    assert cycle == ("rejected", "rejected_low_value")
+
+
+def test_studio_complete_cycle_archives_targeted_publication_recovery_from_explicit_trace_signal(tmp_path):
+    now = 2_000.0
+    db = tmp_path / "jobs.sqlite"
+    storage = SQLiteTaskStorage(db)
+    orch_q = OrchestratorQueue(storage)
+    chat_id = 123
+    order_id = "publication-recovery-order"
+    project_path = str(tmp_path / "quotekit-studio")
+    outcome_summary = (
+        "QuoteKit Studio rejected_low_value after publication review: duplicate prototype with no differentiated value."
+    )
+    trace = {
+        "studio_selected_type": "PUBLICATION_RECOVERY",
+        "studio_recovery_id": project_path.lower(),
+        "studio_recovery_project_key": project_path.lower(),
+        "studio_recovery_project_name": "QuoteKit Studio",
+        "studio_recovery_project_path": project_path,
+        "studio_recovery_source_order_id": "source-order-1",
+        "studio_recovery_status": "archived",
+    }
+    orch_q.submit_task(
+        Task.new(
+            job_id=order_id,
+            source="test",
+            role="skynet",
+            input_text="recover publication",
+            request_type="exec",
+            priority=1,
+            model="gpt-5.5",
+            effort="high",
+            mode_hint="full",
+            requires_approval=False,
+            max_cost_window_usd=0,
+            chat_id=chat_id,
+            state="done",
+            trace=trace,
+        )
+    )
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=chat_id,
+        title="Publication recovery order",
+        body="recover publication",
+        status="done",
+        phase="done",
+    )
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', 'publication-recovery', 'PUBLICATION_RECOVERY', NULL,
+                NULL, 'portfolio', 'Close publication debt.', 'Because open recovery rows block trust.', 'Critic agrees.',
+                'Close one recovery row with exact evidence.', 'SQLite evidence.', 'Low.', 'packet', '[]',
+                '', '', ?, ?, ?)
+            """,
+            ("cycle-1", now, order_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_path.lower(),
+                project_path.lower(),
+                "QuoteKit Studio",
+                project_path,
+                "",
+                "",
+                "",
+                '["github_repo"]',
+                "create_private_remote_and_push_or_archive",
+                "open",
+                "Publication incomplete: missing private GitHub publication evidence.",
+                "source-order-1",
+                now - 60,
+                now - 60,
+            ),
+        )
+        conn.commit()
+
+    bot._studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status="rejected_low_value",
+        outcome_summary=outcome_summary,
+        now=now,
+    )
+
+    with sqlite3.connect(db) as conn:
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (project_path.lower(),),
+        ).fetchone()
+
+    assert recovery == ("archived", outcome_summary)
+
+
 def test_studio_complete_cycle_does_not_close_publication_recovery_without_exact_recovery_id(tmp_path):
     now = 2_000.0
     db = tmp_path / "jobs.sqlite"
@@ -1954,6 +2170,216 @@ def test_studio_complete_cycle_does_not_close_publication_recovery_without_exact
         ("recovery-b", "open", "Publication incomplete: missing private GitHub publication evidence."),
     ]
     assert open_count == 2
+
+
+def test_studio_complete_cycle_keeps_rejected_publication_recovery_when_summary_mentions_archive_non_terminally(tmp_path):
+    now = 2_000.0
+    db = tmp_path / "jobs.sqlite"
+    storage = SQLiteTaskStorage(db)
+    orch_q = OrchestratorQueue(storage)
+    chat_id = 123
+    order_id = "publication-recovery-order"
+    project_path = str(tmp_path / "quotekit-studio")
+    outcome_summary = (
+        "QuoteKit Studio rejected_low_value after publication review: duplicate prototype; operator asked whether this should be archived later."
+    )
+    trace = {
+        "studio_selected_type": "PUBLICATION_RECOVERY",
+        "studio_recovery_id": project_path.lower(),
+        "studio_recovery_project_key": project_path.lower(),
+        "studio_recovery_project_name": "QuoteKit Studio",
+        "studio_recovery_project_path": project_path,
+        "studio_recovery_source_order_id": "source-order-1",
+    }
+    orch_q.submit_task(
+        Task.new(
+            job_id=order_id,
+            source="test",
+            role="skynet",
+            input_text="recover publication",
+            request_type="exec",
+            priority=1,
+            model="gpt-5.5",
+            effort="high",
+            mode_hint="full",
+            requires_approval=False,
+            max_cost_window_usd=0,
+            chat_id=chat_id,
+            state="done",
+            trace=trace,
+        )
+    )
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=chat_id,
+        title="Publication recovery order",
+        body="recover publication",
+        status="done",
+        phase="done",
+    )
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', 'publication-recovery', 'PUBLICATION_RECOVERY', NULL,
+                NULL, 'portfolio', 'Close publication debt.', 'Because open recovery rows block trust.', 'Critic agrees.',
+                'Close one recovery row with exact evidence.', 'SQLite evidence.', 'Low.', 'packet', '[]',
+                '', '', ?, ?, ?)
+            """,
+            ("cycle-1", now, order_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_path.lower(),
+                project_path.lower(),
+                "QuoteKit Studio",
+                project_path,
+                "",
+                "",
+                "",
+                '["github_repo"]',
+                "create_private_remote_and_push_or_archive",
+                "open",
+                "Publication incomplete: missing private GitHub publication evidence.",
+                "source-order-1",
+                now - 60,
+                now - 60,
+            ),
+        )
+        conn.commit()
+
+    bot._studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status="rejected_low_value",
+        outcome_summary=outcome_summary,
+        now=now,
+    )
+
+    with sqlite3.connect(db) as conn:
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (project_path.lower(),),
+        ).fetchone()
+
+    assert recovery == ("rejected_low_value", outcome_summary)
+
+
+def test_studio_complete_cycle_keeps_blocked_publication_recovery_status_even_if_summary_mentions_archive(tmp_path):
+    now = 2_000.0
+    db = tmp_path / "jobs.sqlite"
+    storage = SQLiteTaskStorage(db)
+    orch_q = OrchestratorQueue(storage)
+    chat_id = 123
+    order_id = "publication-recovery-order"
+    project_path = str(tmp_path / "quotekit-studio")
+    outcome_summary = (
+        "QuoteKit Studio blocked_need_operator: operator must archive the duplicate after confirming no external dependency remains."
+    )
+    trace = {
+        "studio_selected_type": "PUBLICATION_RECOVERY",
+        "studio_recovery_id": project_path.lower(),
+        "studio_recovery_project_key": project_path.lower(),
+        "studio_recovery_project_name": "QuoteKit Studio",
+        "studio_recovery_project_path": project_path,
+        "studio_recovery_source_order_id": "source-order-1",
+    }
+    orch_q.submit_task(
+        Task.new(
+            job_id=order_id,
+            source="test",
+            role="skynet",
+            input_text="recover publication",
+            request_type="exec",
+            priority=1,
+            model="gpt-5.5",
+            effort="high",
+            mode_hint="full",
+            requires_approval=False,
+            max_cost_window_usd=0,
+            chat_id=chat_id,
+            state="done",
+            trace=trace,
+        )
+    )
+    orch_q.upsert_order(
+        order_id=order_id,
+        chat_id=chat_id,
+        title="Publication recovery order",
+        body="recover publication",
+        status="done",
+        phase="done",
+    )
+    bot._studio_ensure_schema(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            INSERT INTO studio_cycles(
+                cycle_id, version, ts, status, selected_key, selected_type, selected_repo_id,
+                selected_repo_path, selected_lane, thesis, rationale, debate_summary,
+                operator_visible_outcome, evidence_target, risk_summary, prompt_packet,
+                opportunities_json, outcome_status, outcome_summary, order_id, created_at, updated_at
+            ) VALUES (?, 1, ?, 'active', 'publication-recovery', 'PUBLICATION_RECOVERY', NULL,
+                NULL, 'portfolio', 'Close publication debt.', 'Because open recovery rows block trust.', 'Critic agrees.',
+                'Close one recovery row with exact evidence.', 'SQLite evidence.', 'Low.', 'packet', '[]',
+                '', '', ?, ?, ?)
+            """,
+            ("cycle-1", now, order_id, now, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO studio_publication_recovery(
+                recovery_id, project_key, project_name, project_path, github_repo, github_url,
+                latest_head, missing_json, required_action, status, reason, source_order_id,
+                first_seen_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_path.lower(),
+                project_path.lower(),
+                "QuoteKit Studio",
+                project_path,
+                "",
+                "",
+                "",
+                '["github_repo"]',
+                "create_private_remote_and_push_or_archive",
+                "open",
+                "Publication incomplete: missing private GitHub publication evidence.",
+                "source-order-1",
+                now - 60,
+                now - 60,
+            ),
+        )
+        conn.commit()
+
+    bot._studio_complete_cycle_for_order_from_queue(
+        orch_q=orch_q,
+        order_id=order_id,
+        outcome_status="blocked_need_operator",
+        outcome_summary=outcome_summary,
+        now=now,
+    )
+
+    with sqlite3.connect(db) as conn:
+        recovery = conn.execute(
+            "SELECT status, reason FROM studio_publication_recovery WHERE recovery_id = ?",
+            (project_path.lower(),),
+        ).fetchone()
+
+    assert recovery == ("blocked_need_operator", outcome_summary)
 
 
 def test_auto_merge_tick_root_causes_pre_deploy_controller_snapshot_autoship_failure(tmp_path, monkeypatch):
