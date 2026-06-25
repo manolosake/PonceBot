@@ -5195,7 +5195,19 @@ class StatusService:
             )
             matched_by = "rank"
         elif orders:
-            selected = orders[0]
+            top_rank: int | None = None
+            for order in orders:
+                try:
+                    candidate_rank = int(order.get("rank") or 0)
+                except Exception:
+                    continue
+                if candidate_rank <= 0:
+                    continue
+                if top_rank is None or candidate_rank < top_rank:
+                    top_rank = candidate_rank
+                    selected = order
+            if selected is None:
+                selected = orders[0]
 
         selection = {
             "order_id": normalized_order_id or None,
