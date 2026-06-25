@@ -12559,3 +12559,126 @@ class TestPlanCommandHelpers(unittest.TestCase):
         self.assertTrue(handled)
         svc.proactive_action_plan.assert_called_once_with(chat_id=7, limit=5)
         send_mock.assert_called_once()
+
+
+class TestProactiveSelectionReviewGate(unittest.TestCase):
+    def test_weak_proactive_order_reroutes_delivery_specs_to_selection_review_owner(self) -> None:
+        class FakeQueue:
+            pass
+
+        original_specs = [
+            bot.TaskSpec(
+                key="deliver_backend",
+                role="backend",
+                text="Implement the next proactive slice in bot.py",
+                mode_hint="rw",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=["Land the bounded delivery change."],
+                definition_of_done=["Delivery slice is complete."],
+                eta_minutes=60,
+                sla_tier="high",
+            )
+        ]
+        action_plan = {
+            "lanes": [
+                {
+                    "lane": "selection_review",
+                    "label": "Selection Review",
+                    "orders": [
+                        {
+                            "order_id": "order-1",
+                            "order_id_short": "order-1",
+                            "title": "Weak proactive order",
+                            "decision": "selection_review",
+                            "current_stage": "delivery",
+                            "next_action": "Make a kill/continue/replan decision before more delivery work.",
+                            "selection_quality": {
+                                "status": "needs_review",
+                                "recommended_owner_role": "architect_local",
+                                "delegation_reason": "selection_review_required",
+                                "delegation_focus": "selection_quality_review",
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch.object(bot, "StatusService") as status_service_cls:
+            status_service_cls.return_value.proactive_action_plan.return_value = action_plan
+            gated_specs, gate_meta = bot._apply_proactive_selection_review_gate(
+                specs=original_specs,
+                orch_q=FakeQueue(),  # type: ignore[arg-type]
+                profiles=None,
+                root_ticket="order-1",
+                chat_id=7,
+                current_plan_revision=0,
+                existing_keys=set(),
+                existing_subtasks=[],
+            )
+
+        self.assertIsNotNone(gate_meta)
+        self.assertEqual(len(gated_specs), 1)
+        self.assertEqual(gated_specs[0].role, "architect_local")
+        self.assertEqual(gated_specs[0].mode_hint, "ro")
+        self.assertIn("selection_review", gate_meta["packet"]["delegation_reason"])
+        self.assertIn("kill/continue/replan", gated_specs[0].text.lower())
+        self.assertEqual(gate_meta["suppressed_roles"], ["backend"])
+
+    def test_normal_advance_order_keeps_delivery_specs(self) -> None:
+        class FakeQueue:
+            pass
+
+        original_specs = [
+            bot.TaskSpec(
+                key="deliver_backend",
+                role="backend",
+                text="Implement the proactive improvement in bot.py",
+                mode_hint="rw",
+                priority=1,
+                depends_on=[],
+                requires_approval=False,
+                acceptance_criteria=["Land the bounded delivery change."],
+                definition_of_done=["Delivery slice is complete."],
+                eta_minutes=60,
+                sla_tier="high",
+            )
+        ]
+        action_plan = {
+            "lanes": [
+                {
+                    "lane": "advance",
+                    "label": "Advance",
+                    "orders": [
+                        {
+                            "order_id": "order-1",
+                            "order_id_short": "order-1",
+                            "title": "Healthy proactive order",
+                            "decision": "advance",
+                            "current_stage": "delivery",
+                            "next_action": "Advance delivery.",
+                            "selection_quality": {"status": "ok"},
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch.object(bot, "StatusService") as status_service_cls:
+            status_service_cls.return_value.proactive_action_plan.return_value = action_plan
+            gated_specs, gate_meta = bot._apply_proactive_selection_review_gate(
+                specs=list(original_specs),
+                orch_q=FakeQueue(),  # type: ignore[arg-type]
+                profiles=None,
+                root_ticket="order-1",
+                chat_id=7,
+                current_plan_revision=0,
+                existing_keys=set(),
+                existing_subtasks=[],
+            )
+
+        self.assertIsNone(gate_meta)
+        self.assertEqual(len(gated_specs), 1)
+        self.assertEqual(gated_specs[0].role, "backend")

@@ -63,7 +63,7 @@ from orchestrator.storage import SQLiteTaskStorage
 from orchestrator.scheduler import OrchestratorScheduler
 from orchestrator.runner import run_task as run_orchestrator_task
 from orchestrator.workspaces import WorktreeLease, collect_git_artifacts, ensure_worktree_pool, prepare_clean_workspace
-from orchestrator.status_service import StatusService
+from orchestrator.status_service import StatusService, _proactive_lane_execution_packet
 from orchestrator.status_http import start_status_http_server
 
 try:
@@ -12048,6 +12048,137 @@ def _proactive_action_plan_text(plan: dict[str, Any], *, scope_label: str, limit
             )
 
     return "\n".join(lines)
+
+
+def _resolve_proactive_selection_review_gate(
+    *,
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    root_ticket: str,
+    chat_id: int,
+) -> dict[str, Any] | None:
+    order_id = str(root_ticket or "").strip()
+    if not order_id:
+        return None
+    try:
+        report = StatusService(
+            orch_q=orch_q,
+            role_profiles=profiles,
+            cache_ttl_seconds=0,
+        ).proactive_action_plan(chat_id=int(chat_id), limit=200)
+    except Exception:
+        return None
+
+    for lane in list(report.get("lanes") or []):
+        if not isinstance(lane, dict):
+            continue
+        lane_key = str(lane.get("lane") or "").strip().lower()
+        lane_label = str(lane.get("label") or lane_key.title()).strip() or lane_key.title()
+        for order in list(lane.get("orders") or []):
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("order_id") or "").strip() != order_id:
+                continue
+            selection_quality = order.get("selection_quality") if isinstance(order.get("selection_quality"), dict) else {}
+            needs_review = (
+                lane_key == "selection_review"
+                or (
+                    lane_key == "advance"
+                    and str(selection_quality.get("status") or "").strip().lower() == "needs_review"
+                )
+            )
+            if not needs_review:
+                return None
+            packet = _proactive_lane_execution_packet(order, lane_key, lane_label)
+            if not isinstance(packet, dict):
+                return None
+            return {
+                "lane": lane_key,
+                "label": lane_label,
+                "order": order,
+                "execution_packet": packet,
+            }
+    return None
+
+
+def _apply_proactive_selection_review_gate(
+    *,
+    specs: list[TaskSpec],
+    orch_q: OrchestratorQueue,
+    profiles: dict[str, dict[str, Any]] | None,
+    root_ticket: str,
+    chat_id: int,
+    current_plan_revision: int,
+    existing_keys: set[str],
+    existing_subtasks: list[Task],
+) -> tuple[list[TaskSpec], dict[str, Any] | None]:
+    gate = _resolve_proactive_selection_review_gate(
+        orch_q=orch_q,
+        profiles=profiles,
+        root_ticket=root_ticket,
+        chat_id=int(chat_id),
+    )
+    if not isinstance(gate, dict):
+        return specs, None
+
+    packet = gate.get("execution_packet") if isinstance(gate.get("execution_packet"), dict) else {}
+    owner_role = _coerce_orchestrator_role(str(packet.get("owner_role") or "architect_local"))
+    assignment_prompt = str(packet.get("assignment_prompt") or "").strip()
+    if not assignment_prompt:
+        return specs, None
+
+    active_states = {"queued", "waiting_deps", "blocked_approval", "running", "blocked"}
+    for child in existing_subtasks:
+        child_trace = (child.trace or {}) if isinstance(child.trace, dict) else {}
+        if not bool(child_trace.get("proactive_selection_review_gate", False)):
+            continue
+        if _coerce_orchestrator_role(str(child.role or "")) != owner_role:
+            continue
+        if str(child.state or "").strip().lower() not in active_states:
+            continue
+        return [], {
+            "gate": gate,
+            "packet": packet,
+            "owner_role": owner_role,
+            "existing_gate_job_id": str(child.job_id or "").strip() or None,
+            "suppressed_roles": sorted({_coerce_orchestrator_role(str(spec.role or "")) for spec in specs if str(spec.role or "").strip()}),
+        }
+
+    key_base = f"proactive_selection_review_r{int(current_plan_revision) + 1}"
+    review_key = key_base
+    suffix = 1
+    while review_key in existing_keys:
+        suffix += 1
+        review_key = f"{key_base}_{suffix}"
+
+    review_spec = TaskSpec(
+        key=review_key,
+        role=owner_role,
+        text=assignment_prompt,
+        mode_hint="ro",
+        priority=1,
+        depends_on=[],
+        requires_approval=False,
+        acceptance_criteria=[
+            str(item).strip()
+            for item in list(packet.get("acceptance_criteria") or [])
+            if str(item).strip()
+        ],
+        definition_of_done=[
+            str(item).strip()
+            for item in list(packet.get("definition_of_done") or [])
+            if str(item).strip()
+        ],
+        eta_minutes=45,
+        sla_tier="high",
+    )
+    return [review_spec], {
+        "gate": gate,
+        "packet": packet,
+        "owner_role": owner_role,
+        "review_key": review_key,
+        "suppressed_roles": sorted({_coerce_orchestrator_role(str(spec.role or "")) for spec in specs if str(spec.role or "").strip()}),
+    }
 
 
 def _mobile_latest_apk(artifacts_dir: Path) -> Path | None:
@@ -39112,13 +39243,53 @@ def orchestrator_worker_loop(
                                 except Exception:
                                     pass
 
+                        selection_review_gate_meta: dict[str, Any] | None = None
+                        if autonomous_non_manual and (bool(proactive_lane) or bool(order_is_proactive)):
+                            specs, selection_review_gate_meta = _apply_proactive_selection_review_gate(
+                                specs=specs,
+                                orch_q=orch_q,
+                                profiles=profiles,
+                                root_ticket=root_ticket,
+                                chat_id=int(task.chat_id),
+                                current_plan_revision=int(current_plan_revision),
+                                existing_keys=existing_keys,
+                                existing_subtasks=list(existing_subtasks or []),
+                            )
+                            if selection_review_gate_meta:
+                                try:
+                                    orch_q.append_audit_event(
+                                        event_type="delegation.proactive_selection_review_rerouted",
+                                        actor=controller_actor,
+                                        details={
+                                            "order_id": root_ticket,
+                                            "lane": str(
+                                                (
+                                                    (selection_review_gate_meta.get("gate") or {})
+                                                    if isinstance(selection_review_gate_meta.get("gate"), dict)
+                                                    else {}
+                                                ).get("lane")
+                                                or "selection_review"
+                                            ),
+                                            "owner_role": str(selection_review_gate_meta.get("owner_role") or ""),
+                                            "review_key": str(selection_review_gate_meta.get("review_key") or ""),
+                                            "existing_gate_job_id": selection_review_gate_meta.get("existing_gate_job_id"),
+                                            "suppressed_roles": list(selection_review_gate_meta.get("suppressed_roles") or []),
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+
                         if specs:
                             next_plan_revision = max(1, current_plan_revision + 1)
                             # Quality gate:
                             # - Mandatory for manual CEO tickets (before wrap-up).
                             # - Also mandatory for autonomous/proactive lanes so improvements iterate with evidence.
-                            quality_gate_required = bool(is_top_level_manual) or bool(
-                                autonomous_non_manual and (not enforce_local_only)
+                            quality_gate_required = (
+                                (selection_review_gate_meta is None)
+                                and (
+                                    bool(is_top_level_manual)
+                                    or bool(autonomous_non_manual and (not enforce_local_only))
+                                )
                             )
                             if quality_gate_required:
                                 has_qa = any(str(s.role).strip().lower() in ("qa", "release_mgr", "reviewer_local") for s in specs)
@@ -39210,7 +39381,11 @@ def orchestrator_worker_loop(
                             requested_role = _coerce_orchestrator_role(spec.role)
                             child_role = requested_role
                             remapped_from_role: str | None = None
-                            if enforce_local_only and child_role not in _LOCAL_OLLAMA_ROLE_NAMES:
+                            selection_review_override = bool(
+                                selection_review_gate_meta is not None
+                                and str(selection_review_gate_meta.get("review_key") or "").strip() == str(spec.key or "").strip()
+                            )
+                            if enforce_local_only and (not selection_review_override) and child_role not in _LOCAL_OLLAMA_ROLE_NAMES:
                                 remapped_from_role = child_role
                                 if child_role in {"backend", "frontend", "sre", "product_ops", "release_mgr"}:
                                     child_role = "implementer_local"
@@ -39292,6 +39467,21 @@ def orchestrator_worker_loop(
                                     trace["merge_resolution_base_ref"] = merge_base_ref
                                 if merge_target_ref:
                                     trace["merge_resolution_target_ref"] = merge_target_ref
+                            if selection_review_override and isinstance(selection_review_gate_meta, dict):
+                                packet = (
+                                    selection_review_gate_meta.get("packet")
+                                    if isinstance(selection_review_gate_meta.get("packet"), dict)
+                                    else {}
+                                )
+                                gate = (
+                                    selection_review_gate_meta.get("gate")
+                                    if isinstance(selection_review_gate_meta.get("gate"), dict)
+                                    else {}
+                                )
+                                trace["proactive_selection_review_gate"] = True
+                                trace["proactive_action_plan_lane"] = str(gate.get("lane") or "selection_review")
+                                trace["proactive_action_plan_owner_role"] = str(packet.get("owner_role") or requested_role)
+                                trace["proactive_action_plan_action"] = str(packet.get("action") or "").strip()
                             child = Task.new(
                                 source="telegram",
                                 role=child_role,
