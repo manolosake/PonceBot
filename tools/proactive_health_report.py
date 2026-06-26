@@ -1300,6 +1300,12 @@ def main() -> int:
         'proactive_cli_takeovers_24h': audit_count('delegation.proactive_cli_takeover'),
         'proactive_cli_seeded_24h': audit_count('delegation.proactive_cli_seeded'),
         'proactive_cli_reseeded_24h': audit_count('delegation.proactive_cli_reseeded'),
+        'economic_gate_rejections_24h': audit_count('studio.economic_gate_rejected'),
+        'selection_review_reroutes_24h': audit_count('delegation.proactive_selection_review_rerouted'),
+        'pre_codex_interventions_24h': (
+            audit_count('studio.economic_gate_rejected')
+            + audit_count('delegation.proactive_selection_review_rerouted')
+        ),
         'stale_local_cancels_24h': audit_count('task.proactive_local_stale_cancelled'),
         'final_sweeps_24h': audit_count('order.final_sweep_enqueued'),
         'factory_model_fallback_24h': audit_count('factory.model_fallback'),
@@ -1493,6 +1499,7 @@ def main() -> int:
         f"- Empty local responses (24h): {metrics['empty_response_failures_24h']}",
         f"- CLI takeovers (24h): {metrics['proactive_cli_takeovers_24h']}",
         f"- CLI seeds/reseeds (24h): {metrics['proactive_cli_seeded_24h']}/{metrics['proactive_cli_reseeded_24h']}",
+        f"- Pre-Codex interventions (24h): total={metrics['pre_codex_interventions_24h']} economic_gate_rejections={metrics['economic_gate_rejections_24h']} selection_review_reroutes={metrics['selection_review_reroutes_24h']}",
         f"- Stale local cancels (24h): {metrics['stale_local_cancels_24h']}",
         f"- Final sweeps (24h): {metrics['final_sweeps_24h']}",
         f"- Model fallbacks (24h): {metrics['factory_model_fallback_24h']}",

@@ -1792,6 +1792,108 @@ class TestStudioOutcomeMemory(unittest.TestCase):
         self.assertIn("factory_value 75<", incomplete_value["economic_gate_rejection_reason"])
         self.assertIn("shipability 50<", incomplete_value["economic_gate_rejection_reason"])
 
+    def test_economic_discipline_filter_audits_each_rejected_candidate_before_codex(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.audit_events: list[dict[str, object]] = []
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        governor = {
+            "mode": "economic_discipline_gate",
+            "economic_gate_active": True,
+        }
+        strong = {
+            "key": "repo-codexbot",
+            "type": "DEEP_IMPROVEMENT",
+            "repo_id": "codexbot",
+            "repo_name": "codexbot",
+            "score": 96,
+            "factory_value": {"score": 100, "shipability_score": 100},
+        }
+        low_score = {
+            "key": "repo-shallow",
+            "type": "PRODUCT_WORKFLOW",
+            "repo_id": "shallow",
+            "repo_name": "Shallow",
+            "score": 74,
+            "factory_value": {"score": 100, "shipability_score": 100},
+        }
+        incomplete_value = {
+            "key": "repo-no-ship",
+            "type": "FEATURE",
+            "repo_id": "no-ship",
+            "repo_name": "No Ship",
+            "score": 90,
+            "factory_value": {"score": 75, "shipability_score": 50},
+        }
+        q = FakeQueue()
+
+        filtered = bot._studio_apply_economic_discipline_filter(
+            governor,
+            [strong, low_score, incomplete_value],
+            orch_q=q,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(filtered, [strong])
+        self.assertEqual(len(q.audit_events), 2)
+        self.assertEqual(
+            [event["event_type"] for event in q.audit_events],
+            ["studio.economic_gate_rejected", "studio.economic_gate_rejected"],
+        )
+        self.assertEqual(q.audit_events[0]["actor"], "studio")
+        first_details = q.audit_events[0]["details"]
+        second_details = q.audit_events[1]["details"]
+        self.assertEqual(first_details["candidate_key"], "repo-shallow")
+        self.assertEqual(first_details["score"], 74)
+        self.assertEqual(first_details["factory_value_score"], 100)
+        self.assertEqual(first_details["shipability_score"], 100)
+        self.assertIn("score 74<", str(first_details["reason"]))
+        self.assertEqual(second_details["candidate_key"], "repo-no-ship")
+        self.assertEqual(second_details["factory_value_score"], 75)
+        self.assertEqual(second_details["shipability_score"], 50)
+        self.assertIn("factory_value 75<", str(second_details["reason"]))
+
+    def test_studio_economic_gate_rejected_audit_tolerates_malformed_scores(self) -> None:
+        class FakeQueue:
+            def __init__(self) -> None:
+                self.audit_events: list[dict[str, object]] = []
+
+            def append_audit_event(self, *, event_type: str, actor: str, details: dict[str, object]) -> None:
+                self.audit_events.append({"event_type": event_type, "actor": actor, "details": details})
+
+        governor = {
+            "mode": "economic_discipline_gate",
+            "economic_gate_active": True,
+        }
+        malformed = {
+            "key": "repo-bad-scores",
+            "type": "FEATURE",
+            "repo_id": "bad-scores",
+            "repo_name": "Bad Scores",
+            "score": "oops",
+            "factory_value": {"score": "nan-ish", "shipability_score": "nope"},
+        }
+        q = FakeQueue()
+
+        filtered = bot._studio_apply_economic_discipline_filter(
+            governor,
+            [malformed],
+            orch_q=q,  # type: ignore[arg-type]
+        )
+
+        self.assertEqual(filtered, [])
+        self.assertEqual(len(q.audit_events), 1)
+        event = q.audit_events[0]
+        self.assertEqual(event["event_type"], "studio.economic_gate_rejected")
+        self.assertEqual(event["actor"], "studio")
+        self.assertEqual(event["details"]["candidate_key"], "repo-bad-scores")
+        self.assertEqual(event["details"]["score"], 0)
+        self.assertEqual(event["details"]["factory_value_score"], 0)
+        self.assertEqual(event["details"]["shipability_score"], 0)
+        self.assertIn("score 0<", str(event["details"]["reason"]))
+
     def test_published_project_outcome_records_portfolio_asset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "jobs.sqlite"

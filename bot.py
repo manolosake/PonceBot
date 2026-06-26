@@ -20173,22 +20173,23 @@ def _studio_economic_discipline_gate_applies(governor: dict[str, Any] | None) ->
     return bool(governor.get("economic_gate_active")) or mode == "economic_discipline_gate"
 
 
+def _studio_best_effort_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return default
+
+
 def _studio_economic_gate_rejection_reason(governor: dict[str, Any] | None, opportunity: dict[str, Any]) -> str:
     if not _studio_economic_discipline_gate_applies(governor):
         return ""
     factory_value = opportunity.get("factory_value") if isinstance(opportunity.get("factory_value"), dict) else {}
-    try:
-        factory_score = int(factory_value.get("score") or 0)
-    except Exception:
-        factory_score = 0
-    try:
-        shipability_score = int(factory_value.get("shipability_score") or 0)
-    except Exception:
-        shipability_score = 0
-    try:
-        selection_score = int(opportunity.get("score") or 0)
-    except Exception:
-        selection_score = 0
+    factory_score = _studio_best_effort_int(factory_value.get("score") or 0)
+    shipability_score = _studio_best_effort_int(factory_value.get("shipability_score") or 0)
+    selection_score = _studio_best_effort_int(opportunity.get("score") or 0)
     min_factory = _studio_economic_gate_min_factory_value_score()
     min_shipability = _studio_economic_gate_min_shipability_score()
     min_selection = _studio_economic_gate_min_selection_score()
@@ -20207,6 +20208,8 @@ def _studio_economic_gate_rejection_reason(governor: dict[str, Any] | None, oppo
 def _studio_apply_economic_discipline_filter(
     governor: dict[str, Any] | None,
     opportunities: list[dict[str, Any]],
+    *,
+    orch_q: OrchestratorQueue | None = None,
 ) -> list[dict[str, Any]]:
     if not _studio_economic_discipline_gate_applies(governor):
         return opportunities
@@ -20221,6 +20224,26 @@ def _studio_apply_economic_discipline_filter(
                 item.get("type") or "unknown",
                 reason,
             )
+            if orch_q is not None:
+                try:
+                    factory_value = item.get("factory_value") if isinstance(item.get("factory_value"), dict) else {}
+                    orch_q.append_audit_event(
+                        event_type="studio.economic_gate_rejected",
+                        actor="studio",
+                        details={
+                            "candidate_key": str(item.get("key") or ""),
+                            "candidate_type": str(item.get("type") or ""),
+                            "repo_id": str(item.get("repo_id") or ""),
+                            "repo_name": str(item.get("repo_name") or ""),
+                            "score": _studio_best_effort_int(item.get("score") or 0),
+                            "factory_value_score": _studio_best_effort_int(factory_value.get("score") or 0),
+                            "shipability_score": _studio_best_effort_int(factory_value.get("shipability_score") or 0),
+                            "governor_mode": str((governor or {}).get("mode") or ""),
+                            "reason": reason,
+                        },
+                    )
+                except Exception:
+                    pass
             continue
         filtered.append(item)
     return filtered
@@ -20265,7 +20288,7 @@ def _studio_build_opportunities(
     if _project_incubator_enabled() and "project-incubator" not in occupied_keys and "new-project-incubator" not in occupied_keys:
         incubator = _studio_incubator_opportunity(cfg=cfg, now=now, memory=memory)
         if _studio_governor_avoids_opportunity(governor, incubator):
-            opportunities = _studio_apply_economic_discipline_filter(governor, opportunities)
+            opportunities = _studio_apply_economic_discipline_filter(governor, opportunities, orch_q=orch_q)
             opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
             return opportunities[:5]
         try:
@@ -20276,7 +20299,7 @@ def _studio_build_opportunities(
             pass
         opportunities.append(incubator)
 
-    opportunities = _studio_apply_economic_discipline_filter(governor, opportunities)
+    opportunities = _studio_apply_economic_discipline_filter(governor, opportunities, orch_q=orch_q)
     opportunities.sort(key=lambda item: (-int(item.get("score") or 0), str(item.get("repo_name") or "")))
     return opportunities[:5]
 

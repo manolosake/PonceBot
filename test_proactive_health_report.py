@@ -859,6 +859,65 @@ class TestProactiveHealthReport(unittest.TestCase):
             self.assertIn("## Recommended Actions", markdown)
             self.assertIn("- None", markdown)
 
+    def test_report_surfaces_pre_codex_prevented_launch_metrics_and_markdown(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out_dir = root / "out"
+            db = root / "jobs.sqlite"
+            now = time.time()
+            with sqlite3.connect(db) as con:
+                con.execute(
+                    """
+                    CREATE TABLE ceo_orders (
+                        order_id TEXT,
+                        status TEXT,
+                        phase TEXT,
+                        title TEXT,
+                        body TEXT,
+                        updated_at REAL
+                    )
+                    """
+                )
+                con.execute(
+                    """
+                    CREATE TABLE jobs (
+                        job_id TEXT,
+                        parent_job_id TEXT,
+                        state TEXT,
+                        role TEXT,
+                        labels TEXT,
+                        trace TEXT,
+                        updated_at REAL,
+                        created_at REAL
+                    )
+                    """
+                )
+                con.execute("CREATE TABLE audit_log (ts REAL, event_type TEXT)")
+                con.executemany(
+                    "INSERT INTO audit_log(ts, event_type) VALUES (?, ?)",
+                    [
+                        (now - 60, "studio.economic_gate_rejected"),
+                        (now - 120, "studio.economic_gate_rejected"),
+                        (now - 180, "delegation.proactive_selection_review_rerouted"),
+                    ],
+                )
+
+            proc = self._run_report(root, db, out_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            payload = json.loads((out_dir / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["metrics"]["economic_gate_rejections_24h"], 2)
+            self.assertEqual(payload["metrics"]["selection_review_reroutes_24h"], 1)
+            self.assertEqual(payload["metrics"]["pre_codex_interventions_24h"], 3)
+            self.assertNotIn("pre_codex_prevented_launches_24h", payload["metrics"])
+
+            markdown = (out_dir / "latest.md").read_text(encoding="utf-8")
+            self.assertIn(
+                "Pre-Codex interventions (24h): total=3 economic_gate_rejections=2 selection_review_reroutes=1",
+                markdown,
+            )
+            self.assertNotIn("prevented_launches", markdown)
+
     def test_order_autonomy_funnel_no_code_change_slice_can_close(self) -> None:
         order_id = "order-nochange-1234"
         now = 2000.0
